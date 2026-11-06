@@ -472,6 +472,13 @@ class _EpisodesFakeCursor:
             self.last_inserted_id = eid
             self._result = [(eid,)]  # RETURNING id
             return
+        if s.startswith("SELECT raw FROM episodes WHERE ts"):
+            ts, md = params
+            hits = [e["raw"] for e in self.episodes.values()
+                    if cap._instant(e["ts"]) == cap._instant(ts)
+                    and hashlib.md5(e["summary"].encode()).hexdigest() == md]
+            self._result = [(hits[0],)] if hits else []
+            return
         if s.startswith("SELECT id FROM episodes WHERE ts"):
             ts, md = params
             hits = [eid for eid, e in self.episodes.items()

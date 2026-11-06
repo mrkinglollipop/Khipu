@@ -54,7 +54,7 @@ def test_non_applicable_nightly_steps_are_named_for_a_grey_row(monkeypatch):
     assert "notes_reconcile" in skipped and "embed_provider" in skipped, (health, skipped)
 
 
-def test_held_verbatim_only_capture_with_open_loop_is_informational_and_kept(tmp_path, monkeypatch):
+def test_held_verbatim_only_capture_with_open_loop_needs_recovery(tmp_path, monkeypatch):
     from khipu import cli, session_capture
     from khipu.doctor_summary import health_summary
 
@@ -75,14 +75,14 @@ def test_held_verbatim_only_capture_with_open_loop_is_informational_and_kept(tmp
     meta = session_capture._retry_state_path(held)
     meta.write_text(json.dumps({"disposition": "held", "last_error": "capture rc=65"}))
     local = cli._doctor_local_checks(None)
-    assert local["outbox_ok"] is True, local["outbox"]
-    assert local["outbox"]["at_risk"] is False
+    assert local["outbox_ok"] is False, local["outbox"]
+    assert local["outbox"]["at_risk"] is True
     assert local["outbox"]["dead"] == 1
     line = health_summary({"outbox": local["outbox"], "outbox_ok": True})[0]
-    assert "no summary, so Khipu can't save it" in line
-    assert "Retrying won't help; the file is kept" in line
-    assert "nothing to save" not in line and "retry-dead" not in line
-    assert local["outbox"]["no_summary_held"] == 1
+    assert "can't save" not in line
+    assert "Retrying won't help" not in line
+    assert "nothing to save" not in line
+    assert "retry-dead" in local["outbox"]["fix"]
     assert held.read_text() == original and meta.exists()
     # Real content refused with the same exit code still needs attention.
     held.write_text(json.dumps({"extracted_payload": {"summary": "important"}}))
