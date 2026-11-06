@@ -1390,7 +1390,7 @@ def test_15_health_red_and_recovery(replay, condition, gateway_hub):
     else:
         replay.ack(info)
         if condition == "prompt-skips":
-            outcomes(skips=2)
+            outcomes(skips=3)
         elif condition == "cross-mac-stale":
             replay.configure(routing_replication_live=True)
             routing_replication._save({"caught_up_at": routing._iso(replay.now - timedelta(hours=1))})
