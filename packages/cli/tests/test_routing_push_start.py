@@ -624,7 +624,9 @@ def test_a_large_start_pages_the_note_and_keeps_mandatory_memory(home, monkeypat
     from khipu import routing_delivery
 
     memory = _maximal_memory()
-    words = "Codex first for builds today; Grok for surveys. " * 100
+    unit = "Codex first for builds today; Grok for surveys. "
+    room = CLAUDE_CODE_HOOK_LIMIT - recall_rule._utf16_len(recall_rule.RULE_MD.strip())
+    words = unit * (room // recall_rule._utf16_len(unit) + 2)
     monkeypatch.setattr(recall_rule, "session_start_context", lambda cwd=None: memory)
     routing.set_note(words, via="app")
     _record()

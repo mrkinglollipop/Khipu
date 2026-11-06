@@ -1256,6 +1256,16 @@ _EPISODE_ILIKE_COLUMNS = (
     "COALESCE(people::text, '')",
 )
 
+def _episode_literal_columns(cur):
+    """Search decoded JSON strings, including owner quotes, on existing schema."""
+    verbatim = _episode_verbatim_select(cur)
+    if verbatim == "NULL::jsonb":
+        return _EPISODE_ILIKE_COLUMNS
+    return (*_EPISODE_ILIKE_COLUMNS,
+            f"COALESCE((SELECT string_agg(v #>> '{{}}', chr(10)) FROM "
+            f"jsonb_path_query({verbatim}, 'strict $.** ? (@.type() == \"string\")') AS v), '')")
+
+
 # fast=True columns for `_literal_candidates` (recall_prompt's budgeted
 # lexical leg, khipu_status's prior_work — 2026-09-15): migration 0015 put a
 # pg_trgm GIN index on exactly episodes.summary / topics.title / topics.body
@@ -1351,7 +1361,7 @@ def _search_query(
         )
         topic_order = "slug ASC"
         episode_where = " OR ".join(
-            f"{c} ILIKE %(q)s ESCAPE '\\'" for c in _EPISODE_ILIKE_COLUMNS
+            f"{c} ILIKE %(q)s ESCAPE '\\'" for c in _episode_literal_columns(cur)
         )
         episode_order = "ts DESC NULLS LAST, id DESC"
         node_where = (
@@ -1365,7 +1375,7 @@ def _search_query(
             ("body", "slug", "COALESCE(title, '')"), n
         )
         topic_order = f"({topic_score}) DESC, slug ASC"
-        episode_where, episode_score = _token_match_sql(_EPISODE_ILIKE_COLUMNS, n)
+        episode_where, episode_score = _token_match_sql(_episode_literal_columns(cur), n)
         episode_order = f"({episode_score}) DESC, ts DESC NULLS LAST, id DESC"
         node_where, node_score = _token_match_sql(("id", "COALESCE(name, '')"), n)
         node_order = f"({node_score}) DESC, id ASC"
@@ -1468,7 +1478,7 @@ def _neg_ts_sort_key(ts) -> float:
 
 
 def _literal_candidates(
-    cur, term: str, limit: int, *, kind: str | None = None, filters=None, fast: bool = False
+    cur, term: str, limit: int, *, kind: str | None = None, filters=None, fast: bool = False, owner_words: bool = False
 ) -> list[dict]:
     # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Globally-ranked literal ILIKE candidates for RRF fusion (bugfix,
@@ -1529,7 +1539,12 @@ def _literal_candidates(
             # query still runs, just possibly via the slower seq-scan plan.
             pass
     lim = max(1, int(limit))
-    tokens = search_tokens(term)
+    from khipu.search_text import explicit_search_tokens, search_phrase, session_query
+    term = search_phrase(term)
+    tokens = explicit_search_tokens(term) if owner_words else search_tokens(term)
+    identity = session_query(term) if "episode" in active_kinds else None
+    if identity:
+        active_kinds = ["episode"]
     pool: list[dict] = []
     # ``filters`` (embed._SearchFilters) pushes project/since/until/session_id/
     # harness into THIS pool's SQL instead of trimming it after the fact — a
@@ -1587,7 +1602,7 @@ def _literal_candidates(
             # generator directly inside the outer f"""...""" query below.
             episode_ilike_where = " OR ".join(
                 f"{c} ILIKE %(q)s ESCAPE '\\'"
-                for c in (_EPISODE_ILIKE_COLUMNS_FAST if fast else _EPISODE_ILIKE_COLUMNS)
+                for c in (_EPISODE_ILIKE_COLUMNS_FAST if fast else _episode_literal_columns(cur))
             )
             cur.execute(
                 f"""
@@ -1626,7 +1641,7 @@ def _literal_candidates(
                     "rank_text": f"{label}\n{payload or ''}", "hits": 1, "ts": None,
                 })
     else:
-        params = {**_ilike_token_params(tokens), **filter_params}
+        params = {**_ilike_token_params(tokens), **filter_params, "phrase": f"%{_escape_like(term.strip())}%"}
         n = len(tokens)
         if "topic" in active_kinds:
             topic_cols = _TOPIC_ILIKE_COLUMNS_FAST if fast else ("body", "slug", "COALESCE(title, '')")
@@ -1648,15 +1663,24 @@ def _literal_candidates(
                     "rank_text": f"{label}\n\n{body or ''}", "hits": int(hits), "ts": ts,
                 })
         if "episode" in active_kinds:
-            episode_cols = _EPISODE_ILIKE_COLUMNS_FAST if fast else _EPISODE_ILIKE_COLUMNS
+            episode_cols = _EPISODE_ILIKE_COLUMNS_FAST if fast else _episode_literal_columns(cur)
             episode_where, episode_score = _token_match_sql(episode_cols, n)
+            phrase_where = " OR ".join(f"{c} ILIKE %(phrase)s ESCAPE '\\'" for c in episode_cols)
+            # Session ids are identities, not summary keywords. Exact matching
+            # avoids UUID token fragments selecting unrelated captures.
+            from khipu.search_text import session_query
+            identity = session_query(term)
+            if identity:
+                params["session_query"] = _escape_like(identity) + "%"
+                episode_where = "(session_id LIKE %(session_query)s OR substring(session_id from position(':' in session_id) + 1) LIKE %(session_query)s)"
+                phrase_where = episode_where
             cur.execute(
                 f"""
                 SELECT id::text, summary, topics, decisions, preferences, people, ts,
                        ({episode_score}) AS hits, {_episode_verbatim_select(cur)} AS verbatim
                 FROM episodes
                 WHERE {_episode_live_clause(cur)}({episode_where}) AND ({ep_filter})
-                ORDER BY hits DESC, ts DESC NULLS LAST, id DESC
+                ORDER BY ({phrase_where}) DESC, hits DESC, ts DESC NULLS LAST, id DESC
                 LIMIT %(lim)s
                 """,
                 {**params, "lim": lim},
@@ -1665,7 +1689,7 @@ def _literal_candidates(
                 pool.append({
                     "kind": "episode", "id": eid, "label": summary, "snippet": summary,
                     "rank_text": _episode_rank_text(summary, topics, decisions, preferences, people, verbatim),
-                    "hits": int(hits), "ts": ts,
+                    "hits": int(hits), "ts": ts, "exact_phrase": bool(identity),
                 })
         if "node" in active_kinds:
             node_where, node_score = _token_match_sql(("id", "COALESCE(name, '')"), n)
@@ -1686,10 +1710,30 @@ def _literal_candidates(
                     "rank_text": f"{label}\n{payload or ''}", "hits": int(hits), "ts": None,
                 })
 
+    # Whole phrase only, on the exact expression indexed by 0051. An absent
+    # or unfinished index means no owner-words leg, never a sequential fallback.
+    if owner_words and not identity and "episode" in active_kinds and len(term) >= 3:
+        cur.execute("SELECT EXISTS (SELECT 1 FROM pg_index WHERE indexrelid = "
+                    "to_regclass('public.idx_episodes_owner_words_trgm') AND indisvalid AND indisready)")
+        if cur.fetchone()[0]:
+            cur.execute(
+                f"SELECT id::text, summary, topics, decisions, preferences, people, ts, "
+                f"{_episode_verbatim_select(cur)} AS verbatim FROM episodes "
+                f"WHERE {_episode_live_clause(cur)}public.khipu_owner_words(verbatim) LIKE %(words)s ESCAPE '\\' "
+                f"AND ({ep_filter}) ORDER BY ts DESC NULLS LAST, id DESC LIMIT %(lim)s",
+                {**filter_params, "words": f"%{_escape_like(term.lower())}%", "lim": lim},
+            )
+            for eid, summary, topics, decisions, preferences, people, ts, verbatim in cur.fetchall():
+                # The SQL predicate is the phrase proof, independently of how
+                # episode_text renders the original stored fields.
+                pool.append(dict(kind="episode", id=eid, label=summary, snippet=summary,
+                    rank_text=_episode_rank_text(summary, topics, decisions, preferences, people, verbatim),
+                    hits=len(tokens), ts=ts, exact_phrase=True))
+
     qlower = (term or "").strip().lower()
 
     def _phrase_hit(r: dict) -> int:
-        return 1 if qlower and qlower in (r.get("rank_text") or "").lower() else 0
+        return 1 if r.get("exact_phrase") or (qlower and qlower in (r.get("rank_text") or "").lower()) else 0
 
     pool.sort(key=lambda r: (-_phrase_hit(r), -r.get("hits", 0), _neg_ts_sort_key(r.get("ts"))))
     out = []
@@ -1699,6 +1743,7 @@ def _literal_candidates(
             "label": clip_snippet(r["label"] or "", LABEL_LIMIT),
             "snippet": clip_snippet(r["snippet"] or "", SNIPPET_LIMIT),
             "rank_text": r["rank_text"],
+            "exact_phrase": bool(r.get("exact_phrase") or _phrase_hit(r)),
         })
     return out
 

@@ -6790,11 +6790,14 @@ def search_snapshot(
     are excluded outright rather than guessed at (an explicit non-episode
     ``kind`` combined with one of these filters yields no results, matching
     the PG-path behaviour exactly)."""
-    from khipu.search_text import parse_time_filter, search_tokens
+    from khipu.search_text import parse_time_filter, search_tokens, session_query, session_matches
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
 
     if kind is not None and kind not in ("topic", "episode", "node"):
         raise ValueError("kind must be 'topic', 'episode', or 'node'")
+    identity = session_query(query)
+    if identity and not session_id:
+        session_id = identity
     want_episode_only = bool(project or session_id or harness or t3_thread or via)
     if want_episode_only:
         active_kinds = ["episode"] if kind in (None, "episode") else []
@@ -6835,7 +6838,7 @@ def search_snapshot(
     # Python filter semantics. Register deterministic predicates before the
     # LIMIT so a rejected row cannot consume the result budget.
     con.create_function("khipu_project_match", 2, lambda value, wanted: any(w.lower() in str(value or "").lower() for w in str(wanted or "").split("\x1f")))
-    con.create_function("khipu_prefix", 2, lambda value, prefix: str(value or "").startswith(str(prefix or "")))
+    con.create_function("khipu_prefix", 2, lambda value, prefix: session_matches(str(value or ""), str(prefix or "")))
     def _sql_in_range(value, lo, hi):
         parsed = _parse_snapshot_ts(value)
         if parsed is None:
@@ -6880,6 +6883,11 @@ def search_snapshot(
         )
         node_order = f"({node_score}) DESC, id ASC"
 
+    if identity:
+        episode_where = "(session_id = ? OR substr(session_id, instr(session_id, ':') + 1) = ?)"
+        episode_params = [identity, identity]
+        episode_order = "ts DESC, id DESC"
+
     # since/until filtering happens in Python after fetch (sqlite ISO-text
     # comparison across mixed offset formats is not reliable), so oversample
     # the LIMIT when either bound is active.
@@ -6897,6 +6905,8 @@ def search_snapshot(
         and (topic_n > 0 or episode_n > 0)
         and _fts_ready(con)
     )
+    if identity:
+        use_fts = False
     match_terms = _fts_match_terms(tokens) if use_fts else []
 
     def fts_rows(sql: str, params: Sequence[Any], n: int) -> list[Any] | None:
@@ -7013,7 +7023,7 @@ def search_snapshot(
             (*t3_params, *identity_params), episode_n,
         )
         if rows is None:
-            split_at = len(episode_params) // 2 if search_tokens(query) else len(episode_params)
+            split_at = len(episode_params) // 2 if search_tokens(query) and not identity else len(episode_params)
             rows = con.execute(sql, (*episode_params[:split_at], *t3_params,
                                      *identity_params, *episode_params[split_at:], oversample(episode_n))).fetchall()
         for r in rows:
@@ -7022,7 +7032,8 @@ def search_snapshot(
             row_sid = r[5] or ""
             if project and not any(k.lower() in (r[6] or "").lower() for k in proj_keys):
                 continue
-            if session_id and not row_sid.startswith(session_id):
+            from khipu.search_text import session_matches
+            if session_id and not session_matches(row_sid, session_id):
                 continue
             if harness:
                 row_harness = r[7] or row_sid.split(":", 1)[0]
@@ -7118,7 +7129,8 @@ def merge_outbox_episodes(
             row_harness = str(payload.get("harness") or row_session.split(":", 1)[0])
             if project and project.strip().lower() not in row_project.lower():
                 continue
-            if session_id and not row_session.startswith(session_id):
+            from khipu.search_text import session_matches
+            if session_id and not session_matches(row_session, session_id):
                 continue
             if harness and row_harness != harness:
                 continue
@@ -7689,7 +7701,8 @@ def semantic_search_snapshot(
                 row_sid = row_sid or ""
                 if project and not any(k.lower() in (row_proj or "").lower() for k in proj_keys):
                     continue
-                if session_id and not row_sid.startswith(session_id):
+                from khipu.search_text import session_matches
+                if session_id and not session_matches(row_sid, session_id):
                     continue
                 if harness and (row_harn or row_sid.split(":", 1)[0]) != harness:
                     continue
@@ -8522,7 +8535,8 @@ def _filter_expanded_snapshot_rows(
             sid, harn = episodes.get(str(item["id"]), ("", None))
             if project and not any(p.lower() in str(item.get("project") or "").lower() for p in projects):
                 continue
-            if session_id and not sid.startswith(session_id):
+            from khipu.search_text import session_matches
+            if session_id and not session_matches(sid, session_id):
                 continue
             if harness and (harn or sid.split(":", 1)[0]) != harness:
                 continue
