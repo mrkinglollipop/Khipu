@@ -4309,6 +4309,11 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     events = [routing_replication.proposal(e, cfg) for e in events]
     # A pure replay may name its Mac; unstamped logs retain their local meaning.
     mac = mac or cfg.get("_mac")
+    # Tracking/renaming a login changes only the originating Mac's list.
+    # Old peers already sent these notes under a shared account id; ignore
+    # those too. Shared account removal travels as definition_remove instead.
+    events = [e for e in events if e.get("type") != "account_note"
+              or not (e.get("remote") or (mac and e.get("mac") and e["mac"] != mac))]
     definitions = entry_model.definitions(events, mac)
     known = _definition_accounts(known, events=events, config={}, definitions=definitions, events_ordered=True)
     lane_map = {r: dict(lanes) for r, lanes in lane_map.items()}
@@ -4869,7 +4874,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             continue
         gone = notes.get(key) or {}
         by_key[key] = {"key": key, "label": gone["text"] if gone.get("state") == "untracked" and gone.get("text")
-                       else _label_for_key(key), "harness": key.partition("|")[0],
+                       else _label_for_key(key), "harness": key.partition("|")[0].partition(":")[0],
                        "home": key.partition("|")[2] or None}
     for hold in holds.values():
         hkey = hold["scope"].get("account")
@@ -8899,7 +8904,8 @@ def _harness_label(entry: dict) -> str:
 def _witness_words(entry: dict, push: bool) -> str:
     w = entry.get("witness") or {}
     source, by = w.get("source"), w.get("written_by")
-    cli_name = _harness_label(entry)
+    cli_name = (entry.get("label") if account_identity.STABLE.fullmatch(entry.get("key") or "")
+                else None) or _harness_label(entry)
     if source == "probe":
         if w.get("session_logs"):
             return f"read from {cli_name}'s session logs"

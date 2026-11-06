@@ -177,6 +177,12 @@ def test_the_rebind_can_be_turned_back(macs):
     accounts.track([{"harness": "claude", "label": "Claude"}], expect=accounts.status()["version"], read=False, via="app")
     ids = routing.account_identity.state(routing._in_write_order(routing.read_events()[0]), routing.accounts())[0]
     assert ids["claude|"] == "claude:main"
+    settle(m5, m1, hub)
+    for mac in (m5, m1):
+        mac.activate()
+        view = mac.view()
+        assert entry(view, "claude|").get("note", [None])[0] != "untracked"
+        assert "no longer tracked" not in routing.change_line("account:claude|", view, mac.now)
 
 
 def test_the_owner_action_carries_keep_priority_to_the_command_line():
@@ -196,3 +202,92 @@ def test_a_stop_without_it_would_take_the_main_account_out_of_the_shared_priorit
     accounts.stop("claude|", expect=accounts.status()["version"], via="app")
     written = [e for e in routing._read_event_lines()[0] if e["type"] in ("priority_set", "priority_clear", "priority_drop")]
     assert written[-1]["written_by"]["kind"] == "owner" and "claude|" not in [e["account"] for e in written[-1].get("entries", [])]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_stop_and_retrack_only_changes_the_originating_macs_notes(pair, reverse):
+    a, b, hub = pair
+    if reverse:
+        a, b = b, a
+    for mac in (a, b):
+        mac.activate()
+        routing.report(account="Claude", state="open", author=AUTHOR)
+    a.activate()
+    accounts.stop("claude|", expect=accounts.status()["version"], keep_priority=True, via="app")
+    assert "no longer tracked" in routing.change_line("account:claude|", a.view(), a.now)
+    for mac in (a, b):
+        assert sync(mac, hub)["ok"]
+    b.activate()
+    view = b.view()
+    assert entry(view, "claude|").get("note") is None
+    assert "no longer tracked" not in routing.change_line("account:claude|", view, b.now)
+    a.activate()
+    accounts.track([{"harness": "claude", "label": "Claude second"}],
+                   expect=accounts.status()["version"], read=False, via="app")
+    settle(b, a, hub)
+    a.activate()
+    assert entry(a.view(), "claude|")["note"][0] == "tracked"
+    b.activate()
+    assert entry(b.view(), "claude|").get("note") is None
+    assert "no longer tracked" not in routing.change_line("account:claude|", b.view(), b.now)
+
+
+@pytest.mark.parametrize("state", ["untracked", "tracked", "renamed"])
+def test_stale_peer_note_does_not_change_local_advice_priority_or_caps(macs, state):
+    m5, _m1, _hub, _key = macs
+    m5.activate()
+    before = m5.view()
+    # Exact old wire shape, already retained by an earlier version. Also
+    # exercise the legacy same-key shape: neither describes this Mac's list.
+    for key in ("claude:main", "claude|"):
+        rows = routing.read_events()[0] + [{"type": "account_note", "account": key,
+            "state": state, "written_at": routing._iso(T0 + timedelta(seconds=1)),
+            "written_by": {"kind": "owner"}, "mac": "peer", "remote": True}]
+        view = routing.fold(rows, now=m5.now, cfg=routing.settings(m5.config), known=routing.accounts(),
+                            mac=routing._local_mac())
+        main = entry(view, "claude|")
+        assert main.get("note") is None and main["configured"] is True
+        assert main_as_read(view) == main_as_read(before)
+        assert all(e["in_settings"] for e in view["priority"]["entries"])
+        assert routing_advice.account_advice(view, main, m5.now)["verdict"] == "go"
+        assert "no longer tracked" not in routing.change_line("account:claude|", view, m5.now)
+
+
+def test_peer_probe_words_use_the_account_label(macs):
+    m5, m1, hub, _key = macs
+    m5.activate()
+    m5.write({"type": "evidence", "account": "claude|", "state": "open", "source": "probe",
+              "written_by": {"kind": "probe"}, "via": "probe"})
+    rebind(m1)
+    settle(m5, m1, hub)
+    m1.activate()
+    main = entry(m1.view(), "claude:main")
+    assert main["harness"] == "claude"
+    words = routing.account_line(main, m1.now)
+    assert "read from Claude" in words
+    assert "claude:main" not in words
+    second = dict(main, label="Claude second")
+    assert "read from Claude second" in routing.account_line(second, m1.now)
+
+
+def test_shared_account_definition_removal_still_reaches_the_other_mac(pair):
+    a, b, hub = pair
+    a.activate()
+    value = {"id": "kimi:main", "label": "Kimi", "provider": "kimi"}
+    routing.set_definition("account", value, via="app")
+    routing.set_priority([{"account": "Kimi", "role": "first"}], via="app",
+                         expect=routing.priority_version())
+    for mac in (a, b):
+        assert sync(mac, hub)["ok"]
+    b.activate()
+    assert b.view()["priority"]["entries"][0]["in_settings"] is True
+    a.activate()
+    # This is the existing event emitted when undo removes a definition
+    # that did not exist before the owner's addition.
+    routing._owner_write({"type": "definition_remove", "definition": "account", "value": value}, "app")
+    for mac in (a, b):
+        assert sync(mac, hub)["ok"]
+    b.activate()
+    view = b.view()
+    assert view["priority"]["entries"][0]["in_settings"] is False
+    assert "no longer tracked" in routing.priority_line(view["priority"], b.now, view=view)

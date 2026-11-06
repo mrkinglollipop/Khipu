@@ -321,7 +321,9 @@ describe("JobsCard descriptions", () => {
 describe("GatewayUrlCard", () => {
   it("saves an address and clears it with an empty value", async () => {
     render(<GatewayUrlCard active />);
-    const field = (await screen.findByLabelText(/Public https address/)) as HTMLInputElement;
+    const field = (await screen.findByLabelText("Address for using Khipu away from this Mac")) as HTMLInputElement;
+    expect(screen.getByText("Cloud address")).toBeInTheDocument();
+    expect(screen.queryByText("Gateway address")).not.toBeInTheDocument();
     await waitFor(() => expect(field.value).toBe("https://khipu.example.org"));
     fireEvent.change(field, { target: { value: "" } });
     fireEvent.submit(field.closest("form")!);
