@@ -304,34 +304,6 @@ def _render_project_slice(label: str, slice_data: dict) -> str:
     from khipu.snippets import clip_snippet
 
     lines = ["## Pushed slice", f"project: `{label}`", *_pair_lines(slice_data)]
-    owed = slice_data.get("commitments") or []
-    if owed:
-        lines.append("### Open commitments")
-        display, extra_blockers = _commitment_display_rows(owed)
-        for c in display:
-            text = clip_snippet(str(c.get("text") or ""), 160)
-            owner = str(c.get("owner") or "").strip()
-            who = {"user": " (needs the user)",
-                   "agent": " (for the orchestrator)"}.get(owner, "")
-            if owner == "assistant" and c.get("same_session_lineage"):
-                who = " (yours)"
-            age_days = _commitment_age_days(c)
-            age_txt = f" ({age_days}d old)" if age_days is not None and age_days > 7 else ""
-            lines.append(f"- [{c.get('kind')}]{who}{age_txt} `{c.get('id')}`: {text}")
-        if extra_blockers:
-            lines.append(f"- +{extra_blockers} more blocker(s) in `khipu owed`")
-        lines.append(
-            "Items marked (needs the user) are the user's to do or decide — do not "
-            "act on them yourself. When the user says one is done, close it right "
-            "away with `khipu_owed_update` (or `khipu owed --close ID`) instead of "
-            "waiting for the next capture to notice."
-        )
-        if any(str(c.get("owner") or "").strip().lower() == "agent" for c in display):
-            lines.append(
-                "Items marked (for the orchestrator) came from jobs dispatched in this "
-                "project: yours to do, route or close. Ask the user only if one really "
-                "needs them."
-            )
     decisions = slice_data.get("decisions") or []
     if decisions:
         d_lines = ["### Decisions still standing (last 14 days)"]

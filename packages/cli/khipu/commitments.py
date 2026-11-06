@@ -1363,6 +1363,9 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             norm["text"], kind=norm["kind"], declared=norm["owner"], future_trigger=trigger,
             origin=origin, declared_label=norm.get("owner_label"), new_item=True,
         )
+        # Summaries never assign work to the owner. Explicit asks have their own writer.
+        if owner == OWNER_USER:
+            continue
         reason = rejection_reason(norm["text"], owner=owner, kind=norm["kind"])
         if reason is not None:
             rejected += 1

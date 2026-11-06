@@ -84,7 +84,7 @@ class JobsRunTest(unittest.TestCase):
         run_mock.assert_called_once()
         m_reconcile.assert_called_once_with(dry_run=False)
         m_stale.assert_called_once_with()
-        m_hygiene.assert_called_once_with()
+        m_hygiene.assert_not_called()
         state = json.loads((self.data_dir / "state" / "job-nightly.json").read_text())
         self.assertEqual(state["exit"], 0)
 
@@ -107,7 +107,7 @@ class JobsRunTest(unittest.TestCase):
                 self.assertEqual(jobs.run_nightly(), expected)
             script.assert_called_once()
             self.assertFalse(record.call_args_list[0].kwargs["ok"])
-            self.assertEqual(record.call_count, 18)
+            self.assertEqual(record.call_count, 16)
 
     def test_run_nightly_writes_nightly_last_json_with_every_step(self):
         """F3/D1: nightly-last.json is the persisted evidence Phase 6 will
@@ -127,9 +127,9 @@ class JobsRunTest(unittest.TestCase):
             names,
             ["sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
              "summary_kind_backfill", "query_cache_prune", "routing_ledger_prune", "storage_sweep",
-             "owner_actions_chain", "commitments_close_rules", "fact_changes_prune",
+             "owner_actions_chain", "fact_changes_prune",
              "commitments_mark_stale",
-             "commitments_hygiene", "ledger", "receipt_prune", "project_renames",
+             "ledger", "receipt_prune", "project_renames",
              "recall_eval", "snapshot_refresh"],
         )
         for step in payload["steps"]:
@@ -217,7 +217,6 @@ class JobsRunTest(unittest.TestCase):
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
         m_stale.assert_called_once_with(cur)
-        conn.commit.assert_called_once()
 
     def test_run_nightly_survives_a_commitment_staling_failure(self):
         def _run(cmd, stdout, stderr, env):  # noqa: ARG001
@@ -272,9 +271,8 @@ class JobsRunTest(unittest.TestCase):
         self.assertIn("backfill skipped: RuntimeError: quota",
                       (self.log_dir / "khipu-nightly.out.log").read_text())
 
-    def test_run_nightly_runs_the_commitments_hygiene_pass(self):
-        """W3 Owed quality (2026-09-05): the two hygiene passes run every
-        night, not only on demand via `khipu hygiene commitments`."""
+    def test_run_nightly_omits_the_commitments_hygiene_pass(self):
+        """The removed hygiene pass performs no backups or model calls."""
         def _run(cmd, stdout, stderr, env):  # noqa: ARG001
             stdout.write(b"ok\n")
             return mock.Mock(returncode=0)
@@ -305,13 +303,12 @@ class JobsRunTest(unittest.TestCase):
                 ) as m_rejudge:
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
-        m_backup.assert_called_once_with(conn)
-        m_session.assert_called_once_with(cur, apply=True)
-        m_rejudge.assert_called_once_with(cur, apply=True)
-        conn.commit.assert_called_once()
+        m_backup.assert_not_called()
+        m_session.assert_not_called()
+        m_rejudge.assert_not_called()
         log = (self.log_dir / "khipu-nightly.out.log").read_text()
-        self.assertIn("[khipu-hygiene] session-ended", log)
-        self.assertIn("rejudge", log)
+        self.assertNotIn("[khipu-hygiene] session-ended", log)
+        self.assertNotIn("rejudge", log)
 
     def test_run_nightly_survives_a_commitments_hygiene_failure(self):
         """A failure in the hygiene pass must never flip a good nightly to
@@ -328,7 +325,7 @@ class JobsRunTest(unittest.TestCase):
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
         log = (self.log_dir / "khipu-nightly.out.log").read_text()
-        self.assertIn("[khipu-hygiene] skipped: RuntimeError: hub down", log)
+        self.assertNotIn("[khipu-hygiene]", log)
 
     def test_run_monthly_passes_dry_run(self):
         captured: list[list[str]] = []

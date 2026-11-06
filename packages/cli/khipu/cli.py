@@ -6215,6 +6215,9 @@ def build_parser() -> argparse.ArgumentParser:
     from khipu import owed_origin
 
     owed_origin.add_parser(owed_sub)
+    from khipu import owed_reset
+
+    owed_reset.add_parser(owed_sub)
     tidy = owed_sub.add_parser(
         "tidy", help="Plan the one-time clean-up of a project's Owed list; apply or undo a plan")
     tidy.add_argument("--project", required=True)

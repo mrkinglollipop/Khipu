@@ -552,15 +552,12 @@ def _run_nightly_locked() -> int:
     _record_nightly_step(steps, "storage_sweep", **_step_result(sweep_result),
                          deferred=sweep_result.get("deferred") if isinstance(sweep_result, dict) else None)
     _record_nightly_step(steps, "owner_actions_chain", **_step_result(_owner_actions_chain()))
-    completion_result = _step_result(_commitment_close_rules())
-    _record_nightly_step(steps, "commitments_close_rules", **completion_result)
     # Its own step: it used to ride at the end of close-rules and was skipped
     # whenever anything before it there raised.
     changes_result = _fact_changes_prune()
     _record_nightly_step(steps, "fact_changes_prune", **_step_result(changes_result),
                          deferred=changes_result.get("deferred") if isinstance(changes_result, dict) else None)
     _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
-    _record_nightly_step(steps, "commitments_hygiene", **_step_result(_hygiene_commitments()))
     _record_nightly_step(steps, "ledger", **_step_result(_ledger_nightly()))
     receipt_result = _receipt_prune()
     _record_nightly_step(steps, "receipt_prune", **_step_result(receipt_result),
@@ -580,7 +577,7 @@ def _run_nightly_locked() -> int:
                              deferred=briefs_result.get("deferred")
                              if isinstance(briefs_result, dict) else None)
     briefs_ok = briefs_result is None or _step_result(briefs_result)["ok"]
-    final_rc = rc or (0 if drain_result["ok"] and briefs_ok and completion_result["ok"] else 1)
+    final_rc = rc or (0 if drain_result["ok"] and briefs_ok else 1)
     _write_job_state("nightly", final_rc)
     return final_rc
 
@@ -1422,14 +1419,6 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
     "receipt_prune_ok": (
         "receipt_prune",
         "run `khipu jobs install nightly` or wait for the next nightly",
-    ),
-    "commitments_close_rules_ok": (
-        "commitments_close_rules",
-        "run `khipu jobs install nightly` or wait for the next nightly",
-    ),
-    "commitments_hygiene_ok": (
-        "commitments_hygiene",
-        "run `khipu hygiene commitments` and check the error",
     ),
     "mark_stale_ok": (
         "commitments_mark_stale",
