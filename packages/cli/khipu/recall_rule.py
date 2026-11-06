@@ -325,7 +325,7 @@ def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
     describes. A PG failure degrades to the local hub_snapshot with a visible
     `stale` line and logs the miss via query_log so W6 can count it."""
     from khipu import activity
-    from khipu.cli import _search_query
+    from khipu.cli import _literal_candidates
     from khipu.db import connect
     from khipu.snippets import clip_snippet
     from khipu.topic_graph import enrich_search_results
@@ -402,7 +402,7 @@ def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
     if term:
         with connect() as conn:
             with conn.cursor() as cur:
-                rows = enrich_search_results(cur, _search_query(cur, term, 6))
+                rows = enrich_search_results(cur, _literal_candidates(cur, term, 6, fast=True))
     if not rows:
         rows = [
             {

@@ -376,8 +376,32 @@ def parse_time_filter(value: str) -> datetime:
 def session_query(query: str) -> str | None:
     """Recognize UUID session ids, with or without their harness prefix."""
     q = query.strip()
-    return q if re.fullmatch(r"(?:[a-zA-Z][\w-]*:)?[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", q) else None
+    return q if re.fullmatch(r"(?:[a-zA-Z][\w-]*:)?[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}(?::[A-Za-z0-9_-]+)*", q) else None
 
 
 def session_matches(stored: str, query: str) -> bool:
-    return stored.startswith(query) or (":" not in query and stored.partition(":")[2].startswith(query))
+    return stored.startswith(query) or stored.partition(":")[2].startswith(query)
+
+
+def search_phrase(query: str) -> str:
+    q = query.strip()
+    if len(q) >= 2 and (q[0], q[-1]) in {('"', '"'), ("'", "'"), ('“', '”'), ('‘', '’')}:
+        return q[1:-1].strip()
+    return q
+
+
+def explicit_search_tokens(query: str) -> list[str]:
+    # Keep automatic prompt scoring unchanged. Filter before MAX_TOKENS.
+    return [t for t in search_tokens(search_phrase(query), limit=64)
+            if t not in {"what", "about", "we", "may", "might", "can", "could", "would", "should", "not"}][:MAX_TOKENS]
+
+
+def strong_coverage(hits: int, count: int) -> bool:
+    return count > 0 and (hits >= count or (hits >= 2 and hits * 3 >= count * 2))
+
+
+def order_search_evidence(rows, count):
+    # One explicit rule: exact identity/phrase, then substantial word evidence,
+    # then the existing order. Score nudges cannot promote cosine-only rows.
+    return sorted(rows, key=lambda r: (not bool(r.get("exact_phrase")),
+                  not strong_coverage(int(r.get("lexical_hits") or 0), count)))

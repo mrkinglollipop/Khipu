@@ -2540,7 +2540,7 @@ def _cosine_sql(
             label = "CASE WHEN m.kind = 'media' THEN m.chunk_text END"
         branches.append(
             f"(SELECT {cols}, {label} AS label, ({dist}) AS dist FROM {frm}"
-            " WHERE m.profile = %(p)s AND m.kind NOT IN ('episode', 'topic', 'commitment')"
+            " WHERE m.profile = %(p)s AND m.kind = 'media'"
             f" AND {kind_ok} ORDER BY {order} LIMIT %(lim)s)"
         )
     if not branches:
@@ -2742,7 +2742,7 @@ class _SearchFilters:
                 parts.append(typed)
         if self.session_id:
             parts.append(f"({a}session_id LIKE %(kf_session)s ESCAPE '" + chr(92) + "'"
-                         + (f" OR split_part({a}session_id, ':', 2) LIKE %(kf_session)s ESCAPE '" + chr(92) + "'" if ":" not in self.session_id else "") + ")")
+                         + (f" OR substring({a}session_id from position(':' in {a}session_id) + 1) LIKE %(kf_session)s ESCAPE '" + chr(92) + "'") + ")")
         if self.harness:
             split = f"split_part(COALESCE({a}session_id, ''), ':', 1)"
             expr = (f"COALESCE(NULLIF({a}harness, ''), {split})" if flags["harness"] else split)
@@ -3179,11 +3179,13 @@ def hybrid_search(
     ``ts`` / ``project`` / ``harness``; a topic or node carries ``ts`` only.
     """
     from khipu.cli import _literal_candidates
+    from khipu.search_text import search_phrase, explicit_search_tokens, order_search_evidence, session_query
     from khipu.hub_snapshot import try_hub_connect
     from khipu.search_text import fuse_ranked_lists, note_prompt_term_hits, prompt_terms, search_tokens, token_hit_count
     from khipu.topic_graph import enrich_search_results
 
-    query = (query or "").strip()
+    original_query = query
+    query = search_phrase(query or "")
     if not query:
         raise ValueError("query is required")
     mode = (mode or "hybrid").strip().lower()
@@ -3231,7 +3233,7 @@ def hybrid_search(
     # Default search only: the library legs start now, beside the memory legs.
     # An explicit kind="library" has no memory legs to overlap, so it stays serial.
     lib_legs = (
-        _LibraryLegs(query, mode=mode, oversample=oversample)
+        _LibraryLegs(original_query, mode=mode, oversample=oversample)
         if want_library and kind is None else None
     )
 
@@ -3243,7 +3245,8 @@ def hybrid_search(
     # semantic has no literal leg.
     literal_box: dict[str, Any] = {}
     literal_thread: threading.Thread | None = None
-    want_literal = mode in ("hybrid", "literal") and kind != LIBRARY_KIND
+    identity_query = session_query(query) if kind in (None, "episode") else None
+    want_literal = (mode in ("hybrid", "literal") or identity_query) and kind != LIBRARY_KIND
     if mode == "hybrid" and want_literal:
         literal_kind = kind if kind in _LITERAL_KINDS else None
 
@@ -3254,7 +3257,8 @@ def hybrid_search(
                 with try_hub_connect() as lit_conn:
                     with lit_conn.cursor() as lit_cur:
                         literal_box["rows"] = _literal_candidates(
-                            lit_cur, query, oversample, kind=literal_kind, filters=filters
+                            lit_cur, query, oversample, kind=literal_kind, filters=filters,
+                            fast=literal_kind != "node", owner_words=True
                         )
             except BaseException as exc:  # noqa: BLE001 — memory answer must not sink on literal
                 literal_box["error"] = f"{type(exc).__name__}: {exc}"[:120]
@@ -3271,7 +3275,7 @@ def hybrid_search(
     # embedded. Skip cosine entirely rather than let semantic_kind=None fall
     # through to "no kind filter" and pollute a node-only request with every
     # other kind.
-    if mode in ("hybrid", "semantic") and not (kind and kind not in _SEMANTIC_KINDS):
+    if mode in ("hybrid", "semantic") and not identity_query and not (kind and kind not in _SEMANTIC_KINDS):
         semantic_kind = kind if kind in _SEMANTIC_KINDS else None
         try:
             cosine_rows = _cosine_candidates(
@@ -3307,7 +3311,7 @@ def hybrid_search(
     with try_hub_connect() as conn:
         timing["hub_connect_ms"] = round((time.monotonic() - _connect_started) * 1000, 1)
         with conn.cursor() as cur:
-            if mode == "literal" and want_literal:
+            if literal_thread is None and want_literal:
                 literal_kind = kind if kind in _LITERAL_KINDS else None
                 _t = time.monotonic()
                 literal_rows = _literal_candidates(
@@ -3321,7 +3325,7 @@ def hybrid_search(
                 from khipu import library_search as _ls
 
                 lib_cos_lists, lib_literal, lib_names = _ls.library_candidates(
-                    conn, cur, query, mode=mode, kind=kind, source=source,
+                    conn, cur, original_query, mode=mode, kind=kind, source=source,
                     oversample=oversample, timing=timing, degraded_legs=degraded_legs,
                 )
 
@@ -3329,7 +3333,7 @@ def hybrid_search(
             lists: list[list[dict[str, Any]]] = []
             # R4: the query's own token count matters for confidence below
             # even in modes/branches with no cosine leg at all.
-            tokens = search_tokens(query)
+            tokens = search_tokens(query) if rank is not None else explicit_search_tokens(query)
             # Memory cosine, then one cosine list per library profile: each is
             # its own ranked list in the fusion.
             cos_lists = [lst for lst in [cosine_rows, *lib_cos_lists] if lst]
@@ -3359,7 +3363,7 @@ def hybrid_search(
                         key=lambda r: -token_hit_count(r.get("rank_text") or "", tokens),
                     )
                     lists.append(lex_rows)
-            if literal_rows and mode in ("hybrid", "literal"):
+            if literal_rows and (mode in ("hybrid", "literal") or identity_query):
                 lists.append(list(literal_rows))
             if lib_literal and mode in ("hybrid", "literal"):
                 lists.append(list(lib_literal))
@@ -3431,7 +3435,7 @@ def hybrid_search(
                     out["libraries"] = lib_names
                 return out
             _t = time.monotonic()
-            fused = fuse_ranked_lists(lists, limit=oversample)
+            fused = fuse_ranked_lists(lists, limit=sum(map(len, lists)))
 
             floor_info: dict[str, Any] | None = None
 
@@ -3575,8 +3579,9 @@ def hybrid_search(
                 pass
             # Exact stored words win after every optional ranker and before
             # truncation; semantic neighbours cannot spend boosts past them.
-            fused.sort(key=lambda r: not r.get("exact_phrase", False))
+            fused = order_search_evidence(fused, len(tokens))
             fused = _fair_fill(fused, limit)
+            fused = order_search_evidence(fused, len(tokens))
             timing["enrich_ms"] = round((time.monotonic() - _t) * 1000, 1)
 
     from khipu.recency import HALF_LIFE_DAYS
@@ -3629,7 +3634,8 @@ def search_confidence(rows: list[dict[str, Any]], *, token_count: int) -> str:
         return "none"
     top_cosine = rows[0].get("cosine")
     top_lexical = int(rows[0].get("lexical_hits") or 0)
-    full_coverage = token_count > 0 and top_lexical >= token_count
+    from khipu.search_text import strong_coverage
+    full_coverage = strong_coverage(top_lexical, token_count)
     if rows[0].get("exact_phrase") or full_coverage:
         return "strong"
     if top_lexical >= 1 or (top_cosine is not None and top_cosine >= CONFIDENCE_COSINE_WEAK):

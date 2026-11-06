@@ -242,7 +242,7 @@ TOOLS: list[dict] = [
             "similarity, hybrid/semantic only) and `lexical_hits` (how many "
             "query tokens this row names verbatim) are the honest signals; "
             "the top-level `confidence` ('none'|'weak'|'strong') is derived "
-            "from the top hit: strong requires exact words or full token coverage; cosine alone is at most weak. Treat 'none' as "
+            "from the top hit: strong requires an exact phrase/session match or at least two-thirds content-token coverage (minimum two tokens); cosine alone is at most weak. Treat 'none' as "
             "'nothing found', not as a low-ranked hit. Tombstoned topics are "
             "excluded. Snippets are word-boundary teasers; call khipu_get for "
             "the full row (for a library hit, the chunk with its neighbours)."

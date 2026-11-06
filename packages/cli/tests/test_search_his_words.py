@@ -9,8 +9,10 @@ from tests.hermetic_pg import hub, pg_cluster
 from tests.test_audit_recall_search import configure_hub
 
 
-def test_profile_and_grades(hub, monkeypatch):
+def test_profile_and_grades(hub, monkeypatch, tmp_path):
     configure_hub(monkeypatch, hub)
+    from tests.test_search_indexed_words import install_words
+    install_words(hub, tmp_path)
     conn = hub.connect()
     conn.execute("INSERT INTO episodes (ts,summary,raw,session_id,project,verbatim) VALUES (now(),%s,'{}',%s,'invented',%s::jsonb)",
                  ('synthetic exact', 'codex:12345678-abcd-1234-abcd-123456789abc', json.dumps({'quotes': ['keep the violet reset intact']})))
