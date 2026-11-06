@@ -237,6 +237,19 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
     from khipu.db import has_table
 
     live = " AND deleted_at IS NULL" if live_only else ""
+    if (source is not None and isinstance(payload.get("summary"), str)
+            and not payload["summary"].strip() and not _source_key_is_safe(payload)
+            and sources_ready(cur)):
+        # An exact immutable payload hash proves a replay even for old writers
+        # with a window id but no part. This also survives the row that first
+        # held the blank legacy key gaining a summary or being removed.
+        cur.execute("SELECT s.episode_id FROM episode_sources s JOIN episodes e ON e.id = s.episode_id "
+                    "WHERE s.source_key = %s AND s.payload_sha256 = %s"
+                    + (" AND e.deleted_at IS NULL" if live_only else ""),
+                    (source["source_key"], source["payload_sha256"]))
+        row = cur.fetchone()
+        if row:
+            return int(row[0])
     if sources_ready(cur) and _source_key_is_safe(payload):
         key = source["source_key"] if source else source_key(payload)
         if live_only:
@@ -1368,7 +1381,7 @@ def _replay_lacks(stored: Any, incoming: Any) -> list[str] | None:
     """Whether a capture is a replay of the one a row's raw holds, as a pure
     function of the two, so a resolution record proves itself later.
 
-    None: not shown to be the same capture. It needs the same instant and
+    None: not shown to be the same capture. It needs the same instant (or a recorded blank-summary timestamp allocation) and
     summary, the same session, range and event (a capture with no natural key
     has no such identity), and no disagreement in ``_REPLAY_IF_BOTH``.
 
@@ -1388,7 +1401,21 @@ def _replay_lacks(stored: Any, incoming: Any) -> list[str] | None:
         return "" if value is None else str(value)
 
     at = _instant(incoming.get("ts"))
-    if at is None or at != _instant(stored.get("ts")) or incoming.get("summary") != stored.get("summary"):
+    row_at = _instant(stored.get("ts"))
+    same_time = at is not None and at == row_at
+    if not same_time and at is not None and row_at is not None:
+        from khipu.capture_identity import SOURCE_FIELDS
+
+        # Blank captures may allocate a different microsecond at their legacy
+        # key. Natural ownership and every evidence field must still agree;
+        # archives keep the original queued timestamp as well as the hub raw.
+        same_time = (isinstance(incoming.get("summary"), str)
+                     and incoming["summary"] == stored.get("summary")
+                     and not incoming["summary"].strip()
+                     and at == _instant(stored.get("blank_summary_original_ts"))
+                     and at.replace(microsecond=0) == row_at.replace(microsecond=0)
+                     and all(text(stored.get(k)) == text(incoming.get(k)) for k in SOURCE_FIELDS))
+    if not same_time or incoming.get("summary") != stored.get("summary"):
         return None
     if any(text(stored.get(k)) != text(incoming.get(k)) for k in _REPLAY_SAME):
         return None
@@ -1517,7 +1544,7 @@ def _sibling_part_summary(cur, payload: dict[str, Any]) -> str | None:
 
     part = str(payload.get("part") or "")
     summary = payload.get("summary")
-    if not part or not isinstance(summary, str) or not has_natural_key(payload):
+    if not part or not isinstance(summary, str) or not summary.strip() or not has_natural_key(payload):
         return None
     cur.execute("SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s "
                 "ORDER BY deleted_at IS NOT NULL, id DESC LIMIT 1",
@@ -1543,6 +1570,49 @@ def _sibling_part_summary(cur, payload: dict[str, Any]) -> str | None:
            for k in ("harness", "session_id", "transcript_range", "window_id")):
         return None
     return f"{summary} (part {part})".strip()
+
+
+def _blank_capture_timestamp(cur, payload: dict[str, Any]) -> None:
+    # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
+    """Allocate a subsecond legacy key only for distinct natural blank captures.
+
+    Summary stays byte-for-byte blank. PostgreSQL already stores microseconds;
+    serialize blank writers within the UTC second, then probe rather than
+    assuming a truncated hash is unique. Replays find the same natural owner.
+    The caller snapshots source identity first and passes this same timestamp
+    to every subsequent leg. No synthetic summary or schema change is needed.
+    """
+    from khipu.capture_identity import SOURCE_FIELDS, has_natural_key, source_key
+
+    if not isinstance(payload.get("summary"), str) or payload["summary"].strip() \
+            or not has_natural_key(payload):
+        return
+    original = _instant(payload["ts"]).astimezone(timezone.utc)
+    second = original.replace(microsecond=0)
+    lock = int.from_bytes(hashlib.sha256(("blank-key:" + second.isoformat()).encode()).digest()[:8],
+                          "big", signed=True)
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock,))
+    stamp = original
+    start = 1 + int(source_key(payload)[:16], 16) % 999999
+    for attempt in range(1000001):
+        cur.execute("SELECT raw FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s "
+                    "ORDER BY deleted_at IS NOT NULL, id DESC LIMIT 1",
+                    (stamp.isoformat(), _md5_hex(payload["summary"])))
+        found = cur.fetchone()
+        if not found:
+            break
+        raw = found[0]
+        # A missing natural owner is not proof of a different capture.
+        if not isinstance(raw, dict) or not has_natural_key(raw):
+            break
+        if all(str(raw.get(k) or "") == str(payload.get(k) or "") for k in SOURCE_FIELDS):
+            break
+        stamp = second.replace(microsecond=1 + (start - 1 + attempt) % 999999)
+    else:
+        raise CaptureEvidenceConflict("blank capture timestamp slots exhausted; capture retained")
+    if stamp != original:
+        payload.setdefault("blank_summary_original_ts", payload["ts"])
+        payload["ts"] = stamp.isoformat().replace("+00:00", "Z")
 
 
 def _paragraphs(text: str) -> str:
@@ -1586,15 +1656,16 @@ def _verbatim_contained(stored: Any, incoming: dict[str, Any]) -> bool:
     return True
 
 
-def _verbatim_stored(cur, episode_id: int | None, verbatim: Any) -> bool:
+def _verbatim_stored(cur, episode_id: int | None, verbatim: Any, *, evidence: dict | None = None) -> bool:
     # forget-fence: capture writer: read-back of the row this capture just wrote or matched; returns a bool, never row text
     """Whether the live row ``episode_id`` holds every piece of ``verbatim``,
-    read back inside the caller's transaction before it commits. False when
-    there is nothing to confirm or the read fails: the caller must then keep
+    read back inside the caller's transaction before it commits. When no
+    verbatim exists, structured extraction evidence must instead be on raw.
+    False when there is nothing to confirm or the read fails: the caller must then keep
     the capture rather than acknowledge it."""
     if episode_id is None or not isinstance(verbatim, dict):
         return False
-    if not any(v not in (None, "", [], {}) for v in verbatim.values()):
+    if not any(v not in (None, "", [], {}) for v in verbatim.values()) and not evidence:
         return False
     cur.execute("SAVEPOINT capture_verbatim_check")
     try:
@@ -1609,6 +1680,8 @@ def _verbatim_stored(cur, episode_id: int | None, verbatim: Any) -> bool:
     if not isinstance(target, dict) or target.get("deleted_at"):
         return False
     raw = target.get("raw") if isinstance(target.get("raw"), dict) else {}
+    if evidence:
+        return _verbatim_contained(raw, evidence)
     return (_verbatim_contained(target.get("verbatim"), verbatim)
             or _verbatim_contained(raw.get("verbatim"), verbatim))
 
@@ -1625,7 +1698,7 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
     For an empty-summary ``verbatim_only`` capture it also returns
     ``verbatim_stored``: True only when the row it inserted or matched was
     read back in this transaction, before the commit, holding this payload's
-    verbatim evidence.
+    verbatim evidence, or its structured extraction when no verbatim exists.
 
     Runs the same three steps for every writer that reaches here (the native
     extractor via session_capture.drain, the legacy capture_v2-shaped payload
@@ -1654,8 +1727,12 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
     # Snapshotted with the source: enrichment below may rewrite the payload.
     from copy import deepcopy
 
-    verbatim_check = (deepcopy(payload.get("verbatim"))
+    verbatim_check = (deepcopy(payload.get("verbatim") or {})
                       if _verbatim_only_empty(payload) else None)
+    evidence_check = ({k: deepcopy(payload[k]) for k in
+                       ("open_loops", "closed_loops", "decisions", "preferences", "people",
+                        "decision_details", "edges", "topic_pages", "deliverables")
+                       if payload.get(k)} if verbatim_check == {} else None)
     topics_written = 0
     episode_id: int | None = None
     from khipu import memory_lock
@@ -1682,6 +1759,7 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
                 cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
                 if hub_source_forgotten(cur, payload, source):
                     return _forgotten_result(cur, payload, source)
+                _blank_capture_timestamp(cur, payload)
                 if legacy_projection:
                     # Only explicitly identified, unknown-owner file recovery
                     # opts in. Prove against the untouched input before dedup,
@@ -1805,7 +1883,7 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
                     }
                     if verbatim_check is not None:
                         skipped["verbatim_stored"] = _verbatim_stored(
-                            cur, dedup.get("matched_episode"), verbatim_check)
+                            cur, dedup.get("matched_episode"), verbatim_check, evidence=evidence_check)
                     conn.commit()
                     if dedup["action"] == "merge":
                         _refresh_merged_episode(cur, dedup["matched_episode"])
@@ -1945,7 +2023,7 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
                                 },
                             }
                             if verbatim_check is not None:
-                                duplicate["verbatim_stored"] = _verbatim_stored(cur, episode_id, verbatim_check)
+                                duplicate["verbatim_stored"] = _verbatim_stored(cur, episode_id, verbatim_check, evidence=evidence_check)
                             conn.commit()  # the owner claim above
                             return duplicate
                         # Field names only: this text reaches logs forget does not scan.
@@ -1997,7 +2075,7 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
                     "dedup": dedup,
                 }
                 if verbatim_check is not None:
-                    written["verbatim_stored"] = _verbatim_stored(cur, episode_id, verbatim_check)
+                    written["verbatim_stored"] = _verbatim_stored(cur, episode_id, verbatim_check, evidence=evidence_check)
             conn.commit()
         return written
     except FactStepDeferred:
@@ -2356,7 +2434,8 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
         # The legacy writer refuses an empty summary (exit 65), so the hub row
         # is this capture's only store. Acknowledge only when write_pg read
         # that row back, before committing, holding this payload's verbatim
-        # evidence; a dedup onto a row without it must keep the job queued.
+        # or (when there is none) structured extraction evidence. A dedup onto
+        # a row without that evidence must keep the job queued.
         if stats.get("verbatim_stored") is not True:
             _log("verbatim_only capture not confirmed on the hub row; kept")
             _set_reason(result, "verbatim_only_unconfirmed")

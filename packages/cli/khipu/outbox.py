@@ -724,17 +724,12 @@ def jobs() -> list[Path]:
 
 
 def held_without_summary(path: Path) -> bool:
-    """Read-only classification; open loops may still be present in the file."""
-    from khipu.session_capture import _retry_state
+    """Blank summary is not proof of unsavable evidence (or of an rc=65 cause).
 
-    try:
-        held = json.loads(path.read_text())
-        payload = held.get("extracted_payload")
-        return bool(_retry_state(path).get("last_error") == "capture rc=65"
-                    and isinstance(payload, dict) and not str(payload.get("summary") or "").strip()
-                    and not any(payload.get(k) for k in ("verbatim", "decisions", "preferences", "commitments")))
-    except (OSError, ValueError, AttributeError):
-        return False
+    Kept for status consumers; no held job can be excluded from recovery on
+    the strength of its summary or generic exit code alone.
+    """
+    return False
 
 
 def status() -> dict[str, Any]:
@@ -809,7 +804,6 @@ def status() -> dict[str, Any]:
     no_summary_held = sum(held_without_summary(p) for p in native_paths)
 
     dead = len(dead_jobs()) + quarantined + len(native_held)
-    # Captures with no savable summary remain on disk, including their open loops.
     # Every waiting capture is waiting only because the hub could not be
     # reached: the promotion gate does not refuse a candidate on that.
     offline_only = (bool(js) and offline == len(js) and not unreadable
@@ -834,10 +828,6 @@ def status() -> dict[str, Any]:
     result["dead_waiting"] = max(dead - refused_old - conflicts_old, 0) \
         if (newest_age is None or newest_age > OLD_DEAD_S) else dead
     result["dead_waiting"] = max(0, result["dead_waiting"] - no_summary_held)
-    if no_summary_held:
-        result["plain"] = (f"{no_summary_held} held capture{'s have' if no_summary_held != 1 else ' has'} no summary, "
-                           "so Khipu can't save " + ("them" if no_summary_held != 1 else "it") +
-                           ". Retrying won't help; the " + ("files are" if no_summary_held != 1 else "file is") + " kept.")
     if refused_old:
         result["plain"] = (result.get("plain", "") + " " if result.get("plain") else "") + (f"{refused_old} old capture{'' if refused_old == 1 else 's'} an older app sent without "
                            "announcing its source identities sit refused"
