@@ -882,7 +882,6 @@ const NOT_CONFIGURED_LABEL: Record<string, string> = {
   // a Mac that just updated) — skipped, not red; see healthRows.tsx LABELS.
   notes_reconcile: "Notes reconciled by the nightly",
   embed_provider: "Embedding provider reachable",
-  commitments_hygiene: "Commitments hygiene ran",
   mark_stale: "Stale commitments aged out",
 };
 

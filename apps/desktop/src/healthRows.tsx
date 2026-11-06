@@ -78,7 +78,6 @@ const LABELS: Record<string, string> = {
   embed_provider_ok: "Embedding provider reachable",
   synth_provider_ok: "Summariser provider ready",
   synth_budget_ok: "Summariser within today's call ceiling",
-  commitments_hygiene_ok: "Commitments hygiene ran",
   mark_stale_ok: "Stale commitments aged out",
   // D6/F2/F4: topic-embedding lag and the search-degrade rate.
   topics_embed_lag_ok: "Search index catching up on time",

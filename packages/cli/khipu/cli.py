@@ -434,7 +434,7 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         nightly_steps = {
             k: {"ok": False, "applicable": True, "error": err}
             for k in ("notes_reconcile_ok", "embed_provider_ok",
-                      "commitments_hygiene_ok", "mark_stale_ok")
+                      "mark_stale_ok")
         }
     # A step that has never been recorded is skipped, not red — a fresh
     # install or a Mac that just updated has nothing in nightly-last.json
@@ -1179,7 +1179,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "forget_list_ok": bool(forget_list_block.get("ok")),
         "notes_reconcile_ok": bool(nightly_steps.get("notes_reconcile_ok", {}).get("ok")),
         "embed_provider_ok": bool(nightly_steps.get("embed_provider_ok", {}).get("ok")),
-        "commitments_hygiene_ok": bool(nightly_steps.get("commitments_hygiene_ok", {}).get("ok")),
         "mark_stale_ok": bool(nightly_steps.get("mark_stale_ok", {}).get("ok")),
         "topics_embed_lag_ok": bool(topics_lag.get("ok")),
         "degraded_rate_ok": bool(degraded_rate.get("ok")),

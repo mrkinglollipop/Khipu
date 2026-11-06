@@ -36,7 +36,6 @@ const ALL_OK_KEYS = [
   // Phase 6 (honesty): D1 nightly-step evidence + D6 lag/degrade checks.
   "notes_reconcile_ok",
   "embed_provider_ok",
-  "commitments_hygiene_ok",
   "mark_stale_ok",
   "topics_embed_lag_ok",
   "degraded_rate_ok",
@@ -73,7 +72,7 @@ describe("the offline-copy row's icon matches its sentence", () => {
 describe("healthRows (pure)", () => {
   it("returns one row per _ok key, all green, when everything passes", () => {
     const rows = healthRows(fixture());
-    expect(rows).toHaveLength(20);
+    expect(rows).toHaveLength(19);
     expect(rows.every((r) => r.status === "ok")).toBe(true);
   });
 
@@ -160,7 +159,6 @@ describe("healthRows (pure)", () => {
     const byKey = Object.fromEntries(rows.map((r) => [r.key, r.label]));
     expect(byKey.notes_reconcile_ok).toBe("Notes reconciled by the nightly");
     expect(byKey.embed_provider_ok).toBe("Embedding provider reachable");
-    expect(byKey.commitments_hygiene_ok).toBe("Commitments hygiene ran");
     expect(byKey.mark_stale_ok).toBe("Stale commitments aged out");
     expect(byKey.topics_embed_lag_ok).toBe("Search index catching up on time");
     expect(byKey.degraded_rate_ok).toBe("Search rarely falls back to keyword-only");
@@ -168,12 +166,12 @@ describe("healthRows (pure)", () => {
 });
 
 describe("HealthReportRows", () => {
-  it("(a) renders 20 rows with a check mark and no raw JSON", () => {
+  it("(a) renders 19 rows with a check mark and no raw JSON", () => {
     const { container } = render(
       <HealthReportRows parsed={fixture()} attention={[]} />,
     );
-    expect(container.querySelectorAll(".row-item")).toHaveLength(20);
-    expect(container.querySelectorAll("svg.ok")).toHaveLength(20);
+    expect(container.querySelectorAll(".row-item")).toHaveLength(19);
+    expect(container.querySelectorAll("svg.ok")).toHaveLength(19);
     expect(container.querySelector("pre")).toBeNull();
   });
 
