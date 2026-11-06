@@ -2,6 +2,8 @@
 import json
 import time
 
+import pytest
+
 from khipu import owner_act, owner_background, owner_direction
 from tests.test_t3_owner_confirm import world, _hold_in_t3, _t3_hook_turn, THREAD
 
@@ -205,3 +207,77 @@ def test_a_finished_job_is_untouched_by_the_timer(world, monkeypatch):
     ok, _ = owner_background.run(request)
     assert ok and owner_background.heal(time.time() + 10**7) == []
     assert _row(request)["state"] == "applied"
+
+
+def test_crash_after_claim_before_start_is_recovered(world, monkeypatch):
+    request = _hold_in_t3(world)
+    monkeypatch.setattr(owner_background, "LONG_ACTIONS", {"route.pause"})
+    world["t3"].message(THREAD, time.time() + 1, text="yes")
+    _t3_hook_turn(prompt="yes")
+    # Stop at the exact boundary: confirm saved applying, start never ran.
+    owner_direction.confirm(request)
+    assert _row(request)["state"] == "applying"
+    assert owner_background.heal() == []
+    assert owner_background.heal(time.time() + owner_background.NO_WORKER_GRACE_S + 5) == [request]
+    assert _row(request)["state"] == "interrupted"
+    assert owner_background.heal(time.time() + 10**7) == []
+
+
+def test_crash_before_claim_leaves_request_confirmable(world, monkeypatch):
+    request = _hold_in_t3(world)
+    monkeypatch.setattr(owner_background, "LONG_ACTIONS", {"route.pause"})
+    owner_background.prepare(_row(request))
+    assert owner_background.heal(time.time() + 10**7) == []
+    assert _row(request)["state"] == "pending"
+
+
+@pytest.mark.parametrize("remote", [False, True])
+def test_inline_claim_is_interrupted_only_after_its_process_dies(world, monkeypatch, remote):
+    import select
+    import subprocess
+    import sys
+
+    request = _hold_in_t3(world)
+    # Remote confirmations run inline even for an otherwise long action.
+    code = f"""
+import time
+from khipu import owner_direction, owner_background
+if {remote!r}:
+    owner_background.LONG_ACTIONS = {{"route.pause"}}
+owner_direction.confirm({request!r}, terminal=True,
+    remote={{"mac": "other", "id": "answer", "message_sha": "fixture"}} if {remote!r} else None)
+print("claimed", flush=True)
+time.sleep(60)
+"""
+    worker = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        assert select.select([worker.stdout], [], [], 10)[0], "claiming process did not respond"
+        assert worker.stdout.readline() == b"claimed\n"
+        job = json.loads(owner_background.path(request).read_text())
+        assert job["pid"] == worker.pid and job["worker"] == owner_background._identity(worker.pid)
+        assert _row(request)["state"] == "applying"
+        assert owner_background.heal(time.time() + 10**7) == []
+        assert _row(request)["state"] == "applying"  # slow, but still alive
+        worker.kill()
+        worker.wait(timeout=10)
+        assert owner_background.heal() == [request]
+        assert _row(request)["state"] == "interrupted"
+        assert owner_background.heal() == []
+        assert json.loads(owner_background.path(request).read_text())["state"] == "finished"
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        worker.communicate(timeout=10)
+
+
+def test_normally_finished_inline_action_closes_its_prepared_record(world):
+    request = _hold_in_t3(world)
+    world["t3"].message(THREAD, time.time() + 1, text="yes")
+    _t3_hook_turn(prompt="yes")
+    ok, result = owner_act.act("direction.confirm", {"request": request})
+    assert ok and not result.get("started"), result
+    assert _row(request)["state"] == "applied"
+    assert json.loads(owner_background.path(request).read_text())["state"] == "started"
+    assert owner_background.heal() == []
+    job = json.loads(owner_background.path(request).read_text())
+    assert job["state"] == "finished" and job["ok"] is True

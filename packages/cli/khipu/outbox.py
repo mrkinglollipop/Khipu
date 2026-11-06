@@ -723,6 +723,20 @@ def jobs() -> list[Path]:
         return []
 
 
+def held_without_summary(path: Path) -> bool:
+    """Read-only classification; open loops may still be present in the file."""
+    from khipu.session_capture import _retry_state
+
+    try:
+        held = json.loads(path.read_text())
+        payload = held.get("extracted_payload")
+        return bool(_retry_state(path).get("last_error") == "capture rc=65"
+                    and isinstance(payload, dict) and not str(payload.get("summary") or "").strip()
+                    and not any(payload.get(k) for k in ("verbatim", "decisions", "preferences", "commitments")))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def status() -> dict[str, Any]:
     """`pending` is what makes doctor red. `oldest_*` describe the job that has
     been WAITING longest, which is not the same as the one whose episode has the
@@ -790,15 +804,20 @@ def status() -> dict[str, Any]:
     # Existing doctor callers use ``dead`` to detect work that cannot replay.
     from khipu.session_capture import held_jobs
 
-    native_held = [p.name for p in held_jobs()]
+    native_paths = held_jobs()
+    native_held = [p.name for p in native_paths]
+    no_summary_held = sum(held_without_summary(p) for p in native_paths)
+
     dead = len(dead_jobs()) + quarantined + len(native_held)
+    # Captures with no savable summary remain on disk, including their open loops.
     # Every waiting capture is waiting only because the hub could not be
     # reached: the promotion gate does not refuse a candidate on that.
     offline_only = (bool(js) and offline == len(js) and not unreadable
                     and not dead and not evidence_conflicts)
     result = {"dir": str(outbox_dir()), "pending": len(js), "oldest_age_s": oldest_age,
             "oldest_job": oldest_job, "unreadable": unreadable,
-            "dead": dead, "quarantined": quarantined, "native_held": native_held,
+            "dead": dead, "no_summary_held": no_summary_held, "recoverable_dead": dead - no_summary_held,
+            "quarantined": quarantined, "native_held": native_held,
             "max_attempts": MAX_ATTEMPTS, "offline": offline, "offline_only": offline_only,
             "evidence_conflicts": evidence_conflicts,
             "held_conflicts": len(held_conflicts), "held_conflict_jobs": held_conflicts,
@@ -814,8 +833,13 @@ def status() -> dict[str, Any]:
     result["dead_newest_age_s"] = newest_age
     result["dead_waiting"] = max(dead - refused_old - conflicts_old, 0) \
         if (newest_age is None or newest_age > OLD_DEAD_S) else dead
+    result["dead_waiting"] = max(0, result["dead_waiting"] - no_summary_held)
+    if no_summary_held:
+        result["plain"] = (f"{no_summary_held} held capture{'s have' if no_summary_held != 1 else ' has'} no summary, "
+                           "so Khipu can't save " + ("them" if no_summary_held != 1 else "it") +
+                           ". Retrying won't help; the " + ("files are" if no_summary_held != 1 else "file is") + " kept.")
     if refused_old:
-        result["plain"] = (f"{refused_old} old capture{'' if refused_old == 1 else 's'} an older app sent without "
+        result["plain"] = (result.get("plain", "") + " " if result.get("plain") else "") + (f"{refused_old} old capture{'' if refused_old == 1 else 's'} an older app sent without "
                            "announcing its source identities sit refused"
                            + (f"; the newest died {newest_age // 3600} h ago" if newest_age is not None else "")
                            + (", and nothing newer has died" if (newest_age or 0) > OLD_DEAD_S else "")

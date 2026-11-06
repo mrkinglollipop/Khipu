@@ -234,6 +234,8 @@ def test_only_out_of_time_skips_count_against_the_slow_read_share(replay):
     result = health.prompt_health(acceptance.T0, 1.0)
     assert result["status"] == "green" and result["skipped"] == 7 and result["out_of_time"] == 0
     _log([(f"s{i}", "skipped:budget" if i in (10, 50) else "none") for i in range(100)])
+    assert health.prompt_health(acceptance.T0, 1.0)["status"] == "green"  # two late prompts are not a pattern
+    _log([(f"s{i}", "skipped:budget" if i in (10, 50, 70) else "none") for i in range(100)])
     assert health.prompt_health(acceptance.T0, 1.0)["reasons"] == ["prompt-skips"]
     assert health.prompt_health(acceptance.T0, 5.0)["status"] == "green"
     assert health.prompt_health(acceptance.T0, 0)["status"] == "green"  # 0: never warns
