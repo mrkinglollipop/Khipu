@@ -1435,18 +1435,6 @@ def episode_text(row: dict[str, Any]) -> str:
         note = verbatim.get("note")
         if note:
             parts.append(f"note: {note}")
-        # Retain future stored owner-text fields as well as the original tier.
-        def strings(value):
-            if isinstance(value, str):
-                return [value]
-            if isinstance(value, dict):
-                return [t for v in value.values() for t in strings(v)]
-            if isinstance(value, list):
-                return [t for v in value for t in strings(v)]
-            return []
-        for key, value in verbatim.items():
-            if key not in {"errors", "commands", "paths", "quotes", "note"}:
-                parts.extend(strings(value))
     return "\n".join(p for p in parts if p).strip()
 
 

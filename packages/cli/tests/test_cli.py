@@ -220,7 +220,9 @@ class SearchFixtureTest(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0], 2)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0], 1)
         self.cur = _SqliteSearchCursor(self.conn)
-        patch = mock.patch("khipu.db.has_columns", return_value=True)
+        # The fixture is SQLite with no verbatim column; literal search reads
+        # that column with PostgreSQL JSON syntax only where it exists.
+        patch = mock.patch("khipu.db.has_columns", side_effect=lambda _cur, _table, *cols: "verbatim" not in cols)
         patch.start()
         self.addCleanup(patch.stop)
 
