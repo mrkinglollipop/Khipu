@@ -490,10 +490,10 @@ export function GatewayUrlCard({ active, onSaved }: { active: boolean; onSaved?:
   const fromEnv = Boolean(effective) && effective !== fileValue;
   return (
     <div className="section-card">
-      <div className="section-head">Gateway address</div>
+      <div className="section-head">Cloud address</div>
       <div className="section-body">
         <SettingField
-          label="Public https address of the Khipu gateway"
+          label="Address for using Khipu away from this Mac"
           mono
           inputMode="url"
           placeholder="https://khipu.example.org"
@@ -501,8 +501,8 @@ export function GatewayUrlCard({ active, onSaved }: { active: boolean; onSaved?:
           saveLabel="Save address"
           help={
             <>
-              Cloud harnesses reach your memory here, and a bearer token travels with each request, so the address
-              must start with https://. Leave it empty and save to clear it.
+              Conversations running in the cloud use this address to reach your Khipu memory. It must start with
+              https:// to keep the connection private. Leave it empty and save to clear it.
               {fromEnv ? (
                 <>
                   {" "}

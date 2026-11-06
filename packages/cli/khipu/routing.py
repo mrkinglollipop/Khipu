@@ -4309,6 +4309,11 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     events = [routing_replication.proposal(e, cfg) for e in events]
     # A pure replay may name its Mac; unstamped logs retain their local meaning.
     mac = mac or cfg.get("_mac")
+    # Capture this Mac's actual list before shared definitions add accounts
+    # it knows about but does not read. Pure replays pass their local logins
+    # directly; normal folds retain the explicit list in their inputs.
+    local_accounts = (_fold_accounts(cfg["_raw_sources"]) if "_raw_sources" in cfg else known)
+    locally_tracked = {a["key"] for a in local_accounts if "|" in a["key"]}
     definitions = entry_model.definitions(events, mac)
     known = _definition_accounts(known, events=events, config={}, definitions=definitions, events_ordered=True)
     lane_map = {r: dict(lanes) for r, lanes in lane_map.items()}
@@ -4340,6 +4345,12 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     events = [_rekey_event(e, mapping) if e.get("type") not in ("account_rename", "account_migration") else e
               for e in events]
     extra = [_rekey_event(e, mapping) for e in extra]
+    # A peer's account-list note remains useful where this Mac has no
+    # tracked login for that account. Resolve shared ids first, so this
+    # Mac's own list wins even when the note arrived as e.g. claude:main.
+    events = [e for e in events if e.get("type") != "account_note"
+              or e.get("account") not in locally_tracked
+              or not (e.get("remote") or (mac and e.get("mac") and e["mac"] != mac))]
     # A moved login folder's records, those written under its old key after
     # the move included, belong to the account it moved to.
     forward, events = forward_events(events, {a["key"] for a in known})
@@ -4869,7 +4880,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             continue
         gone = notes.get(key) or {}
         by_key[key] = {"key": key, "label": gone["text"] if gone.get("state") == "untracked" and gone.get("text")
-                       else _label_for_key(key), "harness": key.partition("|")[0],
+                       else _label_for_key(key), "harness": key.partition("|")[0].partition(":")[0],
                        "home": key.partition("|")[2] or None}
     for hold in holds.values():
         hkey = hold["scope"].get("account")
@@ -8899,7 +8910,8 @@ def _harness_label(entry: dict) -> str:
 def _witness_words(entry: dict, push: bool) -> str:
     w = entry.get("witness") or {}
     source, by = w.get("source"), w.get("written_by")
-    cli_name = _harness_label(entry)
+    cli_name = (entry.get("label") if account_identity.STABLE.fullmatch(entry.get("key") or "")
+                else None) or _harness_label(entry)
     if source == "probe":
         if w.get("session_logs"):
             return f"read from {cli_name}'s session logs"
