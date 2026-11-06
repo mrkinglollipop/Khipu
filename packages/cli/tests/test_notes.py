@@ -44,6 +44,33 @@ def _write(path: Path, text: str) -> Path:
     return path
 
 
+def test_summariser_litter_is_skipped_before_stat_or_memory_scan(tmp_path, monkeypatch):
+    projects = tmp_path / 'projects'
+    litter = [projects / name for name in (
+        '-Users-matt--config-khipu-state-synth-cli-work-ab12cd34',
+        '-Volumes-Cloud-Storage-khipu-state-synth-cli-work-a-b_c123')]
+    for folder in litter:
+        _write(folder / 'memory' / 'internal.md', 'Internal summariser data')
+    # Ordinary projects, including a similar name, must still be scanned.
+    ordinary = [projects / '-Users-matt-Code-Khipu',
+                projects / '-Users-matt-Code-state-synth-cli-work-documentation']
+    expected = [_write(folder / 'memory' / 'note.md', 'Owner note') for folder in ordinary]
+    monkeypatch.setattr(notes, 'claude_projects_root', lambda: projects)
+    monkeypatch.setattr(notes, 'codex_memories_root', lambda: tmp_path / 'absent')
+    monkeypatch.setattr(notes, 'cursor_memory_roots', lambda: [])
+    monkeypatch.setattr(notes, 'aegis_memory_roots', lambda: [])
+    original_is_dir = Path.is_dir
+
+    def checked_is_dir(path):
+        assert not any(path == folder or folder in path.parents for folder in litter)
+        return original_is_dir(path)
+
+    monkeypatch.setattr(Path, 'is_dir', checked_is_dir)
+    assert notes._claude_project_dirs(projects) == sorted(ordinary)
+    assert sorted(p for p, _, _ in notes._iter_note_file_candidates()) == sorted(expected)
+    assert notes.memory_dirs() == sorted(folder / 'memory' for folder in ordinary)
+
+
 class ResolveClaudeProjectPathTest(unittest.TestCase):
     """The slug->path inverse is lossy (both '/' and a space collapse to
     '-'), so this walks a real directory tree rather than guessing offline."""
