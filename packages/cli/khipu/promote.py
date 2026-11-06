@@ -932,7 +932,9 @@ def _recall_once(hook: Path, sample: dict[str, Any], session: str, *, legacy: bo
     whether its push is on here (``push``: True, False, or None when it
     could not say)."""
     push = None
-    with tempfile.TemporaryDirectory(prefix="khipu-gate-recall-") as tmp:
+    # A detached helper may still write here while this is removed. A leftover
+    # scratch folder says nothing about the candidate, so it can't fail the gate.
+    with tempfile.TemporaryDirectory(prefix="khipu-gate-recall-", ignore_cleanup_errors=True) as tmp:
         payload = {"session_id": session, "transcript_path": "", "cwd": str(Path.home()),
                    "hook_event_name": "UserPromptSubmit", "prompt": sample["prompt"]}
         env = _replay_env(Path(tmp), legacy=legacy)
