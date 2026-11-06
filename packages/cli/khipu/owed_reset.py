@@ -7,6 +7,7 @@ from pathlib import Path
 from khipu import commitments as co, owed_tidy as tidy
 from khipu.explicit_asks import MARKER
 
+EXPORT_WARNING = "This archive is a copy a forget will not reach; manage or remove the exported file separately."
 FORMAT = "khipu-owed-owner-reset"
 REASON = "Owner-approved reset of summary-inferred Owed items; original items archived with SHA-256"
 
@@ -93,7 +94,8 @@ def command(args):
     if not args.dry_run:
         if not args.export:
             raise ValueError("export requires --export FILE (or use --dry-run)")
-        out.update(export=args.export, sha256=export(doc, args.export))
+        out.update(export=args.export, sha256=export(doc, args.export),
+                   forget_reaches_export=False, warning=EXPORT_WARNING)
     print(json.dumps(out, indent=2))
     return 0
 
@@ -105,7 +107,7 @@ def add_parser(sub):
                             "apply through the existing owner gate: khipu owed tidy --project "
                             "'<all-owner-items>' --apply FILE. Undo the resulting batch with the same project "
                             "and --undo BATCH. Explicit asks and recent owner-ask evidence are kept separately; "
-                            "new or changed items are not silently closed. No automatic reset is installed.")
+                            "new or changed items are not silently closed. No automatic reset is installed. " + EXPORT_WARNING)
     parser.add_argument("--dry-run", action="store_true", help="Print counts and separate protected asks; write nothing")
     parser.add_argument("--export", metavar="FILE", help="Export full archive and FILE.sha256")
     parser.set_defaults(func=command)

@@ -123,6 +123,11 @@ STORES: tuple[Store, ...] = (
           "hold job summaries, ids and hashes only",
           "the Work view's read model, which lists open commitments' text", "work view",
           _w("work._replace_json")),
+    Store("Owed reset export", "the file named with khipu owed reset --export FILE and FILE.sha256",
+          "archived commitment rows, including capture-derived text and lineage",
+          "kept: an owner-chosen archive outside managed stores; forget cannot find or erase it; "
+          "the export output and command help disclose this boundary",
+          _w("owed_reset.export")),
     Store("recall eval record", "a file the owner names with khipu recall eval --record",
           "the golden queries, quoted text included, and the ids each one returned",
           "kept: an owner-chosen file outside the data folder that forget cannot find; a known "

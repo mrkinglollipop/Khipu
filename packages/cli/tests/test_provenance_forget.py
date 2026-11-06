@@ -107,9 +107,20 @@ def _payload(*, loop=CANON, kind="followup", owner="assistant", decision=None, t
 
 
 def _capture(**kw) -> int:
-    out = capture.write_pg(_payload(**kw))
+    payload = _payload(**kw)
+    out = capture.write_pg(payload)
     assert out["episode_inserted"], out
-    return int(out["episode_id"])
+    eid = int(out["episode_id"])
+    if kw.get("owner") == "user" and payload.get("open_loops"):
+        from khipu import db
+        from tests.fact_seed import owner_commitment
+        with db.connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM commitments WHERE project = %s AND owner = 'user' AND status = 'open'",
+                        (payload['project'],))
+            if cur.fetchone() is None:
+                loop = payload['open_loops'][0]
+                owner_commitment(cur, loop['text'], project=payload['project'], episode_id=eid, kind=loop['kind'])
+    return eid
 
 
 def _forget(hub, eid) -> dict:  # noqa: F811

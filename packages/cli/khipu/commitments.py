@@ -1363,9 +1363,6 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             norm["text"], kind=norm["kind"], declared=norm["owner"], future_trigger=trigger,
             origin=origin, declared_label=norm.get("owner_label"), new_item=True,
         )
-        # Summaries never assign work to the owner. Explicit asks have their own writer.
-        if owner == OWNER_USER:
-            continue
         reason = rejection_reason(norm["text"], owner=owner, kind=norm["kind"])
         if reason is not None:
             rejected += 1
@@ -1446,6 +1443,14 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
                 if labels:
                     _keep_pr_refs(cur, existing, labels)
             _report_count("restated")
+            continue
+        # Existing owner facts still need wording witnesses, PR unions and
+        # seen-count updates above. Only creating NEW owner work is removed.
+        # Do not relay/close job twins on behalf of an unfiled owner ask.
+        if owner == OWNER_USER:
+            rejected += 1
+            _report_item("rejected", "open_loop", norm["text"],
+                         "owner ask not filed explicitly: summary extraction cannot create owner work")
             continue
         linked = [r["id"] for r in others
                   if r["id"] == exact or _row_near_dup_score(norm["text"], r) >= NEAR_DUP_MIN_SCORE]
