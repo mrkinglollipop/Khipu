@@ -236,10 +236,12 @@ def test_ack_write_failure_is_fail_open_and_keeps_the_reservation(replay, monkey
 
 @pytest.mark.usefixtures("unbounded_render")
 def test_start_pages_leave_room_for_the_mandatory_memory_rules(replay):
-    routing.add_rule("x" * 7000, via="app")
+    room = recall_rule._HOOK_CONTEXT_BUDGET - recall_rule._utf16_len(recall_rule.RULE_MD.strip())
+    routing.add_rule("x" * (room + 1000), via="app")
     start = recall_rule._RoutingAtStart(session_id="s1").begin()
     text = start.text()
     ctx, pushed = recall_rule.fit_start_context(recall_rule.RULE_MD.strip(), text)
+    assert ctx.startswith(recall_rule.RULE_MD.strip())
     assert pushed
     assert recall_rule._utf16_len(ctx) <= recall_rule._HOOK_CONTEXT_BUDGET
     assert "x" * 100 in text and "page 1/" in text

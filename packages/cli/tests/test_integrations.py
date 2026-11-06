@@ -1363,6 +1363,9 @@ def _green_doctor_patches():
     override (`khipu.integrations.launcher_health`) on top — same recipe as
     test_cli_recall_quality.py's own copy, kept local for the same reason."""
     return [
+        # Launcher tests must not depend on disk pressure or a configured hub.
+        mock.patch("khipu.storage.disk_space", return_value={"ok": True, "level": "green", "volumes": []}),
+        mock.patch("khipu.migrate.doctor_check", return_value={"ok": True, "pending": [], "warnings": []}),
         mock.patch("khipu.drift.status_payload", return_value={"latest_ingested_at": None}),
         mock.patch("khipu.hub_snapshot.maybe_refresh", return_value=None),
         mock.patch("khipu.hub_snapshot.snapshot_freshness", return_value={"ok": True}),
