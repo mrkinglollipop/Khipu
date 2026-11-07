@@ -13,9 +13,9 @@ import time
 import pytest
 
 from khipu import needs_you, owner_act, routing, usage
-from tests.test_owner_needs_you import (_accounts_request, _held_pause, _owner_types, _priority_request, _rule_added,
+from tests.test_owner_needs_you import (_accounts_request, _owner_types, _priority_request, _rule_added,
                                         _setting, _setting_request, _tier_request)
-from tests.test_t3_owner_confirm import _be_front, _front_end_turn, _paused, world
+from tests.test_t3_owner_confirm import _be_front, _front_end_turn, world
 
 assert world  # the fixture, imported for pytest
 
@@ -30,8 +30,19 @@ def _by_kind(items: list[dict]) -> dict[str, dict]:
     return {item["kind"]: item for item in items}
 
 
+def _held_grok_pause(world) -> None:
+    """A change held for the owner (direction.request), on an account the priority doesn't name."""
+    _owner_types(world, "pause Grok")
+    ok, out = owner_act.act("direction.request", {"action": "route.pause", "args": {"account": "Grok"}})
+    assert ok and out["pending"] is True, out
+
+
+def _grok_paused() -> bool:
+    return next(a for a in routing.read_view()["accounts"] if a["label"] == "Grok")["state"] == "paused"
+
+
 def _build_list(world) -> None:
-    _held_pause(world)
+    _held_grok_pause(world)
     _priority_request(world)
     _rule_added(world)
     _setting_request(world)
@@ -72,7 +83,7 @@ def test_one_yes_to_the_list_settles_every_item_it_showed(world, front):
         ok, out = owner_act.act(settle["action"], settle["args"])
         assert ok and out.get("pending") is not True, (kind, out)
     assert _settled(world) == dict.fromkeys(("priority", "rule", "setting", "accounts", "tier_table"), True)
-    assert _setting()["value"] is True and _paused()
+    assert _setting()["value"] is True and _grok_paused()
 
 
 @pytest.mark.parametrize("front", sorted(FRONTS))
