@@ -1059,6 +1059,13 @@ def _direction(tmp_path, monkeypatch, session="s-import"):
                        {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"})
 
 
+def _say_as_owner(tmp_path, text: str, session: str = "s-import") -> None:
+    from khipu import owner_turns
+
+    owner_turns.record({"session_id": session, "prompt": text, "cwd": str(tmp_path)},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"})
+
+
 def _owner_undo(line_id: str) -> tuple[int, dict]:
     from khipu import owner_direction, owner_turns
 
@@ -1098,9 +1105,15 @@ def test_an_import_by_direction_is_undone_by_removing_what_it_added(hub, tmp_pat
 
 def test_catch_up_reaches_the_importer_by_conversation(hub, tmp_path, monkeypatch):
     """The conversation gate does not force a terminal/app detour; importer prerequisites still apply."""
+    from tests import test_owner_direction as base
+
     _direction(tmp_path, monkeypatch)
-    rc, report = _import(_write(tmp_path, _tracker(10)), "--catch-up", "--owner-direction")
-    assert rc != 0 and report.get("reason") == "no_import", report
+    path = _write(tmp_path, {"rows": {"a": _row("a")}})
+    # A catch-up import is class C: held, answered with his yes, then replayed (never run straight by direction).
+    world = type("Owner", (), {"say": staticmethod(lambda text: _say_as_owner(tmp_path, text))})()
+    ok, report = base.run_confirmed(world, "ledger.import", {"file": str(path), "project": P, "catch_up": True},
+                                    "yes, catch up the import")
+    assert not ok and report.get("reason") == "no_import", report
 
 
 def test_a_set_queued_unseen_never_overwrites_a_value_another_mac_imported(hub, tmp_path, monkeypatch):

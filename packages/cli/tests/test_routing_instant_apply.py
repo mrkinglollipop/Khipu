@@ -379,8 +379,9 @@ def test_class_c_is_exactly_what_cant_be_taken_back():
     assert "outbox.span_covered" in owner_direction.PLANNED_ASKS  # B, still always asked
 
 
-def test_a_forget_run_by_direction_is_refused_outside_a_confirmed_replay(monkeypatch):
-    # `khipu forget ... --owner-direction` must not skip the hold in khipu_owner_act.
+def test_a_class_c_command_run_by_direction_is_refused_outside_a_confirmed_replay(monkeypatch):
+    # `khipu forget|ledger purge|ledger import --catch-up ... --owner-direction` must not skip the hold in
+    # khipu_owner_act.
     class Passed(Exception):
         pass
 
@@ -388,23 +389,25 @@ def test_a_forget_run_by_direction_is_refused_outside_a_confirmed_replay(monkeyp
         raise Passed()
 
     monkeypatch.setattr(owner_direction, "check", reached_check)
-    for want in ({"action": "forget.send", "facts": {}}, {"action": "forget.here", "facts": {}},
-                 {"action": "forget.not_same", "facts": {}}):
+    class_c_wants = ({"action": "forget.send", "facts": {}}, {"action": "forget.here", "facts": {}},
+                     {"action": "forget.not_same", "facts": {}}, {"action": "ledger.purge", "facts": {}},
+                     {"action": "ledger.import", "facts": {"project": "p", "catch_up": True}})
+    for want in class_c_wants:
         with pytest.raises(owner_direction.DirectionRefused) as err:
             owner_direction.gate(dict(want))
         assert err.value.code == "class_c", want
     # The replay of a request the owner confirmed goes on to the usual check.
     stamp = {"auth": "terminal", "binding": "owner_cli", "session": "x", "confirmed": {"request": "req-test"}}
-    with owner_direction.confirmed_replay("forget.send", stamp):
-        with pytest.raises(Passed):
-            owner_direction.gate({"action": "forget.send", "facts": {}})
-    # A replay for another action does not open C.
-    with owner_direction.confirmed_replay("route.pause", stamp):
-        with pytest.raises(owner_direction.DirectionRefused):
-            owner_direction.gate({"action": "forget.send", "facts": {}})
-    # Purge and catch-up keep their command path; an A action goes on to the usual check.
-    for want in ({"action": "ledger.purge", "facts": {}},
-                 {"action": "ledger.import", "facts": {"file": "t.json", "catch_up": True}},
+    for want in class_c_wants:
+        with owner_direction.confirmed_replay(want["action"], stamp):
+            with pytest.raises(Passed):
+                owner_direction.gate(dict(want))
+        # A replay for another action does not open C.
+        with owner_direction.confirmed_replay("route.pause", stamp):
+            with pytest.raises(owner_direction.DirectionRefused):
+                owner_direction.gate(dict(want))
+    # A plain import and an A action go on to the usual check.
+    for want in ({"action": "ledger.import", "facts": {"project": "p"}}, {"action": "ledger.import"},
                  {"action": "route.pause", "facts": {}}):
         with pytest.raises(Passed):
             owner_direction.gate(dict(want))

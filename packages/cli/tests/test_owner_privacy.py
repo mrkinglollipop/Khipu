@@ -291,9 +291,8 @@ def _scheduled_purge(world, monkeypatch, row: str = "T-12") -> tuple[dict, list]
     purged: list = []
     monkeypatch.setattr(ledger, "_connect", lambda: type("C", (), {"close": lambda self: None})())
     monkeypatch.setattr(ledger, "purge", lambda conn, project, r: purged.append((project, r)) or {"ok": True})
-    world.say(f"purge {row} from the atlas ledger")
-    rc, out = world.run(["ledger", "purge", row, "--project", "atlas", "--json"], True)
-    assert rc == 0 and out["state"] == "scheduled", out
+    ok, out = base.run_confirmed(world, "ledger.purge", {"id": row, "project": "atlas"}, f"yes, purge {row}")
+    assert ok and out["state"] == "scheduled", out
     return owner_direction.actions()[-1], purged
 
 

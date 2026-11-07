@@ -68,6 +68,21 @@ class World:
             return rc, (json.loads(text[start:]) if start >= 0 else {"text": text})
 
 
+def run_confirmed(world, action: str, args: dict, yes: str = "yes, go ahead") -> tuple[bool, dict]:
+    """A class C change as the owner gets it: ``khipu_owner_act`` holds it, he types
+    his yes, ``direction.confirm`` claims the request and its command is replayed
+    (the real held-request path; a C command by direction applies no other way)."""
+    from khipu import owner_act, owner_background
+
+    ok, held = owner_act.act(action, args)
+    assert ok and held["pending"] and held["applied"] is False, held
+    world.say(yes)
+    ok, done = owner_act.act("direction.confirm", {"request": held["request"]})
+    if ok and done.get("started"):
+        ok, done = owner_background.run(done["request"])
+    return ok, done
+
+
 @pytest.fixture
 def world(tmp_path, monkeypatch, khipu_app):
     data = tmp_path / "data"
@@ -502,9 +517,8 @@ def test_purge_by_direction_is_scheduled_runs_a_day_later_and_undo_cancels_it(wo
     purged: list = []
     monkeypatch.setattr(ledger, "_connect", lambda: type("C", (), {"close": lambda self: None})())
     monkeypatch.setattr(ledger, "purge", lambda conn, project, row: purged.append((project, row)) or {"ok": True})
-    world.say("purge T-12 from the atlas ledger")
-    rc, out = world.run(["ledger", "purge", "T-12", "--project", "atlas", "--json"], True)
-    assert rc == 0 and out["state"] == "scheduled" and purged == []
+    ok, out = run_confirmed(world, "ledger.purge", {"id": "T-12", "project": "atlas"}, "yes, purge T-12")
+    assert ok and out["state"] == "scheduled" and purged == [], out
     (line,) = _log()
     assert line["state"] == "scheduled" and line["runs_at"]
     owner_direction.run_due(now=time.time() + 3600)
@@ -514,8 +528,8 @@ def test_purge_by_direction_is_scheduled_runs_a_day_later_and_undo_cancels_it(wo
     owner_direction.run_due(now=time.time() + 26 * 3600)
     assert purged == [("atlas", "T-12")]
 
-    world.say("purge T-13 from the atlas ledger")
-    rc, out = world.run(["ledger", "purge", "T-13", "--project", "atlas", "--json"], True)
+    ok, out = run_confirmed(world, "ledger.purge", {"id": "T-13", "project": "atlas"}, "yes, purge T-13")
+    assert ok, out
     second = _log()[-1]
     world.say("undo the purge of T-13")
     rc, out = world.run(["owner-direction", "undo", second["id"]], True)

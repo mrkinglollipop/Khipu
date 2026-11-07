@@ -1888,11 +1888,11 @@ def gate(want: dict | None, *, env=None, now: float | None = None) -> dict:
                                "That change can't be made by direction: it needs the Khipu app or a yes typed on a "
                                "terminal.")
     confirmed = _CONFIRMED.get()
-    if want["action"].startswith("forget.") and (confirmed is None or confirmed["action"] != want["action"]):
-        # A forget can never be taken back: by direction it applies only as the
-        # replay of a held request the owner answered (``khipu_owner_act`` holds
-        # it), never straight from a command run with ``--owner-direction``.
-        # Purge (a day to cancel) and a catch-up import keep their command path.
+    if class_c(want["action"], want.get("facts")) and (confirmed is None or confirmed["action"] != want["action"]):
+        # A class C change (a forget, a purge, a catch-up import) can never be
+        # taken back: by direction it applies only as the replay of a held
+        # request the owner answered (``khipu_owner_act`` holds it), never
+        # straight from a command run with ``--owner-direction``.
         raise DirectionRefused("class_c",
                                "That can't be undone, so it needs its own yes: ask for it through khipu_owner_act, "
                                "which shows the owner its words first. Nothing was changed.")
