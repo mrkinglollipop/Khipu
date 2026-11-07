@@ -241,14 +241,14 @@ def test_claude_sonnet_check_allowance_uses_twenty_points(replay, used, expected
 
 
 def test_runner_declarations_match_only_the_same_purpose():
-    from khipu import routing_scanner, routing_sources
+    from khipu import routing_runner_caps, routing_sources
 
     check = {"kind": "pace_target", "window": "weekly", "pct": 100, "slack": 5, "purpose": "check"}
     assert routing_sources._budget_declaration(check) == check
     accounts = [{"key": "codex|", "label": "Codex", "caps": [{**check, "revision": "r"}]}]
-    assert not routing_scanner.compare_runner_caps([{**check, "account": "Codex"}], accounts)
+    assert not routing_runner_caps.compare_runner_caps([{**check, "account": "Codex"}], accounts)
     job = {k: v for k, v in check.items() if k != "purpose"}
-    flags = routing_scanner.compare_runner_caps([{**job, "account": "Codex"}], accounts)
+    flags = routing_runner_caps.compare_runner_caps([{**job, "account": "Codex"}], accounts)
     assert len(flags) == 1 and flags[0]["status"] == "no_fact"
 
 
@@ -462,16 +462,16 @@ def test_a_tier_table_inference_is_not_a_declared_check_tier(replay):
 
 
 def test_runner_declarations_preserve_and_compare_check_qualifiers():
-    from khipu import routing_scanner, routing_sources
+    from khipu import routing_runner_caps, routing_sources
 
     check = {"kind": "pace_target", "window": "weekly", "pct": 100, "slack": 20,
              "purpose": "check", "tier": "sonnet", "sensitive_only": True}
     assert routing_sources._budget_declaration(check) == check
     accounts = [{"key": "codex|", "label": "Codex", "caps": [{**check, "revision": "r"}]}]
-    assert not routing_scanner.compare_runner_caps([{**check, "account": "Codex"}], accounts)
+    assert not routing_runner_caps.compare_runner_caps([{**check, "account": "Codex"}], accounts)
     for field in ("tier", "sensitive_only"):
         declaration = {k: v for k, v in check.items() if k != field}
-        flag, = routing_scanner.compare_runner_caps([{**declaration, "account": "Codex"}], accounts)
+        flag, = routing_runner_caps.compare_runner_caps([{**declaration, "account": "Codex"}], accounts)
         assert flag["status"] == "disagrees"
         assert flag["fact"][field] == check[field]
 

@@ -1,16 +1,12 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
-# agent (brief: do not delegate); no further agent to route to.
-"""Vectors for real — P3 step 3 (2026-08-17) + Gemini Embedding 2 profile (2026-08-19)
-+ native media (PNG/JPEG) under Embedding 2 (2026-08-20).
+"""Vectors for real — P3 step 3 (2026-08-17) + Gemini Embedding 2 profile (2026-08-19).
 
-Embeds episodes, topics, and opted-in media into ``memory_embeddings`` under a
+Embeds episodes and topics into ``memory_embeddings`` under a
 named profile (``embedding_profiles``), per the plan.md "Embedding profiles"
 rules: profile-tagged rows, never overwritten in place, one active pointer for
 search.
 
 Entrypoints:
   backfill(..., profile=None)  — missing/changed episode+topic chunks
-  backfill_media(...)          — PNG/JPEG under sources with embed_media
   activate(profile)            — flip the one-active pointer (coverage gate; text only)
   embed_on_capture(payload)    — one episode under the *active* profile; fail-open
   semantic_search(query, k)    — cosine oversample + token RRF over the *active* profile
@@ -18,13 +14,11 @@ Entrypoints:
 
 Providers:
   gemini-embedding-001 @768 — no task prefixes (task_type era); text only
-  gemini-embedding-2 @768   — document/query prefixes for text; native image parts
-                              for media (no text prefixes). Always outputDimensionality
-                              768. One content per request (v2 aggregates multi-part).
+  gemini-embedding-2 @768   — document/query prefixes for text. Always
+                              outputDimensionality 768.
 """
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import math
@@ -36,7 +30,6 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -69,39 +62,11 @@ BACKFILL_RETRIES = 6  # 429 ladder 5/10/20/40/80/160 s: outlasts a per-minute wi
 BACKFILL_DELAY_S = 5.0
 BACKFILL_PAUSE_S = 1.5  # between batches; the sweep is nightly, not interactive
 COMMITMENT_CATCHUP_LIMIT = 5  # fix 5c: bounded, same spirit as the episode catch-up's limit=5 caller
-MAX_TEXT_CHARS = 8000  # per-item safety, mirrors embed_mirror.embed_text
-# Google Embedding 2 image table (docs 2026-06-22): PNG and JPEG only.
-MEDIA_MIME: dict[str, str] = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-}
-# Skip oversized inline payloads; File API would be a later cut.
-MAX_IMAGE_BYTES = 4 * 1024 * 1024
-MEDIA_PILOT_WITHOUT_YES = 1000
+MAX_TEXT_CHARS = 8000  # per-item safety
 
 
 def _log(msg: str) -> None:
     print(f"[khipu-embed] {msg}", file=sys.stderr, flush=True)
-
-
-def _sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        while True:
-            block = f.read(1024 * 1024)
-            if not block:
-                break
-            h.update(block)
-    return h.hexdigest()
-
-
-def mime_for_image_path(path: Path) -> str | None:
-    return MEDIA_MIME.get(path.suffix.lower())
 
 
 def _l2(vec: list[float]) -> list[float]:
@@ -1051,7 +1016,6 @@ def embed_one(
 
 
 # ---- query-embedding timing log -----------------------------------------------
-# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
 
 TIMING_KEEP = 500          # lines kept after a trim
 TIMING_TRIM_AT = 1000      # trim when the file holds more than this many lines
@@ -1113,281 +1077,6 @@ def median_query_ms(profile: str | None = None, *, hours: float = 24.0) -> dict[
         vals = by.get(profile)
         return {profile: int(statistics.median(vals)) if vals else None}
     return {p: int(statistics.median(v)) for p, v in by.items()}
-
-
-def embed_batch_images(
-    images: list[tuple[bytes, str]],
-    *,
-    profile: str = PROFILE_2,
-    retries: int = 4,
-) -> list[list[float]]:
-    """Embed PNG/JPEG bytes as native Gemini Embedding 2 image parts.
-
-    Each item is ``(raw_bytes, mime_type)``. Always requests ``outputDimensionality``
-    768. Does **not** apply text task prefixes. One image → one request → one vector
-    (v2 aggregates multi-part content).
-    """
-    if not images:
-        return []
-    if profile != PROFILE_2 and not profile.endswith("@768"):
-        # Media is locked to Embedding 2 @768 for this cut.
-        model_for_profile(profile)
-    model = model_for_profile(profile)
-    key = _gemini_key()
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents"
-    requests_body = []
-    for raw, mime in images:
-        if mime not in ("image/png", "image/jpeg"):
-            raise ValueError(f"unsupported image mime {mime!r}; PNG/JPEG only")
-        if len(raw) > MAX_IMAGE_BYTES:
-            raise ValueError(f"image exceeds {MAX_IMAGE_BYTES} bytes inline limit")
-        requests_body.append(
-            {
-                "model": f"models/{model}",
-                "content": {
-                    "parts": [
-                        {
-                            "inline_data": {
-                                "mime_type": mime,
-                                "data": base64.b64encode(raw).decode("ascii"),
-                            }
-                        }
-                    ]
-                },
-                "outputDimensionality": DIM,
-            }
-        )
-    data = json.dumps({"requests": requests_body}).encode("utf-8")
-    delay = 2.0
-    payload: dict[str, Any] = {}
-    for attempt in range(retries + 1):
-        _budget_take()
-        req = urllib.request.Request(
-            url,
-            data=data,
-            method="POST",
-            headers={"Content-Type": "application/json", "x-goog-api-key": key},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            break
-        except urllib.error.HTTPError as e:
-            _note_auth_failure(e.code)
-            err = _redact_provider_diagnostic(
-                e.read().decode("utf-8", errors="replace"),
-                {"x-goog-api-key": key},
-            )
-            if e.code in (429, 500, 502, 503, 504) and attempt < retries:
-                _log(f"embed-image HTTP {e.code}, retry in {delay:.0f}s")
-                time.sleep(delay)
-                delay *= 2
-                continue
-            raise RuntimeError(f"embed-image HTTP {e.code}: {err[:400]}") from e
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            if attempt < retries:
-                _log(f"embed-image network error ({type(e).__name__}), retry in {delay:.0f}s")
-                time.sleep(delay)
-                delay *= 2
-                continue
-            raise RuntimeError(
-                f"embed-image network error after {retries} retries: {type(e).__name__}: {e}"
-            ) from e
-    vecs = [item["values"] for item in payload["embeddings"]]
-    if len(vecs) != len(images):
-        raise RuntimeError(f"embed-image returned {len(vecs)} vectors for {len(images)} images")
-    return [_l2(_validated_vector(v, DIM)) for v in vecs]
-
-
-def _iter_media_files(root: Path) -> Iterable[Path]:
-    """Yield PNG/JPEG files under ``root`` (skip dirs that are not readable)."""
-    if not root.is_dir():
-        return
-    try:
-        for dirpath, _dirnames, filenames in os.walk(root):
-            for name in filenames:
-                p = Path(dirpath) / name
-                if mime_for_image_path(p):
-                    yield p
-    except OSError as e:
-        _log(f"walk skipped {root}: {e}")
-
-
-def _upsert_media_asset(
-    cur,
-    *,
-    source_id: str,
-    path: str,
-    sha256: str,
-    mime: str,
-    nbytes: int,
-) -> str:
-    cur.execute(
-        "SELECT id, sha256 FROM media_assets WHERE source_id = %s AND path = %s FOR UPDATE",
-        (source_id, path),
-    )
-    row = cur.fetchone()
-    if row:
-        mid, old_hash = row[0], row[1]
-        if old_hash != sha256:
-            cur.execute(
-                "UPDATE media_assets SET sha256 = %s, mime = %s, bytes = %s WHERE id = %s",
-                (sha256, mime, nbytes, mid),
-            )
-        return mid
-    mid = str(uuid.uuid4())
-    cur.execute(
-        """
-        INSERT INTO media_assets (id, source_id, path, sha256, mime, bytes)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        """,
-        (mid, source_id, path, sha256, mime, nbytes),
-    )
-    return mid
-
-
-def backfill_media(
-    *,
-    dry_run: bool = False,
-    yes: bool = False,
-    limit: int | None = None,
-    profile: str | None = None,
-    source_id: str | None = None,
-) -> dict[str, Any]:
-    """Embed PNG/JPEG under sources with ``embed_media`` and a walkable root.
-
-    Requires ``--yes`` when more than MEDIA_PILOT_WITHOUT_YES files would be
-    scanned. Activate / doctor text coverage ignore media missing.
-    """
-    from khipu.db import connect
-    from khipu.sources import sources_with_embed_media
-
-    stats: dict[str, Any] = {
-        "scanned": 0,
-        "embedded": 0,
-        "skipped_unchanged": 0,
-        "skipped_oversized": 0,
-        "skipped_missing": 0,
-        "batches": 0,
-        "profile": None,
-        "would_embed": 0,
-        "sources": [],
-        "needs_yes": False,
-    }
-    sources = sources_with_embed_media()
-    if source_id:
-        sources = [s for s in sources if s.get("id") == source_id]
-    candidates: list[tuple[str, Path, str]] = []  # source_id, path, rel_label
-    for s in sources:
-        sid = str(s["id"])
-        root = Path(str(s["root"]))
-        stats["sources"].append(sid)
-        if not root.is_dir():
-            _log(f"path-unreachable (skip, no purge): {sid} -> {root}")
-            continue
-        for p in _iter_media_files(root):
-            try:
-                rel = str(p.relative_to(root))
-            except ValueError:
-                rel = p.name
-            candidates.append((sid, p, rel))
-
-    stats["scanned"] = len(candidates)
-    scheduled = len(candidates) if limit is None else min(len(candidates), max(0, limit))
-    if scheduled > MEDIA_PILOT_WITHOUT_YES and not yes and not dry_run:
-        stats["needs_yes"] = True
-        stats["error"] = (
-            f"{scheduled} scheduled images exceed pilot of {MEDIA_PILOT_WITHOUT_YES}; "
-            "re-run with --yes"
-        )
-        return stats
-
-    with connect() as conn:
-        with conn.cursor() as cur:
-            profile = _resolve_profile(cur, profile or PROFILE_2)
-            if profile != PROFILE_2:
-                # Still allow named @768 Gemini-2 only for this cut.
-                if "gemini-embedding-2" not in profile:
-                    raise ValueError(
-                        f"media backfill requires gemini-embedding-2@768; got {profile!r}"
-                    )
-            stats["profile"] = profile
-            existing = _existing_hashes(cur, profile)
-            todo: list[tuple[str, Path, str, str, str, bytes]] = []
-            # (source_id, path, rel, mime, sha, raw)
-            for sid, path, rel in candidates:
-                mime = mime_for_image_path(path)
-                if not mime:
-                    continue
-                try:
-                    nbytes = path.stat().st_size
-                except OSError:
-                    stats["skipped_missing"] += 1
-                    continue
-                if nbytes > MAX_IMAGE_BYTES:
-                    stats["skipped_oversized"] += 1
-                    continue
-                try:
-                    raw = path.read_bytes()
-                except OSError:
-                    stats["skipped_missing"] += 1
-                    continue
-                sha = _sha256_bytes(raw)
-                mid_probe = None
-                cur.execute(
-                    "SELECT id FROM media_assets WHERE source_id = %s AND path = %s",
-                    (sid, rel),
-                )
-                prow = cur.fetchone()
-                if prow:
-                    mid_probe = prow[0]
-                    if existing.get(("media", mid_probe, 0)) == sha:
-                        stats["skipped_unchanged"] += 1
-                        continue
-                todo.append((sid, path, rel, mime, sha, raw))
-                if limit is not None and len(todo) >= limit:
-                    break
-
-            stats["would_embed"] = len(todo)
-            if dry_run:
-                return stats
-
-            batch: list[tuple[str, Path, str, str, str, bytes]] = []
-            for item in todo:
-                batch.append(item)
-                if len(batch) >= min(BATCH, 16):  # images are heavier; keep batches smaller
-                    _flush_media_batch(cur, profile, batch, stats)
-                    conn.commit()
-                    batch = []
-            if batch:
-                _flush_media_batch(cur, profile, batch, stats)
-                conn.commit()
-    return stats
-
-
-def _flush_media_batch(
-    cur,
-    profile: str,
-    batch: list[tuple[str, Path, str, str, str, bytes]],
-    stats: dict[str, Any],
-) -> None:
-    images = [(raw, mime) for _sid, _p, _rel, mime, _sha, raw in batch]
-    vecs = embed_batch_images(provider_text.live_input(images, "media"), profile=profile)
-    rows: list[tuple[str, str, int, str, str, list[float]]] = []
-    for (sid, _path, rel, mime, sha, raw), vec in zip(batch, vecs):
-        mid = _upsert_media_asset(
-            cur,
-            source_id=sid,
-            path=rel,
-            sha256=sha,
-            mime=mime,
-            nbytes=len(raw),
-        )
-        label = rel
-        rows.append(("media", mid, 0, label, sha, vec))
-    _upsert_chunks(cur, profile, rows)
-    stats["embedded"] += len(batch)
-    stats["batches"] += 1
 
 
 # ---- corpus -------------------------------------------------------------------
@@ -1696,7 +1385,6 @@ def _api_texts(
 
 
 # ---- the memory space as a set of chunks (coverage, estimate) ---------------------
-# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
 
 def memory_chunk_plan(cur, *, cached: bool = False) -> dict[tuple[str, str, int], tuple[str, int]]:
     """Every chunk the default memory sweep embeds (episodes and topics, not
@@ -2865,21 +2553,17 @@ def _apply_search_filters(
         cur.execute(
             "SELECT slug, COALESCE(event_at, updated_at, created_at), status, "
             "frontmatter->>'project', frontmatter->>'type', superseded_by, "
-            "frontmatter->'_routing_state_claim', frontmatter->'_page_chars' "
+            "frontmatter->'_page_chars' "
             "FROM topics WHERE deleted_at IS NULL AND slug = ANY(%s)",
             (topic_ids,),
         )
         for row in cur.fetchall():
             slug, ts, status, proj, note_type, superseded_by = row[:6]
-            # The advisory mark is additive; older metadata adapters return
-            # only the six source-validity fields. Absence is not a claim.
-            routing_claim = row[6] if len(row) > 6 else None
             meta[("topic", slug)] = {
                 "ts": ts, "status": status, "project": proj,
                 "type": note_type, "superseded_by": superseded_by,
-                "_routing_state_claim": routing_claim,
                 # Written by the mirror; search never reads the body itself.
-                "page_chars": row[7] if len(row) > 7 else None,
+                "page_chars": row[6] if len(row) > 6 else None,
             }
     if node_ids:
         cur.execute("SELECT id, built_at FROM nodes WHERE id = ANY(%s)", (node_ids,))
@@ -2959,8 +2643,6 @@ def _apply_search_filters(
             superseded_by = (m.get("superseded_by") or "").strip()
             if superseded_by:
                 r["superseded_by"] = superseded_by
-            if type(m.get("_routing_state_claim")) is bool:
-                r["_routing_state_claim"] = m["_routing_state_claim"]
             # Body length, so recency.is_broad_page can de-rank catch-all pages.
             if type(m.get("page_chars")) is int:
                 r["page_chars"] = m["page_chars"]

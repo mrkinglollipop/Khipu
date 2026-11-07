@@ -43,12 +43,14 @@ class _Log:
         return rc.agree(rc._Log([line for line, _e in rows], inputs), rc._Log(kept, inputs), NOW)
 
 
-def _build():
+def _build(ignored_used=0.0):
     """Five-hour readings that stopped 3.5 days ago (the account has not
     reported the window since; its later probes carry no reset time and the
     fold ignores them), a week-long cycle that reset 2.5 days ago and the one
     after it, with a witness that skews its reset estimate by half an hour
-    now and then."""
+    now and then. The fold reads a 0% line with no reset as a window not
+    started (``routing.pace_sample``, ``unstarted``); ``ignored_used`` other
+    than 0 makes those lines ones it ignores outright."""
     log = _Log()
     ids: dict[str, list[int]] = {}
     five_reset = NOW - timedelta(days=3, hours=14)
@@ -58,7 +60,8 @@ def _build():
     for k in range(12):
         # newer lines for the same window with no reset time: no reading at all
         ids.setdefault("five_ignored", []).append(
-            log.sample("five_hour", NOW - timedelta(days=3, hours=12) + timedelta(hours=3 * k), None, used=0))
+            log.sample("five_hour", NOW - timedelta(days=3, hours=12) + timedelta(hours=3 * k), None,
+                       used=ignored_used))
     old_reset, new_reset = NOW - timedelta(days=2, hours=12), NOW + timedelta(days=4, hours=12)
     for k in range(40):  # the cycle that ended: readings 9..2.5 days back
         at = NOW - timedelta(days=9) + timedelta(hours=4 * k)
@@ -92,8 +95,10 @@ def test_readings_pace_reads_are_not_dropped_for_being_old(world):
 
 def test_the_old_cut_would_have_changed_the_fold(world):
     """The regression: drop what the 3-day, newest-four rule dropped and the
-    compacted log folds without the five-hour window."""
-    log, ids = _build()
+    compacted log folds without the five-hour window. With 0% no-reset lines
+    the fold reads the window from those (not started) either way, so the
+    regression shows where the later lines are ones it ignores."""
+    log, ids = _build(ignored_used=1.0)
     rows, _drop = log.planned()
     old_rule = set()
     cut = NOW - timedelta(days=3)

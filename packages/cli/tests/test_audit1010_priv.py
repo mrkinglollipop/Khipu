@@ -679,8 +679,7 @@ class ForgetPrivacyTest(unittest.TestCase):
                 return (ts, "edited", "codex:session")
 
         with mock.patch.object(forget, "_deliverables_ready", return_value=False), \
-             mock.patch.object(forget, "_decision_evidence_ready", return_value=False), \
-             mock.patch.object(forget, "_briefs_ready", return_value=False):
+             mock.patch.object(forget, "_decision_evidence_ready", return_value=False):
             result = forget.forget_episode(Cur(), 1)
         hashes = {item["summary_md5"] for item in result["legacy_identities"]}
         self.assertEqual(hashes, {

@@ -51,19 +51,17 @@ def _check_desktop_argv(words):
     case(["owner-direction", "undo", "--from-app"], [words], id=words)
     for key in ("latest_window_h", "session_binding", "trust", "untrust"):
         case(["owner-direction", "set", "--from-app"], [key, words], key=key, value=words)
-    for verb in ("get", "set", "remove", "restore", "import"):
+    for verb in ("get", "set", "remove", "restore"):
         prefix = ["ledger", verb, "--json", "--project=synthetic"]
         if verb != "get":
             prefix.append("--from-app")
         flags = {
             "set": [f"--title={words}", f"--note={words}", "--if-state=ready"],
             "remove": ["--children=move-up", f"--note={words}"],
-            "import": ["--dry-run"],
         }.get(verb, [])
-        field = "file" if verb == "import" else "id"
-        case([*prefix, *flags], [words], **{field: words})
+        case([*prefix, *flags], [words], id=words)
         if flags:
-            case(prefix, [words], **{field: words})
+            case(prefix, [words], id=words)
     for verb in ("hide", "unhide"):
         case(["work", verb], [words], id=words)
     for verb in ("same", "not-same"):

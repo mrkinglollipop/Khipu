@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """khipu.t3 and khipu.claude_homes — slice A of docs/plans/2026-10-07-khipu-t3.md.
 
 Discovery of Claude config homes (``~/.claude``, ``CLAUDE_CONFIG_DIR``, T3's

@@ -339,9 +339,7 @@ TOOLS: list[dict] = [
             "slug, title, updated_at, content_hash, body_total_bytes, "
             "body_offset, body_next_offset and complete; while complete is "
             "false, call again with offset set to body_next_offset to read the "
-            "rest. When briefs are on and a current brief exists, the body is "
-            "that brief (source='brief', content_hash=brief id) unless wiki is "
-            "true. Media: path/sha256/mime. Library ids "
+            "rest. Media: path/sha256/mime. Library ids "
             "(library:<name>:<doc>#<chunk>): the chunk text, its document "
             "(title, author, tags, rel_path, root) and the previous/next chunk "
             "text so you can read around a hit; library:<name>:<doc> returns the "
@@ -382,13 +380,6 @@ TOOLS: list[dict] = [
                         "Topics only: largest page body in UTF-8 bytes "
                         f"(default {PAGE_BYTES_DEFAULT}, at most {PAGE_BYTES_MAX}). "
                         "A page never splits a character."
-                    ),
-                },
-                "wiki": {
-                    "type": "boolean",
-                    "description": (
-                        "Topics only: when true, return the raw wiki page even "
-                        "if a current brief exists (default false)."
                     ),
                 },
             },
@@ -762,52 +753,6 @@ TOOLS: list[dict] = [
         },
     },
     {
-        "name": "khipu_brief",
-        "annotations": {"readOnlyHint": True, "openWorldHint": False},
-        "description": (
-            "Read the source-backed brief for one topic: a derived summary in "
-            "which every claim lists the episode ids it came from (fetch one "
-            "with khipu_get before acting on it). state is 'current' or "
-            "'stale' (a source changed, was forgotten or was retracted since "
-            "it was built); age_seconds and source_count say how fresh and "
-            "how well-grounded it is. It is a summary, never evidence itself: "
-            "cite the episodes. Returns {available: false, reason} when "
-            "briefs are switched off or not yet set up, and found: false when "
-            "the topic has none."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"topic": {"type": "string", "description": "Topic slug (from a search hit)"}},
-            "required": ["topic"],
-        },
-    },
-    {
-        "name": "khipu_reflect",
-        "annotations": {"readOnlyHint": True, "openWorldHint": False},
-        "description": (
-            "Answer one question from memory and show the evidence. Runs one "
-            "search, then asks the configured model to answer only from what "
-            "it found; every claim lists the episode or topic ids it rests on "
-            "(fetch one with khipu_get before acting on it). Validation checks "
-            "citation identifiers, not whether sources support the claims or "
-            "the model's separate answer. Superseded or retracted "
-            "decisions are treated as history. Abstains (abstained: true, with "
-            "a reason, answer empty) rather than answer without sources. It "
-            "calls a model, so use it when you want a synthesis, not for a "
-            "lookup: khipu_search is the lookup. Writes no memory content; "
-            "retrieval caches and usage counters may be updated. Returns "
-            "{available: false, reason} when reflection is switched off."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "question": {"type": "string", "description": "The question to answer from memory"},
-                "project": {"type": "string", "description": "Prefer sources from this project (a preference, not a filter)"},
-            },
-            "required": ["question"],
-        },
-    },
-    {
         "name": "khipu_usage",
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
         "description": (
@@ -1086,25 +1031,6 @@ TOOLS: list[dict] = [
         },
     },
     {
-        "name": "khipu_project",
-        "annotations": {"readOnlyHint": True, "openWorldHint": False},
-        "description": (
-            "Is this one project? For any name of a project, its canonical "
-            "name, every name grouped with it (owner, same checkout or GitHub) "
-            "with the evidence and date, what each name holds (open "
-            "commitments, standing decisions, episodes) and in total, and the "
-            "'same project?' pairs the owner is asked about or kept separate. "
-            "The same answer whichever name is passed; paste it as proof. A "
-            "pair that is asked is the owner's to answer: ask them, then call "
-            "khipu_owner_act with project.merge or project.keep_separate."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"name": {"type": "string", "description": "Any name of the project, e.g. owner/repo"}},
-            "required": ["name"],
-        },
-    },
-    {
         "name": "khipu_owner_act",
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
         "description": (
@@ -1117,8 +1043,8 @@ TOOLS: list[dict] = [
             "on a message the owner typed after the list that showed it. One reply answers the whole list: \"yes\" "
             "settles every item shown, \"yes except 2\" all but item 2, and \"no to 3\" takes item 3's undo; call "
             "this once per item. (C) What can't be taken back (forget.send, forget.here, forget.not_same, "
-            "ledger.purge, ledger.import with catch_up) is held with its own ask, never settled by a yes to a list. "
-            "outbox.span_covered is held too, and direction.request holds any change on purpose. "
+            "ledger.purge) is held with its own ask, never settled by a yes to a list. "
+            "direction.request holds any change on purpose. "
             "A held answer says pending: true and what to ask the owner; after their reply, call direction.confirm "
             "with {\"request\": id}, or direction.decline with it if they say no. "
             "Every change is logged and named in the next routing block. Undo it from Settings, Owner actions, or "
@@ -1419,7 +1345,6 @@ def _tool_get(args: dict) -> dict:
     if kind not in (None, "episode", "topic", "media", "library"):
         raise ValueError("kind must be 'episode', 'topic', 'media', or 'library'")
     offset, max_bytes = page_args(args.get("offset"), args.get("max_bytes"))
-    wiki = bool(args.get("wiki"))
     _ensure_path()
     from khipu import library_search
 
@@ -1474,7 +1399,7 @@ def _tool_get(args: dict) -> dict:
                 row.update(decision_states_for_episode(int(ident)))
                 return _detail_response("episode", row)
         if inferred == "topic":
-            row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
+            row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
             if row is None and kind is None:
                 media = media_detail(ident)
                 if media is not None:
@@ -2713,39 +2638,6 @@ def _decisions_update_on_hub(args: dict) -> dict:
             return owner_writes.apply_on_hub(conn, cur, "decisions_update", args, write, echo)
 
 
-def _tool_brief(args: dict) -> dict:
-    """khipu_brief: the current source-backed brief for a topic. Hub-only, no
-    snapshot fallback (same posture as decisions); the switch is checked before
-    any connection is opened."""
-    topic = (args.get("topic") or "").strip()
-    if not topic:
-        raise ValueError("topic is required")
-    _ensure_path()
-    from khipu import briefs, features
-
-    if not features.enabled("briefs"):
-        return {"available": False, "reason": briefs.REASON_SWITCH_OFF}
-    from khipu.db import connect
-
-    with connect() as conn:
-        with conn.cursor() as cur:
-            return briefs.read_brief(cur, topic)
-
-
-def _tool_reflect(args: dict) -> dict:
-    """khipu_reflect: an explicit cited answer. The switch is checked before
-    any search or connection; nothing else in the server calls this."""
-    question = (args.get("question") or "").strip()
-    if not question:
-        raise ValueError("question is required")
-    _ensure_path()
-    from khipu import features, reflect
-
-    if not features.enabled("reflect"):
-        return {"available": False, "reason": reflect.REASON_SWITCH_OFF}
-    return reflect.reflect(question, project=args.get("project") or None)
-
-
 USAGE_GATEWAY_REASON = (
     "plan usage is read from the CLIs on the machine that runs them; the HTTPS gateway has none. "
     "Use the local khipu MCP server or `khipu usage`."
@@ -3190,21 +3082,6 @@ def _tool_needs_you(args: dict) -> dict:
         return {"available": False, "reason": agent_view.INCOMPLETE}
 
 
-def _tool_project(args: dict) -> dict:
-    """``khipu_project``: one project's names, evidence, counts and pairs
-    (``project_group.show``). Read-only."""
-    name = str((args or {}).get("name") or "").strip()
-    if not name:
-        raise _ToolFailure({"ok": False, "code": "bad_args", "error": "khipu_project needs a name"})
-    _ensure_path()
-    from khipu import project_group
-    from khipu.db import connect
-
-    with connect() as conn:
-        with conn.cursor() as cur:
-            return project_group.show(cur, name)
-
-
 _LEDGER_VERBS = ("add", "set", "get", "list", "loose-ends", "needs-owner", "needs-matt", "render", "check",
                  "remove", "removed")
 _LEDGER_TEXT = ("project", "id", "title", "kind", "parent", "state", "evidence", "owner", "note", "link", "if_state",
@@ -3330,8 +3207,6 @@ TOOL_FUNCS = {
     "khipu_forget": _tool_forget,
     "khipu_decisions": _tool_decisions,
     "khipu_decisions_update": _tool_decisions_update,
-    "khipu_brief": _tool_brief,
-    "khipu_reflect": _tool_reflect,
     "khipu_usage": _tool_usage,
     "khipu_route": _tool_route,
     "khipu_route_advise": _tool_route_advise,
@@ -3341,7 +3216,6 @@ TOOL_FUNCS = {
     "khipu_ledger": _tool_ledger,
     "khipu_owner_act": _tool_owner_act,
     "khipu_needs_you": _tool_needs_you,
-    "khipu_project": _tool_project,
 }
 
 # Tools the HTTPS gateway neither lists nor runs: owner direction needs the

@@ -1,5 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
-# Sonnet build agent (brief: do not delegate); no further agent to route to.
 """Embedding profiles: what a profile id means, and how to add one.
 
 A profile is a row of ``embedding_profiles`` (provider, model, dim, normalize,
@@ -603,7 +601,6 @@ class BulkLoad:
 
 
 # ---- prices, keys, deletion (the Embeddings screen) ---------------------------
-# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
 
 # USD per million input tokens. List prices as of 2026-10, informational: the
 # provider's own pricing page is the authority, and a free allowance or a

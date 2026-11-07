@@ -90,11 +90,7 @@ def default_document() -> dict:
 
 
 def _normalize_source_row(row: dict) -> dict:
-    """Ensure per-source keys exist; missing ``embed_media`` means false."""
-    if "embed_media" not in row:
-        row["embed_media"] = False
-    else:
-        row["embed_media"] = bool(row.get("embed_media"))
+    """Fill in the conversation_memory root when it is missing."""
     if row.get("id") == "conversation_memory" and not row.get("root"):
         row["root"] = str(conversation_media_root())
     return row
@@ -176,43 +172,6 @@ def set_enabled(source_id: str, enabled: bool) -> dict:
     return doc
 
 
-def set_embed_media(source_id: str, embed_media: bool) -> dict:
-    """Per-source opt-in for native image embed (default off). Does not purge PG."""
-    doc = _load_sources_for_mutation()
-    row = _find_source(doc, source_id)
-    if row is None:
-        raise ValueError(f"unknown source id: {source_id}")
-    row["embed_media"] = bool(embed_media)
-    if source_id == "conversation_memory":
-        row["root"] = str(conversation_media_root())
-    doc["schema_version"] = SCHEMA_VERSION
-    save_sources(doc)
-    return doc
-
-
-def embed_media_enabled(source_id: str) -> bool:
-    doc = load_sources()
-    row = _find_source(doc, source_id)
-    if row is None:
-        return False
-    return bool(row.get("embed_media", False))
-
-
-def sources_with_embed_media() -> list[dict]:
-    """Sources opted into image embed that have a walkable ``root``."""
-    out: list[dict] = []
-    for s in load_sources().get("sources", []):
-        if not isinstance(s, dict):
-            continue
-        if not bool(s.get("embed_media", False)):
-            continue
-        root = s.get("root")
-        if not root:
-            continue
-        out.append(s)
-    return out
-
-
 def _slug_from_path(root: Path) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", root.name.lower()).strip("-")
     return slug or "root"
@@ -236,7 +195,6 @@ def add_code_root(root: Path) -> dict:
             "kind": "code_ast",
             "root": str(root),
             "enabled": True,
-            "embed_media": False,
         }
     )
     save_sources(doc)

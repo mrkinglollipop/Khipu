@@ -95,12 +95,11 @@ ACTIONS: frozenset[str] = frozenset({
     "route.tier_table.clear", "accounts.track", "accounts.rename", "accounts.stop",
     "accounts.move", "accounts.decline", "accounts.offer_again", "accounts.auto_track", "accounts.request.confirm",
     "accounts.request.undo", "config.usage_accounts", "config.routing_setting", "config.answer_request.confirm",
-    "config.answer_request.undo", "promote.gate_ignore", "promote.gate_ignore.cancel", "ledger.import",
+    "config.answer_request.undo", "promote.gate_ignore", "promote.gate_ignore.cancel",
     "ledger.restore", "ledger.purge", "ledger.project", "ledger.add", "ledger.set", "ledger.remove", "work.hide", "work.unhide",
     "work.same", "work.not_same", "owed.change", "owed.tidy", "direction.off", "direction.on", "direction.acknowledge", "direction.set",
     "direction.undo", "project.alias_add", "project.alias_remove", "project.merge", "project.keep_separate",
-    "project.separate", "forget.send", "forget.here", "forget.not_same", "outbox.merge_preferences",
-    "outbox.span_covered",
+    "project.separate", "forget.send", "forget.here", "forget.not_same",
 })
 
 # Owner changes come in three classes (owner decision 2026-11-07). A: his own
@@ -109,28 +108,19 @@ ACTIONS: frozenset[str] = frozenset({
 # else made (``ANSWER_ACTIONS``): he has to have been shown it first. C: a
 # change that can't be taken back (``CLASS_C``): ``khipu_owner_act`` holds it
 # with its own words for his yes even when he asked for it himself.
-# ``ledger.import`` is C only with ``catch_up``. Every action not named here
-# is A, so the C list is kept by hand.
-CLASS_C: frozenset[str] = frozenset({"forget.send", "forget.here", "forget.not_same", "ledger.purge",
-                                     "ledger.import"})
+# Every action not named here is A, so the C list is kept by hand.
+CLASS_C: frozenset[str] = frozenset({"forget.send", "forget.here", "forget.not_same", "ledger.purge"})
 
 
 def class_c(action: str, values: dict | None = None) -> bool:
     """Whether ``action`` with ``values`` is a change that can't be taken back."""
-    if action not in CLASS_C:
-        return False
-    return action != "ledger.import" or bool((values or {}).get("catch_up"))
+    return action in CLASS_C
 
 
 # A clean-up an agent planned (B) with no Needs-you item of its own: always
 # held with these words, and the command's ``--owner-direction`` passes only
 # in the replay of a request ``confirm`` proved he answered (``replaying``).
-PLANNED_ASKS: dict[str, str] = {
-    "outbox.span_covered": ("Retire the dead outbox jobs `khipu outbox span-covered` counts? Each has a live episode "
-                            "whose range contains its own and which holds every evidence field it carries. Summaries "
-                            "are not compared and a range does not prove the same text, so each job's own summary "
-                            "then stays only in the local record; nothing is written to the hub."),
-}
+PLANNED_ASKS: dict[str, str] = {}
 
 # The routing changes whose direction pushes a receipt to every conversation.
 RECEIPTED: frozenset[str] = frozenset({
@@ -521,12 +511,12 @@ def reviewed_hold(request: dict) -> bool:
     args, files = request.get("args"), request.get("files")
     if not isinstance(args, dict):
         return False
-    key = {"ledger.import": "file", "owed.tidy": "plan"}.get(request.get("action"))
+    key = {"owed.tidy": "plan"}.get(request.get("action"))
     return not key or not args.get(key) or (isinstance(files, dict) and str(args[key]) in files)
 
 
 def _review_files(action: str, args: dict) -> dict:
-    key = {"ledger.import": "file", "owed.tidy": "plan"}.get(action)
+    key = {"owed.tidy": "plan"}.get(action)
     if not key or not args.get(key):
         return {}
     from khipu import safe_read
@@ -1007,13 +997,11 @@ _ASK_ALONE = ("Not confirmed: this can't be taken back, so a yes to a list never
 
 def permanent(request: dict) -> bool:
     """A held request that can't be taken back (class C), one mirrored from
-    another Mac included (its holder says so; a forget or a purge always is,
-    and so is any import, since an older holder may not say whether it is a
-    catch-up and the mirror has no args to tell)."""
+    another Mac included (its holder says so; a forget or a purge always is)."""
     remote = request.get("remote")
     if request.get("action") == "direction.remote" and isinstance(remote, dict):
         action = str(remote.get("action") or "")
-        return remote.get("permanent") is True or action == "ledger.import" or class_c(action, None)
+        return remote.get("permanent") is True or class_c(action, None)
     return class_c(request.get("action", ""), request.get("args"))
 
 
@@ -2032,54 +2020,6 @@ def record_owed_undo_scope(batch: str, ids: list[int]) -> None:
     pend["before"] = before
 
 
-def record_preference_merges(entries: list[dict]) -> None:
-    """Persist one transaction's preference additions (episode ids, exact
-    strings, prior lists) before it commits: the Undo of the merge."""
-    pend = _PENDING.get()
-    line = (pend or {}).get("line")
-    if not pend or pend["intent"]["action"] != "outbox.merge_preferences" or line is None:
-        raise OSError("the owner action must be recorded before preferences can be merged")
-    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
-             "state": "pending", "preference_merges": entries})
-
-
-_RESOLVING_ACTIONS = ("outbox.merge_preferences", "outbox.span_covered")
-
-
-def record_preference_resolutions(jobs: list[dict]) -> None:
-    """Persist the held jobs a merge is about to archive as resolved (record
-    id, job name, where it was held) before any moves: the Undo puts them
-    back."""
-    pend = _PENDING.get()
-    line = (pend or {}).get("line")
-    if not pend or pend["intent"]["action"] not in _RESOLVING_ACTIONS or line is None:
-        raise OSError("the owner action must be recorded before held lines can be resolved")
-    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
-             "state": "pending", "preference_resolutions": jobs})
-
-
-def record_preference_commits(episode_ids: list[int]) -> None:
-    """Mark one transaction's recorded additions committed, after its commit
-    returns: Undo reverts only entries proven committed."""
-    pend = _PENDING.get()
-    line = (pend or {}).get("line")
-    if not pend or pend["intent"]["action"] != "outbox.merge_preferences" or line is None:
-        raise OSError("the owner action must be recorded before a merge commit can be marked")
-    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
-             "state": "pending", "preference_commits": [{"episode_id": int(i)} for i in episode_ids]})
-
-
-def preference_merges(line_id: str, key: str = "preference_merges") -> list[dict]:
-    """Every addition a merge recorded (or, with ``preference_resolutions``,
-    every job it resolved), in log order. Read from the raw log: the merged
-    view keeps only the last state line's fields."""
-    out: list[dict] = []
-    for row in read_log():
-        if row.get("kind") == "state" and row.get("target") == line_id:
-            out += [e for e in row.get(key) or [] if isinstance(e, dict)]
-    return out
-
-
 def record_setting_before(key: str, data: dict) -> None:
     """Record the exact replaced state while the setter holds both locks."""
     from khipu import routing
@@ -2150,19 +2090,6 @@ def record_owner_write(tool: str, args: dict) -> None:
     _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
              "state": "pending", "owner_write": write})
     pend["owner_write"] = write
-
-
-def import_source(path, project: str, *, catch_up: bool = False) -> dict | None:
-    """The parsed tracker read by this import's gate; never stored in the log."""
-    pend = _PENDING.get()
-    if pend is None:
-        return None
-    want = pend["intent"]
-    facts = want.get("facts") or {}
-    if (want["action"] != "ledger.import" or want["target"] != str(path)
-            or facts.get("project") != project or catch_up):
-        return None
-    return want.get("_import_source")
 
 
 def _ahead_line(want: dict, stamp: dict, before) -> dict:
@@ -2278,22 +2205,11 @@ def _abandon() -> None:
             state = _hub_write_state(write)
         elif pend["line"].get("inverse_writes"):
             state = _inverse_state(pend["line"]["inverse_writes"])
-        elif pend["intent"]["action"] in _RESOLVING_ACTIONS and _merge_recorded(pend["line"]["id"]):
-            # Batches before the failure committed and their Undo is logged:
-            # unconfirmed, so Undo still runs.
-            state = "pending"
         try:
             _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": pend["line"]["id"],
                      "state": state, **outcome})
         except OSError:
             pass
-
-
-def _merge_recorded(line_id: str) -> bool:
-    try:
-        return bool(preference_merges(line_id) or preference_merges(line_id, "preference_resolutions"))
-    except Exception:  # noqa: BLE001 - an unreadable log can't show a merge to undo
-        return False
 
 
 _INCOMPLETE = ("The change was made and its Undo is recorded, but Khipu could not write that it finished, so "
@@ -2362,7 +2278,7 @@ _PUSH_WORDS = {
     "direction.set": "Changed the owner-direction settings",
     "direction.acknowledge": "Acknowledged the owner-actions tamper alarm",
     "direction.undo": "Undid an owner change",
-    "ledger.import": "Imported a tracker into the ledger", "ledger.restore": "Brought back a removed ledger row",
+    "ledger.restore": "Brought back a removed ledger row",
     "ledger.purge": "Removed a ledger row for good", "ledger.project": "Changed a ledger project",
     "ledger.add": "Added a ledger row", "ledger.set": "Changed a ledger row", "ledger.remove": "Removed a ledger row",
     "work.hide": "Hid a work item", "work.unhide": "Showed a hidden work item",
@@ -2382,8 +2298,6 @@ _PUSH_WORDS = {
     "forget.send": "Sent this Mac's forgets the hub lacked to the hub",
     "forget.here": "Forgot a hub episode this Mac had forgotten by id",
     "forget.not_same": "Marked a hub episode as not the one forgotten on this Mac",
-    "outbox.merge_preferences": "Merged preferences held only in memory-file lines into the hub",
-    "outbox.span_covered": "Retired dead outbox jobs whose range and evidence fields another episode holds",
 }
 
 
@@ -2570,7 +2484,6 @@ _UNREADABLE = object()  # what it changes can't be read now: a direction is refu
 
 # Why a change has no undo, in words the app shows beside it.
 _NO_UNDO_WHY = {
-    "ledger.import": "A catch-up import can't be undone: it changes rows that were already there.",
     "forget.send": "A forget sent to the hub can't be undone: the hub keeps the episodes forgotten.",
     "forget.here": "A forget can't be undone: the hub keeps the episode forgotten.",
     "forget.not_same": "Not undone from its record line: forget that hub episode instead if it was the same one.",
@@ -2726,23 +2639,6 @@ def _before(want: dict):
         from khipu import promote
 
         return {"checks": list(promote.gate_ignore_status().get("value") or [])}
-    if action == "ledger.import":
-        facts = want.get("facts") or {}
-        if facts.get("catch_up") or not facts.get("project"):
-            return _NO_UNDO
-        from khipu import ledger_import
-
-        try:
-            source = ledger_import.read_tracker(target)
-        except Exception:  # noqa: BLE001 - the import itself says what is wrong with the file
-            return _UNREADABLE
-        digest = source["digest"]
-        try:
-            had = ledger_import.done_imports(facts["project"], digest)
-        except Exception:  # noqa: BLE001 - an import needs the database too
-            return _UNREADABLE
-        want["_import_source"] = source
-        return {"project": facts["project"], "digest": digest, "had": had}
     if action == "ledger.project":
         from khipu import ledger
 
@@ -2788,13 +2684,6 @@ def _before(want: dict):
         facts = want.get("facts") or {}
         return {"project": target, "change": facts.get("change"), "batch": facts.get("batch"),
                 **({"ids": []} if facts.get("change") == "undo" else {})}
-    if action == "outbox.merge_preferences":
-        # Each transaction's additions are written ahead as their own state
-        # line (``record_preference_merges``) before it commits.
-        return {"change": "apply"}
-    if action == "outbox.span_covered":
-        # Each batch's jobs are written ahead (``record_preference_resolutions``).
-        return {"change": "apply"}
     if action in ("direction.off", "direction.on"):
         return {"enabled": owner_turns.settings()["enabled"]}
     if action == "direction.acknowledge":
@@ -3241,15 +3130,6 @@ def _undo_project_group(line, via):
     return project_group.run_undo(line["action"], line["target"], line.get("result"))
 
 
-def _undo_import(line, via):
-    from khipu import ledger_import
-
-    before = _b(line)
-    if not before.get("digest"):
-        raise ValueError("Khipu can't tell which import this was, so it can't undo it")
-    return ledger_import.undo_import(before["project"], before["digest"], before.get("had"))
-
-
 def _undo_owed_change(line, via):
     from khipu import owed_tidy
 
@@ -3285,38 +3165,6 @@ def _undo_owed_tidy(line, via):
     if not out.get("ok"):
         raise ValueError(out.get("error") or f"batch {batch} could not be undone")
     return {"ok": True, **counted, "left_alone": out.get("left_alone") or []}
-
-
-_INCLUDE_UNPROVEN: contextvars.ContextVar[bool] = contextvars.ContextVar("khipu_include_unproven", default=False)
-
-
-def _undo_outbox_preferences(line, via):
-    from khipu import outbox_preferences
-
-    entries = preference_merges(line["id"])
-    resolved = preference_merges(line["id"], "preference_resolutions")
-    if not (entries or resolved):
-        result = line.get("result") or {}
-        if (int(result.get("episodes_merged") or 0) == 0 and int(result.get("lines_resolved") or 0) == 0
-                and line["state"] == "applied"):
-            return {"ok": True, "restored": 0, "left_alone": []}
-        raise ValueError("Khipu has no record of which preferences this merge added, so it can't undo it")
-    # Committed: a batch's own marker, or the finished result's episode list
-    # (written only after every batch committed).
-    committed = {int(c["episode_id"]) for c in preference_merges(line["id"], "preference_commits")}
-    committed |= {int(i) for i in (line.get("result") or {}).get("episode_ids") or []}
-    return outbox_preferences.undo(entries, resolved, committed, include_unproven=_INCLUDE_UNPROVEN.get(),
-                                   retract_reason=f"undo of owner action {line['id']} "
-                                                  "(outbox merge-line-preferences --include-decisions)")
-
-
-def _undo_span_covered(line, via):
-    from khipu import outbox_span_covered
-
-    entries = preference_merges(line["id"], "preference_resolutions")
-    if not entries and not (line["state"] == "applied" and not int((line.get("result") or {}).get("retired") or 0)):
-        raise ValueError("Khipu has no record of which jobs this retired, so it can't undo it")
-    return outbox_span_covered.undo(entries)
 
 
 def _ledger_undo(verb: str):
@@ -3426,7 +3274,6 @@ _UNDO = {
     "config.answer_request.undo": _undo_setting,
     "promote.gate_ignore": _undo_gate_ignore,
     "promote.gate_ignore.cancel": _undo_gate_ignore,
-    "ledger.import": _undo_import,
     "ledger.restore": _ledger_undo("remove"),
     "ledger.add": _ledger_undo("remove"),
     "ledger.set": _undo_ledger_set,
@@ -3444,8 +3291,6 @@ _UNDO = {
     "owed.change": _undo_owed_change,
     "owed.tidy": _undo_owed_tidy,
     "owed.correct_job_origin.confirm": _undo_owed_change,
-    "outbox.merge_preferences": _undo_outbox_preferences,
-    "outbox.span_covered": _undo_span_covered,
     "direction.off": _undo_direction,
     "direction.on": _undo_direction,
     "direction.set": _undo_direction,
@@ -3984,18 +3829,12 @@ def _refuse_over_newer(line: dict, over_newer: bool) -> None:
         ahead["facts"] = facts
 
 
-def undo(line_id: str, via: str, *, holds: dict | None = None, over_newer: bool = False,
-         include_unproven: bool = False) -> dict:
+def undo(line_id: str, via: str, *, holds: dict | None = None, over_newer: bool = False) -> dict:
     """Apply the inverse of a logged action. Its ``undo`` line is written
     ahead by the owner gate (``gate``/``noted``) and completed by
     ``finish``. Refused (``NewerChange``) when a newer change touched the
-    same target, unless ``over_newer``. ``include_unproven`` (a preference
-    merge only) also reverts episodes whose commit was never proven."""
-    token = _INCLUDE_UNPROVEN.set(include_unproven)
-    try:
-        return _undo(line_id, via, holds, over_newer)
-    finally:
-        _INCLUDE_UNPROVEN.reset(token)
+    same target, unless ``over_newer``."""
+    return _undo(line_id, via, holds, over_newer)
 
 
 def _undo(line_id: str, via: str, holds: dict | None, over_newer: bool = False) -> dict:

@@ -41,7 +41,7 @@ import { GROUPS, oldFileRules, accountTags, accountWeek, lanesWithoutAccount, pr
 import type { GroupKey, GroupTag, OverviewSettings, Problem, ProviderRow } from "./routingOverview";
 import { paceModel } from "./routingPace";
 import type { PaceTrend, PaceWindow } from "./routingPace";
-import { checksModel, fileCopySkipWords } from "./routingChecks";
+import { checksModel } from "./routingChecks";
 import { endedWords, holdChoiceIds, holdChoiceTargets, proposalsModel } from "./routingProposals";
 import type { ProposalRow } from "./routingProposals";
 import {
@@ -1041,7 +1041,7 @@ const FIND_SETTINGS: readonly FindSetting[] = [
   { name: "Tell conversations about routing", where: "Conversations", page: "conversations", aliases: ["telling", "telling conversations", "when conversations hear", "before each prompt"], selector: "[data-find-setting='group-telling']", group: "telling" },
   { name: "Recent changes", where: "What changed", page: "changes", aliases: ["history", "bring back", "undo"], selector: "[data-find-setting='group-changes']", group: "changes" },
   { name: "Checks and job runners", where: "Something's wrong", page: "wrong", aliases: ["checks", "lane", "lanes", "job slots", "providers", "runner folders", "conflicts"], selector: "[data-find-setting='group-checks']", group: "checks" },
-  { name: "Technical limits and timing", where: "Rarely needed", page: "rare", aliases: ["sizes", "times", "warnings", "dispatch scripts"], selector: "[data-find-setting='rare-sizes']", rare: true },
+  { name: "Technical limits and timing", where: "Rarely needed", page: "rare", aliases: ["sizes", "times", "warnings"], selector: "[data-find-setting='rare-sizes']", rare: true },
   { name: "Reading usage from logins", where: "Rarely needed", page: "rare", aliases: ["grok login", "cursor login", "opencode login"], selector: "[data-find-setting='rare-logins']", rare: true },
   { name: "Old routing table file", where: "Rarely needed", page: "rare", aliases: ["routing-now", "legacy routing file", "old file"], selector: "[data-find-setting='rare-table']", rare: true },
 ];
@@ -2934,99 +2934,6 @@ function SwitchRow({
   );
 }
 
-function dispatchScripts(cfg: RouteConfig | null): string[] | null {
-  const raw = cfg?.routing?.routing_dispatch_scripts?.value;
-  return Array.isArray(raw) && raw.every((v) => typeof v === "string") ? (raw as string[]) : null;
-}
-
-function DispatchScriptsRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Writer; reread: () => Promise<unknown> }) {
-  const names = dispatchScripts(cfg);
-  const [open, setOpen] = useState(false);
-  const [draft, setDraft] = useState("");
-  const btn = useRef<HTMLButtonElement>(null);
-  const formId = `dispatch-${useId().replace(/:/g, "")}`;
-  const id = "dispatch-scripts";
-  const close = () => {
-    setOpen(false);
-    w.fail(id, null);
-    requestAnimationFrame(() => btn.current?.focus());
-  };
-  async function save(e: FormEvent) {
-    e.preventDefault();
-    const next = [...new Set(draft.split(",").map((t) => t.trim()).filter((t) => t !== ""))];
-    if (next.some((t) => !/^[A-Za-z0-9._-]{1,64}$/.test(t) || t === "." || t === ".." || t.startsWith("-"))) {
-      w.fail(id, "Give file names only, such as dispatch.py: letters, digits, dots, dashes and underscores, no folder.");
-      return;
-    }
-    if (next.length > 16) {
-      w.fail(id, "At most 16 scripts.");
-      return;
-    }
-    if (await w.run(id, "khipu_config_set", { key: "routing_dispatch_scripts", value: JSON.stringify(next) }, reread)) close();
-  }
-  return (
-    <div className="row-item route-limit">
-      <span className="route-limit-text">
-        <span className="route-limit-name">Your hand-off scripts</span>
-        <span className="set-help">
-          Scripts of your own that hand work to another agent. A shell command that runs one counts as handing work on,
-          like claude -p or codex exec.
-        </span>
-        <MacTag keys={["routing_dispatch_scripts"]} />
-      </span>
-      <span className="route-val">{names == null ? "…" : names.length ? names.join(", ") : "None"}</span>
-      <button
-        ref={btn}
-        type="button"
-        className="sm"
-        aria-label="Change your hand-off scripts"
-        aria-expanded={open}
-        aria-controls={open ? formId : undefined}
-        disabled={names == null}
-        onClick={() => {
-          if (open) {
-            close();
-            return;
-          }
-          setDraft((names ?? []).join(", "));
-          w.fail(id, null);
-          setOpen(true);
-        }}
-      >
-        Change…
-      </button>
-      {open ? (
-        <form className="route-pause" id={formId} aria-label="Change your hand-off scripts" onSubmit={save} onKeyDown={escapeCloses(close)}>
-          <div className="toolbar">
-            <label htmlFor={`${formId}-names`}>File names</label>
-            <input
-              id={`${formId}-names`}
-              className="mono"
-              value={draft}
-              autoFocus
-              autoComplete="off"
-              spellCheck={false}
-              placeholder="dispatch.py, run-job.sh…"
-              onChange={(e) => setDraft(e.target.value)}
-            />
-          </div>
-          <p className="set-help">File names only, separated by commas. Leave it empty for none.</p>
-          <WriteError w={w} id={id} say={(m) => settingWords(m, "routing_dispatch_scripts", "Your hand-off scripts")} />
-          <div className="toolbar">
-            <button type="submit" className="primary sm" disabled={w.isBusy(id)}>
-              <Busy on={w.isBusy(id)} />
-              Save
-            </button>
-            <button type="button" className="sm link" onClick={close}>
-              Cancel
-            </button>
-          </div>
-        </form>
-      ) : null}
-    </div>
-  );
-}
-
 /** Telling's sizes and times, each a row with Change…. */
 const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }[] = [
   {
@@ -3282,7 +3189,7 @@ function TellingSection({
         <SwitchRow
           id="route-push-delegation"
           label="Before handing work to another agent"
-          what="Reaches an orchestrator in the middle of a long turn when it starts a subagent, a delegated task or a job such as claude -p or codex exec. It arrives with the call's result and never stops the call. A subagent hears the full summary when it starts."
+          what="Reaches an orchestrator in the middle of a long turn when it starts a subagent or a delegated task. A job started from a shell, such as claude -p or codex exec, hears routing at its own start instead. It arrives with the call's result and never stops the call. A subagent hears the full summary when it starts."
           tag={<Tag tone="ok">Delegation</Tag>}
           checked={moment("routing_push_delegation")}
           disabled={!cfg || w.anyBusy}
@@ -3336,7 +3243,6 @@ function TellingRarelySettings({ cfg, cfgError, w, reread }: { cfg: RouteConfig 
   return <div className="section-body">
     <h2 className="sub-title">Sizes and times <span className="meta">{sizesLine(cfg, cfgError)}</span></h2>
     <div className="rows">{SIZES.map((r) => <LimitRow key={r.name} name={r.name} help={r.help} fields={r.fields} join={r.join} cfg={cfg} w={w} reread={reread} />)}</div>
-    <div className="rows"><DispatchScriptsRow cfg={cfg} w={w} reread={reread} /></div>
   </div>;
 }
 
@@ -3650,8 +3556,7 @@ function ProvidersList({ view }: { view: RouteView }) {
  *  stays in the group that owns the words, and nothing here sends, stops or
  *  refuses work. The checks `route --json` does not carry yet (model
  *  stale level words) are left out rather than guessed.
- *  Today's model mismatches, open owed directions and routing copies
- *  found in files stay local to the owner's Mac. */
+ *  Open owed directions stay local to the owner's Mac. */
 function ChecksSection({ data, now, folds, includeTable = true }: { data: RouteView; now: Date; folds: Folds; includeTable?: boolean }) {
   const model = checksModel(data, now);
   const row = (r: { key: string; title: string; sub: string }, tag?: ReactNode) => (
@@ -3664,14 +3569,6 @@ function ChecksSection({ data, now, folds, includeTable = true }: { data: RouteV
   return (
     <>
       <p className="set-help">Khipu flags these so you can fix them. None of them stops any work.</p>
-      {model.mismatches.length ? (
-        <div className="section-body">
-          <h2 className="sub-title">Model mismatches today <span className="meta">{model.mismatches.length}</span></h2>
-          <div className="mrows" role="list" aria-label="Model mismatches today">
-            {model.mismatches.map((r) => row(r, <Tag>{r.guessed ? "Guess" : "From the brief"}</Tag>))}
-          </div>
-        </div>
-      ) : null}
       {includeTable && model.table ? (
         <div className="section-body">
           <SubFold k="sub:model-table" name="Your model table" line={model.table.line} folds={folds}>
@@ -3702,55 +3599,6 @@ function ChecksSection({ data, now, folds, includeTable = true }: { data: RouteV
           </div>
         </div>
       ) : null}
-      {model.fileCopies ? (
-        <div className="section-body">
-          <h2 className="sub-title">Routing written in files{model.fileCopies.status !== "not_checked" ? <span className="meta">{model.fileCopies.hits_total} found</span> : null}</h2>
-          {model.fileCopies.status === "not_checked" ? (
-            <div className="empty">
-              <b>Khipu hasn't looked at your files yet</b>
-              <span>Nothing is known about copies until the first look. It reads only, and never edits a file.</span>
-            </div>
-          ) : (
-            <>
-              <p className="set-help">
-                Files last looked at{model.fileCopies.scanned_at && whenLocal(model.fileCopies.scanned_at, now)
-                  ? ` ${whenLocal(model.fileCopies.scanned_at, now)}` : " at an unknown time"}: {model.fileCopies.files_checked} files, {model.fileCopies.hits_total} {model.fileCopies.hits_total === 1 ? "copy" : "copies"}.
-              </p>
-              {model.fileCopies.status === "stale" ? (
-                <p className="set-help">Scan is out of date. These are retained results from the last look.</p>
-              ) : null}
-              {model.fileCopies.status === "incomplete" || model.fileCopies.skipped.length || model.fileCopies.too_large.length ? (
-                <p className="set-help">Scan incomplete. Some files were not read.</p>
-              ) : null}
-              {model.fileCopies.hits.length ? (
-                <>
-                  <p className="set-help">Conversations are told Khipu's record wins over these.</p>
-                  <div className="mrows" role="list" aria-label="Copies of routing found in files">
-                    {model.fileCopies.hits.map((h) => row({
-                      key: `copy:${h.file}:${h.line}`,
-                      title: `${h.file} line ${h.line}`,
-                      sub: `“${h.quote}”`,
-                    }))}
-                  </div>
-                  {model.fileCopies.more_not_shown ? (
-                    <p className="set-help">{model.fileCopies.more_not_shown} more not shown.</p>
-                  ) : null}
-                </>
-              ) : null}
-              {model.fileCopies.too_large.length ? (
-                <p className="set-help">Too large to read: {model.fileCopies.too_large.join(", ")}.</p>
-              ) : null}
-              {model.fileCopies.skipped.length ? (
-                <ul className="set-help" aria-label="Files not checked">
-                  {model.fileCopies.skipped.map((skip, index) => (
-                    <li key={`${skip.file}:${skip.reason}:${index}`}>{skip.file}: {fileCopySkipWords(skip)}</li>
-                  ))}
-                </ul>
-              ) : null}
-            </>
-          )}
-        </div>
-      ) : null}
       {model.unreached.length ? (
         <div className="section-body">
           <h2 className="sub-title">Said in a conversation, not in Khipu <span className="meta">{model.unreached.length}</span></h2>
@@ -3759,8 +3607,8 @@ function ChecksSection({ data, now, folds, includeTable = true }: { data: RouteV
           </div>
         </div>
       ) : null}
-      {(!includeTable || !model.table) && !model.mismatches.length && !model.contradictions.length && !model.upkeep.length && !model.unreached.length
-        && !model.fileCopies?.hits.length && !(model.fileCopies && model.fileCopies.status !== "checked") ? (
+      {(!includeTable || !model.table) && !model.contradictions.length && !model.upkeep.length && !model.unreached.length
+        ? (
         <div className="section-body">
           <EmptyState title="Nothing to fix" hint="No priority, rule or direction disagrees with an account." />
         </div>
@@ -5311,7 +5159,7 @@ export function RoutingSettings({
             <RareFold name="Checking accounts when they reset" findKey="rare-resets">{group("resets")}</RareFold>
             <RareFold name="Old routing table file" findKey="rare-table">{group("table")}</RareFold>
             <RareFold name="Priority and hold limits" findKey="rare-priority"><PriorityRarelySetting cfg={config.data} w={w} reread={rereadConfig} /><HoldRarelySettings cfg={config.data} w={w} reread={rereadConfig} /></RareFold>
-            <RareFold name="Sizes, timing and hand-off scripts" findKey="rare-sizes"><TellingRarelySettings cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} /></RareFold>
+            <RareFold name="Sizes and timing" findKey="rare-sizes"><TellingRarelySettings cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} /></RareFold>
             <RareFold name="Model table" findKey="rare-models">{data ? <ModelTableSection data={data} now={now} /> : null}</RareFold>
             <RareFold name="Providers and account setup" findKey="rare-providers"><ProvidersLanesSection data={data} cfg={config.data} lists={lists} recordRead={recordRead} w={w} now={now} reread={rereadConfig} folds={folds} mode="providers" /></RareFold>
             <RareFold name="Reading usage from logins" findKey="rare-logins"><section className="route-page-group" aria-labelledby="route-login-reads">

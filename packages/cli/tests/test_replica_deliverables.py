@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """The "You produced ..." line comes from the local replica, not the hub.
 
 The per-prompt hook used to open a hub connection on every prompt to answer

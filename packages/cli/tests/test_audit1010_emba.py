@@ -51,18 +51,6 @@ class ProviderDiagnosticsTest(unittest.TestCase):
             )
         self.assertNotIn("text-secret", str(ctx.exception))
 
-    def test_image_http_error_redacts_credential_echo(self) -> None:
-        err = urllib.error.HTTPError(
-            "https://example.invalid", 401, "no", {},
-            io.BytesIO(b"x-goog-api-key: image-secret"),
-        )
-        with mock.patch.object(embed, "_budget_take"), \
-                mock.patch.object(embed, "_gemini_key", return_value="image-secret"), \
-                mock.patch.object(embed.urllib.request, "urlopen", side_effect=err), \
-                self.assertRaises(RuntimeError) as ctx:
-            embed.embed_batch_images([(b"png", "image/png")], retries=0)
-        self.assertNotIn("image-secret", str(ctx.exception))
-
     def test_header_credential_stays_redacted_when_memory_redaction_is_disabled(self) -> None:
         with mock.patch.dict("os.environ", {"KHIPU_REDACT_SECRETS": "0"}):
             self.assertNotIn(
@@ -560,44 +548,6 @@ class BackfillTailPruneTest(unittest.TestCase):
         self.assertEqual(self._run(old={}).deletes, [])
         # An unrelated source's stored indexes never trigger a delete here.
         self.assertEqual(self._run(old={("episode", "9", 4): "x"}).deletes, [])
-
-
-class MediaLimitTest(unittest.TestCase):
-    def test_limit_counts_changed_images_after_unchanged_skips(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            paths = [root / "a.png", root / "b.png"]
-            for i, path in enumerate(paths):
-                path.write_bytes(f"png-{i}".encode())
-            state, flushed = {}, []
-            cur = mock.MagicMock()
-            cur.__enter__.return_value = cur
-            cur.fetchone.side_effect = lambda: ((state.get("last"),) if state.get("last") else None)
-
-            def execute(_sql, params=None):
-                rel = params[1] if params else None
-                state["last"] = rel if rel in state else None
-            cur.execute.side_effect = execute
-            def hashes(_cur, _profile):
-                return {("media", rel, 0): sha for rel, sha in state.items() if rel != "last"}
-            def flush(_cur, _profile, batch, stats):
-                for _sid, _path, rel, _mime, sha, _raw in batch:
-                    state[rel] = sha
-                    flushed.append(rel)
-                    stats["embedded"] += 1
-            conn = _Conn(cur)
-            patches = (
-                mock.patch("khipu.db.connect", return_value=conn),
-                mock.patch("khipu.sources.sources_with_embed_media", return_value=[{"id": "s", "root": str(root)}]),
-                mock.patch.object(embed, "_iter_media_files", side_effect=lambda _root: iter(paths)),
-                mock.patch.object(embed, "_resolve_profile", return_value=embed.PROFILE_2),
-                mock.patch.object(embed, "_existing_hashes", side_effect=hashes),
-                mock.patch.object(embed, "_flush_media_batch", side_effect=flush),
-            )
-            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
-                embed.backfill_media(limit=1, yes=True)
-                embed.backfill_media(limit=1, yes=True)
-            self.assertEqual(flushed, ["a.png", "b.png"])
 
 
 class SearchValidityTest(unittest.TestCase):

@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane): authored by a dispatched on-sub
-# Agent(model="sonnet") subagent for Phase 1 of docs/plans/2026-09-05-
-# setup-that-cannot-strand-you.md.
 """khipu.setup — the one connect pipeline shared by the CLI and the desktop
 Database step. Fake connections throughout; no live database except the one
 Live check the phase brief calls out separately (test_cli.py / manual run).

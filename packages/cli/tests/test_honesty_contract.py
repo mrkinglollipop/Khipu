@@ -66,8 +66,6 @@ class NightlyStepHealthTest(unittest.TestCase):
             "ledger",
         ):
             self.assertIn(name, skipped)
-        # briefs disabled → applicable:false, also greyed via the same list
-        self.assertIn("briefs_build", skipped)
 
     def test_a_stale_recording_over_36h_old_is_red_even_if_it_was_ok(self):
         """A nightly that stopped running altogether must not hide behind a
