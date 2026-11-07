@@ -13,9 +13,9 @@ import time
 import pytest
 
 from khipu import needs_you, owner_act, routing, usage
-from tests.test_owner_needs_you import (_accounts_request, _owner_types, _priority_request, _rule_added,
+from tests.test_owner_needs_you import (_accounts_request, _held_pause, _owner_types, _priority_request, _rule_added,
                                         _setting, _setting_request, _tier_request)
-from tests.test_t3_owner_confirm import _be_front, _front_end_turn, world
+from tests.test_t3_owner_confirm import _be_front, _front_end_turn, _paused, world
 
 assert world  # the fixture, imported for pytest
 
@@ -31,6 +31,7 @@ def _by_kind(items: list[dict]) -> dict[str, dict]:
 
 
 def _build_list(world) -> None:
+    _held_pause(world)
     _priority_request(world)
     _rule_added(world)
     _setting_request(world)
@@ -64,14 +65,14 @@ def test_one_yes_to_the_list_settles_every_item_it_showed(world, front):
     _build_list(world)
     FRONTS[front](world, "what needs my confirmation?")
     items = _by_kind(_read())
-    assert {"priority", "rule", "setting", "accounts", "tier_table"} <= set(items)
+    assert {"held", "priority", "rule", "setting", "accounts", "tier_table"} <= set(items)
     FRONTS[front](world, "yes")
-    for kind in ("priority", "rule", "setting", "accounts", "tier_table"):
+    for kind in ("held", "priority", "rule", "setting", "accounts", "tier_table"):
         settle = items[kind]["settle"]["confirm"]
         ok, out = owner_act.act(settle["action"], settle["args"])
         assert ok and out.get("pending") is not True, (kind, out)
     assert _settled(world) == dict.fromkeys(("priority", "rule", "setting", "accounts", "tier_table"), True)
-    assert _setting()["value"] is True
+    assert _setting()["value"] is True and _paused()
 
 
 @pytest.mark.parametrize("front", sorted(FRONTS))
@@ -86,6 +87,16 @@ def test_yes_except_one_settles_the_rest_and_the_no_undoes_that_one(world, front
         assert ok and out.get("pending") is not True, (kind, out)
     assert _setting()["pending"] is False and _setting()["value"] is False
     assert not routing.read_view()["priority"]["pending"]
+
+
+def _confirm(request: str) -> tuple[bool, dict]:
+    """direction.confirm, and the background run a long change starts."""
+    ok, done = owner_act.act("direction.confirm", {"request": request})
+    if ok and done.get("started"):
+        from khipu import owner_background
+
+        return owner_background.run(done["request"])
+    return ok, done
 
 
 def _forget_waits(world) -> list:
@@ -113,7 +124,7 @@ def test_a_yes_to_a_list_never_settles_what_cant_be_taken_back(world, front):
     assert not ran
     # Its own ask, then the owner's yes to it.
     FRONTS[front](world, "yes, forget it")
-    ok, done = owner_act.act("direction.confirm", {"request": held["request"]})
+    ok, done = _confirm(held["request"])
     assert ok, done
     assert ran and ran[0][0] == "forget.here"
 
@@ -132,12 +143,12 @@ def test_a_yes_to_a_list_never_confirms_a_held_request_that_cant_be_taken_back(w
                                                           "args": {"request": held["request"]}}
     assert len(items) > 1
     FRONTS[front](world, "yes")
-    ok, refused = owner_act.act("direction.confirm", {"request": held["request"]})
+    ok, refused = _confirm(held["request"])
     assert not ok and refused["code"] == "not_confirmed", refused
     assert "roof" in refused["error"] and "list" in refused["error"]
     assert not ran
     FRONTS[front](world, "yes, forget it")
-    ok, done = owner_act.act("direction.confirm", {"request": held["request"]})
+    ok, done = _confirm(held["request"])
     assert ok, done
     assert ran and ran[0][0] == "forget.here"
 
@@ -149,6 +160,6 @@ def test_what_cant_be_taken_back_still_settles_on_its_own_ask(world, front):
     ok, held = owner_act.act("forget.here", {"id": "9"})
     assert ok and held["pending"] is True, held
     FRONTS[front](world, "yes")
-    ok, done = owner_act.act("direction.confirm", {"request": held["request"]})
+    ok, done = _confirm(held["request"])
     assert ok, done
     assert ran and ran[0][0] == "forget.here"
