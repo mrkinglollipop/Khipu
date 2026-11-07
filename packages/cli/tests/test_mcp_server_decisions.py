@@ -59,7 +59,7 @@ class ToolAnnotationsTest(unittest.TestCase):
 
     _EXPECTED_READ_ONLY = {
         "khipu_search", "khipu_get", "khipu_graph", "khipu_status",
-        "khipu_owed", "khipu_decisions", "khipu_brief", "khipu_reflect",
+        "khipu_owed", "khipu_decisions",
         "khipu_usage", "khipu_route", "khipu_route_advise", "khipu_project",
         "khipu_needs_you",
     }

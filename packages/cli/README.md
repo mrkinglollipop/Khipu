@@ -49,7 +49,7 @@ To point Khipu at a legacy file wiki, use `python3 -m khipu config --set memory_
 | Group | Commands |
 |---|---|
 | Health and data | `doctor`, `status`, `activity`, `revisions`, `reconcile`, `migrate`, `snapshot`, `outbox` |
-| Search and records | `search`, `get`, `graph`, `episode`, `topic`, `notes`, `owed`, `decisions`, `briefs`, `reflect`, `recall` |
+| Search and records | `search`, `get`, `graph`, `episode`, `topic`, `notes`, `owed`, `decisions`, `recall` |
 | Maintenance | `regen-memory`, `backfill`, `project`, `hygiene`, `topic-graph`, `graph-sync`, `git-sync` |
 | Embeddings and libraries | `embed`, `embed-backfill`, `embed-media-backfill`, `library`, `library-backfill`, `sources` |
 | Models and limits | `models`, `budget`, `features`, `secrets`, `config` |

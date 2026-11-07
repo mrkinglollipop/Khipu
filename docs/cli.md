@@ -48,8 +48,6 @@ There are 65 top-level commands; the reference below includes storage, ledger, w
 | `get ID` | Load one record by id. |
 | `graph ID` | Neighbours of a graph node. `--hops`, `--limit`. |
 | `recall` | Recall tooling (warm service, logs, evaluation). |
-| `reflect QUESTION` | Answer from memory with cited evidence. `--project`. Needs the `reflect` switch. |
-| `briefs` | Source-backed topic briefs: `plan` (topics whose brief is missing or stale), `build` (`--topic`, `--limit`, needs the `briefs` switch), `show SLUG`. |
 
 ### search
 

@@ -518,9 +518,6 @@ def run_nightly() -> int:
 
 def _run_nightly_locked() -> int:
     steps: list[dict[str, Any]] = []
-    # Capture last night's briefs outcome before this run overwrites the
-    # receipt: a second night of lock-held deferral goes red.
-    _capture_previous_briefs_step()
     _capture_previous_receipts()
     drain_result = _step_result(_drain_sessions())
     _record_nightly_step(steps, "sessions_drain", **drain_result)
@@ -572,14 +569,7 @@ def _run_nightly_locked() -> int:
                          deferred=recall_eval_result.get("deferred")
                          if isinstance(recall_eval_result, dict) else None)
     _record_nightly_step(steps, "snapshot_refresh", **_step_result(_refresh_snapshot()))
-    briefs_result = _briefs_build_if_on()
-    if briefs_result is not None:
-        briefs_step = _step_result(briefs_result)
-        _record_nightly_step(steps, "briefs_build", **briefs_step,
-                             deferred=briefs_result.get("deferred")
-                             if isinstance(briefs_result, dict) else None)
-    briefs_ok = briefs_result is None or _step_result(briefs_result)["ok"]
-    final_rc = rc or (0 if drain_result["ok"] and briefs_ok and provenance_result["ok"] else 1)
+    final_rc = rc or (0 if drain_result["ok"] and provenance_result["ok"] else 1)
     _write_job_state("nightly", final_rc)
     return final_rc
 
@@ -771,105 +761,6 @@ def _drain_sessions() -> dict[str, Any]:
         # fail every nightly until someone deletes it).
         return {"ok": out["failed"] == 0 and not out.get("time_budget_exhausted"), **out}
     except Exception as exc:  # noqa: BLE001 — capture failure cannot block consolidation
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-
-# Each brief is one request to the synth provider, so a first run over every
-# topic is spread across nights instead of sent in one burst.
-BRIEFS_NIGHTLY_LIMIT = 40
-
-
-_UNCAPTURED: Any = object()
-# Last night's ``briefs_build`` step, captured by the nightly before its own
-# receipt overwrites it (``_UNCAPTURED`` outside a nightly run).
-_PREVIOUS_BRIEFS_STEP: Any = _UNCAPTURED
-
-
-def _read_briefs_step() -> dict[str, Any] | None:
-    try:
-        data = nightly_last() or {}
-        found = None
-        if isinstance(data.get("steps"), list):
-            for entry in data["steps"]:
-                if isinstance(entry, dict) and entry.get("name") == "briefs_build":
-                    found = entry
-        return found
-    except Exception:  # noqa: BLE001 — a broken receipt must not fail the night
-        return None
-
-
-def _capture_previous_briefs_step() -> None:
-    global _PREVIOUS_BRIEFS_STEP
-    _PREVIOUS_BRIEFS_STEP = _read_briefs_step()
-
-
-def _briefs_build_if_on() -> dict[str, Any] | None:
-    """Rebuild the stale or missing source-backed briefs, at most
-    BRIEFS_NIGHTLY_LIMIT a night. ``None`` (no step recorded) while the
-    `briefs` switch is off, so an unswitched nightly is unchanged. The
-    advisory lock is the same one `khipu briefs build` takes: a manual build
-    in flight means this one builds nothing rather than racing it. A lock
-    held is a deferral (not "built 0" green); two nights running still
-    deferred goes red; last night's briefs step is the one the nightly
-    captured before this run overwrote the receipt (else read from the
-    receipt). Fail-open like every step here:
-    it never raises."""
-    try:
-        from khipu import briefs, features
-
-        if not features.enabled("briefs"):
-            return None
-        from khipu.db import connect
-
-        with connect() as conn:
-            with conn.cursor() as cur:
-                if not briefs.acquire_build_lock(cur):
-                    _nightly_log("[khipu-briefs] another build holds the lock; deferred")
-                    prev = (_PREVIOUS_BRIEFS_STEP if _PREVIOUS_BRIEFS_STEP is not _UNCAPTURED
-                            else _read_briefs_step())
-                    again = bool(prev and (prev.get("deferred") or (
-                        isinstance(prev.get("counts"), dict) and prev["counts"].get("reason") == "lock held")
-                        or prev.get("reason") == "lock held"))
-                    msg = "briefs build deferred: advisory lock held"
-                    if again:
-                        return {"ok": False, "built": 0, "deferred": msg + " again",
-                                "error": msg + " two nights running", "reason": "lock held"}
-                    return {"ok": True, "built": 0, "deferred": msg, "reason": "lock held"}
-                try:
-                    chosen = briefs.select_for_build(cur, None, BRIEFS_NIGHTLY_LIMIT)
-                    if not chosen.get("available"):
-                        _nightly_log(f"[khipu-briefs] unavailable: {chosen.get('reason')}")
-                        return {"ok": False, "built": 0, "reason": chosen.get("reason") or "unavailable"}
-                    results = briefs.build_many(conn, chosen["topics"])
-                finally:
-                    briefs.release_build_lock(cur)
-                    conn.commit()
-        out: dict[str, Any] = {"ok": True, "built": 0}
-        failed_topics: list[str] = []
-        could_not_run = 0
-        for r in results:
-            status = str(r.get("status") or "unavailable").lower()
-            key = "succeeded" if status == "ok" else status
-            out[key] = int(out.get(key, 0)) + 1
-            if status == "failed":
-                failed_topics.append(str(r.get("topic")))
-            elif status in {"error", "unavailable"} or r.get("ok") is False:
-                could_not_run += 1
-        # A topic whose brief the model could not produce is recorded as a
-        # failed row, keeps its previous brief, and is retried only when its
-        # sources change: a handled outcome for one topic. Counting it as a
-        # failed night made one busy topic fail the nightly on three nights of
-        # four (2026-10-09..12). The night fails when the build could not run
-        # for a topic (provider or table error) or when nothing got through.
-        progressed = sum(int(out.get(k, 0)) for k in ("built", "succeeded", "unchanged"))
-        if could_not_run or (failed_topics and not progressed):
-            out["ok"] = False
-        if failed_topics:
-            out["failed_topics"] = failed_topics[:10]
-        _nightly_log(f"[khipu-briefs] built {json.dumps(out, default=str)[:400]}")
-        return out
-    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
-        _nightly_log(f"[khipu-briefs] skipped: {type(exc).__name__}: {exc}")
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -1381,10 +1272,6 @@ def nightly_consolidate_ts(log_mtime: float | None, *, slack_s: float) -> float 
 # "green because evidence never arrived" (audit 2026-08-17), the same class
 # `_record_nightly_step`'s own docstring names.
 _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
-    "briefs_build_ok": (
-        "briefs_build",
-        "check the synthesis provider, then run `khipu briefs build`",
-    ),
     "notes_reconcile_ok": (
         "notes_reconcile",
         "run `khipu notes reconcile` and check the error",
@@ -1574,8 +1461,6 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
     red too, REGARDLESS of that recording's own `ok` — a nightly that
     stopped running altogether is exactly what a same-day `ok: true` from a
     week ago would otherwise hide."""
-    from khipu import features
-
     applicable = _is_index_sync_host()
     data = nightly_last()
     receipt_path = _nightly_last_path()
@@ -1671,9 +1556,6 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
             "note": "not the nightly host — evaluated on the sync host",
         }
     for doctor_key, (step_name, fix) in _NIGHTLY_STEP_CHECKS.items():
-        if step_name == "briefs_build" and not features.enabled("briefs"):
-            out[doctor_key] = {"ok": True, "applicable": False, "note": "briefs disabled"}
-            continue
         if not applicable:
             out[doctor_key] = {
                 "ok": True, "applicable": False,

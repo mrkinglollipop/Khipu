@@ -15,8 +15,6 @@ const NAMES = [
   "time_interpretation",
   "relevance_floor",
   "rerank",
-  "reflect",
-  "briefs",
   "graph_candidates",
   "decision_details",
   "auto_supersede",
@@ -99,17 +97,15 @@ function switchFor(label: RegExp) {
 }
 
 describe("OptionalFeatures", () => {
-  it("shows the ten switches, the six recommended ones first, routing apart, then the rejected group", async () => {
+  it("shows the eight switches, the four recommended ones first, routing apart, then the rejected group", async () => {
     render(<OptionalFeatures active />);
-    await waitFor(() => expect(screen.getAllByRole("switch")).toHaveLength(11)); // ten plus the recall service
+    await waitFor(() => expect(screen.getAllByRole("switch")).toHaveLength(9)); // eight plus the recall service
     const order = screen.getAllByRole("switch").map((el) => el.id);
     expect(order).toEqual([
       "feat-validity_ranking",
       "feat-time_interpretation",
       "feat-relevance_floor",
       "feat-rerank",
-      "feat-reflect",
-      "feat-briefs",
       "feat-recall-service",
       "feat-routing_push",
       "feat-graph_candidates",
@@ -168,23 +164,23 @@ describe("OptionalFeatures", () => {
   });
 
   it("shows the CLI's error text and leaves the switch where the CLI says it is", async () => {
-    backend.refuse = "unknown feature 'briefs'; known: [...]";
+    backend.refuse = "unknown feature 'relevance_floor'; known: [...]";
     render(<OptionalFeatures active />);
-    await waitFor(() => expect(switchFor(/sourced summary page/)).not.toBeDisabled());
-    fireEvent.click(switchFor(/sourced summary page/));
-    expect(await screen.findByRole("alert")).toHaveTextContent("unknown feature 'briefs'");
-    expect(switchFor(/sourced summary page/)).not.toBeChecked();
+    await waitFor(() => expect(switchFor(/Return nothing when nothing matches/)).not.toBeDisabled());
+    fireEvent.click(switchFor(/Return nothing when nothing matches/));
+    expect(await screen.findByRole("alert")).toHaveTextContent("unknown feature 'relevance_floor'");
+    expect(switchFor(/Return nothing when nothing matches/)).not.toBeChecked();
   });
 
   it("shows an error when the Tauri command itself fails", async () => {
     render(<OptionalFeatures active />);
-    await waitFor(() => expect(switchFor(/Answer questions from memory/)).not.toBeDisabled());
+    await waitFor(() => expect(switchFor(/Return nothing when nothing matches/)).not.toBeDisabled());
     const impl = invokeMock.getMockImplementation()!;
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "khipu_feature_set") throw "khipu exited 2: boom";
       return impl(cmd, args);
     });
-    fireEvent.click(switchFor(/Answer questions from memory/));
+    fireEvent.click(switchFor(/Return nothing when nothing matches/));
     expect(await screen.findByRole("alert")).toHaveTextContent("khipu exited 2: boom");
   });
 

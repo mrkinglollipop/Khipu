@@ -262,7 +262,7 @@ def test_nested_cleanup_failure_must_fail_nightly(harness, monkeypatch, tmp_path
     monkeypatch.setattr(jobs, '_run_script', lambda *a, **kw: 0)
     for name in ('_drain_sessions', '_reconcile_notes_if_due', '_embed_backfill', '_prune_query_cache',
                  '_mark_stale_commitments', '_ledger_nightly',
-                 '_project_renames_sweep', '_refresh_snapshot', '_briefs_build_if_on'):
+                 '_project_renames_sweep', '_refresh_snapshot'):
         monkeypatch.setattr(jobs, name, lambda: {'ok': True})
     assert jobs.run_nightly() != 0
 
@@ -272,7 +272,7 @@ def _install_nightly_cleanup(monkeypatch, tmp_path):
     monkeypatch.setattr(jobs, '_run_script', lambda *a, **kw: 0)
     for name in ('_drain_sessions', '_reconcile_notes_if_due', '_embed_backfill', '_prune_query_cache',
                  '_mark_stale_commitments', '_ledger_nightly',
-                 '_project_renames_sweep', '_refresh_snapshot', '_briefs_build_if_on'):
+                 '_project_renames_sweep', '_refresh_snapshot'):
         monkeypatch.setattr(jobs, name, lambda: {'ok': True})
     monkeypatch.setattr(close_rules.GitHub, 'state', lambda *a: ('merged', None))
     monkeypatch.setattr(provenance, 'backfill', lambda conn: {'ok': True})

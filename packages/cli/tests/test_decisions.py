@@ -798,7 +798,7 @@ class DecisionStatesForEpisodeTest(unittest.TestCase):
             {"id": 3, "text": "new", "state": "current", "superseded_by": None},
             {"id": 4, "text": "bad", "state": "retracted", "superseded_by": None},
         ]
-        with mock.patch("khipu.briefs._decision_rows", return_value={7: rows}), \
+        with mock.patch("khipu.decisions.decision_rows_for_episodes", return_value={7: rows}), \
                 mock.patch.object(de, "_decisions_ready", return_value=True), \
                 mock.patch("khipu.db.connect") as connect:
             fake_conn = connect.return_value.__enter__.return_value

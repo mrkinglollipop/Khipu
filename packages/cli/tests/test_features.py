@@ -66,8 +66,8 @@ class BoolParsingTest(unittest.TestCase):
 
     def test_an_unparseable_env_value_falls_through_to_file_then_default(self):
         patch, _ = _isolated_data_dir()
-        with patch, mock.patch.dict(os.environ, {"KHIPU_FEATURE_REFLECT": "maybe"}):
-            self.assertFalse(features.enabled("reflect"))
+        with patch, mock.patch.dict(os.environ, {"KHIPU_FEATURE_GRAPH_CANDIDATES": "maybe"}):
+            self.assertFalse(features.enabled("graph_candidates"))
 
 
 class UnknownNameTest(unittest.TestCase):
@@ -102,24 +102,24 @@ class SetEnabledRoundTripTest(unittest.TestCase):
     def test_round_trip_under_a_temp_data_dir(self):
         patch, tmp = _isolated_data_dir()
         with patch:
-            features.set_enabled("briefs", True)
-            self.assertTrue(features.enabled("briefs"))
+            features.set_enabled("graph_candidates", True)
+            self.assertTrue(features.enabled("graph_candidates"))
             on_disk = json.loads((tmp / "config.json").read_text())
-            self.assertEqual(on_disk["features"]["briefs"], True)
-            features.set_enabled("briefs", False)
-            self.assertFalse(features.enabled("briefs"))
+            self.assertEqual(on_disk["features"]["graph_candidates"], True)
+            features.set_enabled("graph_candidates", False)
+            self.assertFalse(features.enabled("graph_candidates"))
 
     def test_states_reports_the_source(self):
         patch, _ = _isolated_data_dir()
         with patch:
             out = features.states()
-            self.assertEqual(out["features"]["briefs"]["source"], "default")
-            features.set_enabled("briefs", True)
+            self.assertEqual(out["features"]["graph_candidates"]["source"], "default")
+            features.set_enabled("graph_candidates", True)
             out = features.states()
-            self.assertEqual(out["features"]["briefs"], {"enabled": True, "source": "file"})
-            with mock.patch.dict(os.environ, {"KHIPU_FEATURE_BRIEFS": "off"}):
+            self.assertEqual(out["features"]["graph_candidates"], {"enabled": True, "source": "file"})
+            with mock.patch.dict(os.environ, {"KHIPU_FEATURE_GRAPH_CANDIDATES": "off"}):
                 out = features.states()
-                self.assertEqual(out["features"]["briefs"], {"enabled": False, "source": "env"})
+                self.assertEqual(out["features"]["graph_candidates"], {"enabled": False, "source": "env"})
 
 
 class ContractShapeTest(unittest.TestCase):

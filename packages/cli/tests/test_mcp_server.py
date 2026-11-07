@@ -108,8 +108,6 @@ class ProtocolTest(unittest.TestCase):
                 "khipu_owed",
                 "khipu_decisions",
                 "khipu_decisions_update",
-                "khipu_brief",
-                "khipu_reflect",
                 "khipu_usage",
                 "khipu_route",
                 "khipu_route_advise",

@@ -281,7 +281,6 @@ FENCED_OUTPUTS = {
     "hub_snapshot.search_stale_payload": "offline search",
     "query_log.log_query": "the query log",
     "drift.status_payload": "khipu_status recent captures",
-    "reflect._search": "khipu_reflect evidence",
 }
 
 def test_every_output_builder_reaches_the_fence():
@@ -745,7 +744,7 @@ def embed_one(text):
 def nested(texts):
     def _again(t):
         return _generate_gemini(t)
-    return provider_text.fenced_texts(texts, None, "reflect"), _again
+    return provider_text.fenced_texts(texts, None, "rerank"), _again
 '''
 
 
@@ -827,7 +826,7 @@ def test_the_provider_guard_catches_alias_lambda_getattr_and_unrelated_chokepoin
 
 
 
-# ---- embedding sources and the briefs plan --------------------------------
+# ---- embedding sources --------------------------------
 
 def _episode_source_cur():
     from unittest import mock
@@ -962,24 +961,6 @@ def test_backfill_batches_pass_the_chokepoint_again(list_state):
     out = embed.provider_text.fence_chunks(cur, [("topic", "secret-topic", "FORGOTTEN-TOPIC"),
                                                  ("episode", "902", "FORGOTTEN-EPISODE")])
     assert out == [None, None]
-
-
-def test_reflect_sends_no_source_derived_from_a_forgotten_episode(list_state):
-    from khipu import reflect
-
-    prompts: list = []
-    sources = [{"kind": "topic", "id": "secret-topic", "origin": [902], "text": "FORGOTTEN-TOPIC",
-                "summary": "FORGOTTEN-TOPIC", "decisions": []}]
-    rows = [{"kind": "topic", "id": "secret-topic"}]
-    conn = mock.MagicMock()
-    conn.__enter__.return_value = conn
-    with mock.patch.object(reflect, "_search", return_value=rows), \
-            mock.patch.object(reflect, "gather", return_value=sources), \
-            mock.patch("khipu.db.connect", return_value=conn), \
-            mock.patch("khipu.rerank._call_model", side_effect=lambda p, **k: prompts.append(p) or ("{}", "m")):
-        out = reflect.reflect("what is secret-topic?")
-    assert prompts == []
-    assert out.get("reason") == "no-sources"
 
 
 def test_rerank_shows_the_model_no_candidate_a_forgotten_episode_feeds(list_state):

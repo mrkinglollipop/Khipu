@@ -288,19 +288,9 @@ Decisions are a registry with a lifecycle: supersede, restore, retract. Possible
 
 One validity module gives each result a state: current, mixed, superseded, retracted or unknown. Topics marked superseded, retired or abandoned rank lower. They are not excluded. Use `khipu decisions` or the `khipu_decisions` tools. Automatic supersession (`auto_supersede`) and validity ranking (`validity_ranking`) are feature switches and default off.
 
-### Briefs
-
-A brief is a source-backed summary of a topic. Every claim cites episode ids. Citations to episodes that were not offered are removed, and a claim left with no valid citation is dropped. A failed build never replaces the current brief. A brief goes stale when its sources change or a cited episode is forgotten.
-
-Briefs are off by default. Turn on the `briefs` switch, then use `khipu briefs plan|build|show` or `khipu_brief`.
-
-### Reflect
-
-`khipu reflect "question"` answers from memory with citations. It abstains rather than answer without sources. It writes no memory and has a 20 second deadline. It is off by default and needs the `reflect` switch. The agent tool is `khipu_reflect`.
-
 ### Forget
 
-`khipu episode forget ID` tombstones one episode. It does not erase the row: it sets `deleted_at`, and the summary and its provenance stay in the `episodes` table. Search, `khipu_get`, the episode detail view and recent-capture readers exclude it, including Activity, doctor, status, the full `khipu_status` and the session-start fallback. It also removes the episode's vectors, closes the commitments it opened (reason `forgotten`; the closed rows stay), retracts its decisions, deletes its deliverables, removes its lines from the legacy file and Khipu's own forget backups, updates the local replica, and marks briefs that cited it stale. Graph topic nodes are shared across episodes and are left alone, and database backups made before the forget still contain it. The legacy file and local replica steps can fail. Forget removes queued jobs that exactly match the episode’s sources under the outbox lock; unreadable, loosely matching or shared jobs remain and are reported with reasons and locations. If anything is left, the result says `complete: false` and lists it under `partial`.
+`khipu episode forget ID` tombstones one episode. It does not erase the row: it sets `deleted_at`, and the summary and its provenance stay in the `episodes` table. Search, `khipu_get`, the episode detail view and recent-capture readers exclude it, including Activity, doctor, status, the full `khipu_status` and the session-start fallback. It also removes the episode's vectors, closes the commitments it opened (reason `forgotten`; the closed rows stay), retracts its decisions, deletes its deliverables, removes its lines from the legacy file and Khipu's own forget backups, and updates the local replica. Graph topic nodes are shared across episodes and are left alone, and database backups made before the forget still contain it. The legacy file and local replica steps can fail. Forget removes queued jobs that exactly match the episode’s sources under the outbox lock; unreadable, loosely matching or shared jobs remain and are reported with reasons and locations. If anything is left, the result says `complete: false` and lists it under `partial`.
 
 Forget publishes durable source identities to prevent later replay from resurrecting the episode. The tombstoned row and text remain, with no episode purge or restore command. Independent routing words remain until removed using their routing commands.
 

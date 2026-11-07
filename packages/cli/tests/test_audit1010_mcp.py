@@ -362,15 +362,6 @@ class RecallBoundaryTest(unittest.TestCase):
             srv._tool_search({"query": "find " + secret})
         self.assertNotIn(secret, search.call_args.args[0])
 
-    def test_reflection_description_matches_identifier_validation_and_cache_writes(self):
-        description = next(t["description"] for t in srv.TOOLS if t["name"] == "khipu_reflect")
-        self.assertIn("citation identifiers", description)
-        self.assertNotIn("a claim the sources do not support is removed", description)
-        self.assertIn("retrieval caches", description)
-        self.assertNotIn("Writes nothing", description)
-
-
-class BoundsTest(unittest.TestCase):
     def test_oversized_stdio_frame_is_bounded_and_next_ping_survives(self):
         output = io.StringIO()
         frames = '"' + 'x' * 1500 + '"\n' + json.dumps({"jsonrpc": "2.0", "id": 9, "method": "ping"}) + '\n'

@@ -7419,7 +7419,7 @@ def _decision_states_for_episode_snapshot(
 ) -> dict[str, Any]:
     """Replica twin of ``decisions.decision_states_for_episode`` for rows
     owned by this episode id only. Unlike the hub path
-    (``briefs._decision_rows`` / ``decision_states_for_episode``), this does
+    (``decisions.decision_rows_for_episodes`` / ``decision_states_for_episode``), this does
     not attach decisions by normalized text within the project and dedupe
     window — a restatement whose row lives on an earlier episode therefore
     still has empty ``decision_states`` when the hub is down. Empty/zeroed

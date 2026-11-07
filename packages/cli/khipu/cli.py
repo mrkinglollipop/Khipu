@@ -3695,10 +3695,9 @@ def cmd_get(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
-        wiki = bool(getattr(args, "wiki", False))
         if getattr(args, "all", False):
-            return _get_topic_all(ident, offset, max_bytes, wiki=wiki)
-        row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
+            return _get_topic_all(ident, offset, max_bytes)
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
     if row is None:
         print(json.dumps({"ok": False, "error": f"{kind} not found: {ident}"}))
         return 1
@@ -3714,8 +3713,7 @@ def cmd_get(args: argparse.Namespace) -> int:
     return 0
 
 
-def _get_topic_all(ident: str, offset: int, max_bytes: int, *,
-                   wiki: bool = False) -> int:
+def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
     """`khipu get <topic> --all`: follow body_next_offset and write the body
     from ``offset`` to the end on stdout, raw, one page at a time. Stops with
     an error if the topic changes between pages (content_hash or updated_at),
@@ -3724,7 +3722,7 @@ def _get_topic_all(ident: str, offset: int, max_bytes: int, *,
 
     first = None
     while True:
-        row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
         if row is None:
             print(json.dumps({"ok": False, "error": f"topic not found: {ident}"}),
                   file=sys.stderr)
@@ -5280,20 +5278,6 @@ def cmd_features(args: argparse.Namespace) -> int:
             return 2
     print(json.dumps(features.states(), indent=2))
     return 0
-
-
-def cmd_briefs(args: argparse.Namespace) -> int:
-    """`khipu briefs plan | build [--topic SLUG] [--limit N] | show SLUG`."""
-    from khipu import briefs
-
-    return briefs.cli_main(args)
-
-
-def cmd_reflect(args: argparse.Namespace) -> int:
-    """`khipu reflect "question" [--project P]`."""
-    from khipu import reflect
-
-    return reflect.cli_main(args)
 
 
 def cmd_paths(args: argparse.Namespace) -> int:
@@ -6870,10 +6854,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--all", action="store_true",
         help="Topics: write the whole body (from --offset) to stdout, page by page",
     )
-    gt.add_argument(
-        "--wiki", action="store_true",
-        help="Topics: return the raw wiki page even when a current brief exists",
-    )
     gt.set_defaults(func=cmd_get)
 
     mg = sub.add_parser(
@@ -7516,23 +7496,6 @@ def build_parser() -> argparse.ArgumentParser:
     feat = sub.add_parser("features", help="Show or set feature switches")
     feat.add_argument("--set", nargs=2, metavar=("NAME", "VALUE"), default=None)
     feat.set_defaults(func=cmd_features)
-
-    br = sub.add_parser("briefs", help="Source-backed topic briefs: plan / build / show")
-    br_sub = br.add_subparsers(dest="briefs_cmd", required=True)
-    br_sub.add_parser("plan", help="Topics whose brief is missing or stale")
-    br_build = br_sub.add_parser(
-        "build", help="Build briefs for planned topics (needs the briefs switch on)"
-    )
-    br_build.add_argument("--topic", default=None, help="Build only this planned topic")
-    br_build.add_argument("--limit", type=int, default=5, help="Most topics to build (default 5)")
-    br_show = br_sub.add_parser("show", help="Print a topic's current brief")
-    br_show.add_argument("slug")
-    br.set_defaults(func=cmd_briefs)
-
-    rf = sub.add_parser("reflect", help="Answer a question from memory with cited evidence (needs the reflect switch on)")
-    rf.add_argument("question")
-    rf.add_argument("--project", default=None, help="Prefer sources from this project")
-    rf.set_defaults(func=cmd_reflect)
 
     comp = sub.add_parser(
         "components",

@@ -36,8 +36,6 @@ FEATURES: dict[str, str] = {
     "graph_candidates": "Let bounded graph traversal contribute candidate results to recall.",
     "time_interpretation": "Parse natural-language time in a query and use it to filter/rank results.",
     "rerank": "Run an independently switchable reranking stage over candidate results.",
-    "briefs": "Generate source-backed incremental topic briefs instead of the legacy topic-page pipeline.",
-    "reflect": "Run an optional cited-reflection step over dependable evidence.",
     "relevance_floor": "Drop rows with no keyword hit and a cosine similarity below an absolute floor, so an unrelated prompt returns nothing.",
     "routing_push": "Tell each conversation, at its start and after compaction, the owner's standing rules and note and which accounts are open, limited, paused or down, and before each prompt what changed since it last heard (Khipu's routing record; it reports and never routes).",
 }
@@ -77,10 +75,6 @@ _CAPABILITIES = (
     # Phase 3, session B.
     "search.rerank",
     "replica.deliverables",
-    # Phase 4, session A.
-    "briefs.read",
-    # Phase 4, session B.
-    "reflect",
     "search.relevance_floor",
     "recall.daemon",
     # Routing truth, phase 2: khipu_route, khipu_route_report and the

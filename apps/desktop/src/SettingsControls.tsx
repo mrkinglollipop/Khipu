@@ -762,7 +762,7 @@ const JOB_ROWS: ReadonlyArray<readonly [string, string, string]> = [
   [
     "nightly",
     "Nightly upkeep",
-    "Consolidates the day's captures, indexes anything new, ages out stale commitments, and builds topic briefs when that switch is on.",
+    "Consolidates the day's captures, indexes anything new, and ages out stale commitments.",
   ],
   ["monthly", "Monthly topic pass", "Runs the monthly topic pass on the first of the month, with its own model."],
   [

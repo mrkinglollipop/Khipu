@@ -1677,7 +1677,7 @@ class NightlyAndDoctorTest(_Base):
 
     def test_the_nightly_still_records_the_same_steps(self):
         src = open(jobs.__file__, encoding="utf-8").read()
-        run = src[src.index("def run_nightly"):src.index("BRIEFS_NIGHTLY_LIMIT")]
+        run = src[src.index("def run_nightly"):src.index("def _nightly_log")]
         self.assertIn("_embed_backfill()", run)
         self.assertNotIn("library_backfill", run)  # rides inside embed_backfill; step set unchanged
 

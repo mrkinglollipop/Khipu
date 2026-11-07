@@ -97,7 +97,6 @@ class EmbedBackfillRegressionTest(unittest.TestCase):
             mock.patch.object(jobs, "_prune_query_cache", return_value={"ok": True}),
             mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True}),
             mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}),
-            mock.patch.object(jobs, "_briefs_build_if_on", return_value=None),
             mock.patch.object(jobs, "_write_job_state") as write_state,
         ):
             self.assertEqual(jobs.run_nightly(), 1)
@@ -137,7 +136,6 @@ class EmbedProviderIntegrationRegressionTest(unittest.TestCase):
                 mock.patch.object(jobs, "_prune_query_cache", return_value={"ok": True}),
                 mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True}),
                 mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}),
-                mock.patch.object(jobs, "_briefs_build_if_on", return_value=None),
             ):
                 rc = jobs.run_nightly()
                 state = jobs._read_job_state("nightly")
@@ -407,69 +405,6 @@ class NightlyHealthRegressionTest(unittest.TestCase):
 
 
 class NightlyAggregateRegressionTest(unittest.TestCase):
-    def test_rv4_07_failed_brief_reaches_nightly_state_and_health(self) -> None:
-        from khipu import briefs
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(jobs, "ensure_data_dir", return_value=Path(tmp)), \
-                    mock.patch.object(jobs, "_drain_sessions", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_run_script", return_value=0), \
-                    mock.patch.object(jobs, "_reconcile_notes_if_due", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_embed_backfill", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_prune_query_cache", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}), \
-                    mock.patch("khipu.features.enabled", return_value=True), \
-                    mock.patch("khipu.db.connect", return_value=mock.MagicMock()), \
-                    mock.patch.object(briefs, "acquire_build_lock", return_value=True), \
-                    mock.patch.object(briefs, "release_build_lock"), \
-                    mock.patch.object(briefs, "select_for_build", return_value={"available": True, "topics": ["a"]}), \
-                    mock.patch.object(briefs, "build_many", return_value=[{"status": "failed", "error": "provider"}]), \
-                    mock.patch.object(jobs, "_nightly_log"):
-                rc = jobs.run_nightly()
-                self.assertEqual(rc, 1)
-                self.assertEqual(jobs._read_job_state("nightly")["exit"], 1)
-                with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
-                        mock.patch.object(jobs, "_job_entry", return_value={"last_exit": rc,
-                            "last_exit_ts": datetime.now(timezone.utc).isoformat(), "plist_loaded": True}):
-                    health = jobs.nightly_step_health()
-                self.assertFalse(health["briefs_build_ok"]["ok"])
-                self.assertTrue(health["briefs_build_ok"]["applicable"])
-
-    def test_rv4_07_disabled_briefs_do_not_gate_health(self) -> None:
-        with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
-                mock.patch.object(jobs, "_job_entry", return_value={}), \
-                mock.patch.object(jobs, "nightly_last", return_value={"steps": [
-                    {"name": "briefs_build", "ok": False, "error": "old provider failure"}]}), \
-                mock.patch("khipu.features.enabled", return_value=False):
-            health = jobs.nightly_step_health()
-        self.assertTrue(health["briefs_build_ok"]["ok"])
-        self.assertFalse(health["briefs_build_ok"]["applicable"])
-
-    def test_briefs_error_or_unavailable_result_is_unhealthy(self) -> None:
-        # A provider or table error for a topic is status "error"/"unavailable".
-        # A recorded per-topic "failed" brief beside built ones is not a failed
-        # night (tests/test_jobs_briefs.py covers that side).
-        from khipu import briefs, features
-
-        chosen = {"available": True, "topics": ["a", "b"]}
-        results = [
-            {"status": "ok"},
-            {"status": "error", "error": "provider"},
-        ]
-        conn = mock.MagicMock()
-        with (
-            mock.patch.object(briefs, "acquire_build_lock", return_value=True),
-            mock.patch.object(briefs, "release_build_lock"),
-            mock.patch.object(briefs, "select_for_build", return_value=chosen),
-            mock.patch.object(briefs, "build_many", return_value=results),
-            mock.patch.object(features, "enabled", return_value=True),
-            mock.patch("khipu.db.connect") as connect,
-            mock.patch.object(jobs, "_nightly_log"),
-        ):
-            connect.return_value.__enter__.return_value = conn
-            out = jobs._briefs_build_if_on()
-        self.assertFalse(out["ok"])
-
     def test_library_nested_failure_overrides_top_level_ok(self) -> None:
         fake_library = mock.Mock()
         fake_library.nightly.return_value = {
