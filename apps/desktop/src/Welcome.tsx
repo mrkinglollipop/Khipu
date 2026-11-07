@@ -45,14 +45,13 @@ export function welcomeCompleted(): boolean {
 
 export const SUPPORT_EMAIL = "support@kinglollipop.com";
 
-export type StepId = "welcome" | "database" | "model" | "graph" | "agents" | "accounts" | "finish";
+export type StepId = "welcome" | "database" | "model" | "agents" | "accounts" | "finish";
 type DbMode = "join" | "local" | "remote";
 
 const STEPS: { id: StepId; label: string }[] = [
   { id: "welcome", label: "Welcome" },
   { id: "database", label: "Database" },
   { id: "model", label: "Model" },
-  { id: "graph", label: "Graph" },
   { id: "agents", label: "Agents" },
   { id: "accounts", label: "Accounts" },
   { id: "finish", label: "Finish" },
@@ -113,15 +112,12 @@ type DoctorPayload = {
   not_configured?: string[];
   backup_ok?: boolean;
   drift_ok?: boolean;
-  graph_drift_ok?: boolean;
   outbox_ok?: boolean;
   capture_liveness_ok?: boolean;
   git_sync_ok?: boolean;
   dsn_file_ok?: boolean;
   index_freshness_ok?: boolean;
   embed_coverage_ok?: boolean;
-  graph_backup_ok?: boolean;
-  graph_offsite_ok?: boolean;
   recall_probe_ok?: boolean;
   recall_probe?: RecallProbeStatus;
   bundle_seal_ok?: boolean;
@@ -256,9 +252,6 @@ export function Welcome({
   const [joinedHub, setJoinedHub] = useState(false);
   const [joinExpected, setJoinExpected] = useState<Record<string, number> | null>(null);
   const [joinLive, setJoinLive] = useState<Record<string, number> | null>(null);
-
-  const [newCodeRoot, setNewCodeRoot] = useState("");
-  const [graphSourcesMsg, setGraphSourcesMsg] = useState<string | null>(null);
 
   const [plan, setPlan] = useState<MigratePlan | null>(null);
   const [planErr, setPlanErr] = useState<string | null>(null);
@@ -499,7 +492,7 @@ export function Welcome({
         await loadPlan();
         if (selErr) {
           setDbMsg(
-            `Joined — the graph builder's version did not save (${selErr}). You can retry on the Graph step.`,
+            `Joined — the component version did not save (${selErr}).`,
           );
         } else {
           setDbMsg(
@@ -581,38 +574,6 @@ export function Welcome({
       setJoinBusy(false);
     }
   }, [joinPassphrase, joinPin, completeJoinAfterImport]);
-
-  const addGraphCodeRootPath = useCallback(
-    async (path: string) => {
-      const trimmed = path.trim();
-      if (!trimmed) return;
-      setGraphSourcesMsg(null);
-      try {
-        const raw = await runKhipu(["sources", "add", `--root=${trimmed}`]);
-        const out = parse(raw);
-        if (out?.ok !== true) {
-          setGraphSourcesMsg(String(out?.error ?? "Could not add folder."));
-          return;
-        }
-        setNewCodeRoot("");
-        setGraphSourcesMsg(`Added ${trimmed} — runs on the next graph build.`);
-      } catch (e) {
-        setGraphSourcesMsg(String(e));
-      }
-    },
-    [runKhipu],
-  );
-
-  const pickGraphCodeRoot = useCallback(async () => {
-    try {
-      const selected = await openFileDialog({ directory: true, multiple: false });
-      if (typeof selected === "string" && selected.trim()) {
-        await addGraphCodeRootPath(selected);
-      }
-    } catch (e) {
-      setGraphSourcesMsg(String(e));
-    }
-  }, [addGraphCodeRootPath]);
 
   const [presence, setPresence] = useState<Presence | null>(null);
   const [key, setKey] = useState("");
@@ -764,49 +725,6 @@ export function Welcome({
     localEmbedModel,
     runKhipu,
   ]);
-
-  const [graphMsg, setGraphMsg] = useState<string | null>(null);
-  const [graphErr, setGraphErr] = useState<string | null>(null);
-  const [graphInstalling, setGraphInstalling] = useState(false);
-  const [graphOk, setGraphOk] = useState<boolean | null>(null);
-  // A Mac that can't reach the Graphify download (offline, blocked network,
-  // no release for this arch) has no way to get graphOk true — mirrors the
-  // model step's "skip for now" so setup isn't a dead end (audit 2026-08-31).
-  const [graphSkipped, setGraphSkipped] = useState(false);
-  const installGraphify = useCallback(async () => {
-    setGraphInstalling(true);
-    setGraphErr(null);
-    setGraphMsg(null);
-    try {
-      const raw = await invoke<string>("install_graphify");
-      const out = parse(raw);
-      if (out?.ok) {
-        setGraphOk(true);
-        setGraphMsg(
-          typeof out.semver === "string"
-            ? `Graph builder ${out.semver} installed.`
-            : "Graph builder installed.",
-        );
-      } else {
-        setGraphOk(false);
-        const title = typeof out?.title === "string" ? plainWords(out.title) : null;
-        const detail = typeof out?.detail === "string" ? plainWords(out.detail) : null;
-        const fix = typeof out?.fix === "string" ? plainWords(out.fix) : null;
-        const words = [title, detail, fix].filter((s): s is string => Boolean(s)).join(" ");
-        setGraphErr(words || plainWords(String(out?.error ?? raw)));
-      }
-    } catch (e) {
-      setGraphOk(false);
-      setGraphErr(plainWords(String(e)));
-    } finally {
-      setGraphInstalling(false);
-    }
-  }, []);
-  useEffect(() => {
-    if (step === "graph" && graphOk == null && !graphInstalling) {
-      void installGraphify();
-    }
-  }, [step, graphOk, graphInstalling, installGraphify]);
 
   const [harnesses, setHarnesses] = useState<HarnessRow[] | null>(null);
   const [harnessesError, setHarnessesError] = useState<string | null>(null);
@@ -977,11 +895,9 @@ export function Welcome({
               ? "Saving key…"
               : modelSaving
                 ? "Saving models…"
-                : graphInstalling
-                  ? "Installing the graph builder…"
-                  : doctorBusy && step === "finish"
-                    ? "Running doctor…"
-                    : null;
+                : doctorBusy && step === "finish"
+                  ? "Running doctor…"
+                  : null;
 
   return (
     <div className="onboard welcome" data-step={step}>
@@ -1020,13 +936,12 @@ export function Welcome({
             back, from any of your Macs.
           </p>
           <p className="muted">
-            Setup is seven steps. Each one checks itself, so you can close this and
+            Setup is six steps. Each one checks itself, so you can close this and
             come back; nothing here has to be finished in one go.
           </p>
           <ul className="welcome-list">
             <li><strong>Database</strong>: join a Khipu you already have, set one up on this Mac, or connect to one you run.</li>
             <li><strong>Model</strong>: cloud Gemini, a local model, or skip for now (recording waits, nothing is lost).</li>
-            <li><strong>Graph</strong>: installs the graph builder next to the app.</li>
             <li><strong>Agents</strong>: one click per harness to wire in recording.</li>
             <li className="new-line"><strong>Accounts</strong>: see how much of each plan is left and tell your agents which accounts have room. Optional.</li>
             <li><strong>Finish</strong>: a health check, and where to get help.</li>
@@ -1537,99 +1452,6 @@ export function Welcome({
         </>
       ) : null}
 
-      {step === "graph" ? (
-        <>
-          <h1>Install the graph builder</h1>
-          <p className="muted" title="Graphify">
-            The graph builder works out how what you talked about connects — to
-            files, topics and each other. It installs next to the app, not inside
-            it, so it can be updated on its own.
-          </p>
-          {graphOk ? (
-            <Callout tone="ok" title="The graph builder is ready">
-              {graphMsg ?? "Installed."}
-            </Callout>
-          ) : graphInstalling ? (
-            <p className="muted">Downloading and unpacking the graph builder…</p>
-          ) : graphSkipped ? (
-            <Callout
-              tone="warn"
-              title="Graph builder skipped"
-              action={
-                <button
-                  type="button"
-                  className="primary"
-                  onClick={() => {
-                    setGraphSkipped(false);
-                    void installGraphify();
-                  }}
-                >
-                  Retry
-                </button>
-              }
-            >
-              Recording and search still work. Connections stay empty until the
-              graph builder is installed, which you can do later from Settings →
-              Components.
-            </Callout>
-          ) : (
-            <Callout
-              tone="warn"
-              title="The graph builder did not finish installing"
-              action={
-                <>
-                  <button type="button" className="primary" onClick={() => void installGraphify()}>
-                    Retry
-                  </button>
-                  <button type="button" onClick={() => setGraphSkipped(true)}>
-                    Skip for now
-                  </button>
-                </>
-              }
-            >
-              {graphErr ?? "It is not installed yet — retry, or skip it and install it later from Settings → Components."}
-            </Callout>
-          )}
-          {joinedHub ? (
-            <div className="section-card">
-              <div className="section-head">Add folders on this Mac</div>
-              <div className="section-body">
-                <p className="muted">
-                  Optional — add code folders on this Mac for the next graph build.
-                  Skip it to read only (search and connections still work from the
-                  shared database). The same repo in two places on one Mac makes
-                  duplicate entries.
-                </p>
-                <div className="toolbar">
-                  <input
-                    className="mono"
-                    value={newCodeRoot}
-                    onChange={(e) => setNewCodeRoot(e.target.value)}
-                    placeholder="/absolute/path/to/code"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && newCodeRoot.trim()) {
-                        void addGraphCodeRootPath(newCodeRoot);
-                      }
-                    }}
-                  />
-                  <button
-                    type="button"
-                    disabled={!newCodeRoot.trim()}
-                    onClick={() => void addGraphCodeRootPath(newCodeRoot)}
-                  >
-                    Add folder
-                  </button>
-                  <button type="button" onClick={() => void pickGraphCodeRoot()}>
-                    Choose folder…
-                  </button>
-                </div>
-                {graphSourcesMsg ? <pre className="code">{graphSourcesMsg}</pre> : null}
-              </div>
-            </div>
-          ) : null}
-        </>
-      ) : null}
-
       {step === "agents" ? (
         <>
           <h1>Connect your agents</h1>
@@ -1678,12 +1500,6 @@ export function Welcome({
       {step === "finish" ? (
         <>
           <h1>You're set</h1>
-          {graphSkipped ? (
-            <Callout tone="warn" title="Graph builder skipped">
-              Recording and search work now. Install the graph builder later from
-              Settings → Components to fill in the connections.
-            </Callout>
-          ) : null}
           {doctorErr ? (
             <p className="muted">The health check could not run: {doctorErr}</p>
           ) : doctor == null ? (
@@ -1787,8 +1603,7 @@ export function Welcome({
             className="primary"
             disabled={
               modelSaving ||
-              (step === "database" && !databaseReady) ||
-              (step === "graph" && graphOk !== true && !graphSkipped)
+              (step === "database" && !databaseReady)
             }
             onClick={() => {
               if (step === "model") {

@@ -123,7 +123,6 @@ class LocalDsnPasswordTest(unittest.TestCase):
                 "image": IMAGE,
                 "port": 54329,
             },
-            "graphify": {"semver": "1.0.0"},
         }
         row = {
             "postgres_image": "ghcr.io/mrkinglollipop/khipu-postgres:19beta4-pgvector",
@@ -174,7 +173,7 @@ class ComponentsStatusFallbackTest(unittest.TestCase):
         )
 
     def test_probes_remote_dsn_when_versions_json_has_no_postgres(self):
-        versions = {"graphify": {"semver": "1.0.0", "path": "/opt/graphify"}}
+        versions = {}
         with contextlib.ExitStack() as stack:
             self._base_stack(stack, versions)
             probe = stack.enter_context(
@@ -192,7 +191,7 @@ class ComponentsStatusFallbackTest(unittest.TestCase):
         self.assertIsNone(result["postgres_probe"])
 
     def test_records_probe_failure_without_writing_postgres_block(self):
-        versions = {"graphify": {"semver": "1.0.0", "path": "/opt/graphify"}}
+        versions = {}
         with contextlib.ExitStack() as stack:
             self._base_stack(stack, versions)
             stack.enter_context(
@@ -206,33 +205,6 @@ class ComponentsStatusFallbackTest(unittest.TestCase):
         self.assertEqual(
             result["postgres_probe"], {"ok": False, "error": "connection_refused"}
         )
-
-    def test_falls_back_to_external_graphify_script(self):
-        versions = {"postgres": {"mode": "remote", "source": "dsn"}}
-        script = mock.Mock()
-        script.parent = "/opt/khipu-ops/graphify"
-        with contextlib.ExitStack() as stack:
-            self._base_stack(stack, versions)
-            nightly = stack.enter_context(
-                mock.patch("khipu.jobs.graphify_nightly_path", return_value=script)
-            )
-            result = components_status()
-        nightly.assert_called_once_with()
-        self.assertEqual(result["graphify"]["semver"], "external")
-        self.assertEqual(result["graphify"]["source"], "env")
-        self.assertEqual(result["graphify"]["path"], "/opt/khipu-ops/graphify")
-        self.assertIsNone(result["graphify_upgrade"])
-
-    def test_no_external_graphify_script_leaves_graphify_empty(self):
-        versions = {"postgres": {"mode": "remote", "source": "dsn"}}
-        with contextlib.ExitStack() as stack:
-            self._base_stack(stack, versions)
-            stack.enter_context(
-                mock.patch("khipu.jobs.graphify_nightly_path", return_value=None)
-            )
-            result = components_status()
-        self.assertEqual(result["graphify"], {})
-        self.assertIsNone(result["graphify_upgrade"])
 
 
 class EnsurePostgresImageLocalFirstTest(unittest.TestCase):

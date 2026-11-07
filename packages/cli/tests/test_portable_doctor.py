@@ -7,7 +7,7 @@ import os
 import unittest
 from unittest import mock
 
-from khipu import git_sync_health, graph_sync
+from khipu import git_sync_health
 from khipu.drift import backup_health
 
 
@@ -26,19 +26,6 @@ class PortableProducerSyncHostTest(unittest.TestCase):
             "khipu.components_matrix.read_versions", return_value=versions
         ):
             self.assertTrue(git_sync_health.is_sync_host())
-
-    def test_graph_producer_false_without_opt_in(self):
-        with mock.patch.dict(os.environ, {"KHIPU_GRAPH_PRODUCER": ""}, clear=False), mock.patch(
-            "khipu.components_matrix.read_versions", return_value={}
-        ):
-            self.assertFalse(graph_sync.is_graph_producer())
-
-    def test_graph_producer_true_when_scheduled_graph_build(self):
-        versions = {"scheduled_jobs": {"graph_build": True}}
-        with mock.patch.dict(os.environ, {"KHIPU_GRAPH_PRODUCER": ""}, clear=False), mock.patch(
-            "khipu.components_matrix.read_versions", return_value=versions
-        ):
-            self.assertTrue(graph_sync.is_graph_producer())
 
 
 class LocalBackupHealthTest(unittest.TestCase):

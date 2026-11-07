@@ -32,7 +32,7 @@ The updater uses `tauri-plugin-updater`. It reads `https://github.com/mrkingloll
 - After an upgrade, the app can show a one-time notice for that version.
 - `latest.json` lists `darwin-aarch64` only.
 
-The compatibility matrix (Postgres, pgvector and Graphify versions) is fetched from [`mrkinglollipop/khipu-compat`](https://github.com/mrkinglollipop/khipu-compat), not from the app release feed. `scripts/bundle_cli.sh` stages a floor copy from `docs/compat/khipu-graphify-postgres.json`.
+The compatibility matrix (Postgres and pgvector versions) is fetched from [`mrkinglollipop/khipu-compat`](https://github.com/mrkinglollipop/khipu-compat), not from the app release feed. `scripts/bundle_cli.sh` stages a floor copy from `docs/compat/khipu-graphify-postgres.json`.
 
 ## Tray
 

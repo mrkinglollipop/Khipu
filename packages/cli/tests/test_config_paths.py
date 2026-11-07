@@ -44,12 +44,12 @@ class PathSettingTest(unittest.TestCase):
             self.assertEqual(config.path_setting("memory_root"), Path("/legacy"))
 
     def test_set_and_unset_round_trip_through_the_file(self):
-        p = config.set_path_setting("graph_sqlite", "~/g.sqlite")
-        stored = json.loads(p.read_text())["graph_sqlite"]
+        p = config.set_path_setting("capture_v2", "~/g.sqlite")
+        stored = json.loads(p.read_text())["capture_v2"]
         self.assertFalse(stored.startswith("~"), "tilde must be expanded on write")
-        config.set_path_setting("graph_sqlite", None)
-        self.assertNotIn("graph_sqlite", json.loads(p.read_text()))
-        self.assertIsNone(config.path_setting("graph_sqlite"))
+        config.set_path_setting("capture_v2", None)
+        self.assertNotIn("capture_v2", json.loads(p.read_text()))
+        self.assertIsNone(config.path_setting("capture_v2"))
 
     def test_unknown_key_is_refused(self):
         with self.assertRaises(KeyError):

@@ -20,10 +20,7 @@ afterEach(() => {
 
 const ALL_OK_KEYS = [
   "hub_ok",
-  "graph_backup_ok",
-  "graph_offsite_ok",
   "drift_ok",
-  "graph_drift_ok",
   "outbox_ok",
   "capture_liveness_ok",
   "git_sync_ok",
@@ -146,11 +143,11 @@ describe("healthRows (pure)", () => {
     const rows = healthRows(
       fixture({
         recall_probe_ok: false,
-        not_configured: ["graph_sqlite"],
+        not_configured: ["memory_root"],
       }),
     );
     expect(rows[0]).toMatchObject({ key: "recall_probe_ok", status: "err" });
-    expect(rows[1]).toMatchObject({ key: "graph_drift_ok", status: "skipped" });
+    expect(rows[1]).toMatchObject({ key: "drift_ok", status: "skipped" });
     expect(rows[rows.length - 1].status).toBe("ok");
   });
 

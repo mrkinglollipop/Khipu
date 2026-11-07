@@ -4892,8 +4892,8 @@ def _sweep_stale_temps_locked(directory: Path) -> list[str]:
 
 
 def _graph_temp_dirs() -> list[Path]:
-    """Directories where a killed graph build leaves ``graph_build_*.sqlite``.
-    Exact paths from ``third_party/graphify/build_graph.py`` staging."""
+    """Directories where a killed graph build (the removed code-graph builder)
+    left ``graph_build_*.sqlite``. Kept so leftovers on disk still get swept."""
     return [Path("/tmp"), Path("/var/tmp")]
 
 

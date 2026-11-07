@@ -14,7 +14,6 @@ from xml.sax.saxutils import escape
 
 from khipu.components_matrix import application_support_dir, read_versions, write_versions
 from khipu.jobs import (
-    PLIST_GRAPH,
     PLIST_MONTHLY,
     PLIST_NIGHTLY,
     PLIST_NOTES_WATCH,
@@ -35,7 +34,6 @@ TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "launchd"
 _JOB_TEMPLATE: dict[str, str] = {
     "nightly": "com.matt.khipu-nightly.plist",
     "monthly": "com.matt.khipu-monthly.plist",
-    "graph_build": "com.matt.khipu-graph.plist",
     "notes_watch": "com.khipu.notes-watch.plist",
     "queue_drain": "com.khipu.queue-drain.plist",
     "recall_daemon": "com.khipu.recall-daemon.plist",
@@ -51,7 +49,6 @@ _DEFAULT_JOBS = tuple(job for job in _JOB_TEMPLATE if job != "recall_daemon")
 _LABELS = {
     "nightly": PLIST_NIGHTLY,
     "monthly": PLIST_MONTHLY,
-    "graph_build": PLIST_GRAPH,
     "notes_watch": PLIST_NOTES_WATCH,
     "queue_drain": PLIST_QUEUE_DRAIN,
     "recall_daemon": PLIST_RECALL_DAEMON,
@@ -232,10 +229,7 @@ PASSTHROUGH_ENV = (
     "ALZY_DATA_DIR",
     "KHIPU_CONSOLIDATE_NIGHTLY",
     "KHIPU_CONSOLIDATE_MONTHLY",
-    "KHIPU_GRAPHIFY_NIGHTLY",
     "KHIPU_BUILD_INDEX",
-    "KHIPU_GRAPH_SNAPSHOT_DIR",
-    "KHIPU_GRAPH_SOURCES_RESOLVED",
     "KHIPU_LEGACY_LOG_DIR",
     "KHIPU_VOLUME_ROOT",
     "KHIPU_USER_ALIASES",
@@ -428,9 +422,6 @@ def install_job(job: str, *, environ: dict[str, str] | None = None) -> dict[str,
     scheduled = versions.setdefault("scheduled_jobs", {})
     if isinstance(scheduled, dict):
         scheduled[job] = True
-        if job == "graph_build":
-            scheduled["graph"] = True
-            versions["graph_producer"] = True
     write_versions(versions)
     return {"ok": True, "job": job, "label": label, "path": str(dest)}
 
@@ -449,10 +440,6 @@ def uninstall_job(job: str) -> dict[str, Any]:
     scheduled = versions.get("scheduled_jobs")
     if isinstance(scheduled, dict):
         scheduled.pop(job, None)
-        if job == "graph_build":
-            scheduled.pop("graph", None)
-        if job == "nightly" and not scheduled.get("graph_build"):
-            versions.pop("graph_producer", None)
         if not scheduled:
             versions.pop("scheduled_jobs", None)
     write_versions(versions)

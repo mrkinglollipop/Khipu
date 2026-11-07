@@ -60,13 +60,10 @@ const LABELS: Record<string, string> = {
   ledger_copy_ok: "Offline copy of the ledger",
   dsn_file_ok: "Connection stored on this Mac",
   drift_ok: "Memory index matches the database",
-  graph_drift_ok: "Connections index matches the database",
   outbox_ok: "Queued captures delivered",
   capture_liveness_ok: "Capture hook is recording",
   git_sync_ok: "Notes repository in sync",
   backup_ok: "Database backup fresh",
-  graph_backup_ok: "Connections snapshot fresh",
-  graph_offsite_ok: "Off-site copy fresh",
   index_freshness_ok: "Search index fresh",
   embed_coverage_ok: "Search index complete",
   recall_probe_ok: "Memory round trip works",
@@ -97,12 +94,11 @@ const LABELS: Record<string, string> = {
 const ORDER = Object.keys(LABELS);
 
 // `not_configured` names the CHECK's input, not the `*_ok` field — doctor
-// says "memory_root"/"graph_sqlite" (packages/cli/khipu/cli.py `not_configured
-// .append(...)`), matching `NOT_CONFIGURED_LABEL` in App.tsx, not "drift"/
-// "graph_drift". Everything else lines up with the `_ok` key's own base name.
+// says "memory_root" (packages/cli/khipu/cli.py `not_configured
+// .append(...)`), matching `NOT_CONFIGURED_LABEL` in App.tsx, not "drift".
+// Everything else lines up with the `_ok` key's own base name.
 const NOT_CONFIGURED_NAME_FOR_OK: Record<string, string> = {
   drift_ok: "memory_root",
-  graph_drift_ok: "graph_sqlite",
 };
 
 /** `foo_bar_ok` -> "Foo bar" for a key this file doesn't have plain-words
@@ -538,11 +534,8 @@ export function healthRows(
 // "liveness:<harness>", because a harness name is not known ahead of time.
 const ATTENTION_KEY_FOR_OK: Record<string, string> = {
   drift_ok: "drift",
-  graph_drift_ok: "graph_drift",
   outbox_ok: "outbox",
   backup_ok: "backup",
-  graph_backup_ok: "graph_backup",
-  graph_offsite_ok: "graph_offsite",
   index_freshness_ok: "index_freshness",
   embed_coverage_ok: "embed_coverage",
   synth_budget_ok: "synth_budget",
@@ -572,7 +565,7 @@ export const TILE_HEALTH_KEYS = {
   database: ["hub_ok", "hub_snapshot_ok", "schema_migrations_ok"],
   recording: ["capture_liveness_ok", "outbox_ok"],
   search: ["embed_coverage_ok", "index_freshness_ok", "topics_embed_lag_ok", "degraded_rate_ok", "drift_ok"],
-  backups: ["backup_ok", "graph_backup_ok", "graph_offsite_ok"],
+  backups: ["backup_ok"],
 } as const;
 
 /** Marks the rendered rows for `keys` (the whole report when none render) and

@@ -9,7 +9,6 @@ Memory goes to your own PostgreSQL server, and text goes to the model providers 
 
 - Summaries: transcript windows go to the summariser provider you pick, in parts of at most 14,000 characters. The default is Google Gemini. You can switch to Anthropic, OpenAI, OpenRouter, or a local OpenAI-compatible endpoint. You can also use the `claude` or `codex` CLI on your own login, in which case Khipu holds no credential. By default, if a provider other than Gemini or local fails a window and a Gemini key is configured, that window is retried once on Gemini Flash. Set `synth_fallback` to `none` to turn that off.
 - Embeddings: memory chunks and search queries go to the embedding provider of the active profile. That can be Google Gemini, Voyage, or an OpenAI-compatible endpoint. A provider of type `local` accepts plain HTTP only on this Mac (loopback) but also accepts any HTTPS address, so it keeps text on your Mac only if you point it at one.
-- Graph backups: if `rclone` is installed and a remote named `r2` is configured, the graph job copies the newest graph snapshot to that remote about once a week. Without an `r2` remote nothing is uploaded.
 
 There is no telemetry. The app checks GitHub Releases for updates. Something reaches the maintainer only when you send it from the app's feedback form: your message, reply-to email, app version, macOS version and any files you attach.
 

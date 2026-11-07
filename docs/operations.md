@@ -6,24 +6,23 @@ Khipu runs as `python3 -m khipu` (there is no installed `khipu` executable in th
 
 ## Background jobs
 
-Khipu runs its upkeep as macOS LaunchAgents. A fresh install (the Database step, or `khipu db connect`) schedules six of them:
+Khipu runs its upkeep as macOS LaunchAgents. A fresh install (the Database step, or `khipu db connect`) schedules five of them:
 
 | Job | When | What it does |
 |---|---|---|
 | `nightly` | Daily at 02:05 | Memory upkeep: capture-queue drain, consolidation, notes reconcile, embedding catch-up, query-cache prune, commitment hygiene, offline-copy refresh, and topic briefs when that switch is on |
-| `graph_build` | Daily at 02:17 | Builds the graph |
 | `monthly` | 1st of the month, 09:00 | Monthly organisation pass |
 | `notes_watch` | When watched note files change (30 s throttle) | Syncs edited notes |
 | `queue_drain` | Every 5 minutes | Drains the capture queue |
 | `replica_refresh` | Every 5 minutes (setting `replica_check_every`) | Runs `snapshot heal`. Updates when the copy is 15 minutes old (setting `replica_refresh_after`) or recovery is needed: missing, behind, wrong schema, failed/overdue dump, or hub reconnect. Idle checks make no connection. Also runs daily local-storage maintenance |
 
-A seventh job, `recall_daemon`, is opt-in: `khipu jobs install recall_daemon`. It keeps a warm recall service running so the per-prompt hook avoids a cold Python start. See [how-it-works.md](how-it-works.md).
+A sixth job, `recall_daemon`, is opt-in: `khipu jobs install recall_daemon`. It keeps a warm recall service running so the per-prompt hook avoids a cold Python start. See [how-it-works.md](how-it-works.md).
 
 ```bash
 khipu jobs status                      # what is installed and loaded
 khipu jobs install [NAME ...]          # render and load (default: the six above)
 khipu jobs refresh [NAME ...]          # re-render installed jobs whose plist is stale
-khipu jobs uninstall [NAME ...]        # default: all seven job types, recall_daemon included
+khipu jobs uninstall [NAME ...]        # default: all six job types, recall_daemon included
 ```
 
 The desktop app lists the jobs under Settings, Advanced. **Health checks** exposes disk-space thresholds and retention limits, and **Open storage report** shows local usage. The replica timer runs local-storage maintenance at most once a day.
@@ -53,7 +52,6 @@ The main ones:
 | `git_sync_ok` | The memory repo's auto-sync failed, was blocked, was left mid-flow (off `main`, or on a leftover autosync branch), or has not run since the last nightly. Judged only on the Mac that runs the sync |
 | `dsn_file_ok` | The on-disk connection string cannot be read, names a certificate file that does not exist, or asks for certificate verification without naming one |
 | `backup_ok` | See [Backups](#backups-and-restore) |
-| `graph_backup_ok`, `graph_offsite_ok` | See [Graph backup](#graph-backup) |
 | `hub_snapshot_ok` | The offline copy is stale. See [Snapshots](#snapshots-the-offline-copy) |
 | `ledger_copy_ok` | The separate offline ledger copy is too old while the hub answers, or its recovery failure has persisted |
 | `disk_space_ok` | Free space is below the configured red threshold. Settings > Advanced > Health checks controls disk thresholds and retention limits |
@@ -156,22 +154,6 @@ These are also in the app under Settings, Data & backups.
 ### Getting your memory out
 
 Memory is ordinary tables in your own PostgreSQL. `khipu regen-memory` writes topics back out as markdown at any time.
-
-## Graph backup
-
-For the Mac that builds the graph (the producer). Other Macs report these checks as skipped.
-
-```bash
-khipu graph-backup status
-khipu graph-backup record-local   # record a local snapshot
-khipu graph-backup offsite        # rclone copy of the latest snapshot to graph_backup_remote
-khipu graph-backup drill          # restore into scratch; never touches the live graph
-```
-
-- `graph_backup_ok` is red when the latest local snapshot is missing, empty or older than 36 hours.
-- `graph_offsite_ok` is red when no `r2:` rclone remote is configured, no successful offsite copy is recorded, or the last copy is more than 8 days old. The graph job runs the offsite copy when it is due (every 7 days), and recording a local snapshot on the producer starts a drill when the last good one is more than 8 days old.
-
-You need `rclone` installed and a remote named `r2` for the offsite part. The copy goes to the `graph_backup_remote` setting, an rclone `remote:path` (default `r2:khipu-backups/khipu-graph`). It must name a remote: a local path or a value starting with a dash is refused wherever it is set, and the offsite check reports it. Set it in Settings, Data & backups, or with `khipu config --set graph_backup_remote r2:bucket/folder`; the environment variable `KHIPU_GRAPH_BACKUP_REMOTE` overrides both.
 
 ## Snapshots, the offline copy
 

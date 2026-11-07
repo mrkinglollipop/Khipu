@@ -536,7 +536,6 @@ const PATH_ROWS: ReadonlyArray<readonly [string, string, string]> = [
   ["memory_root", "Session file folder", "Where the older file-based memory keeps its session files."],
   ["memory_repo", "Memory git repository", "The repository that folder is pushed from, usually its parent."],
   ["capture_v2", "Capture script", "The older capture script that Files and Khipu mode chains to."],
-  ["graph_sqlite", "Graph database file", "The older graph file that the graph sync copies from."],
   ["gemini_key_file", "Gemini key file", "A last-resort file the Gemini key is read from when nothing else has it."],
 ];
 
@@ -584,67 +583,6 @@ export function PathOverridesCard({ active }: { active: boolean }) {
             />
           );
         })}
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Data: where the graph backup's off-site copy goes.
-// ---------------------------------------------------------------------------
-
-/** Same shape the Tauri command and the CLI enforce: `remote:path`, one token,
- *  the remote name first. This only saves a round trip. */
-export function backupRemoteError(raw: string): string | null {
-  const v = raw.trim().replace(/\/+$/, "");
-  const i = v.indexOf(":");
-  const remote = i > 0 ? v.slice(0, i) : "";
-  const path = i > 0 ? v.slice(i + 1) : "";
-  if (!remote || !path || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(remote) || /\s/.test(v)) {
-    return "Enter an rclone remote and folder, such as r2:my-bucket/khipu-graph.";
-  }
-  return null;
-}
-
-const BACKUP_SOURCE_WORDS: Record<string, string> = {
-  env: "the environment variable KHIPU_GRAPH_BACKUP_REMOTE",
-  config: "this Mac's settings",
-  default: "the default",
-};
-
-export function GraphBackupRemoteCard({ active }: { active: boolean }) {
-  const cfg = useCliState<ConfigShape>("khipu_config_show", active);
-  const row = cfg.data?.graph_backup_remote;
-  const source = row?.source ?? "default";
-  return (
-    <div className="section-card">
-      <div className="section-head">Graph backup destination</div>
-      <div className="section-body">
-        <p className="set-help">
-          On the Mac that builds the graph, a copy of the latest graph snapshot goes here about once a week, through
-          rclone. The remote must be named r2.
-        </p>
-        {cfg.error && !cfg.data ? (
-          <p className="set-error" role="alert">
-            Could not read the settings: {cfg.error}
-          </p>
-        ) : null}
-        <SettingField
-          label="Off-site copy goes to"
-          mono
-          value={row?.value ?? ""}
-          placeholder={row?.default ?? "r2:khipu-backups/khipu-graph"}
-          lockedBy={source === "env" ? "KHIPU_GRAPH_BACKUP_REMOTE" : null}
-          canReset={source === "config"}
-          resetLabel="Use the default"
-          onReset={() => unsetConfig("graph_backup_remote", cfg.reload)}
-          help={
-            row
-              ? `Comes from ${BACKUP_SOURCE_WORDS[source] ?? source}.${row.error ? ` Not usable: ${row.error}` : ""}`
-              : "Reading the setting…"
-          }
-          onSave={async (v) => backupRemoteError(v) ?? writeConfig("graph_backup_remote", v.trim(), cfg.reload)}
-        />
       </div>
     </div>
   );
@@ -756,7 +694,7 @@ export function HubAwayCard({ active }: { active: boolean }) {
 // ---------------------------------------------------------------------------
 
 /** Plain one-liners taken from what each job runs (khipu/jobs.py `run_nightly`,
- *  `run_monthly`, `run_graph_build`, the notes-watch and queue-drain plists and
+ *  `run_monthly`, the notes-watch and queue-drain plists and
  *  their comments, and khipu/recall_daemon.py). */
 const JOB_ROWS: ReadonlyArray<readonly [string, string, string]> = [
   [
@@ -765,11 +703,6 @@ const JOB_ROWS: ReadonlyArray<readonly [string, string, string]> = [
     "Consolidates the day's captures, indexes anything new, ages out stale commitments, and builds topic briefs when that switch is on.",
   ],
   ["monthly", "Monthly topic pass", "Runs the monthly topic pass on the first of the month, with its own model."],
-  [
-    "graph_build",
-    "Graph rebuild",
-    "Rebuilds the knowledge graph each night and copies an off-site backup when one is due.",
-  ],
   [
     "notes_watch",
     "Notes watcher",

@@ -4,10 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import {
-  open as openDirectoryDialog,
-  save as saveFileDialog,
-} from "@tauri-apps/plugin-dialog";
+import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   CircleCheck,
   CircleMinus,
@@ -79,7 +76,6 @@ import {
   GatewayUrlCard,
   JobsCard,
   PathOverridesCard,
-  GraphBackupRemoteCard,
   HubAwayCard,
 } from "./SettingsControls";
 import { type DiskSpace, HealthChecksCard } from "./HealthChecksCard";
@@ -858,26 +854,11 @@ type JobEntry = {
 type DoctorJobs = {
   nightly?: JobEntry;
   monthly?: JobEntry;
-  graph_build?: JobEntry;
   embed_media_backfill?: JobEntry;
-};
-
-// graph_backup / graph_offsite from khipu.graph_backup.local_health() /
-// offsite_health(): "skipped" means non-producer machine (by design, not a
-// failure); a configured-but-failing check is skipped:false, ok:false.
-type DoctorHealthCheck = {
-  ok?: boolean;
-  skipped?: boolean;
-  reason?: string;
-  age_seconds?: number;
-  max_age_hours?: number;
-  max_age_days?: number;
-  latest?: { age_seconds?: number };
 };
 
 const NOT_CONFIGURED_LABEL: Record<string, string> = {
   memory_root: "File ↔ PG drift (legacy wiki)",
-  graph_sqlite: "Graph mirror drift",
   // A step nightly_step_health() has never recorded yet (fresh install, or
   // a Mac that just updated) — skipped, not red; see healthRows.tsx LABELS.
   notes_reconcile: "Notes reconciled by the nightly",
@@ -1072,37 +1053,6 @@ function RawJson({
     <Disclosure label={label} openKey={openKey}>
       <RawBlock text={text} empty={empty} />
     </Disclosure>
-  );
-}
-
-// Positive health row for a check that can be ok / red / skipped-by-design
-// (graph_backup, graph_offsite). Skipped is always neutral gray — folding it
-// into green is exactly the bug this row exists to avoid (audit 2026-08-31).
-function renderHealthRow(
-  label: string,
-  check: DoctorHealthCheck | null,
-  detail: (c: DoctorHealthCheck) => string,
-) {
-  const tone: "ok" | "err" | "muted" = !check
-    ? "muted"
-    : check.skipped
-      ? "muted"
-      : check.ok
-        ? "ok"
-        : "err";
-  const Icon =
-    tone === "ok" ? CircleCheck : tone === "err" ? TriangleAlert : CircleMinus;
-  const text = !check
-    ? "Run Refresh to check."
-    : check.skipped
-      ? `Not checked — ${check.reason ?? "not the graph producer on this Mac"}`
-      : detail(check);
-  return (
-    <div key={label} className="row-item">
-      <Icon size={16} strokeWidth={1.75} aria-hidden className={tone} />
-      <span className="row-main">{label}</span>
-      <span className="row-meta">{text}</span>
-    </div>
   );
 }
 
@@ -1375,17 +1325,12 @@ export default function App() {
   } | null>(null);
   const [probeBusy, setProbeBusy] = useState(false);
   const [doctorJobs, setDoctorJobs] = useState<DoctorJobs | null>(null);
-  // Checks the CLI never ran on this machine (`not_configured`) plus the two
-  // health checks that can be skipped by design (graph_backup/graph_offsite
-  // on a non-producer Mac). Kept separate from doctorIssues so a skip never
-  // gets folded into either "all green" or the red issue list.
+  // Checks the CLI never ran on this machine (`not_configured`). Kept
+  // separate from doctorIssues so a skip never gets folded into either
+  // "all green" or the red issue list.
   const [doctorNotConfigured, setDoctorNotConfigured] = useState<string[]>(
     [],
   );
-  const [doctorGraphBackup, setDoctorGraphBackup] =
-    useState<DoctorHealthCheck | null>(null);
-  const [doctorGraphOffsite, setDoctorGraphOffsite] =
-    useState<DoctorHealthCheck | null>(null);
   const [doctorSkipReasons, setDoctorSkipReasons] = useState<
     Record<string, string | undefined>
   >({});
@@ -1761,14 +1706,6 @@ export default function App() {
           ? notConfiguredRaw.filter((x): x is string => typeof x === "string")
           : [],
       );
-      setDoctorGraphBackup(
-        (parsed as { graph_backup?: DoctorHealthCheck }).graph_backup ??
-          null,
-      );
-      setDoctorGraphOffsite(
-        (parsed as { graph_offsite?: DoctorHealthCheck }).graph_offsite ??
-          null,
-      );
       const nightlyStepsForSkip = (
         parsed as {
           nightly_steps?: Record<string, { skipped?: boolean; reason?: string }>;
@@ -1783,8 +1720,6 @@ export default function App() {
       setDoctorSkipReasons({
         memory_root: (parsed as { drift?: { skipped?: string } }).drift
           ?.skipped,
-        graph_sqlite: (parsed as { graph_drift?: { skipped?: string } })
-          .graph_drift?.skipped,
         ...nightlyStepSkipReasons,
       });
       setAttention(items);
@@ -2732,12 +2667,7 @@ export default function App() {
       embed_media?: boolean;
     }>
   >([]);
-  const [graphSourcesResolved, setGraphSourcesResolved] = useState<{
-    unreachable?: Array<{ id?: string; root?: string }>;
-  } | null>(null);
-  const [graphSourcesProducer, setGraphSourcesProducer] = useState(true);
   const [graphSourcesMsg, setGraphSourcesMsg] = useState<string | null>(null);
-  const [newCodeRoot, setNewCodeRoot] = useState("");
   const [appVersion, setAppVersion] = useState<string>("…");
   const [noticeDialog, setNoticeDialog] = useState<LaunchPlan["dialog"]>(null);
   const [noticeCard, setNoticeCard] = useState<CardState | null>(null);
@@ -3058,12 +2988,8 @@ export default function App() {
           root?: string;
           embed_media?: boolean;
         }>;
-        resolved?: { unreachable?: Array<{ id?: string; root?: string }> };
-        graph_producer?: boolean;
       } | null;
       setGraphSources(parsed?.sources ?? []);
-      setGraphSourcesResolved(parsed?.resolved ?? null);
-      setGraphSourcesProducer(Boolean(parsed?.graph_producer));
       setGraphSourcesMsg(null);
     } catch (e) {
       setGraphSourcesMsg(String(e));
@@ -3162,7 +3088,6 @@ export default function App() {
 
   const toggleGraphSource = useCallback(
     async (id: string, enabled: boolean) => {
-      if (!graphSourcesProducer) return;
       setGraphSourcesMsg(null);
       try {
         const raw = await runKhipu([
@@ -3180,12 +3105,11 @@ export default function App() {
         setGraphSourcesMsg(String(e));
       }
     },
-    [graphSourcesProducer, loadGraphSources],
+    [loadGraphSources],
   );
 
   const toggleEmbedMedia = useCallback(
     async (id: string, embedMedia: boolean) => {
-      if (!graphSourcesProducer) return;
       setGraphSourcesMsg(null);
       try {
         const raw = await runKhipu([
@@ -3204,67 +3128,7 @@ export default function App() {
         setGraphSourcesMsg(String(e));
       }
     },
-    [graphSourcesProducer, loadGraphSources],
-  );
-
-  const addGraphCodeRootPath = useCallback(
-    async (path: string) => {
-      const trimmed = path.trim();
-      if (!graphSourcesProducer || !trimmed) return;
-      setGraphSourcesMsg(null);
-      try {
-        const raw = await runKhipu(["sources", "add", `--root=${trimmed}`]);
-        const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
-        if (!parsed?.ok) {
-          setGraphSourcesMsg(parsed?.error ?? "add failed");
-          return;
-        }
-        setNewCodeRoot("");
-        await loadGraphSources();
-      } catch (e) {
-        setGraphSourcesMsg(String(e));
-      }
-    },
-    [graphSourcesProducer, loadGraphSources],
-  );
-
-  const addGraphCodeRoot = useCallback(
-    () => addGraphCodeRootPath(newCodeRoot),
-    [addGraphCodeRootPath, newCodeRoot],
-  );
-
-  const pickGraphCodeRoot = useCallback(async () => {
-    if (!graphSourcesProducer) return;
-    try {
-      const selected = await openDirectoryDialog({
-        directory: true,
-        multiple: false,
-      });
-      if (typeof selected === "string" && selected.trim()) {
-        await addGraphCodeRootPath(selected);
-      }
-    } catch (e) {
-      setGraphSourcesMsg(String(e));
-    }
-  }, [graphSourcesProducer, addGraphCodeRootPath]);
-
-  const removeGraphSource = useCallback(
-    async (id: string) => {
-      if (!graphSourcesProducer) return;
-      setGraphSourcesMsg(null);
-      try {
-        const raw = await runKhipu(["sources", "remove", id]);
-        const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
-        if (!parsed?.ok) {
-          setGraphSourcesMsg(parsed?.error ?? "remove failed");
-          return;
-        }
-        await loadGraphSources();
-      } catch (e) {
-        setGraphSourcesMsg(String(e));
-      }
-    },
-    [graphSourcesProducer, loadGraphSources],
+    [loadGraphSources],
   );
 
   useEffect(() => {
@@ -3609,13 +3473,9 @@ export default function App() {
     setPaneRetryKeys((keys) => ({ ...keys, [activeTab]: keys[activeTab] + 1 }));
   };
 
-  // Total checks that never ran on this machine — not_configured entries
-  // plus graph_backup/graph_offsite when this Mac isn't the graph producer.
+  // Total checks that never ran on this machine — not_configured entries.
   // A skip must never read as a clean pass (audit 2026-08-31).
-  const doctorSkipCount =
-    doctorNotConfigured.length +
-    (doctorGraphBackup?.skipped ? 1 : 0) +
-    (doctorGraphOffsite?.skipped ? 1 : 0);
+  const doctorSkipCount = doctorNotConfigured.length;
 
   /* ---- Home tiles. Every value below comes from a field `khipu status` or
      `khipu doctor` actually returns; where one is absent the element is
@@ -3710,17 +3570,14 @@ export default function App() {
   })();
 
   const backupAge = backupHealth?.freshest_backup_age_seconds;
-  const offsiteAge = doctorGraphOffsite?.latest?.age_seconds;
   const backupSub = [
     backupAge != null ? `Database ${fmtAgo(backupAge)}` : null,
-    offsiteAge != null ? `off-site copy ${fmtAgo(offsiteAge)}` : null,
   ]
     .filter(Boolean)
     .join(" · ");
 
   const jobEntries: Array<[string, JobEntry | undefined]> = [
     ["Nightly consolidate", doctorJobs?.nightly],
-    ["Graph build", doctorJobs?.graph_build],
     ["Monthly consolidate", doctorJobs?.monthly],
   ];
   const jobsOk = jobEntries.filter(
@@ -4516,7 +4373,6 @@ export default function App() {
                 <div className="rows">
                   <div className="rows-head">Scheduled jobs</div>
                   {renderJobRow("Nightly consolidate", doctorJobs.nightly, "nightly")}
-                  {renderJobRow("Graph build", doctorJobs.graph_build, "graph-build")}
                   {renderJobRow("Monthly consolidate", doctorJobs.monthly, "monthly")}
                   <div className="rows-head">On demand</div>
                   {renderOnDemandJobRow(
@@ -4526,20 +4382,6 @@ export default function App() {
                 </div>
               ) : null}
               {jobSpawnMsg ? <pre className="code">{jobSpawnMsg}</pre> : null}
-
-              <div className="rows">
-                <div className="rows-head">Backups of the connections index</div>
-                {renderHealthRow("Snapshot", doctorGraphBackup, (c) =>
-                  c.ok
-                    ? `Fresh — newest copy ${fmtAgo(c.age_seconds)} (limit ${c.max_age_hours}h)`
-                    : (c.reason ?? "stale or missing"),
-                )}
-                {renderHealthRow("Off-site copy", doctorGraphOffsite, (c) =>
-                  c.ok
-                    ? `Fresh — last copy ${fmtAgo(c.latest?.age_seconds)} (limit ${c.max_age_days}d)`
-                    : (c.reason ?? "stale or missing"),
-                )}
-              </div>
 
               {doctorNotConfigured.length ? (
                 <div className="rows">
@@ -6307,7 +6149,6 @@ export default function App() {
 
                     <PathOverridesCard active={tab === "settings" && settingsSection === "data"} />
 
-                    <GraphBackupRemoteCard active={tab === "settings" && settingsSection === "data"} />
                     <HubAwayCard active={tab === "settings" && settingsSection === "data"} />
 
                     <div className="section-card">
@@ -6509,41 +6350,26 @@ export default function App() {
                       <div className="section-head">Components</div>
                       <div className="section-body">
                         <p className="muted">
-                          The database and the graph builder upgrade
-                          independently of the app. Versions come from
-                          Application Support and the compatibility matrix.
+                          The database upgrades independently of the app.
+                          Versions come from Application Support and the
+                          compatibility matrix.
                         </p>
                         <ComponentsPanel active={tab === "settings"} />
                       </div>
                     </div>
 
                     <div className="section-card">
-                      <div className="section-head">What feeds the graph</div>
+                      <div className="section-head">Memory sources</div>
                       <div className="section-body">
                         <p className="muted">
-                          Which local folders the graph builder reads on its next
-                          run. Turning one off skips it next time; nothing already
+                          Turning a source off skips it next time; nothing already
                           in the database is deleted. &quot;Embed images&quot;
                           includes PNG and JPEG files from a folder in the search
                           index.
                         </p>
-                        {!graphSourcesProducer ? (
-                          <p className="muted">
-                            This Mac does not build the graph, so these are
-                            read-only here.
-                          </p>
-                        ) : null}
                         <div className="rows">
                           {graphSources.map((row) => {
-                            const unreachable = (graphSourcesResolved?.unreachable ?? [])
-                              .some((u) => u.id === row.id);
-                            const status = !row.enabled
-                              ? "Turned off"
-                              : unreachable
-                                ? "Folder not found"
-                                : "On";
-                            const userCode =
-                              row.kind === "code_ast" && row.id !== "code:claude";
+                            const status = row.enabled ? "On" : "Turned off";
                             const hasRoot = Boolean(row.root);
                             return (
                               <div key={row.id} className="row-item">
@@ -6551,7 +6377,6 @@ export default function App() {
                                   <input
                                     type="checkbox"
                                     checked={Boolean(row.enabled)}
-                                    disabled={!graphSourcesProducer}
                                     onChange={(e) =>
                                       void toggleGraphSource(row.id, e.target.checked)
                                     }
@@ -6566,7 +6391,6 @@ export default function App() {
                                     <input
                                       type="checkbox"
                                       checked={Boolean(row.embed_media)}
-                                      disabled={!graphSourcesProducer}
                                       onChange={(e) =>
                                         void toggleEmbedMedia(row.id, e.target.checked)
                                       }
@@ -6577,37 +6401,10 @@ export default function App() {
                                   <span className="row-meta muted">no folder</span>
                                 )}
                                 <span className="row-meta">{status}</span>
-                                {graphSourcesProducer && userCode ? (
-                                  <button
-                                    type="button"
-                                    onClick={() => void removeGraphSource(row.id)}
-                                  >
-                                    Remove
-                                  </button>
-                                ) : null}
                               </div>
                             );
                           })}
                         </div>
-                        {graphSourcesProducer ? (
-                          <div className="toolbar">
-                            <input
-                              className="mono"
-                              value={newCodeRoot}
-                              onChange={(e) => setNewCodeRoot(e.target.value)}
-                              placeholder="/absolute/path/to/code"
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter") void addGraphCodeRoot();
-                              }}
-                            />
-                            <button type="button" onClick={() => void addGraphCodeRoot()}>
-                              Add folder
-                            </button>
-                            <button type="button" onClick={() => void pickGraphCodeRoot()}>
-                              Choose folder…
-                            </button>
-                          </div>
-                        ) : null}
                         {graphSourcesMsg ? (
                           <pre className="code">{graphSourcesMsg}</pre>
                         ) : null}

@@ -395,7 +395,7 @@ def _gb(n: int) -> str:
 
 def _disk_write_targets() -> list[tuple[str, Path]]:
     """Every distinct place Khipu writes that can sit on its own volume:
-    the data dir, the process temp dir, graph-build staging dirs, and the
+    the data dir, the process temp dir, and the
     inactive live slot."""
     import tempfile
 
@@ -418,7 +418,7 @@ def _disk_write_targets() -> list[tuple[str, Path]]:
 
 def disk_space(limits: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Free space on every distinct device Khipu writes (data dir, temp,
-    graph-build staging, the inactive live slot, and a configured worktree
+    the inactive live slot, and a configured worktree
     root when one is set). One row per device. Red below the fail
     thresholds, which holds back an update; amber below the warning ones,
     which never does. The fullest (worst) volume decides."""

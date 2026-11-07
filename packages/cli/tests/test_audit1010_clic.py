@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import socket
-import sqlite3
 import tempfile
 import threading
 import unittest
@@ -14,19 +13,6 @@ from pathlib import Path
 from unittest import mock
 
 from khipu import config, join, jobs, launchd_gen, setup, sources
-
-
-class SourceBoundaryRegressionTest(unittest.TestCase):
-    def test_code_root_does_not_claim_a_sibling_prefix(self) -> None:
-        doc = {
-            "sources": [
-                {"id": "code:app", "kind": "code_ast", "root": "/code/app"},
-            ]
-        }
-        self.assertIsNone(sources._code_source_id_for_path("/code/app-backup/main.py", doc))
-        self.assertEqual(
-            sources._code_source_id_for_path("/code/app/main.py", doc), "code:app"
-        )
 
 
 class CorruptDocumentMutationRegressionTest(unittest.TestCase):
@@ -55,7 +41,7 @@ class CorruptDocumentMutationRegressionTest(unittest.TestCase):
         raw = b'{"sources": {}}'
         path.write_bytes(raw)
         with self.assertRaises(ValueError):
-            sources.add_code_root(self.dir / "code")
+            sources.set_enabled("conversation_memory", False)
         self.assertEqual(path.read_bytes(), raw)
 
 
@@ -726,33 +712,6 @@ class SourceRegistryBoundaryRegressionTest(unittest.TestCase):
             with mock.patch.object(sources, "sources_file", return_value=registry):
                 with self.assertRaises(sources.InvalidSourcesDocument):
                     sources.load_sources()
-
-    def test_graph_sync_refuses_corrupt_registry_before_pg_mutation(self) -> None:
-        from khipu import graph_sync
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            db = root / "graph.sqlite"
-            con = sqlite3.connect(db)
-            con.executescript(
-                "CREATE TABLE nodes (id TEXT PRIMARY KEY, type TEXT, bucket TEXT, name TEXT, "
-                "payload TEXT, source_path TEXT, built_at TEXT, frozen INTEGER);"
-                "CREATE TABLE edges (src TEXT, dst TEXT, type TEXT, weight REAL, payload TEXT, built_at TEXT);"
-                "INSERT INTO nodes VALUES ('pg-only','concept','code','x',NULL,'/code/a.py',NULL,0);"
-            )
-            con.commit()
-            con.close()
-            registry = root / "graph_sources.json"
-            registry.write_text("{broken")
-            with (
-                mock.patch.object(sources, "sources_file", return_value=registry),
-                # Only the producer mirrors; a non-producer skips before reading the registry.
-                mock.patch.object(graph_sync, "is_graph_producer", return_value=True),
-                mock.patch("khipu.db.connect") as connect,
-            ):
-                with self.assertRaises(sources.InvalidSourcesDocument):
-                    graph_sync.sync_from_sqlite(db)
-            connect.assert_not_called()
 
 
 class LocalMoveGuardRegressionTest(unittest.TestCase):

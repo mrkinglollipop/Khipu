@@ -9,7 +9,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from khipu import graph_sync as gs
 from khipu.mirror import _upsert_topic, backfill_topic_graph, parse_topic_file
 from khipu.topic_graph import (
     KHIPU_BUCKET,
@@ -164,12 +163,6 @@ class OwnershipTest(unittest.TestCase):
         src = inspect.getsource(tg._insert_khipu_node)
         self.assertIn("WHERE nodes.bucket = %s", src)
         self.assertIn(KHIPU_BUCKET, inspect.getsource(tg))
-
-    def test_graphify_delete_spares_conversation_memory(self) -> None:
-        self.assertIn("conversation-memory", gs.KHIPU_OWNED_NODE_SQL)
-        sync_src = inspect.getsource(gs.sync_from_sqlite)
-        self.assertIn("should_delete_graphify_node", sync_src)
-        self.assertIn("KHIPU_OWNED_NODE_SQL", sync_src)
 
     def test_persist_never_mints_memory_topic(self) -> None:
         cur = mock.Mock()
