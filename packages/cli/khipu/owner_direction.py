@@ -504,7 +504,8 @@ def note_read(shown: list[str], *, env=None, now: float | None = None) -> str | 
 
 def _seed(thread: str | None, session: str, answer: str) -> dict | None:
     """The boundary of the read that showed ``answer``: a hold made after the
-    owner replied to that read starts from it, so his one yes counts."""
+    owner replied to that read starts from it, so one yes to the list counts
+    (class B). A class C hold is never seeded: it is asked on its own."""
     for row in _read_rows():
         if thread is not None and _t3_parts((row.get("t3_snapshots") or {}).get(thread)) is not None:
             return ({"t3_snapshots": {thread: json.loads(json.dumps(row["t3_snapshots"][thread]))}}
@@ -587,7 +588,7 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
             elif any(t.get("entrypoint") in ("t3", "t3-unverified") for t in turns_):
                 with t3.owner_read_budget():
                     thread, _ = _t3_bound(environ, session, now)
-                    seeded = _seed(thread, session, signature(action, args))
+                    seeded = None if class_c(action, args) else _seed(thread, session, signature(action, args))
                     extra = {**seeded, "seeded": True} if seeded else {
                         "t3_snapshots": {thread: _t3_boundary(None, _t3_read(thread, (), None), session)}}
             else:
@@ -599,7 +600,7 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
                                            "The owner has not typed in this conversation, so it can't ask for an "
                                            "owner's change (a background or dispatched job never can). If they did, "
                                            "Khipu's prompt hook may not be installed in this front end.")
-                seeded = _seed(None, session, signature(action, args))
+                seeded = None if class_c(action, args) else _seed(None, session, signature(action, args))
                 extra = {**seeded, "seeded": True} if seeded else {
                     "asks": {session: _ask_boundary(None, turns_, now, session)}}
             request = {"id": "req-" + secrets.token_hex(6), "action": action, "args": args, "state": "pending",
@@ -980,6 +981,10 @@ def confirm(request_id: str, *, env=None, now: float | None = None, remote: dict
                     member = owner_turns._t3_membership(session)
                     if member == "unverified":
                         raise DirectionRefused("t3_unreadable", _T3_UNREADABLE_WHY)
+                    if _listed_since_asked(state, request, session):
+                        _ask_alone(environ, session, request, now, t3_member=member == "t3")
+                        _save(path, state, now)
+                        raise DirectionRefused("not_confirmed", _ASK_ALONE.format(ask=request.get("ask") or ""))
                     stamp = _proof(environ, session, request, now)
             if isinstance(stamp, str):
                 _save(path, state, now)
@@ -994,6 +999,52 @@ def confirm(request_id: str, *, env=None, now: float | None = None, remote: dict
         raise DirectionRefused("log_unwritable", f"Khipu can't read or write the held requests ({err}), so nothing "
                                                  "was changed.") from None
     return request, stamp
+
+
+_ASK_ALONE = ("Not confirmed: this can't be taken back, so a yes to a list never settles it. Nothing was changed. "
+              "Ask the owner about it on its own: {ask} Once they reply, call direction.confirm again.")
+
+
+def permanent(request: dict) -> bool:
+    """A held request that can't be taken back (class C), one mirrored from
+    another Mac included (its holder says so; a forget or a purge always is,
+    and so is any import, since an older holder may not say whether it is a
+    catch-up and the mirror has no args to tell)."""
+    remote = request.get("remote")
+    if request.get("action") == "direction.remote" and isinstance(remote, dict):
+        action = str(remote.get("action") or "")
+        return remote.get("permanent") is True or action == "ledger.import" or class_c(action, None)
+    return class_c(request.get("action", ""), request.get("args"))
+
+
+def _listed_since_asked(state: dict, request: dict, session: str) -> bool:
+    """A class C request this conversation read the list after its own ask
+    here: the owner's next yes may answer the list, so it is asked alone
+    again. Each conversation's own ask counts only for that conversation."""
+    if not permanent(request):
+        return False
+    asked = _float(((request.get("asked_alone") or {}).get(session)) or request.get("created_ts"))
+    return any(r.get("action") == READ_ACTION and r.get("session") == session and _float(r.get("settled_ts")) > asked
+               for r in state["requests"])
+
+
+def _ask_alone(environ, session: str, request: dict, now: float, *, t3_member: bool) -> None:
+    """Put a class C request's own ask again in this conversation: only a
+    message after now answers it here."""
+    if not isinstance(request.get("asked_alone"), dict):
+        request["asked_alone"] = {}
+    request["asked_alone"][session] = now
+    if t3_member:
+        thread = _t3_refusals(environ, session)
+        snapshots = request.get("t3_snapshots")
+        if not isinstance(snapshots, dict):
+            snapshots = request["t3_snapshots"] = {}
+        snapshots[thread] = _t3_boundary(snapshots.get(thread), _t3_read(thread, (), None), session)
+        return
+    asks = request.get("asks")
+    if not isinstance(asks, dict):
+        asks = request["asks"] = {}
+    asks[session] = _ask_boundary(asks.get(session), owner_turns.turns(session, now), now, session)
 
 
 DECLINE_ACTION = "direction.decline"
