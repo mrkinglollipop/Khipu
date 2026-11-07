@@ -3136,7 +3136,11 @@ def hybrid_search(
                     if missed:
                         degraded_legs.append("graph_candidates")
                     elif cand_rows:
-                        fused = fuse_ranked_lists([fused, cand_rows], limit=oversample)
+                        # One more ranked list beside the original ones, not
+                        # a second fusion over `fused`: that replaced every
+                        # row's summed vote with its bare rank and tied the
+                        # first candidate with the first hit.
+                        fused = fuse_ranked_lists([*lists, cand_rows], limit=oversample)
                 except Exception as exc:  # noqa: BLE001 — a candidate-leg failure must not sink the search
                     degraded_legs.append("graph_candidates")
                     timing["graph_candidates_error"] = str(exc)[:120]
