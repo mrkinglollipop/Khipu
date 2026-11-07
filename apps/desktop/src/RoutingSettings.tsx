@@ -3556,7 +3556,7 @@ function ProvidersList({ view }: { view: RouteView }) {
  *  stays in the group that owns the words, and nothing here sends, stops or
  *  refuses work. The checks `route --json` does not carry yet (model
  *  stale level words) are left out rather than guessed.
-   *  Open owed directions stay local to the owner's Mac. */
+ *  Open owed directions stay local to the owner's Mac. */
 function ChecksSection({ data, now, folds, includeTable = true }: { data: RouteView; now: Date; folds: Folds; includeTable?: boolean }) {
   const model = checksModel(data, now);
   const row = (r: { key: string; title: string; sub: string }, tag?: ReactNode) => (
