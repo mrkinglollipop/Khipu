@@ -1,7 +1,3 @@
-# --bypass-harness (sonnet lane): authored by a dispatched on-sub
-# Agent(model="sonnet") subagent for the "gaps become oracles" layer 1 of
-# docs/plans/2026-09-05-setup-that-cannot-strand-you.md — pure unit tests,
-# no Docker, no live hub. See test_setup_live.py for layer 2.
 """Contract tests for khipu.setup / khipu.dbmove / the ``khipu db`` CLI face.
 
 These encode the promises the plan's "gaps become oracles" section makes:

@@ -216,7 +216,7 @@ def test_a_mirrored_request_is_permanent_without_its_holders_flag():
             remote["permanent"] = flag
         return {"action": "direction.remote", "remote": remote}
 
-    for action in ("forget.send", "forget.here", "forget.not_same", "ledger.purge", "ledger.import"):
+    for action in ("forget.send", "forget.here", "forget.not_same", "ledger.purge"):
         assert owner_direction.permanent(mirror(action)), action
         assert owner_direction.permanent(mirror(action, False)), action
     assert owner_direction.permanent(mirror("route.pause", True))

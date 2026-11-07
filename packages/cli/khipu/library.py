@@ -1,5 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
-# Sonnet build agent (brief: do not delegate); no further agent to route to.
 """Library sources: a folder of .txt/.md files indexed as a search space of its
 own (scope: docs/plans/2026-10-07-library-sources-byoe.md, Session B).
 
@@ -678,7 +676,6 @@ def backfill(conn, name: str, *, limit: int | None = None, stale: bool = False,
     (``khipu.embed_jobs.Job``) gets ``update(done, total, failed)`` after each
     batch and is asked ``cancelled`` before the next; a cancelled run finishes
     the batch in flight, stops, and returns ``cancelled: True``."""
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     with conn.cursor() as cur:
         src = get_source(cur, name)
         if profile and profile != src.profile:

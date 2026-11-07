@@ -49,7 +49,7 @@ import type { LedgerSetReply, Vocab, WaitItem, WorkBoard, WorkJob, WorkPr, WorkS
 import "./Work.css";
 
 const FIRST_RUN_HINT =
-  "A project shows here once a conversation adds its first ledger row, or when you bring in a tracker you already keep or a job runner's summary file.";
+  "A project shows here once a conversation adds its first ledger row, or when you add a job runner's summary file.";
 const WAIT_FIRST = 8;
 
 const OWED_KIND_WORDS: Record<string, string> = {
@@ -75,8 +75,6 @@ export type WorkViewProps = {
   /** Opens App's Snooze dialog for one commitment. */
   onSnooze: (id: string, title: string) => void;
   onOpenRouting: () => void;
-  /** Opens Settings -> Work -> Ledger -> Import a tracker... */
-  onImportTracker?: () => void;
   /** Opens Settings, Work (a board's Raise the limit and Open Settings). */
   onOpenWorkSettings?: () => void;
 };
@@ -284,13 +282,6 @@ export function WorkView(props: WorkViewProps) {
               title="No projects yet"
               hint={FIRST_RUN_HINT}
             />
-            {props.onImportTracker ? (
-              <div className="toolbar wk-first-run">
-                <button type="button" className="sm" onClick={props.onImportTracker}>
-                  Import a tracker…
-                </button>
-              </div>
-            ) : null}
           </div>
         ) : (
           <>

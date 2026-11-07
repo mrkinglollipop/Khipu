@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Stable session identity: repo root + project, resolved from a cwd (W1.2).
 
 ``scope`` today is whatever the model wrote in the extraction prompt — a free

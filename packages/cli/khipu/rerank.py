@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Optional reranking stage for explicit search (``embed.hybrid_search``).
 
 One request to the configured ``models.synth`` provider (the same routing as

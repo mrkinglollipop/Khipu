@@ -1,5 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
-# Sonnet build agent (brief: do not delegate); no further agent to route to.
 """khipu.profiles and `khipu embed profiles list|add` (library sources + BYO
 embeddings, Session A). Fake cursor, no database, no model call."""
 from __future__ import annotations

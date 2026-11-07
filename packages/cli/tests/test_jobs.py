@@ -102,8 +102,7 @@ class JobsRunTest(unittest.TestCase):
                     mock.patch.object(jobs, "_provenance_nightly"), \
                     mock.patch.object(jobs, "_ledger_nightly"), \
                     mock.patch.object(jobs, "_refresh_snapshot"), \
-                    mock.patch.object(jobs, "_recall_eval_step"), \
-                    mock.patch.object(jobs, "_briefs_build_if_on", return_value=None):
+                    mock.patch.object(jobs, "_recall_eval_step"):
                 self.assertEqual(jobs.run_nightly(), expected)
             script.assert_called_once()
             self.assertFalse(record.call_args_list[0].kwargs["ok"])
@@ -574,7 +573,7 @@ class JobsMetadataTest(unittest.TestCase):
         self.assertEqual(
             set(out),
             {"nightly", "monthly", "graph_build", "notes_watch", "queue_drain",
-             "recall_daemon", "replica_refresh", "embed_media_backfill"},
+             "recall_daemon", "replica_refresh"},
         )
 
 

@@ -1,6 +1,6 @@
 # MCP tools
 
-Khipu exposes 22 tools locally and 20 through the HTTPS gateway, which omits `khipu_owner_act` and `khipu_needs_you`, through one MCP server (server id `khipu`). Agents call them to read memory, write to it, manage commitments and decisions, ask for synthesis, and read the routing record, and take an owner action the owner asked for.
+Khipu exposes 19 tools locally and 17 through the HTTPS gateway, which omits `khipu_owner_act` and `khipu_needs_you`, through one MCP server (server id `khipu`). Agents call them to read memory, write to it, manage commitments and decisions, and read the routing record, and take an owner action the owner asked for.
 
 The tool list is returned verbatim by the server's `tools/list`. This page groups the tools by job. For the exact schema of any tool, ask the server.
 
@@ -12,7 +12,6 @@ The tool list is returned verbatim by the server's `tools/list`. This page group
   - `khipu_forget` refuses an episode unless the calling token captured it itself: an episode with no known owner, one captured on a Mac, and one captured by another gateway token are all refused. (A hub without the origin column falls back to refusing session ids that start with a local harness name: `claude_code`, `cursor`, `codex`, `aegis` or `grok_build`.)
   - `khipu_capture` writes immediately (see below).
   - `khipu_owner_act` is not listed and refuses every call: owner direction needs the owner's typed turns, which only a prompt hook on the owner's Mac records.
-- **Features that are off.** `khipu_brief` and `khipu_reflect` reply `{available: false}` while their feature switches are off. Both default to off. `khipu features` shows the switches.
 
 ## Memory read
 
@@ -81,10 +80,6 @@ Hub status: table counts, latest episode time, mirror lag and recent captures. R
 With `prompt` and no `full`, the answer always has `hub_ok`. `prior_work`, `prior_work_text`, `prior_work_meta`, `notes_freshness`, `routing`, `contract` and `hub_error` are optional: each is left out when it is unavailable or its lookup fails. `prior_work` holds up to three items and `prior_work_text` is a short Markdown block. Without `prompt` (or with `full`), the answer is the complete payload: counts, recent captures, replica freshness (`hub_snapshot`, `snapshot_age_seconds`, `snapshot_state`), `pending_turns`, the capability `contract`, and `warnings` for plans nearly used up (read from the usage cache only). If the hub cannot be reached, the answer falls back to the local replica and carries `hub_error`.
 
 The prompt path is the pull path for harnesses that get no pushed recall, such as Aegis and the gateway.
-
-### khipu_brief
-
-Read the source-backed brief for one topic. Read-only. Parameter: `topic` (required). Every claim in a brief lists the episode ids it came from. The `state` is `current` or `stale`. Off by default (`briefs` switch).
 
 ## Memory write
 
@@ -184,14 +179,6 @@ Change one decision.
 
 Supersede requires `id` and exactly one of `by` or `new_text`. Restore and retract require `id`; confirm and reject require `link_id`. Supersede only when the user reverses or replaces a decision, not for a refinement. Retract marks a decision wrong outright.
 
-## Synthesis
-
-### khipu_reflect
-
-Answer one question from memory, with the evidence. Read-only. Parameters: `question` (required), `project`. It runs one search, then asks the configured model to answer only from what it found. Each claim lists the episode or topic ids it rests on, and it abstains rather than answer without sources. It writes no memory. Off by default (`reflect` switch).
-
-`khipu_brief` (above) is the other synthesis tool: a stored, cited summary of one topic rather than an answer to a question.
-
 ## Routing
 
 These tools report account state and provide advisory account rankings. They never launch or enforce work: Khipu reports, and routing stays with the caller. Usage and routing write/advice tools are unavailable through the gateway, but `khipu_route` serves the owner-enabled published cloud copy, with its hub timestamp, stale status and persistent pull receipts. See [Routing](routing.md) for the full model.
@@ -282,17 +269,13 @@ Each item has `kind`, `words` (one or two plain sentences, no ids), `asked_by` (
 
 Reading it confirms nothing and records no rule or priority as shown, but it is the ask: Khipu records where the conversation stood and which answers the read showed whole, and only what the owner types after that can answer. Nothing typed before it counts, the question included. In T3, one typed message newer than the read settles an item shown in it, routing kinds at once and held kinds by the same call; a turn Khipu can't prove stays held, with nothing changed. Outside T3 an answer is refused in the same turn as the read, but an agent that never read the list still passes on a recent typed turn. Khipu proves a new typed message and doesn't read it, so it can't tell a yes from "thanks". `direction.decline` drops a held request on the owner's no, on the same proof as `direction.confirm`, and is logged. `key` reads one item with its words whole. Owed items that need the owner are a separate list: `khipu_owed`.
 
-### khipu_project
-
-Read one project’s canonical name, grouped names, evidence and dates, counts per name and in total, and same-project pairs awaiting an answer or kept separate. Parameter: `name` (required). The answer is the same for every grouped name. Project merges and keep-separate choices belong to the owner, through `khipu_owner_act` actions `project.merge` and `project.keep_separate`.
-
 ## Work
 
 ### khipu_ledger
 
 The project's ledger of what work is done and what is not, with the old tracker script's verbs. Parameters: `verb` (required: `add`, `set`, `get`, `list`, `loose-ends`, `needs-owner`, `needs-matt`, `render`, `check`, `remove` or `removed`), plus the same fields as `khipu ledger` as JSON: `project` (default: the folder's project), `id`, `title`, `kind`, `parent`, `state`, `evidence`, `owner`, `note`, `link`, `if_state`, `children`, `op_id`, `stale_hours` and `summary`.
 
-Supply `id` to name the row for `add`, `set`, `get` and `remove`; writes reject an empty id rather than generating one. Add requires `title` and `kind` and may set `parent`. Set changes `state`, `evidence`, `owner`, `title` or `link`, and alone supports `if_state` to write only while the row is still in that state. Remove alone accepts `children` (`remove` or `move-up`). A write returns its result and its `op_id`; pass the same `op_id` to retry it safely. `get`, `list`, `loose-ends` and `needs-owner` return rows; `render` returns the markdown board and `check` the check's result. A refusal is a tool error carrying `error` and `reason`. When the database is away a write waits on this Mac and reaches the ledger when it answers. Restoring a removed row, removing it for good and importing an old tracker are the owner's, in the app.
+Supply `id` to name the row for `add`, `set`, `get` and `remove`; writes reject an empty id rather than generating one. Add requires `title` and `kind` and may set `parent`. Set changes `state`, `evidence`, `owner`, `title` or `link`, and alone supports `if_state` to write only while the row is still in that state. Remove alone accepts `children` (`remove` or `move-up`). A write returns its result and its `op_id`; pass the same `op_id` to retry it safely. `get`, `list`, `loose-ends` and `needs-owner` return rows; `render` returns the markdown board and `check` the check's result. A refusal is a tool error carrying `error` and `reason`. When the database is away a write waits on this Mac and reaches the ledger when it answers. Restoring a removed row and removing it for good are the owner's, in the app.
 
 Rows carry titles and short plain-words lines about the work, never code, diffs, file contents, command output, logs, prompts, briefs, customer or financial details.
 

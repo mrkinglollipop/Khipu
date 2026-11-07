@@ -2791,13 +2791,10 @@ def doctor_block() -> dict[str, Any]:
                 projects.setdefault(p, {"rows": 0, "removed": 0})["history"] = n
             cur.execute("SELECT count(*) FROM ledger_removed")
             out["purged_markers"] = cur.fetchone()[0]
-            cur.execute("SELECT count(*), max(at) FROM ledger_imports")
-            n_imports, last_import = cur.fetchone()
         conn.rollback()
         out["hub"] = {"ok": True}
         out["projects"] = projects
         out["removed_waiting_to_purge"] = sum(p["removed"] for p in projects.values())
-        out["imports"] = {"count": n_imports, "last": _z(last_import) if last_import else None}
         if projects and not out.get("in_offline_copy"):
             out["warnings"].append("ledger: the offline copy has no ledger yet (it is added at the next refresh)")
     finally:
@@ -2911,8 +2908,6 @@ def cmd(args: argparse.Namespace) -> int:
                 _emit(args, out, out["line"])
                 return 0
             return _cmd_purge(args, project)
-        if verb == "import":
-            return _cmd_import(args, project)
         if verb == "export":
             return _cmd_export(args, project)
         if verb == "removed":
@@ -3005,7 +3000,7 @@ def cmd(args: argparse.Namespace) -> int:
 # ``require`` before it does anything.
 WRITE_POLICY: dict[str, str] = {
     "ledger add": "writer", "ledger set": "writer", "ledger remove": "writer",
-    "ledger restore": "app", "ledger purge": "app", "ledger import": "owner", "ledger project": "owner",
+    "ledger restore": "app", "ledger purge": "app", "ledger project": "owner",
     "work hide": "owner", "work unhide": "owner", "work same": "owner", "work not-same": "owner",
 }
 READ_VERBS = frozenset({"ledger get", "ledger list", "ledger loose-ends", "ledger needs-owner", "ledger needs-matt",
@@ -3021,7 +3016,7 @@ _APP_ONLY = {
 # a writer verb is the owner's only when it is written as him (row 16 of the
 # owner-direction scope: --from-app, or his direction).
 DIRECTION_ACTIONS = {
-    "ledger import": "ledger.import", "ledger restore": "ledger.restore", "ledger purge": "ledger.purge",
+    "ledger restore": "ledger.restore", "ledger purge": "ledger.purge",
     "ledger project": "ledger.project",
     "ledger add": "ledger.add", "ledger set": "ledger.set", "ledger remove": "ledger.remove",
     "work hide": "work.hide", "work unhide": "work.unhide", "work same": "work.same", "work not-same": "work.not_same",
@@ -3096,11 +3091,6 @@ def direction_intent(command: str, args: argparse.Namespace, project: str | None
     action = DIRECTION_ACTIONS.get(command)
     if action is None:
         return None
-    if action == "ledger.import":
-        facts = {"project": project} if project else {}
-        if getattr(args, "catch_up", False):
-            facts["catch_up"] = True
-        return owner_direction.intent(action, str(args.file), facts=facts or None)
     if action == "ledger.project":
         return owner_direction.intent(action, project) if project else None
     if action.startswith("ledger."):
@@ -3159,21 +3149,9 @@ def _cmd_purge(args: argparse.Namespace, project: str) -> int:
     return 0
 
 
-def _cmd_import(args: argparse.Namespace, project: str) -> int:
-    from khipu import ledger_import
-
-    report = ledger_import.run_import(args.file, project, dry_run=args.dry_run, catch_up=args.catch_up)
-    if not args.dry_run:
-        from khipu import owner_direction
-
-        report = owner_direction.finish(report) or report
-    _emit(args, report, ledger_import.report_text(report))
-    return 0 if report["result"] in ("done", "caught up", "nothing new", "dry run") else 1
-
-
 def _cmd_export(args: argparse.Namespace, project: str) -> int:
     """The project in the tracker file's shape, every row and its history."""
-    from khipu import ledger_import
+    from khipu import ledger_export
 
     try:
         conn = _connect()
@@ -3181,7 +3159,7 @@ def _cmd_export(args: argparse.Namespace, project: str) -> int:
         raise LedgerError("the database is away; export needs it", "away") from exc
     try:
         with conn.cursor() as cur:
-            rows = ledger_import.export_rows(cur, project)
+            rows = ledger_export.export_rows(cur, project)
         conn.rollback()
     finally:
         conn.close()
@@ -3319,14 +3297,6 @@ def add_parser(sub) -> None:
     shown.add_argument("--hide", action="store_true", help="Take it off the Work tab; its rows stay")
     shown.add_argument("--show", action="store_true")
     common(pj, write=True)
-
-    im = verbs.add_parser("import", help="Import an old tracker file (the app's Import a tracker)")
-    im.add_argument("file")
-    im.add_argument("--dry-run", action="store_true", help="Report what would be imported; write nothing")
-    im.add_argument("--catch-up", action="store_true", help="Bring in only what changed since the last import")
-    im.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
-    _owner_flags(im)
-    common(im)
 
     ex = verbs.add_parser("export", help="The project in the old tracker file's shape")
     ex.add_argument("--tracker-json", action="store_true", required=True)

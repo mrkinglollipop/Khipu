@@ -198,17 +198,6 @@ def _forget_claims(cur, episode_id: int) -> dict[str, Any]:
     return out
 
 
-def _briefs_ready(cur) -> bool:
-    """Same check as ``khipu.briefs._ready`` (migration 0025), duplicated —
-    see ``_deliverables_ready`` above."""
-    try:
-        from khipu.db import has_columns
-
-        return has_columns(cur, "briefs", "id", "source_episode_ids", "state", "superseded_at")
-    except Exception:  # noqa: BLE001 — introspection is best-effort
-        return False
-
-
 def _clear_cited_suggestions(cur, episode_id: int) -> int:
     # forget-fence: the forget itself: reads what it hides
     """Clear every commitment's "Looks done" / "Looks settled" suggestion
@@ -265,8 +254,7 @@ def _clear_cited_closes(cur, episode_id: int) -> int:
 def tombstone_on_hub(cur, episode_id: int) -> dict[str, Any]:
     """Tombstone one episode (its row already locked) and cascade: its
     vectors, its fact claims (each fact re-projected, or retired as the
-    pre-provenance cascade did on a hub without 0047), and the briefs it
-    sourced. Idempotent on an episode already tombstoned. ``refuse()`` and
+    pre-provenance cascade did on a hub without 0047). Idempotent on an episode already tombstoned. ``refuse()`` and
     the index pass run it on every carrier they tombstone."""
     cur.execute(
         "UPDATE episodes SET deleted_at = now() WHERE id = %s AND deleted_at IS NULL",
@@ -324,14 +312,6 @@ def tombstone_on_hub(cur, episode_id: int) -> dict[str, Any]:
             )
             decisions_retracted = cur.rowcount
 
-    briefs_staled = 0
-    if _briefs_ready(cur):
-        cur.execute(
-            "UPDATE briefs SET state = 'stale' WHERE state = 'current' AND superseded_at IS NULL "
-            "AND source_episode_ids && %s::bigint[]",
-            ([episode_id],),
-        )
-        briefs_staled = cur.rowcount
     return {
         "soft_deleted": soft_deleted,
         "embeddings_removed": embeddings_removed,
@@ -339,7 +319,6 @@ def tombstone_on_hub(cur, episode_id: int) -> dict[str, Any]:
         "commitment_vectors_removed": commitment_vectors_removed,
         "deliverables_removed": deliverables_removed,
         "decisions_retracted": decisions_retracted,
-        "briefs_staled": briefs_staled,
         "suggestions_cleared": suggestions_cleared,
         "closes_cleared": closes_cleared,
         "facts_reprojected": (provenance_out or {}).get("facts_reprojected", 0),

@@ -10,12 +10,10 @@ ledger cursor is a fake.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
-from unittest.mock import patch
 
 import pytest
 
-from khipu import agent_view, claude_homes, config, ledger_import, routing, safe_read
+from khipu import agent_view, claude_homes, config, routing, safe_read
 
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch, tmp_path):
@@ -70,32 +68,3 @@ def test_config_read_failure_keeps_login_file_refused(tmp_path):
 
 
 
-class _Cursor:
-    def execute(self, *_args, **_kwargs):
-        pass
-
-    def fetchall(self):
-        return []
-
-
-def test_catch_up_refuses_a_purged_row_still_present_in_the_old_tracker():
-    row = {
-        "id": "gone",
-        "title": "Synthetic row",
-        "kind": "slice",
-        "parent": "",
-        "state": "QUEUED",
-        "evidence": "",
-        "owner": "none",
-        "updated": "2026-10-01T00:00:00Z",
-        "history": [],
-    }
-    before = {"ids": set(), "all": {}, "hist": {}, "rows": {}}
-    with patch.object(ledger_import, "_snapshot", return_value=before):
-        got = ledger_import._catch_up(
-            _Cursor(), "synthetic/project", {"rows": {"gone": row}},
-            {"ok": True}, {}, {"gone": datetime(2026, 10, 1, tzinfo=timezone.utc)},
-            {"state": [], "kind": []}, dry_run=False,
-        )
-    assert got["result"] == "refused"
-    assert got["reason"] == "purged"

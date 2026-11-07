@@ -231,7 +231,6 @@ def test_large_note_plan_includes_redirects_in_deadline(tmp_path, monkeypatch):
     monkeypatch.setattr(notes, "claude_projects_root", lambda: tmp_path)
     monkeypatch.setattr(notes, "codex_memories_root", lambda: tmp_path)
     monkeypatch.setattr(notes, "_any_memory_root_exists", lambda: False)
-    monkeypatch.setattr(notes, "_refresh_scan_report", lambda: None)
     monkeypatch.setattr(notes, "_write_state", lambda state: None)
     monkeypatch.setattr("khipu.organise.after_reconcile", lambda **kw: {"ok": True})
     monkeypatch.setattr("khipu.offline.setting", lambda name: 30)

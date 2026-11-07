@@ -18,40 +18,9 @@ export type ChecksRow = {
 
 export type TierRow = { label: string; tier: string };
 
-export type FileCopiesModel = {
-  status: string;
-  scanned_at: string | null;
-  files_checked: number;
-  hits: { file: string; line: number; quote: string; superseded: boolean }[];
-  hits_total: number;
-  more_not_shown: number;
-  too_large: string[];
-  skipped: { file: string; reason: string; message?: string }[];
-};
-
-/** Owner-visible reasons are retained even for empty or expired snapshots. */
-export function fileCopySkipWords(skip: FileCopiesModel["skipped"][number]): string {
-  if (skip.message) return skip.message;
-  const reasons: Record<string, string> = {
-    timeout: "Couldn't read in time.",
-    protected_path: "Protected path; not read.",
-    symlink: "Symbolic link; not read.",
-    dataless: "File is not available locally; not read.",
-    unreadable: "Couldn't read this path.",
-    not_regular: "Not a regular file.",
-    not_directory: "Not a directory.",
-    candidate_limit: "Candidate limit reached; some files were not checked.",
-    refresh_budget: "Scan time limit reached; remaining files were not checked.",
-    worker_limit: "Reader limit reached; not checked.",
-    unavailable: "Bounded reader unavailable; not checked.",
-  };
-  return reasons[skip.reason] ?? skip.reason.replace(/_/g, " ");
-}
-
 export type ChecksModel = {
   contradictions: ChecksRow[];
   upkeep: ChecksRow[];
-  fileCopies: FileCopiesModel | null;
   unreached: ChecksRow[];
   /** The confirmed model table, or null: `route --json` carries only a
    *  confirmed one, so an absent table can mean none or one still waiting. */
@@ -267,7 +236,7 @@ function upkeepRow(h: RouteHygiene, i: number, view: RouteView, rules: Map<strin
 
 /** Every advisory row and the model table, in the group's order. */
 export function checksModel(view: RouteView | null, now: Date): ChecksModel {
-  if (!view) return { contradictions: [], upkeep: [], fileCopies: null, unreached: [], table: null };
+  if (!view) return { contradictions: [], upkeep: [], unreached: [], table: null };
   const rules = ruleByEntity(view);
   const contradictions = (view.contradictions ?? []).map((c, i) => contradictionRow(c, i, view, rules, now));
   const upkeep = (view.rule_hygiene ?? []).map((h, i) => upkeepRow(h, i, view, rules, now));
@@ -280,16 +249,6 @@ export function checksModel(view: RouteView | null, now: Date): ChecksModel {
         ? `The owner turn could not be matched${d.reason ? `: ${d.reason}` : ""}.`
         : "Nothing in Khipu matches it."),
   }));
-  const copies = view.routing_file_copies;
-  const fileCopies: FileCopiesModel | null = copies
-    ? { status: copies.status === "checked" && (copies.skipped?.length || copies.too_large?.length)
-          ? "incomplete" : copies.status,
-        scanned_at: copies.scanned_at ?? null,
-        files_checked: copies.files_checked ?? 0, hits: copies.hits ?? [],
-        hits_total: copies.hits_total ?? copies.hits?.length ?? 0,
-        more_not_shown: copies.more_not_shown ?? 0,
-        too_large: copies.too_large ?? [], skipped: copies.skipped ?? [] }
-    : null;
   let table: ChecksModel["table"] = null;
   const tiers = view.tier_table?.tiers;
   if (tiers && Object.keys(tiers).length && view.tier_table?.confirmed !== false) {
@@ -301,7 +260,7 @@ export function checksModel(view: RouteView | null, now: Date): ChecksModel {
     const rows = [...known, ...extra];
     table = { rows, line: `${plural(rows.length, "kind", "kinds")} of work · confirmed by you` };
   }
-  return { contradictions, upkeep, fileCopies, unreached, table };
+  return { contradictions, upkeep, unreached, table };
 }
 
 /** The group's closed line: what is flagged, in the parts Khipu can see. */
@@ -310,12 +269,8 @@ export function checksLine(view: RouteView | null, now: Date): string {
   const parts: string[] = [];
   if (model.contradictions.length) parts.push(plural(model.contradictions.length, "contradiction", "contradictions"));
   if (model.upkeep.length) parts.push(`${plural(model.upkeep.length, "rule", "rules")} to look at`);
-  if (model.fileCopies?.hits_total) parts.push(`${plural(model.fileCopies.hits_total, "copy", "copies")} in files`);
-  if (model.fileCopies?.status === "stale") parts.push("File scan out of date");
-  if (model.fileCopies?.status === "incomplete") parts.push("File scan incomplete");
   if (model.unreached.length) parts.push(`${plural(model.unreached.length, "direction", "directions")} not in Khipu`);
   if (parts.length) return parts.join(" · ");
-  if (model.fileCopies && model.fileCopies.status !== "checked") return "Files not looked at yet";
   if (model.table) return "Your model table · nothing flagged";
   return "Nothing flagged in Khipu's record";
 }

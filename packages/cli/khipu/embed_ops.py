@@ -1,5 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
-# agent (brief: do not delegate); no further agent to route to.
 """What the Embeddings screen asks of the CLI that is not a backfill:
 
 * ``estimate``       how many chunks, characters, tokens, dollars and seconds a

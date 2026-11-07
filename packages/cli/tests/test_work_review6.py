@@ -20,7 +20,7 @@ from urllib.parse import unquote
 
 import pytest
 
-from khipu import agent_view, ledger, ledger_import, mcp_server, safe_read, work
+from khipu import agent_view, ledger, ledger_export, mcp_server, safe_read, work
 from tests.test_work import NO_LEDGER, NO_OWED, NOW, ROUTING, cfg, entry, job, put, summary
 from tests.test_work_structural import _argv, _run, _subcommands, private_backends  # noqa: F401
 
@@ -90,7 +90,7 @@ def _unexpected(*a, **k):
 def failing_backends(private_backends, monkeypatch):  # noqa: F811
     """Every data source of both commands raising an error no verb expects."""
     for module, names in ((ledger, ("load", "get", "removed_rows", "write", "purge")),
-                          (ledger_import, ("export_rows", "run_import")),
+                          (ledger_export, ("export_rows",)),
                           (work, ("build_view", "check_file", "read_owed", "set_hidden", "read_hidden",
                                   "set_link"))):
         for attr in names:

@@ -10,7 +10,7 @@ Khipu runs its upkeep as macOS LaunchAgents. A fresh install (the Database step,
 
 | Job | When | What it does |
 |---|---|---|
-| `nightly` | Daily at 02:05 | Memory upkeep: capture-queue drain, consolidation, notes reconcile, embedding catch-up, query-cache prune, commitment hygiene, offline-copy refresh, and topic briefs when that switch is on |
+| `nightly` | Daily at 02:05 | Memory upkeep: capture-queue drain, consolidation, notes reconcile, embedding catch-up, query-cache prune, commitment hygiene, offline-copy refresh |
 | `graph_build` | Daily at 02:17 | Builds the graph |
 | `monthly` | 1st of the month, 09:00 | Monthly organisation pass |
 | `notes_watch` | When watched note files change (30 s throttle) | Syncs edited notes |
@@ -70,7 +70,7 @@ Related commands:
 
 - `khipu status` prints row counts. `--sample 0` skips the file walk. `--drift` adds the drift sample.
 - `khipu reconcile` syncs files into PostgreSQL. It is safe to run again.
-- `khipu outbox status|drain|retry-dead` handles the offline write queue. `khipu outbox span-covered` is a dry run over dead jobs refused for not announcing their source identities. `retry-dead` leaves those jobs held.
+- `khipu outbox status|drain|retry-dead` handles the offline write queue. `retry-dead` leaves dead jobs refused for not announcing their source identities held.
 - `khipu sessions status|liveness|drain|sweep` handles the capture queue.
 - `khipu revisions` shows topic revisions, including edits that lost a last-write-wins conflict.
 

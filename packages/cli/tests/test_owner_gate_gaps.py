@@ -1,9 +1,8 @@
 """Regression coverage derived from the owner-gate review probes. No live state."""
-import hashlib
 import json
 import time
 
-from khipu import ledger_import, owner_act, owner_direction, owner_turns, routing
+from khipu import owner_act, owner_direction, owner_turns, routing
 from tests.test_t3_owner_confirm import (
     THREAD, T3_SESSION, _be, _confirm_id, _hold_in_t3, _t3_hook_turn, world,
 )
@@ -41,35 +40,6 @@ def test_priority_confirm_discloses_and_pins_underlying_change(world):
     priority = routing.read_view()['priority_stored']
     assert not priority['pending']
     assert secret_change in json.dumps(priority)
-
-
-def test_ledger_import_replays_reviewed_bytes(world, monkeypatch):
-    path=world['tmp'] / 'tracker.json'
-    original={'rows': {'ok': {'title':'Reviewed task', 'kind':'task', 'state':'todo'}}}
-    swapped={'rows': {'unshown': {'title':'Unreviewed replacement', 'kind':'task', 'state':'done'}}}
-    path.write_text(json.dumps(original))
-    original_digest=hashlib.sha256(path.read_bytes()).hexdigest()
-    ok, held = _ask_in_t3(world, 'direction.request', {'action': 'ledger.import',
-                                                      'args': {'project':'p','file':str(path)}})
-    assert ok and held['pending'], held
-    request=owner_direction._read_requests(owner_direction.requests_path())[0]
-    assert request['args'] == {'project':'p','file':str(path)}
-    path.write_text(json.dumps(swapped))
-    seen=[]
-    monkeypatch.setattr(ledger_import, 'done_imports', lambda *a: [])
-    def fake_import_sink(file, project, **kw):
-        src=owner_direction.import_source(file,project)
-        assert src is not None
-        seen.append(src)
-        return {'ok':True,'project':project,'file':src['name'],'digest':src['digest'],
-                'counts_in_file':ledger_import.tracker_counts(src['rows']),
-                'masked':src['masked'],'other_keys':src['other_keys'],'result':'done'}
-    monkeypatch.setattr(ledger_import, 'run_import', fake_import_sink)
-    _owner_says_yes(world)
-    ok, out=_confirm_id(held['request'])
-    assert ok, out
-    assert seen[0]['digest'] == original_digest
-    assert seen[0]['rows'] == original['rows']
 
 
 def test_config_confirm_cannot_retarget_new_request(world):

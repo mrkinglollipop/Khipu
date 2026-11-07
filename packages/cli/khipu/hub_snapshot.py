@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Full hub read replica for airplane mode (P3).
 
 When PostgreSQL is reachable, ``refresh()`` atomically replaces
@@ -3130,7 +3127,7 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     removed += con.execute("DELETE FROM topics WHERE slug = ?", (slug,)).rowcount
                     _record_read_at(con, "topics", slug, read_at)
                 for row in topic_rows or ():
-                    row = _topic_routing_metadata(row)
+                    row = _topic_page_metadata(row)
                     slug = row.get("slug")
                     if slug is None:
                         continue
@@ -4043,7 +4040,7 @@ def _insert_topics(cur, con: sqlite3.Connection) -> int:
     rows = cur.fetchall()
     ph = ", ".join(cols)
     for row in rows:
-        prepared = _topic_routing_metadata(dict(zip(cols, row, strict=True)))
+        prepared = _topic_page_metadata(dict(zip(cols, row, strict=True)))
         vals = []
         for col in cols:
             val = prepared[col]
@@ -5487,7 +5484,7 @@ def upsert_embeddings(
             for row in topic_rows:
                 if row["slug"] in purged:
                     continue
-                row = _topic_routing_metadata(row)
+                row = _topic_page_metadata(row)
                 old = con.execute("SELECT deleted_at, updated_at FROM topics WHERE slug = ?",
                                   (row["slug"],)).fetchone()
                 if old and old[0] is not None:
@@ -7419,7 +7416,7 @@ def _decision_states_for_episode_snapshot(
 ) -> dict[str, Any]:
     """Replica twin of ``decisions.decision_states_for_episode`` for rows
     owned by this episode id only. Unlike the hub path
-    (``briefs._decision_rows`` / ``decision_states_for_episode``), this does
+    (``decisions.decision_rows_for_episodes`` / ``decision_states_for_episode``), this does
     not attach decisions by normalized text within the project and dedupe
     window — a restatement whose row lives on an earlier episode therefore
     still has empty ``decision_states`` when the hub is down. Empty/zeroed
@@ -8255,13 +8252,9 @@ def cosine_candidates_snapshot(
     return out
 
 
-def _topic_routing_metadata(row: Mapping[str, Any]) -> dict[str, Any]:
-    """Derive legacy-note metadata when writing a replica, never in search.
-
-    Imported notes already carry this boolean. Old hub rows acquire it on
-    replica import as well, without adding body text to metadata or payloads.
-    Every topic with a body also gets ``_page_chars``, its length.
-    """
+def _topic_page_metadata(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive topic metadata when writing a replica, never in search: every
+    topic with a body gets ``_page_chars``, its length."""
     item = dict(row)
     if "body" not in row or "frontmatter" not in row:
         return item
@@ -8277,18 +8270,6 @@ def _topic_routing_metadata(row: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(row.get("body"), str):
             fm = {**fm, "_page_chars": len(row["body"])}
             item["frontmatter"] = fm
-        if type(fm.get("_routing_state_claim")) is bool:
-            return item
-        if not fm.get("note_source") and not str(row.get("slug") or "").startswith("note:"):
-            return item
-        from khipu.routing_scanner import has_routing_claim
-
-        item["frontmatter"] = {
-            **fm, "_routing_state_claim": has_routing_claim(
-                str(fm.get("note_source") or row.get("slug") or ""),
-                str(row.get("body") or ""),
-            ),
-        }
     except Exception:  # noqa: BLE001 — advisory; never log source or exception text
         pass
     return item
@@ -8380,15 +8361,11 @@ def snapshot_row_metadata(
                 topic_ids,
             ).fetchall():
                 proj = None
-                routing_claim = None
                 page_chars = None
                 if frontmatter:
                     try:
                         fm = json.loads(frontmatter)
                         proj = fm.get("project")
-                        flag = fm.get("_routing_state_claim")
-                        if type(flag) is bool:
-                            routing_claim = flag
                         size = fm.get("_page_chars")
                         if type(size) is int:
                             page_chars = size
@@ -8397,7 +8374,7 @@ def snapshot_row_metadata(
                 meta[("topic", slug)] = {
                     "ts": ts, "status": status or "active", "project": proj,
                     "deleted": deleted is not None, "superseded_by": superseded_by,
-                    "_routing_state_claim": routing_claim, "page_chars": page_chars,
+                    "page_chars": page_chars,
                 }
     for r in rows:
         row_kind = r.get("kind")
@@ -8418,8 +8395,6 @@ def snapshot_row_metadata(
             item["status"] = m["status"]
         if m.get("superseded_by"):
             item["superseded_by"] = m["superseded_by"]
-        if type(m.get("_routing_state_claim")) is bool:
-            item["_routing_state_claim"] = m["_routing_state_claim"]
         if m.get("page_chars") is not None:
             item["page_chars"] = int(m["page_chars"])
         if m.get("placeholder_summary"):

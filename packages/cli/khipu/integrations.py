@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Per-harness native packs — the engine under the Integrations pane (P3 step 4).
 
 Scope locked 2026-08-17 (agent-integration note § "Integrations pane"): one

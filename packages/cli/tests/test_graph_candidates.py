@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Unit tests for khipu.graph_candidates' replica (SQLite) backend, against
 the synthetic corpus (tests.fixtures.corpus) — no database, no network. The
 hub (PostgreSQL) backend is covered separately, with real SQL, in

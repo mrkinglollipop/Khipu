@@ -1,12 +1,11 @@
 """Owner changes keep their recovery identity before any mutation."""
 from __future__ import annotations
 
-import json
 from contextlib import nullcontext
 
 import pytest
 
-from khipu import ledger, ledger_import, owed_tidy, owner_direction
+from khipu import owed_tidy, owner_direction
 
 
 @pytest.fixture(autouse=True)
@@ -150,40 +149,3 @@ def test_tidy_undo_survives_lost_finish(monkeypatch, change):
     out = owner_direction.undo(action_id, "direction")
     assert out["reapplied" if change == "undo" else "restored"] == 2
     assert seen == [batch]
-
-
-@pytest.mark.parametrize("replacement", ["After", None])
-def test_directed_import_undo_identifies_the_file_bytes_actually_imported(tmp_path, monkeypatch, replacement):
-    monkeypatch.setattr(ledger_import, "done_imports", lambda *_a: [])
-    tracker = tmp_path / "tracker.json"
-    tracker.write_text(json.dumps({"rows": {"item": {"title": "Before", "state": "open", "kind": "slice"}}}))
-    reads = []
-    real_read = ledger_import.read_tracker
-
-    def read(path):
-        reads.append(str(path))
-        return real_read(path)
-
-    monkeypatch.setattr(ledger_import, "read_tracker", read)
-    owner_direction.gate(owner_direction.intent("ledger.import", str(tracker), facts={"project": "test/project"}))
-    if replacement is None:
-        tracker.unlink()
-    else:
-        tracker.write_text(json.dumps({"rows": {"item": {"title": replacement, "state": "open", "kind": "slice"}}}))
-    monkeypatch.setattr(ledger, "_ledger_lock", nullcontext)
-    monkeypatch.setattr(ledger, "drain", lambda _conn: None)
-    monkeypatch.setattr(ledger_import, "in_inbox", lambda _path: False)
-    saved = {}
-
-    def transaction(conn, project, src, report, **kw):
-        saved.update(src)
-        return dict(report, result="done")
-
-    monkeypatch.setattr(ledger_import, "_import_locked", transaction)
-    report = ledger_import.run_import(tracker, "test/project", conn=object())
-    owner_direction.finish(report)
-    action = owner_direction.actions()[0]
-    assert action["before"]["digest"] == saved["digest"]
-    assert saved["rows"]["item"]["title"] == "Before"
-    assert reads == [str(tracker)]
-    assert "rows" not in action["before"]

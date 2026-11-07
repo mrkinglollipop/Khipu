@@ -1332,9 +1332,8 @@ def _legacy_landed_line(original: Any, incoming: Any) -> bool:
 def _legacy_preferences_contained(original: Any, incoming: Any) -> bool:
     """A memory-file line whose every preference is on the hub row (which may
     hold more, in another order) and whose other fields pass
-    ``_legacy_landed_line``. Never a drain proof: only the owner's
-    ``khipu outbox merge-line-preferences`` resolves such a line, as
-    ``preferences_contained``."""
+    ``_legacy_landed_line``. Never a drain proof: it only re-proves the
+    ``preferences_contained`` records the old owner merge archived."""
     if not isinstance(original, dict) or not isinstance(incoming, dict):
         return False
     line, stored = incoming.get("preferences"), original.get("preferences")
@@ -1513,7 +1512,7 @@ def _span_rewound(stored: dict[str, Any], incoming: dict[str, Any]) -> bool:
 
 def _span_lacks(stored: Any, incoming: Any) -> list[str] | None:
     """Whether a row's raw spans a capture, as a pure function of the two, so a
-    resolution record proves itself later (``khipu outbox span-covered``).
+    resolution record proves itself later.
 
     None unless ``_span_contains``, ``_span_same_window`` and not
     ``_span_rewound``. Otherwise ``_evidence_lacks``, which is ``[]`` when the
@@ -2008,7 +2007,7 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
                     # capture, every piece of its evidence on the episode. Anything
                     # less is retained, including the same capture holding content
                     # the episode lacks: the drain merges nothing (a merge into an
-                    # existing row is the owner's, outbox_preferences).
+                    # existing row is the owner's).
                     if not target or payload_sha256(stored_raw) != source["payload_sha256"]:
                         lacks = None if sibling_summary else _replay_lacks(stored_raw, payload)
                         if lacks == []:

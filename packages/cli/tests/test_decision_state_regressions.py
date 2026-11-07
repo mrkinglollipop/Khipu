@@ -1,4 +1,4 @@
-"""Regressions for decision state on restatements, API gaps, and topic: briefs."""
+"""Regressions for decision state on restatements and API gaps."""
 from __future__ import annotations
 
 import contextlib
@@ -10,7 +10,7 @@ from unittest import mock
 
 import pytest
 
-from khipu import briefs, decisions as de, reflect
+from khipu import decisions as de
 from tests.fact_seed import announce
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 
@@ -96,9 +96,8 @@ def test_retraction_survives_forgetting_the_original_episode(hub):  # noqa: F811
     cur.execute("SELECT id FROM decisions WHERE episode_id = %s", (a,))
     assert de.retract(cur, cur.fetchone()[0], "wrong")
     cur.execute("UPDATE episodes SET deleted_at = now() WHERE id = %s", (a,))
-    sources = reflect._episode_sources(cur, [b])
-    lines = sources[b]["decisions"]
-    assert lines == [], f"offered to the model: {lines!r}"
+    rows = de.decision_rows_for_episodes(cur, [b], with_text=True)[b]
+    assert [r["state"] for r in rows] == ["retracted"], rows
 
 
 def _episode_at(cur, ts, decisions, topics=("alpha",), project=PROJECT):
@@ -132,122 +131,3 @@ def test_hub_down_get_reports_decision_states_from_the_replica():
     assert "decision_states" in row and "validity" in row, sorted(row)
     assert row["decision_states"][0]["state"] == "superseded"
     assert row["validity"]["superseded"] == 1
-
-
-def test_topic_citation_fetches_the_text_that_was_offered(hub):  # noqa: F811
-    """With a current brief, reflect offers the brief under topic:<slug>;
-    khipu_get / topic_detail must return that same body, not the wiki page."""
-    from khipu import activity, db, features
-
-    hub.migrate()
-    db._TABLE_COLUMNS_CACHE.clear()
-
-    @contextlib.contextmanager
-    def fake_connect(*a, **k):
-        yield hub.connect()
-
-    with hub.connect() as conn, conn.cursor() as cur:
-        announce(cur)
-        e = _episode_at(cur, T0, [])
-        brief_body = f"- plan stands [episode:{e}]"
-        cur.execute(
-            "INSERT INTO topics (slug, title, body) VALUES ('alpha', 'Alpha', 'PAGE BODY')"
-        )
-        cur.execute(
-            "INSERT INTO briefs (topic_slug, body, claims, source_episode_ids, source_hash, "
-            "derivation_version, state) VALUES ('alpha', %s, '[]'::jsonb, %s::bigint[], 'h', %s, "
-            "'current')",
-            (brief_body, [e], briefs.DERIVATION_VERSION),
-        )
-        conn.commit()
-        current = {"found": True, "state": "current", "body": brief_body}
-        with mock.patch.object(features, "enabled", lambda name: name == "briefs"), \
-                mock.patch.object(briefs, "read_brief", lambda c, s: current):
-            offered = reflect._topic_sources(cur, ["alpha"])["alpha"]["summary"]
-    with mock.patch.object(features, "enabled", lambda name: name == "briefs"), \
-            mock.patch.object(briefs, "read_brief", lambda c, s: current), \
-            mock.patch.object(activity, "connect", fake_connect):
-        fetched = activity.topic_detail("alpha")["body"]
-    assert offered == brief_body
-    assert offered == fetched, f"offered {offered!r} but get returns {fetched!r}"
-
-
-def test_brief_topic_page_marks_source_and_uses_brief_id_as_hash(hub):  # noqa: F811
-    """A brief page must not reuse the wiki content_hash: paging guards on
-    (content_hash, updated_at), so a brief→wiki flip mid-page would splice
-    undetected if the hash stayed the wiki's."""
-    from khipu import activity, db, features
-
-    hub.migrate()
-    db._TABLE_COLUMNS_CACHE.clear()
-
-    @contextlib.contextmanager
-    def fake_connect(*a, **k):
-        yield hub.connect()
-
-    with hub.connect() as conn, conn.cursor() as cur:
-        announce(cur)
-        e = _episode_at(cur, T0, [])
-        brief_body = f"- plan stands [episode:{e}]"
-        cur.execute(
-            "INSERT INTO topics (slug, title, body, content_hash) "
-            "VALUES ('alpha', 'Alpha', 'PAGE BODY', 'wiki-hash')"
-        )
-        cur.execute(
-            "INSERT INTO briefs (topic_slug, body, claims, source_episode_ids, source_hash, "
-            "derivation_version, state) VALUES ('alpha', %s, '[]'::jsonb, %s::bigint[], 'h', %s, "
-            "'current') RETURNING id",
-            (brief_body, [e], briefs.DERIVATION_VERSION),
-        )
-        brief_id = int(cur.fetchone()[0])
-        conn.commit()
-        current = {
-            "found": True, "state": "current", "body": brief_body, "brief_id": brief_id,
-        }
-    with mock.patch.object(features, "enabled", lambda name: name == "briefs"), \
-            mock.patch.object(briefs, "read_brief", lambda c, s: current), \
-            mock.patch.object(activity, "connect", fake_connect):
-        page = activity.topic_detail("alpha")
-    assert page["body"] == brief_body
-    assert page.get("source") == "brief", page
-    assert page["content_hash"] == str(brief_id), page["content_hash"]
-    assert page["content_hash"] != "wiki-hash"
-
-
-def test_wiki_flag_returns_the_raw_topic_page_when_briefs_are_on(hub):  # noqa: F811
-    """With briefs on, callers must still be able to read the wiki page."""
-    from khipu import activity, db, features
-
-    hub.migrate()
-    db._TABLE_COLUMNS_CACHE.clear()
-
-    @contextlib.contextmanager
-    def fake_connect(*a, **k):
-        yield hub.connect()
-
-    with hub.connect() as conn, conn.cursor() as cur:
-        announce(cur)
-        e = _episode_at(cur, T0, [])
-        brief_body = f"- plan stands [episode:{e}]"
-        cur.execute(
-            "INSERT INTO topics (slug, title, body, content_hash) "
-            "VALUES ('alpha', 'Alpha', 'PAGE BODY', 'wiki-hash')"
-        )
-        cur.execute(
-            "INSERT INTO briefs (topic_slug, body, claims, source_episode_ids, source_hash, "
-            "derivation_version, state) VALUES ('alpha', %s, '[]'::jsonb, %s::bigint[], 'h', %s, "
-            "'current') RETURNING id",
-            (brief_body, [e], briefs.DERIVATION_VERSION),
-        )
-        brief_id = int(cur.fetchone()[0])
-        conn.commit()
-        current = {
-            "found": True, "state": "current", "body": brief_body, "brief_id": brief_id,
-        }
-    with mock.patch.object(features, "enabled", lambda name: name == "briefs"), \
-            mock.patch.object(briefs, "read_brief", lambda c, s: current), \
-            mock.patch.object(activity, "connect", fake_connect):
-        page = activity.topic_detail("alpha", wiki=True)
-    assert page["body"] == "PAGE BODY", page["body"]
-    assert page["content_hash"] == "wiki-hash"
-    assert page.get("source") != "brief"

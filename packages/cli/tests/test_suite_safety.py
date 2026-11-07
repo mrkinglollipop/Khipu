@@ -89,7 +89,7 @@ class LiveResourceSafetyTest(unittest.TestCase):
         self.assertIsNotNone(module._SKIP_REASON)
 
     def test_scratch_requires_opt_in_before_connecting(self):
-        for name in ("test_pg_scratch", "test_briefs_scratch"):
+        for name in ("test_pg_scratch",):
             with self.subTest(module=name), mock.patch.dict(os.environ, {
                 "KHIPU_SCRATCH_DSN": "postgresql://u@127.0.0.1/production_scratch_archive",
             }, clear=True), mock.patch("psycopg.connect") as connect:

@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """khipu-recall-client — ask the warm recall service (khipu.recall_daemon) for
 one prompt's answer. Standard library only and no khipu package import, so it
 starts under ``python3 -S -E -B`` in a few milliseconds; the whole point of

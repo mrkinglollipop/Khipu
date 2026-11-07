@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """What Khipu knows about T3 Code (pingdotgg/t3code), read-only.
 
 T3 lets one thread switch provider and account mid-conversation. Three facts of

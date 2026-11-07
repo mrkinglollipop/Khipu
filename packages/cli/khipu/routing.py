@@ -6589,9 +6589,9 @@ def runner_cap_flags(view: dict, account: str | None = None) -> list[dict]:
     report only: the runner's files are read through routing_sources'
     registration, never written, and no runner number becomes a fact.
     When ``account`` (a key) is given, only that account's flags are kept."""
-    from khipu import routing_scanner, routing_sources
+    from khipu import routing_runner_caps, routing_sources
 
-    return routing_scanner.compare_runner_caps(
+    return routing_runner_caps.compare_runner_caps(
         routing_sources.runner_budget_declarations(view.get("source_cache") or {}),
         view.get("accounts") or [], account_key=account)
 
@@ -10577,16 +10577,6 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     recipients = delivery.get("recipients") or {}
     out["changes"] = [dict(change, recipients=recipients.get(change.get("version")))
                        for change in out["changes"]]
-    # Owner-local only: file paths and quoted owner words from the scan
-    # report never enter the fold or any routing delivery projection.
-    from khipu import routing_scan_report
-
-    try:
-        out["routing_file_copies"] = routing_scan_report.report(now)
-    except Exception:  # noqa: BLE001 - a damaged scan report must not break the route view
-        out["routing_file_copies"] = {"status": "not_checked", "scanned_at": None,
-                                      "files_checked": 0, "hits": [], "hits_total": 0,
-                                      "more_not_shown": 0, "too_large": []}
     return out
 
 

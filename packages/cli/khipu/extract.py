@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Transcript → durable-memory extraction (the LLM step of capture).
 
 Khipu's role in the harnesses that already have a legacy extractor (Claude Code,
@@ -319,7 +316,7 @@ def _generate_gemini(prompt: str, *, model_id: str, timeout: int, retries: int,
     }).encode("utf-8")
     last: Exception | None = None
     for attempt in range(retries + 1):
-        # Every cloud synth caller (captures, briefs, hygiene, rerank) reaches
+        # Every cloud synth caller (captures, hygiene, rerank) reaches
         # the network only here, so this is the daily ceiling's single gate.
         # BudgetExhausted propagates unwrapped, before the request is sent.
         _synth_budget_take()

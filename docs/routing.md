@@ -633,18 +633,6 @@ and rule upkeep: expired deadlines, overlapping rules, roles repeating rules
 and edits pending over 24 hours. Follow its links to edit owner state; checks
 themselves stop or change nothing.
 
-It also lists routing claims found in approved instruction and memory files,
-with file and line. Khipu marks them superseded by its record and never edits
-those files. The bounded report and quoted words stay local to the owner in
-`state/routing/scan-report.json`.
-
-The scan includes `~/.claude/CLAUDE.md`, `~/.claude/AGENTS.md`,
-`~/.codex/AGENTS.md`, `~/AGENTS.md`, root `CLAUDE.md` and `AGENTS.md` files for
-projects Khipu already knows, and imported memory notes. It never walks for
-arbitrary repositories. Files over 1,000,000 bytes are skipped, quotes are
-limited to 140 characters, and at most 50 hits per file and 500 total are shown,
-with omissions counted.
-
 The Home screen has a Routing card with one row per account, holds, your note, a priority headline, and attention items (a broken rule, a silent runner, two sources that disagree). It also has a Plans card for usage.
 
 **CLI equivalent.** Owner commands use the verified app path, eligible `--owner-direction` (also through `khipu_owner_act`), or typed confirmation in a standalone terminal:

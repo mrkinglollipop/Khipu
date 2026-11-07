@@ -1,5 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
-# Sonnet build agent (brief: do not delegate); no further agent to route to.
 """Provider dispatch for embed_batch / embed_one (library sources + BYO
 embeddings, Session A): the voyage and openai-compatible adapters, keyed on
 the profile's provider, over a fake transport. No network, no database, no

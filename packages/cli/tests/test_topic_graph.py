@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from khipu import graph_sync as gs
-from khipu.mirror import _upsert_topic, backfill_topic_graph, parse_topic_file
+from khipu.mirror import _upsert_topic, parse_topic_file
 from khipu.topic_graph import (
     KHIPU_BUCKET,
     LIVES_IN_EDGE,
@@ -259,36 +259,6 @@ class EnrichTest(unittest.TestCase):
             self.assertIn(key, out[0])
         self.assertTrue(any("uw-intro-acut-fill-2026-07-26" in p for p in out[0]["paths"]))
         self.assertEqual(out[0]["neighbors"][0]["type"], LIVES_IN_EDGE)
-
-
-class DryRunBackfillTest(unittest.TestCase):
-    def test_dry_run_reports_column_and_graph_counts(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            topics = root / "topics"
-            topics.mkdir()
-            (topics / "demo.md").write_text(
-                "---\ntitle: Demo\nlinks:\n  - other\n---\n\nSee `foo/bar/baz/` here.\n",
-                encoding="utf-8",
-            )
-            fake_conn = mock.MagicMock()
-            cur = mock.Mock()
-            cur.fetchone.return_value = ([], {})
-            cur.fetchall.return_value = []
-            fake_conn.cursor.return_value.__enter__.return_value = cur
-            fake_conn.cursor.return_value.__exit__.return_value = False
-
-            with mock.patch("khipu.db.connect") as connect:
-                connect.return_value.__enter__.return_value = fake_conn
-                connect.return_value.__exit__.return_value = False
-                stats = backfill_topic_graph(root, dry_run=True)
-        self.assertTrue(stats["dry_run"])
-        self.assertEqual(stats["topics"], 1)
-        self.assertGreaterEqual(stats["column_updates"], 1)
-        self.assertGreaterEqual(stats["nodes_minted"], 1)
-        self.assertGreaterEqual(stats["edges_minted"], 1)
-        fake_conn.rollback.assert_called()
-        fake_conn.commit.assert_not_called()
 
 
 class ConversationMemoryToggleTest(unittest.TestCase):
