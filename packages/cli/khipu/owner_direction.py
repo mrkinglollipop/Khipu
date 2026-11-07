@@ -1005,19 +1005,32 @@ _ASK_ALONE = ("Not confirmed: this can't be taken back, so a yes to a list never
               "Ask the owner about it on its own: {ask} Once they reply, call direction.confirm again.")
 
 
+def permanent(request: dict) -> bool:
+    """A held request that can't be taken back (class C), one mirrored from
+    another Mac included (its holder says so; a forget or a purge always is)."""
+    remote = request.get("remote")
+    if request.get("action") == "direction.remote" and isinstance(remote, dict):
+        return remote.get("permanent") is True or class_c(str(remote.get("action") or ""), None)
+    return class_c(request.get("action", ""), request.get("args"))
+
+
 def _listed_since_asked(state: dict, request: dict, session: str) -> bool:
-    """A class C request this conversation read the list after its own ask:
-    the owner's next yes may answer the list, so it is asked alone again."""
-    if not class_c(request.get("action", ""), request.get("args")):
+    """A class C request this conversation read the list after its own ask
+    here: the owner's next yes may answer the list, so it is asked alone
+    again. Each conversation's own ask counts only for that conversation."""
+    if not permanent(request):
         return False
-    asked = _float(request.get("asked_ts") or request.get("created_ts"))
+    asked = _float(((request.get("asked_alone") or {}).get(session)) or request.get("created_ts"))
     return any(r.get("action") == READ_ACTION and r.get("session") == session and _float(r.get("settled_ts")) > asked
                for r in state["requests"])
 
 
 def _ask_alone(environ, session: str, request: dict, now: float, *, t3_member: bool) -> None:
-    """Put a class C request's own ask again: only a message after now answers it."""
-    request["asked_ts"] = now
+    """Put a class C request's own ask again in this conversation: only a
+    message after now answers it here."""
+    if not isinstance(request.get("asked_alone"), dict):
+        request["asked_alone"] = {}
+    request["asked_alone"][session] = now
     if t3_member:
         thread = _t3_refusals(environ, session)
         snapshots = request.get("t3_snapshots")

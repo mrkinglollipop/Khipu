@@ -552,7 +552,8 @@ def _request_rows():
         out.append((str(row["id"]), "held", state, str(row.get("action") or ""),
                     _sig(owner_direction.signature(row["action"], row["args"])), row.get("created_at"), ask, withheld,
                     (row.get("by") or {}).get("harness") if isinstance(row.get("by"), dict)
-                    and row["by"].get("kind") in (None, "conversation") else None, blocked))
+                    and row["by"].get("kind") in (None, "conversation") else None, blocked,
+                    owner_direction.class_c(row["action"], row["args"])))
     config = load_config()
     for key, waiting in routing._setting_requests(config).items():
         if key not in routing.SETTINGS:
@@ -563,11 +564,11 @@ def _request_rows():
                  f"{needs_you._setting_value(kind, before)} to {needs_you._setting_value(kind, config.get(key))}.")
         out.append((f"setting:{key}", "setting", "pending", "config.answer_request",
                     _sig(routing.setting_request_pin(key, waiting, config.get(key))), waiting.get("at"), words, False,
-                    None, None))
+                    None, None, False))
     return out
 
 
-def _request_event(request, kind, state, action, sig, asked_at, ask, withheld, by=None, blocked=None):
+def _request_event(request, kind, state, action, sig, asked_at, ask, withheld, by=None, blocked=None, permanent=False):
     from khipu import owner_direction
 
     event = {"type": "request_state", "request": request, "req_kind": kind, "req_state": state, "sig": sig,
@@ -578,6 +579,9 @@ def _request_event(request, kind, state, action, sig, asked_at, ask, withheld, b
         event["asked_harness"] = by
     if blocked in owner_direction.UNAPPLYABLE_WORDS:
         event["req_blocked"] = blocked
+    if permanent is True:
+        # It can't be taken back (class C), so the other Mac asks it on its own too.
+        event["req_permanent"] = True
     if action and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", action):
         event["req_action"] = action
     if isinstance(asked_at, str) and asked_at:
@@ -591,7 +595,7 @@ def _emit_request_states(rows, state):
     sent = state.setdefault("requests_published", {})
     batch = []
     for row in rows:
-        request, kind, st, action, sig, asked_at, ask, withheld, by, blocked = row
+        request, kind, st, action, sig, asked_at, ask, withheld, by, blocked, *_ = row
         # A waiting request is sent again when its refusal reason appears; an
         # older line without the reason slot is sent once more to carry it.
         key = [st, sig, blocked or ""] if st == "pending" else [st, sig]
@@ -620,7 +624,7 @@ def publish_requests():
         # Whatever was sent as waiting and is no longer here, a setting answered
         # or a held request withdrawn or dropped, is told as gone, so no other
         # Mac keeps asking the owner about it.
-        gone = [(request, "setting" if request.startswith("setting:") else "held", "gone", "", sig, None, "", False, None, None)
+        gone = [(request, "setting" if request.startswith("setting:") else "held", "gone", "", sig, None, "", False, None, None, False)
                 for request, (st, sig, *_rest) in (state.get("requests_published") or {}).items()
                 if request not in seen and st == "pending"]
         stale_format = state.get("requests_format") != REQUEST_LINE_FORMAT
@@ -735,7 +739,7 @@ def mirror_remote_requests(state):
                              "files": None,
                              "remote": {"mac": mac, "request": request, "sig": row.get("sig"), "withheld": withheld,
                                         "kind": row.get("req_kind"), "action": row.get("req_action"),
-                                        "blocked": _blocked(row)}})
+                                        "blocked": _blocked(row), "permanent": row.get("req_permanent") is True}})
                 return True
             if current is None or current.get("state") not in ("pending", "answered", "applying"):
                 return False

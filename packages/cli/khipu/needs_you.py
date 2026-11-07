@@ -497,11 +497,14 @@ def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
                                  undo_does=f"Tells {where} no: it drops the request and nothing changes.",
                                  undo=decline))
                 continue
+            permanent = owner_direction.permanent(row)
             out.append(_item("held", f"held:{request}", f"On {where}, a conversation asked for a change, and it is "
                              f"held until you answer.{said}", by=by, at=row.get("created_at"),
-                             confirm_does=f"Tells {where} yes: it makes the change there within a few minutes.",
+                             confirm_does=f"Tells {where} yes: it makes the change there within a few minutes."
+                             + (" It can't be taken back, so it is asked on its own." if permanent else ""),
                              undo_does=f"Tells {where} no: it drops the request and nothing changes.",
-                             confirm=_act("direction.confirm", request=request), undo=decline))
+                             confirm=_act("direction.confirm", request=request), undo=decline,
+                             **({"permanent": True} if permanent else {})))
             continue
         reason = owner_direction.unapplyable_reason(row)
         if reason:
@@ -534,7 +537,7 @@ def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
                              at=at, decline_only=True, confirm_does="Nothing to confirm: it would be refused.",
                              undo_does="Drops the held request. Nothing changes.", undo=decline))
             continue
-        permanent = owner_direction.class_c(action or "", args if isinstance(args, dict) else None)
+        permanent = owner_direction.permanent(row)
         out.append(_item("held", f"held:{request}", f"A conversation asked to {phrase}, and it is held until you "
                          f"answer.{said}", by=by, at=at, confirm_does=f"Makes the change: {phrase}."
                          + (" It can't be taken back, so it is asked on its own." if permanent else ""),

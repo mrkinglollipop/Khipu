@@ -642,3 +642,28 @@ def test_a_label_is_derived_from_a_shared_id_when_no_mac_holds_one():
     assert routing._label_for_key("claude:second") == "Claude second"
     assert routing._label_for_key("codex:main") == "Codex"
     assert routing._label_for_key("claude|/some/home") == "Claude (home)"
+
+
+def test_a_forget_held_on_the_other_mac_is_never_settled_by_a_yes_to_a_list(macs, monkeypatch):
+    """Class C across Macs: B's list yes doesn't answer A's held forget; its own ask then a yes does."""
+    from khipu import forget
+
+    a, b = macs
+    both_on(a, b)
+    monkeypatch.setattr(forget, "unsent_forgets", lambda: {"ok": True, "strings": [], "count": 1,
+                                                           "ids": [{"id": 9, "summary": "the roof"}]})
+    a.say("forget the roof one on the hub too", "sF")
+    bad, held = a.act("forget.here", {"id": "9"}, "sF")
+    assert not bad and held["pending"] is True, held
+    request = held["request"]
+    sync_all(a, b)
+    b.say("what needs my confirmation?", "sB")
+    item = _item_on(b, request)
+    assert item.get("permanent") is True and "asked on its own" in item["confirm_does"], item
+    b.say("yes", "sB")
+    bad, out = b.act("direction.confirm", {"request": f"rm-{request}"}, "sB")
+    assert bad and out["code"] == "not_confirmed" and "list" in out["error"], out
+    assert not [e for e in (b.activate() or rr.remote_events()) if e.get("type") == "request_answer"]
+    b.say("yes, forget it", "sB")
+    bad, out = b.act("direction.confirm", {"request": f"rm-{request}"}, "sB")
+    assert not bad and out["sent"] is True, out

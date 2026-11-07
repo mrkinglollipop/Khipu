@@ -175,3 +175,31 @@ def test_what_cant_be_taken_back_still_settles_on_its_own_ask(world, front):
     ok, done = _confirm(held["request"])
     assert ok, done
     assert ran and ran[0][0] == "forget.here"
+
+
+def test_one_conversations_own_ask_never_clears_another_conversations_list_read(world):
+    """Two conversations read the held forget in a list and both get a yes. The
+    first one's confirm asks it on its own there; that ask is not the second
+    one's, so the second one's yes to its list still settles nothing."""
+
+    ran = _forget_waits(world)
+    _in_t3(world, "forget the roof one on the hub too")
+    ok, held = owner_act.act("forget.here", {"id": "9"})
+    assert ok and held["pending"] is True, held
+    _rule_added(world)
+    _in_t3(world, "what needs my confirmation?")
+    _read()
+    _in_claude_code(world, "what needs my confirmation?")
+    _read()
+    _in_claude_code(world, "yes")
+    _in_t3(world, "yes")
+    ok, refused = _confirm(held["request"])
+    assert not ok and refused["code"] == "not_confirmed", refused
+    _be_front(world, "claude_code:cli", TERMINAL)
+    ok, refused = _confirm(held["request"])
+    assert not ok and refused["code"] == "not_confirmed" and "list" in refused["error"], refused
+    assert not ran
+    _in_claude_code(world, "yes, forget it")
+    ok, done = _confirm(held["request"])
+    assert ok, done
+    assert ran and ran[0][0] == "forget.here"

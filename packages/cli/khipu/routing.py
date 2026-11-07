@@ -2129,7 +2129,8 @@ _REPLICATION_FIELDS: dict[str, dict[str, Any]] = {
     "request_state": {"request": "id", "req_kind": frozenset({"held", "setting"}),
                       "req_state": frozenset({"pending", "applied", "declined", "failed", "stale", "gone"}),
                       "req_action": "id", "sig": "revision_id", "asked_at": "time", "withheld": "bool",
-                      "asked_harness": "name", "req_blocked": frozenset({"expired", "out_of_date"})},
+                      "asked_harness": "name", "req_blocked": frozenset({"expired", "out_of_date"}),
+                      "req_permanent": "bool"},
     "request_answer": {"request": "id", "req_answer": frozenset({"confirm", "decline"}), "sig": "revision_id",
                        "answer_harness": "name", "message_sha": "revision_id"},
     # A pace reading crosses whole, under the shapes the fold reads it with
@@ -2593,7 +2594,8 @@ _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub
                  "batch_n", "window_mins")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
-                  "observed", "observed_turn", "session_logs", "silent", "unmatched", "receipt", "value_set", "enabled", "snapshot", "withheld")
+                  "observed", "observed_turn", "session_logs", "silent", "unmatched", "receipt", "value_set", "enabled", "snapshot", "withheld",
+                  "req_permanent")
 _AUTHOR_FIELDS = ("kind", "harness", "project", "session", "provider_session", "name", "file", "mac")
 _HOLD_KINDS = ("account", "machine", "all")
 
