@@ -132,6 +132,7 @@ def test_refusal_no_recorded_turn_when_the_hook_did_not_run(world):
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check()
     assert err.value.code == "no_recorded_turn"
+    assert "prompt hook may not be installed" in str(err.value)
 
 
 def test_refusal_no_recorded_turn_for_a_dispatched_job(world):

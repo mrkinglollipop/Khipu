@@ -456,6 +456,18 @@ def test_a_failed_t3_lookup_never_hands_back_a_trusted_entrypoint(home, monkeypa
     assert not ok and why.startswith("Khipu could not read T3's record")
 
 
+def test_a_t3_file_without_its_thread_table_is_not_t3(home, monkeypatch):
+    # A leftover or odd T3 file (no thread table) must not make every plain turn "t3-unverified".
+    db = home["tmp"] / "other.sqlite"
+    with sqlite3.connect(db) as con:
+        con.execute("CREATE TABLE unrelated (id TEXT)")
+    monkeypatch.setenv("KHIPU_T3_DB", str(db))
+    assert owner_turns._t3_membership(SESSION) == "none"
+    entry = owner_turns.entrypoint_of("claude_code", {"CLAUDE_CODE_ENTRYPOINT": "cli"}, {}, SESSION)
+    assert entry == "cli"
+    assert owner_turns.eligible({"entrypoint": entry, "harness": "claude_code", "typed": True, "text": "x"})[0]
+
+
 def test_no_t3_database_keeps_the_native_entrypoint(home, monkeypatch):
     monkeypatch.setenv("KHIPU_T3_DB", str(home["tmp"] / "no-such-t3.sqlite"))
     assert owner_turns.entrypoint_of("claude_code", {"CLAUDE_CODE_ENTRYPOINT": "cli"}, {}, SESSION) == "cli"

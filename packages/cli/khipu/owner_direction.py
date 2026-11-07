@@ -259,7 +259,8 @@ def _recent_turn(session: str, conf: dict, now: float, recorded: list[dict] | No
         raise DirectionRefused("no_recorded_turn",
                                "The owner has not typed in this conversation, so it can't make an owner's change "
                                "(a background or dispatched job never can). Ask the owner to say it in a "
-                               "conversation they are typing in.")
+                               "conversation they are typing in. If they did, Khipu's prompt hook may not be "
+                               "installed in this front end.")
     turn = usable[-1]
     return turn
 
@@ -586,7 +587,8 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
                 if not usable:
                     raise DirectionRefused("no_recorded_turn",
                                            "The owner has not typed in this conversation, so it can't ask for an "
-                                           "owner's change (a background or dispatched job never can).")
+                                           "owner's change (a background or dispatched job never can). If they did, "
+                                           "Khipu's prompt hook may not be installed in this front end.")
                 seeded = _seed(None, session, signature(action, args))
                 extra = {**seeded, "seeded": True} if seeded else {
                     "asks": {session: _ask_boundary(None, turns_, now, session)}}
@@ -876,7 +878,8 @@ def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
     conf = owner_turns.settings()
     turn = next((t for t in reversed(recorded) if owner_turns.eligible(t, conf)[0]), None)
     if turn is None:
-        raise DirectionRefused("no_recorded_turn", "No typed owner reply was recorded in this conversation.")
+        raise DirectionRefused("no_recorded_turn", "No typed owner reply was recorded in this conversation. Khipu's "
+                                                   "prompt hook may not be installed in this front end.")
     asks = request.get("asks")
     if not isinstance(asks, dict):
         asks = request["asks"] = {}

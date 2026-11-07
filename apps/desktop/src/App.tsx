@@ -5986,6 +5986,7 @@ export default function App() {
               startItems={guideStartItems}
               setupKnown={{ prefs: guideSignals.prefsLoaded, signals: setupSignalsKnown }}
               states={guideRowStates}
+              hasT3={t3Health != null}
               open={guideOpen}
               onOpen={(id) => openGuide(id)}
               onBack={() => setGuideOpen(null)}

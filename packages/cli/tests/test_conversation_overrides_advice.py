@@ -170,7 +170,16 @@ def test_a_t3_thread_it_cannot_identify_gets_normal_pace(replay, tmp_path, monke
     _grant(replay)
     out = routing.advise("Claude", now=replay.now, environ=MINE)
     assert out["verdict"] == "hold_back"
-    assert out["override_refused"] == "Khipu can't identify this T3 thread, so it uses normal pace."
+    assert out["override_refused"] == "Khipu can't identify this conversation, so it uses normal pace."
+
+
+def test_a_t3_file_without_its_thread_table_still_names_a_native_session(tmp_path, monkeypatch):
+    path = tmp_path / "odd-t3.sqlite"
+    with sqlite3.connect(path) as con:
+        con.execute("CREATE TABLE unrelated (id TEXT)")
+    monkeypatch.setenv("KHIPU_T3_DB", str(path))
+    subj, why = overrides.subject(environ=MINE)
+    assert why is None and subj["kind"] == "session" and subj["id"] == "sess-mine"
 
 
 def test_an_override_for_a_whole_folder_reaches_each_conversation_in_it(replay, monkeypatch):
