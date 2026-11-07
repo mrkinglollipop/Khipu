@@ -346,7 +346,10 @@ def test_a_direction_from_a_session_with_no_owner_turn_is_refused_and_changes_no
         want = owner_direction.intent(ledger.DIRECTION_ACTIONS[name], "atlas#one")
         with pytest.raises(ledger.LedgerError) as err:
             ledger.require(name, by_direction=True, intent=want)
-        assert err.value.reason == "no_recorded_turn", name
+        # A class C change (purge) is refused before the turn is even looked at:
+        # it applies by direction only as a confirmed replay.
+        expected = "class_c" if owner_direction.class_c(want["action"], want.get("facts")) else "no_recorded_turn"
+        assert err.value.reason == expected, name
     assert work.read_links() == {"same": [], "not_same": []} and work.read_hidden() == {}
 
 
