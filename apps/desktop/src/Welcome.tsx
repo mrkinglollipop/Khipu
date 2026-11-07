@@ -5,7 +5,7 @@ import { resourceDir } from "@tauri-apps/api/path";
 import { Check, ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
 import { WorkingBanner } from "./WorkingBanner";
 import { Callout, Tag } from "./ui";
-import { SetupStages, plainWords } from "./SetupStages";
+import { SetupStages } from "./SetupStages";
 import type { SetupPhase, SetupPipelineResult } from "./SetupStages";
 import { buildAttention, type Attention } from "./doctorAttention";
 import { LABEL as HARNESS_LABEL } from "./IntegrationsPanel";
@@ -249,7 +249,6 @@ export function Welcome({
   const [joinPin, setJoinPin] = useState("");
   const [joinBusy, setJoinBusy] = useState(false);
   const [joinReady, setJoinReady] = useState(false);
-  const [joinedHub, setJoinedHub] = useState(false);
   const [joinExpected, setJoinExpected] = useState<Record<string, number> | null>(null);
   const [joinLive, setJoinLive] = useState<Record<string, number> | null>(null);
 
@@ -456,7 +455,6 @@ export function Welcome({
       }
       await refreshDsn();
       setJoinReady(true);
-      setJoinedHub(true);
       const mismatches = Array.isArray(counts?.mismatches)
         ? (counts.mismatches as string[])
         : [];

@@ -6,7 +6,6 @@ import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
-  CircleCheck,
   CircleMinus,
   Loader2,
   MessageSquare,
@@ -14,7 +13,6 @@ import {
   Search,
   Stethoscope,
   Trash2,
-  TriangleAlert,
   Waypoints,
   X,
 } from "lucide-react";
