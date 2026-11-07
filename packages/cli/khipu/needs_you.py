@@ -807,6 +807,23 @@ def _gather(now: datetime) -> tuple[list[dict], list[dict], dict | None]:
     return sorted(items, key=lambda it: rank[it["kind"]]), unread, view
 
 
+def _refresh_from_other_macs() -> None:
+    """When something listed could have been settled on another Mac (a request
+    it holds, or a setting a conversation asked for here, which a yes there
+    also answers), pull what the other Macs said first, so it is never asked
+    again here (``routing_replication.refresh_for_owner``)."""
+    try:
+        from khipu import routing_replication
+        from khipu.config import load_config
+
+        rows = owner_direction._read_requests(owner_direction.requests_path())
+        if any(r.get("remote") and r.get("state") == "pending" for r in rows) \
+                or routing._setting_requests(load_config()):
+            routing_replication.refresh_for_owner()
+    except Exception:  # noqa: BLE001 - the list still reads what is here
+        pass
+
+
 def waiting(*, kind: str | None = None, offset: int = 0, key: str | None = None, now: datetime | None = None,
             record_read: bool = True) -> dict:
     """The answer of ``khipu_needs_you``. Every read that fails is named in
@@ -814,6 +831,7 @@ def waiting(*, kind: str | None = None, offset: int = 0, key: str | None = None,
     words whole. Reading it is the ask (``owner_direction.note_read``)."""
     if key is not None and kind is not None:
         raise ValueError("key is one item: it takes no kind")
+    _refresh_from_other_macs()
     now = now or routing._now()
     caller = owner_direction.session_of()
     whole, clipped = _WHOLE.set(key is not None), _CLIPPED.set(False)
