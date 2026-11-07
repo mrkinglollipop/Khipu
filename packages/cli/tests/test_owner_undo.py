@@ -395,11 +395,9 @@ def test_an_owner_hold_whose_finish_was_lost_can_still_be_undone(world, monkeypa
 
 
 def test_a_purge_whose_finish_was_lost_is_scheduled_and_can_be_cancelled(world, monkeypatch):
-    world.say()
     restore = _no_finish(monkeypatch)
-    world.say()
-    rc, out = world.run(["ledger", "purge", "R1", "--project", "atlas", "--json"], True)
-    assert rc == 0, out
+    ok, out = base.run_confirmed(world, "ledger.purge", {"id": "R1", "project": "atlas"}, "yes, purge R1")
+    assert ok, out
     restore()
     (line,) = owner_direction.actions()
     assert line["state"] == "unconfirmed" and line["runs_at_ts"] > owner_direction._clock()
@@ -412,9 +410,9 @@ def test_a_purge_whose_finish_was_lost_is_scheduled_and_can_be_cancelled(world, 
 def test_a_lost_finish_purge_runs_on_its_day_and_then_says_it_ran(world, monkeypatch):
     from khipu import ledger
 
-    world.say()
     restore = _no_finish(monkeypatch)
-    rc, out = world.run(["ledger", "purge", "R1", "--project", "atlas", "--json"], True)
+    ok, out = base.run_confirmed(world, "ledger.purge", {"id": "R1", "project": "atlas"}, "yes, purge R1")
+    assert ok, out
     restore()
     (line,) = owner_direction.actions()
     purged = []

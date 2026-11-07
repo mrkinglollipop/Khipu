@@ -1,7 +1,8 @@
 """A conversation's priority request waiting for the owner, settled by
-talking to a conversation (2026-11-03): an owner amend asked for while it
-waits says so at ask time and its one yes confirms the request as shown,
-then applies the amendment; route.priority.confirm and route.priority.undo
+talking to a conversation (2026-11-03): an owner amend held for his yes
+(``direction.request``) while it waits says so at ask time and its one yes
+confirms the request as shown, then applies the amendment; an amend made at
+once never confirms it (2026-11-07); route.priority.confirm and route.priority.undo
 work end to end through a T3 held request; confirming clears "the owner has
 not confirmed"; priority writes answer with a short receipt, and a since=
 read that shows the priority counts as shown.
@@ -54,6 +55,13 @@ def _ask_in_t3(world, action: str, args: dict):
     return owner_act.act(action, args)
 
 
+def _hold_amend(world, args: dict):
+    """An amend the agent holds for the owner's yes (``direction.request``):
+    the one way an amend's ask may name a waiting request, so his yes
+    settles both."""
+    return _ask_in_t3(world, "direction.request", {"action": "route.priority.amend", "args": args})
+
+
 def _owner_says_yes(world) -> str:
     mid = world["t3"].message(THREAD, time.time() + 1, text="Yes confirm")
     _t3_hook_turn(prompt="Yes confirm")
@@ -73,7 +81,7 @@ def _proposal_status() -> str:
 
 def test_an_amend_while_a_request_waits_is_held_with_an_ask_naming_both_and_one_yes_settles_both(world):
     version = _pending_request(world)
-    ok, out = _ask_in_t3(world, "route.priority.amend",
+    ok, out = _hold_amend(world,
                          {"account": "Claude", "append": "and the docs", "expect": version})
     assert ok and out["pending"] is True and out["applied"] is False, out
     ask = out["ask"]
@@ -102,7 +110,7 @@ def test_an_amend_while_a_request_waits_is_held_with_an_ask_naming_both_and_one_
 
 def test_a_newer_request_landing_before_the_yes_is_refused_never_confirmed_unseen(world):
     version = _pending_request(world)
-    ok, out = _ask_in_t3(world, "route.priority.amend",
+    ok, out = _hold_amend(world,
                          {"account": "Claude", "append": "and the docs", "expect": version})
     assert ok and out["pending"] is True, out
     # A newer request from a third conversation lands before the owner answers.
@@ -126,16 +134,33 @@ def test_an_amend_on_an_older_version_is_refused_at_ask_time(world):
     assert not owner_direction.requests_path().exists()
 
 
-def test_an_owners_instant_amend_while_a_request_waits_is_held_not_applied(world):
-    """The owner typed the amend, never a yes to the waiting request's words:
-    the amend that would confirm it waits for his answer to the ask."""
+@pytest.mark.parametrize("front", ["claude_code", "t3"])
+def test_an_owners_own_amend_while_a_request_waits_never_confirms_it(world, front):
+    """Class A (2026-11-07): the owner's own amend is no longer held. Made at
+    once while another conversation's request waits, it must never take that
+    request live: it is refused naming the settles, nothing is written or
+    logged, and the request stays waiting, pinned as it was, on Needs you."""
+    from khipu import needs_you
+
     version = _pending_request(world)
-    _front_end_turn(world, "claude_code:cli", "s-direct")
-    _be_front(world, "claude_code:cli", "s-direct")
-    ok, out = owner_act.act("route.priority.amend", {"account": "Claude", "append": "and docs", "expect": version})
-    assert ok and out["pending"] is True and out["applied"] is False, out
-    assert "Codex takes the release work this week" in out["ask"]
-    assert routing.read_view()["priority"]["pending"] is True and _roles()["Claude"] == "main work"
+    pin = routing.pending_priority_pin(routing.read_view())
+    args = {"account": "Claude", "append": "and docs", "expect": version}
+    if front == "t3":
+        ok, out = _ask_in_t3(world, "route.priority.amend", args)
+    else:
+        _front_end_turn(world, "claude_code:cli", "s-direct")
+        _be_front(world, "claude_code:cli", "s-direct")
+        ok, out = owner_act.act("route.priority.amend", args)
+    assert not ok and out["code"] == "priority_pending", out
+    assert "route.priority.confirm" in out["error"] and "route.priority.undo" in out["error"], out
+    assert not owner_direction.requests_path().exists()  # not held either
+    view = routing.read_view()
+    assert view["priority"]["pending"] is True and routing.pending_priority_pin(view) == pin
+    assert view["priority_version"] == version and _proposal_status() == "live"
+    assert _roles() == {"Claude": "main work", "Codex": "reviews"}
+    assert owner_direction.actions() == []
+    assert any((i["settle"].get("confirm") or {}).get("action") == "route.priority.confirm"
+               for i in needs_you.waiting()["items"]), "the request is still on Needs you"
 
 
 def test_confirm_pending_with_nothing_waiting_is_refused(world):
@@ -156,7 +181,7 @@ def test_the_owner_write_refusal_names_confirm_and_undo(world):
 
 def test_undoing_the_one_step_amend_puts_the_waiting_request_back(world):
     version = _pending_request(world)
-    ok, out = _ask_in_t3(world, "route.priority.amend", {"account": "Claude", "append": "and docs",
+    ok, out = _hold_amend(world, {"account": "Claude", "append": "and docs",
                                                          "expect": version})
     _owner_says_yes(world)
     ok, done = _confirm_id(out["request"])
@@ -307,7 +332,7 @@ def test_a_level_the_request_drops_is_named_in_the_ask_never_no_change(world):
     version = _owner_then_request(world, [{"account": "Claude", "role": "main work"},
                                           {"account": "Codex", "role": "reviews", "level": LEVEL}],
                                   [{"account": "Claude", "role": "main work"}, {"account": "Codex", "role": "reviews"}])
-    ok, out = _ask_in_t3(world, "route.priority.amend", {"account": "Claude", "append": "x", "expect": version})
+    ok, out = _hold_amend(world, {"account": "Claude", "append": "x", "expect": version})
     assert ok and out["pending"] is True, out
     ask = out["ask"]
     assert "no change" not in ask, ask
@@ -331,7 +356,7 @@ def test_a_first_priority_requests_end_is_named(world):
     assert out["ok"] is True, out
     changes = routing.pending_priority_changes(routing.read_view())
     assert "whole priority until 2029-06-01T00:00:00Z" in changes, changes
-    ok, held = _ask_in_t3(world, "route.priority.amend", {"account": "Claude", "append": "x",
+    ok, held = _hold_amend(world, {"account": "Claude", "append": "x",
                                                           "expect": routing.priority_version()})
     assert ok and "whole priority until 2029-06-01T00:00:00Z" in held["ask"], held
 
@@ -426,7 +451,7 @@ def test_an_amend_whose_request_has_a_change_with_no_words_is_refused_at_ask_tim
         return view
 
     monkeypatch.setattr(routing, "read_view", odd)
-    ok, out = _ask_in_t3(world, "route.priority.amend", {"account": "Claude", "append": "x", "expect": version})
+    ok, out = _hold_amend(world, {"account": "Claude", "append": "x", "expect": version})
     assert not ok and out["code"] == "priority_pending", out
     assert "route.priority.confirm" in out["error"] and "route.priority.undo" in out["error"], out
     assert "colour" in out["error"], out
@@ -451,7 +476,7 @@ def test_the_priority_replaced_changing_under_an_unmoved_version_is_refused_at_t
     waiting["hlc"] = dict(waiting["hlc"], wall=owner["hlc"]["wall"] + 10, counter=0)
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))
     version = routing.priority_version()
-    ok, out = _ask_in_t3(world, "route.priority.amend", {"account": "Claude", "append": "and docs",
+    ok, out = _hold_amend(world, {"account": "Claude", "append": "and docs",
                                                          "expect": version})
     assert ok and out["pending"] is True, out
     assert "Codex takes the release work this week" in out["ask"]
@@ -480,7 +505,7 @@ def test_confirm_pending_on_an_owner_turn_without_an_ask_is_refused(world):
     pin = routing.pending_priority_pin(routing.read_view())
     _front_end_turn(world, "claude_code:cli", "s-direct")
     _be_front(world, "claude_code:cli", "s-direct")
-    owner_direction.check("route.priority.amend", instant=True)  # the turn is the owner's
+    owner_direction.check("route.priority.amend")  # the turn is the owner's
     head, positionals = owner_act.argv("route.priority.amend", {"account": "Claude", "append": "x",
                                                                 "expect": version, "confirm_pending": pin})
     ok, out = owner_act._run("route.priority.amend", owner_act.full_argv(head, positionals, ["--owner-direction"]))

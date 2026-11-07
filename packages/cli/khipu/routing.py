@@ -8451,7 +8451,7 @@ def pending_amend_refusal(version: str, *, combine: bool = True) -> str:
            f"it before amending it (khipu_owner_act route.priority.confirm or route.priority.undo, each with expect "
            f"{version})")
     if combine:
-        out += (", or ask for the amend again through khipu_owner_act, whose ask names that request so one yes "
+        out += (", or hold the amend with khipu_owner_act direction.request, whose ask names that request so one yes "
                 "confirms it and applies the amendment")
     return out
 

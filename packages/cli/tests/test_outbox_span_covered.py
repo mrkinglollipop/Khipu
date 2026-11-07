@@ -592,7 +592,7 @@ def test_a_summary_only_job_can_retire_and_every_word_says_what_that_costs(pg):
     assert hub_text(pg, "A summary found nowhere else") == 0
     (record,) = records()
     assert record["queued_evidence"]["payload"]["summary"] == "A summary found nowhere else in the hub"
-    ask = owner_direction.CONFIRM_ONLY[span.ACTION]
+    ask = owner_direction.PLANNED_ASKS[span.ACTION]
     assert "Summaries are not compared" in ask and "does not prove the same text" in ask
     assert "stays only in the local record" in ask and "proves" not in ask
 

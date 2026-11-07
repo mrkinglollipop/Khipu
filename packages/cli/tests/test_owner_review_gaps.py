@@ -40,7 +40,7 @@ def test_other_thread_read_cannot_authorize_priority(world):
     world['t3'].message(OTHER_THREAD, time.time() - 1, text='earlier')
     _t3_hook_turn(session=OTHER_SESSION)
     _be(world, OTHER_SESSION)
-    ok, held = owner_act.act('route.pause', {'account': 'Grok'})
+    ok, held = owner_act.act('direction.request', {'action': 'route.pause', 'args': {'account': 'Grok'}})
     assert ok and held.get('pending'), held
     world['t3'].message(OTHER_THREAD, time.time() + 1, text='yes')
     _t3_hook_turn(session=OTHER_SESSION, prompt='yes')
