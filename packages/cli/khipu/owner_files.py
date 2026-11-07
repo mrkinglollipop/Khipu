@@ -38,6 +38,8 @@ PATTERNS: tuple[tuple[str, str, str], ...] = (
     # Persistent, empty flock inode: deleting it would let new writers
     # bypass a transaction still holding the old inode.
     ("lock", "turns", "routing-directions.lock"),
+    # Rows the rule 12 mismatch log wrote until it was removed (2026-11-07):
+    # no longer written, still named so they never read as unknown files.
     ("mismatches", "turns", "routing-mismatch-*.json"),
     ("turns", "turns", "*.jsonl"),
     ("temp", "data", ".owner-*.tmp"),

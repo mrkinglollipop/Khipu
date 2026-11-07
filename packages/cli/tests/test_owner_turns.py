@@ -374,10 +374,6 @@ BRIEF = "Build the owner turns recorder and run its tests before reporting back.
     ("spawn_agent", {"message": BRIEF, "task_name": "build"}),
     ("mcp__t3__delegate_task", {"prompt": BRIEF, "target": {}}),
     ("delegate_task", {"target": {"providerInstanceId": "codex_2"}, "work": {"text": BRIEF}}),
-    ("Bash", {"command": f"CLAUDE_CONFIG_DIR=x claude -p {json.dumps(BRIEF)} --model opus"}),
-    ("Bash", {"command": f"cd /work && claude --model opus -p {json.dumps(BRIEF)}"}),
-    ("Bash", {"command": f"codex exec -m gpt -c model_reasoning_effort=high {json.dumps(BRIEF)}"}),
-    ("shell", {"command": ["codex", "exec", "--full-auto", BRIEF]}),
 ])
 def test_each_delegation_notes_its_brief(home, monkeypatch, tool, tool_input):
     monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
@@ -386,7 +382,14 @@ def test_each_delegation_notes_its_brief(home, monkeypatch, tool, tool_input):
     assert brief is not None and brief["parent"] == "parent-1"
 
 
+# Shell commands are no longer read (the shell half of the delegation hook
+# was removed on 2026-11-07). A job a shell starts runs on a front end the
+# owner check never trusts (``claude -p`` is sdk-cli, ``codex exec``
+# codex_exec, see the entrypoint table above), so its brief needs no note.
 @pytest.mark.parametrize("tool,tool_input", [
+    ("Bash", {"command": f"CLAUDE_CONFIG_DIR=x claude -p {json.dumps(BRIEF)} --model opus"}),
+    ("Bash", {"command": f"codex exec -m gpt -c model_reasoning_effort=high {json.dumps(BRIEF)}"}),
+    ("shell", {"command": ["codex", "exec", "--full-auto", BRIEF]}),
     ("Bash", {"command": "claude -p \"$(cat brief.md)\""}),
     ("Bash", {"command": "claude -p < brief.md"}),
     ("Bash", {"command": "claude -p --allowedTools Bash Read"}),

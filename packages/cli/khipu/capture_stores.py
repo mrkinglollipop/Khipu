@@ -144,11 +144,11 @@ STORES: tuple[Store, ...] = (
           "none: it never holds summary or transcript text",
           _w("session_capture._log")),
     Store("owner turns", "capture home owner-turns/: <session>.jsonl, briefs.jsonl, settings.json and "
-          "their .tmp rewrites, and routing-mismatch-*.json rows (owner_files.PATTERNS)",
+          "their .tmp rewrites, and routing-mismatch-*.json rows the removed mismatch log left (owner_files.PATTERNS)",
           "the typed text of each prompt and the briefs of dispatched jobs, for the owner-direction check; "
-          "each model mismatch's account, model and project labels, kept a week",
+          "old model mismatch rows hold account, model and project labels and are no longer written",
           "owner words",
-          _w("owner_turns._record", "owner_turns._write_private", "routing_mismatches._write_event")),
+          _w("owner_turns._record", "owner_turns._write_private")),
     Store("owner actions", "data folder owner-actions.jsonl and its sealed segments owner-actions.NNNNNN.jsonl, its head owner-actions.head.json and lock, "
           "owner-direction-pending.json, owner-requests.json and their .tmp rewrites (owner_files.PATTERNS)",
           "each owner action with the owner's quoted words, widenings waiting for a second turn, and "

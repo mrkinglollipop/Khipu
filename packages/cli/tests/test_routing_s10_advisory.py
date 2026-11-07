@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import copy
 import json
-import shlex
 
 import pytest
 
@@ -104,10 +103,7 @@ def test_10_untrusted_table_cannot_replace_confirmed_owner_table(replay, replace
     payload(),
     dict(payload(), tool_name="Task"),
     dict(payload(), tool_name="spawn_agent", tool_input={"model": "opus", "message": "task: fix-round\nRepair it."}),
-    dict(payload(), tool_name="Bash", tool_input={"command": "claude --model opus -p 'task: fix-round\nRepair it.'"}),
-    dict(payload(), tool_name="Bash", tool_input={"command": "claude -m opus -p 'task: fix-round\nRepair it.'"}),
-    dict(payload(), tool_name="Bash", tool_input={"command": "claude --model=opus -p 'task: fix-round\nRepair it.'"}),
-], ids=["Agent", "Task", "native-child", "long-model", "short-model", "equals-model"])
+], ids=["Agent", "Task", "native-child"])
 def test_10_opus_fix_round_advisory_on_each_dispatch_shape(replay, call):
     table(replay)
     expect(dispatch_lines(hook(call)), [LINE], "10: Opus fix-round result lacks the exact rule 12 line")
@@ -136,16 +132,11 @@ def test_10_model_id_resolves_to_tier(replay, model):
     expect(dispatch_lines(hook(payload(model))), [LINE], "10: Opus model id has no fix-round advisory")
 
 
-def test_10_model_from_fake_config_home_without_credentials(replay):
+def test_10_a_shell_dispatch_gets_no_rule_12_line(replay):
+    # The shell half of the delegation hook was removed (2026-11-07): a
+    # ``claude -p`` job is not read for its model or brief.
     table(replay)
-    home = replay.root / "fake-opus-home"
-    home.mkdir()
-    (home / "settings.json").write_text(json.dumps({"model": "opus"}))
-    call = dict(payload(), tool_name="Bash", tool_input={"command":
-        f"CLAUDE_CONFIG_DIR={shlex.quote(str(home))} claude -p 'task: fix-round\nRepair it.'"})
-    expect(dispatch_lines(hook(call)), [LINE], "10: local settings model is not used for tier check")
-    call["tool_input"]["command"] = (
-        f"CLAUDE_CONFIG_DIR={shlex.quote(str(home))} claude --model sonnet -p 'task: fix-round\nRepair it.'")
+    call = dict(payload(), tool_name="Bash", tool_input={"command": "claude --model opus -p 'task: fix-round\nRepair it.'"})
     assert dispatch_lines(hook(call)) == []
 
 

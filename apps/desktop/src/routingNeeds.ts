@@ -306,7 +306,6 @@ const SETTING_WORDS: Record<string, { name: string; unit?: Unit; zero?: string; 
   routing_push_start: { name: "routing news at the start of a conversation" },
   routing_push_prompt: { name: "routing news before each prompt" },
   routing_push_delegation: { name: "routing news before a conversation hands work to a helper" },
-  routing_dispatch_scripts: { name: "your scripts that hand work to a helper" },
   routing_delivery_live_after: { name: "how long a quiet conversation still counts as running" },
   routing_delivery_slack: { name: "how far behind a conversation can fall before Khipu warns you", unit: ["change", "changes"] },
   routing_override_log_keep_days: { name: "how long Khipu keeps the record of an ended conversation override", unit: ["day", "days"], zero: "Forever" },

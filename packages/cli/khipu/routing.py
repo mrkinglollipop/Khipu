@@ -187,7 +187,6 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_push_start": ("switch", True, "Tell conversations at the start and after compaction"),
     "routing_push_prompt": ("switch", True, "Tell conversations before each prompt"),
     "routing_push_delegation": ("switch", True, "Tell conversations before handing work to another agent"),
-    "routing_dispatch_scripts": ("names", [], "Your own scripts that hand work to another agent, by file name"),
     "routing_delivery_live_after": ("duration", 12 * 3600, "How long a delivery identity counts as live"),
     "routing_delivery_slack": ("count", 2, "Extra delivery points before stalled delivery turns red"),
     "routing_ledger_keep_days": ("count", 7, "Remove a conversation's routing delivery ledger after this many unused days (0: never)"),
@@ -10578,11 +10577,6 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     recipients = delivery.get("recipients") or {}
     out["changes"] = [dict(change, recipients=recipients.get(change.get("version")))
                        for change in out["changes"]]
-    # Owner-local only, like the directions above: today's rule 12 model
-    # mismatches (labels, never brief text, session ids or paths).
-    from khipu import routing_mismatches
-
-    out["model_mismatches"] = routing_mismatches.today(now)
     # Owner-local only: file paths and quoted owner words from the scan
     # report never enter the fold or any routing delivery projection.
     from khipu import routing_scan_report

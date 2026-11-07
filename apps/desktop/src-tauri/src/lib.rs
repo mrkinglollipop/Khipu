@@ -1069,9 +1069,6 @@ const ROUTING_SWITCH_KEYS: &[&str] = &[
     "routing_usage_login_cursor",
     "routing_usage_login_opencode",
 ];
-/// The owner's own dispatch scripts, by file name (phase 6).
-const ROUTING_DISPATCH_SCRIPTS_KEY: &str = "routing_dispatch_scripts";
-const ROUTING_DISPATCH_SCRIPTS_MAX: usize = 16;
 const ROUTING_RETRIES_KEY: &str = "routing_reset_check_retries";
 const ROUTING_SOURCES_KEY: &str = "routing_sources";
 const ROUTING_LANE_MAP_KEY: &str = "routing_lane_map";
@@ -1297,35 +1294,6 @@ fn routing_key(key: &str) -> bool {
         || key == ROUTING_SOURCES_KEY
         || key == ROUTING_LANE_MAP_KEY
         || key == ROUTING_TABLE_KEY
-        || key == ROUTING_DISPATCH_SCRIPTS_KEY
-}
-
-/// The dispatch scripts: a JSON list of file names only (letters, digits,
-/// dots, dashes and underscores; no folder), re-serialised.
-fn checked_dispatch_scripts(raw: &str) -> Result<String, String> {
-    let bad = || "dispatch scripts must be a JSON list of file names".to_string();
-    let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|_| bad())?;
-    let items = value.as_array().ok_or_else(bad)?;
-    if items.len() > ROUTING_DISPATCH_SCRIPTS_MAX {
-        return Err(format!("at most {ROUTING_DISPATCH_SCRIPTS_MAX} dispatch scripts"));
-    }
-    let mut out: Vec<String> = Vec::with_capacity(items.len());
-    for item in items {
-        let name = item.as_str().ok_or_else(bad)?.trim();
-        let plain = !name.is_empty()
-            && name.chars().count() <= 64
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-            && name != "."
-            && name != ".."
-            && !name.starts_with('-');
-        if !plain {
-            return Err(format!("{name:?} must be a file name only: letters, digits, dots, dashes and underscores"));
-        }
-        if !out.iter().any(|n| n == name) {
-            out.push(name.to_string());
-        }
-    }
-    serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
 /// A file's full path, one line, starting with `/` or `~/` (so never with
@@ -1422,9 +1390,6 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     }
     if key == ROUTING_TABLE_KEY {
         return checked_routing_path("the routing table file", v);
-    }
-    if key == ROUTING_DISPATCH_SCRIPTS_KEY {
-        return checked_dispatch_scripts(v);
     }
     if key == ROUTING_RETRIES_KEY {
         if has_control(v) { return Err("retry times must be one line".to_string()); }
@@ -6520,23 +6485,12 @@ mod settings_command_tests {
             assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }
         assert_eq!(config_unset_argv("routing_reset_check").unwrap(), v(&["config", "--from-app", "--unset=routing_reset_check"]));
-        // Phase 6: the push before handing work to another agent, and the
-        // owner's dispatch scripts, by file name only.
+        // Phase 6: the push before handing work to another agent. The owner's
+        // dispatch scripts went with the shell half of the hook (2026-11-07).
         assert_eq!(config_set_argv("routing_push_delegation", "off").unwrap(), v(&["config", "--from-app", "--set", "routing_push_delegation", "off"]));
         assert_eq!(config_unset_argv("routing_push_delegation").unwrap(), v(&["config", "--from-app", "--unset=routing_push_delegation"]));
         assert!(config_set_argv("routing_push_delegation", "yes").is_err());
-        assert_eq!(
-            config_set_argv("routing_dispatch_scripts", r#"[" dispatch.py ", "run-job.sh", "dispatch.py"]"#).unwrap(),
-            v(&["config", "--from-app", "--set", "routing_dispatch_scripts", r#"["dispatch.py","run-job.sh"]"#])
-        );
-        assert_eq!(config_set_argv("routing_dispatch_scripts", "[]").unwrap(), v(&["config", "--from-app", "--set", "routing_dispatch_scripts", "[]"]));
-        assert_eq!(config_unset_argv("routing_dispatch_scripts").unwrap(), v(&["config", "--from-app", "--unset=routing_dispatch_scripts"]));
-        for bad in [r#"["/bin/dispatch.py"]"#, r#"["a b"]"#, r#"[".."]"#, r#"["-x"]"#, r#"["-c"]"#, r#"["a\nb"]"#, r#"[3]"#,
-                    "dispatch.py", r#"{"a": 1}"#] {
-            assert!(config_set_argv("routing_dispatch_scripts", bad).is_err(), "{bad}");
-        }
-        let many: Vec<String> = (0..17).map(|i| format!("\"s{i}.py\"")).collect();
-        assert!(config_set_argv("routing_dispatch_scripts", &format!("[{}]", many.join(","))).is_err());
+        assert!(config_set_argv("routing_dispatch_scripts", "[]").is_err());
         // Replication between Macs is an owner switch from the app.
         assert_eq!(config_set_argv("routing_replication_live", "on").unwrap(), v(&["config", "--from-app", "--set", "routing_replication_live", "on"]));
         assert_eq!(config_set_argv("routing_replication_live", "off").unwrap(), v(&["config", "--from-app", "--set", "routing_replication_live", "off"]));

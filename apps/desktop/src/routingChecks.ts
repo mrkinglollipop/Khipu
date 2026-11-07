@@ -13,9 +13,7 @@ export type ChecksRow = {
   key: string;
   title: string;
   sub: string;
-  kind: "contradiction" | "upkeep" | "unreached" | "mismatch";
-  /** Mismatch rows only: the mock's "From the brief" or "Guess" tag. */
-  guessed?: boolean;
+  kind: "contradiction" | "upkeep" | "unreached";
 };
 
 export type TierRow = { label: string; tier: string };
@@ -51,7 +49,6 @@ export function fileCopySkipWords(skip: FileCopiesModel["skipped"][number]): str
 }
 
 export type ChecksModel = {
-  mismatches: ChecksRow[];
   contradictions: ChecksRow[];
   upkeep: ChecksRow[];
   fileCopies: FileCopiesModel | null;
@@ -78,13 +75,6 @@ const TASK_CLASSES: ReadonlyArray<[string, string]> = [
   ["synthesis", "Reports and summaries"],
   ["mechanical", "Searches and lookups"],
 ];
-
-/** The mock's singular words for one dispatch ("A fix round went to Opus"). */
-const MISMATCH_WORK: Record<string, string> = {
-  scope: "A scope", mock: "A mock", ruling: "A ruling", "hard-security": "Hard security code",
-  "failed-fix": "A fix that already failed", build: "A build", "fix-round": "A fix round", tests: "Tests",
-  docs: "Docs", synthesis: "A report", mechanical: "A search",
-};
 
 function capitalise(word: string): string {
   return word ? word.charAt(0).toUpperCase() + word.slice(1) : word;
@@ -277,7 +267,7 @@ function upkeepRow(h: RouteHygiene, i: number, view: RouteView, rules: Map<strin
 
 /** Every advisory row and the model table, in the group's order. */
 export function checksModel(view: RouteView | null, now: Date): ChecksModel {
-  if (!view) return { mismatches: [], contradictions: [], upkeep: [], fileCopies: null, unreached: [], table: null };
+  if (!view) return { contradictions: [], upkeep: [], fileCopies: null, unreached: [], table: null };
   const rules = ruleByEntity(view);
   const contradictions = (view.contradictions ?? []).map((c, i) => contradictionRow(c, i, view, rules, now));
   const upkeep = (view.rule_hygiene ?? []).map((h, i) => upkeepRow(h, i, view, rules, now));
@@ -290,18 +280,6 @@ export function checksModel(view: RouteView | null, now: Date): ChecksModel {
         ? `The owner turn could not be matched${d.reason ? `: ${d.reason}` : ""}.`
         : "Nothing in Khipu matches it."),
   }));
-  const mismatches: ChecksRow[] = (view.model_mismatches ?? []).map((m, i) => {
-    const work = m.task ? (MISMATCH_WORK[m.task] ?? m.task) : "Work";
-    const where = [m.account, m.project ? `in ${m.project}` : ""].filter(Boolean).join(" ");
-    return {
-      key: `mismatch:${i}:${m.at}`,
-      kind: "mismatch",
-      guessed: m.guessed,
-      title: `${work} went to ${capitalise(m.actual ?? "a different model")}; your table says ${capitalise(m.expected ?? "another")}`,
-      sub: `${where ? `${where}, ` : ""}${whenLocal(m.at, now)} · ` +
-        (m.guessed ? "guessed from the brief's words" : "the brief named the kind of work"),
-    };
-  });
   const copies = view.routing_file_copies;
   const fileCopies: FileCopiesModel | null = copies
     ? { status: copies.status === "checked" && (copies.skipped?.length || copies.too_large?.length)
@@ -323,14 +301,13 @@ export function checksModel(view: RouteView | null, now: Date): ChecksModel {
     const rows = [...known, ...extra];
     table = { rows, line: `${plural(rows.length, "kind", "kinds")} of work · confirmed by you` };
   }
-  return { mismatches, contradictions, upkeep, fileCopies, unreached, table };
+  return { contradictions, upkeep, fileCopies, unreached, table };
 }
 
 /** The group's closed line: what is flagged, in the parts Khipu can see. */
 export function checksLine(view: RouteView | null, now: Date): string {
   const model = checksModel(view, now);
   const parts: string[] = [];
-  if (model.mismatches.length) parts.push(`${plural(model.mismatches.length, "model mismatch", "model mismatches")} today`);
   if (model.contradictions.length) parts.push(plural(model.contradictions.length, "contradiction", "contradictions"));
   if (model.upkeep.length) parts.push(`${plural(model.upkeep.length, "rule", "rules")} to look at`);
   if (model.fileCopies?.hits_total) parts.push(`${plural(model.fileCopies.hits_total, "copy", "copies")} in files`);
