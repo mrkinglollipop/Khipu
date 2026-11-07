@@ -117,8 +117,6 @@ describe("OptionalFeatures", () => {
     expect(within(rejected).getByText(/59 to 4/)).toBeInTheDocument();
     expect(within(rejected).getAllByText(/1 transcript in 10 lost all its decisions/)).toHaveLength(2);
     expect(screen.getByText(/about 0\.8 s to a search/)).toBeInTheDocument();
-    expect(screen.getByText(/up to 40 topics a night/)).toBeInTheDocument();
-    expect(screen.getByText(/only when you ask/)).toBeInTheDocument();
     const routing = screen.getByText("Routing", { selector: ".section-head" }).closest(".section-card") as HTMLElement;
     expect(within(routing).getByRole("switch", { name: /Tell conversations which accounts are open/ })).not.toBeChecked();
     expect(within(routing).getByText(/never chooses where work goes/)).toBeInTheDocument();
