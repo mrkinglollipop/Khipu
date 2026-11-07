@@ -531,9 +531,9 @@ def _slice_name(name: Any) -> str:
     """A project name as the slice shows it: in backticks only when it is of
     the safe shape (and short), else a fixed stand-in; never its raw text."""
     if not identity.safe_project_name(name):
-        return "(a project name with unusual characters; run `khipu project show`)"
+        return "(a project name with unusual characters; `khipu project show`)"
     if len(name) > _SLICE_NAME_CHARS:
-        return "(a long project name; run `khipu project show`)"
+        return "(a long project name; `khipu project show`)"
     return f"`{name}`"
 
 
