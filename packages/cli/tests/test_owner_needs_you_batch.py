@@ -20,6 +20,7 @@ from tests.test_t3_owner_confirm import _be_front, _front_end_turn, world
 assert world  # the fixture, imported for pytest
 
 TERMINAL = "s-terminal"
+RULE = "Docs go to the cheapest tier"  # names no account, so the held pause doesn't touch it
 
 
 def _read() -> list[dict]:
@@ -44,7 +45,7 @@ def _grok_paused() -> bool:
 def _build_list(world) -> None:
     _held_grok_pause(world)
     _priority_request(world)
-    _rule_added(world)
+    _rule_added(world, RULE)
     _setting_request(world)
     _accounts_request(world)
     _tier_request(world)
@@ -65,7 +66,7 @@ FRONTS = {"t3": _in_t3, "claude_code": _in_claude_code}
 
 def _settled(world) -> dict[str, bool]:
     view = routing.read_view()
-    rule = next(r for r in view["rules"] if r.get("text") == "Never send client work to Grok")
+    rule = next(r for r in view["rules"] if r.get("text") == RULE)
     return {"priority": not view["priority"]["pending"], "rule": not rule.get("pending"),
             "setting": _setting()["pending"] is False, "accounts": usage.accounts_status().get("request") is None,
             "tier_table": routing.pending_tier_table() is None}
