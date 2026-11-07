@@ -12,7 +12,8 @@ from tests.test_owner_priority_pending import _ask_in_t3, _owner_says_yes, _pend
 
 def test_a_typed_turn_can_direct_more_than_one_routing_change(world):
     _hold_in_t3(world)
-    ok, sensitive = owner_act.act('direction.set', {'key':'latest_window_h', 'value':'1000'})
+    ok, sensitive = owner_act.act('direction.request', {'action': 'direction.set',
+                                                        'args': {'key':'latest_window_h', 'value':'1000'}})
     assert ok and sensitive['pending'], sensitive
     mid = world['t3'].message(THREAD, time.time()+1, text='thanks')
     _t3_hook_turn(prompt='thanks')
@@ -48,7 +49,8 @@ def test_ledger_import_replays_reviewed_bytes(world, monkeypatch):
     swapped={'rows': {'unshown': {'title':'Unreviewed replacement', 'kind':'task', 'state':'done'}}}
     path.write_text(json.dumps(original))
     original_digest=hashlib.sha256(path.read_bytes()).hexdigest()
-    ok, held = _ask_in_t3(world, 'ledger.import', {'project':'p','file':str(path)})
+    ok, held = _ask_in_t3(world, 'direction.request', {'action': 'ledger.import',
+                                                      'args': {'project':'p','file':str(path)}})
     assert ok and held['pending'], held
     request=owner_direction._read_requests(owner_direction.requests_path())[0]
     assert request['args'] == {'project':'p','file':str(path)}
@@ -87,7 +89,8 @@ def test_config_confirm_cannot_retarget_new_request(world):
 
 def test_t3_confirmation_does_not_compare_transport_text(world):
     _hold_in_t3(world)
-    ok, held = owner_act.act('direction.set', {'key':'latest_window_h', 'value':'1000'})
+    ok, held = owner_act.act('direction.request', {'action': 'direction.set',
+                                                   'args': {'key':'latest_window_h', 'value':'1000'}})
     assert ok and held['pending']
     world['t3'].message(THREAD, time.time()+1, text='a real owner message')
     _t3_hook_turn(prompt='a synthetic different prompt')
@@ -113,7 +116,8 @@ def test_terminal_pty_from_harness_is_refused_but_owner_terminal_works(monkeypat
 
 def test_each_asked_request_applies_once_without_a_message_quota(world):
     first = _hold_in_t3(world)
-    ok, second = owner_act.act('direction.set', {'key': 'latest_window_h', 'value': '1000'})
+    ok, second = owner_act.act('direction.request', {'action': 'direction.set',
+                                                     'args': {'key': 'latest_window_h', 'value': '1000'}})
     assert ok and second['pending']
     _owner_says_yes(world)
     ok, out = _confirm_id(first)
@@ -155,7 +159,8 @@ def test_owed_tidy_hold_replays_the_full_reviewed_plan(world, monkeypatch):
     path = world['tmp'] / 'plan.json'
     original = {'project': 'p', 'items': [{'id': 4, 'owner': 'assistant'}]}
     path.write_text(json.dumps(original))
-    ok, held = _ask_in_t3(world, 'owed.tidy', {'project': 'p', 'plan': str(path)})
+    ok, held = _ask_in_t3(world, 'direction.request', {'action': 'owed.tidy',
+                                                      'args': {'project': 'p', 'plan': str(path)}})
     assert ok and held['pending'] and 'assistant' in held['ask'], held
     path.write_text(json.dumps({'project': 'p', 'items': [{'id': 99, 'owner': 'user'}]}))
     seen = []

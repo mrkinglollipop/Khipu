@@ -303,7 +303,7 @@ def test_a_t3_own_priority_request_needs_no_prior_question(t3world):
     t3world["t3"].message(t3t.THREAD, time.time() - 3, text="loosen Codex a bit")
     t3t._t3_hook_turn()
     out = _amend_request("a bit")
-    assert out["applied"] is True and not routing.read_view()["priority"].get("pending"), out
+    assert out.get("applied") is True and not routing.read_view()["priority"].get("pending"), out
 
 
 # ---- Undo: exactly one change, with a receipt -----------------------------------------------------

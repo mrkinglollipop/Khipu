@@ -351,7 +351,7 @@ _T3_WHY = ("a T3 conversation can't be told apart from T3's own scheduled or rel
            "a change asked for there waits for the owner to confirm it")
 
 
-def test_a_t3_conversation_the_owner_typed_in_is_held_for_confirmation(t3_conversation):
+def test_a_t3_conversations_hook_turn_alone_never_makes_the_change(t3_conversation):
     from khipu import t3
 
     assert t3.thread_for_session(OWNER) is None  # behind the newest window
@@ -359,9 +359,10 @@ def test_a_t3_conversation_the_owner_typed_in_is_held_for_confirmation(t3_conver
     (row,) = owner_turns.turns(OWNER)
     assert row["entrypoint"] == "t3" and row["eligible"] is False and row["why"] == _T3_WHY
     assert not row.get("dispatched")
+    # T3's own record of the owner's messages decides (class A, 2026-11-07); here it can't be read.
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check("config.routing_setting")
-    assert err.value.code == "confirm_needed"
+    assert err.value.code == "t3_unreadable"
     rc, out = t3_conversation.run(["config", "--set", "routing_prompt_budget_ms", "500"], True)
     assert rc != 0, out
 
@@ -401,12 +402,12 @@ def test_another_t3_conversations_turn_is_refused(t3_conversation):
     assert err.value.code == "no_recorded_turn"
 
 
-def test_an_old_t3_turn_still_only_holds_the_change(t3_conversation):
+def test_an_old_t3_turn_is_proved_by_t3s_record_too(t3_conversation):
     _t3_say(ago=7 * 3600)
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check("config.routing_setting")
-    # No age limit on a hold: it changes nothing until the owner confirms.
-    assert err.value.code == "confirm_needed"
+    # No age limit and no hold: T3's own record decides, and here it can't be read.
+    assert err.value.code == "t3_unreadable"
 
 
 # ---- apply, log, undo --------------------------------------------------------------------------
@@ -829,7 +830,7 @@ def _be_with(world, session, monkeypatch, env):
         monkeypatch.setenv(name, value)
 
 
-def test_a_t3_top_level_thread_with_the_sdk_child_markers_is_held(t3_conversation, monkeypatch):
+def test_a_t3_top_level_thread_with_the_sdk_child_markers_is_proved_by_t3s_record(t3_conversation, monkeypatch):
     _t3_say(**_T3_SDK_ENV)
     row = owner_turns.turns(OWNER)[-1]
     assert row["entrypoint"] == "t3" and row["eligible"] is False and row["why"] == _T3_WHY
@@ -837,7 +838,7 @@ def test_a_t3_top_level_thread_with_the_sdk_child_markers_is_held(t3_conversatio
     _be_with(t3_conversation, OWNER, monkeypatch, _T3_SDK_ENV)
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check("config.routing_setting")
-    assert err.value.code == "confirm_needed"
+    assert err.value.code == "t3_unreadable"
 
 
 def test_a_t3_child_lookup_that_never_completes_fails_closed(t3_conversation, monkeypatch):
