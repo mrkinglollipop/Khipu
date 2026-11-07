@@ -103,6 +103,40 @@ def test_mapping_missing_and_schema_change(tmp_path, monkeypatch):
     assert t3.thread_for_session('x') is None
 
 
+def test_session_ids_with_no_thread_table_is_a_settled_none_but_a_lock_or_garbage_is_not(tmp_path, monkeypatch):
+    other = tmp_path / 'other.sqlite'
+    with sqlite3.connect(other) as con:
+        con.execute('CREATE TABLE renamed (id TEXT)')
+    monkeypatch.setenv('KHIPU_T3_DB', str(other))
+    assert t3.session_thread_ids_result('x') == ([], True)
+    nocol = tmp_path / 'nocol.sqlite'
+    with sqlite3.connect(nocol) as con:
+        con.execute('CREATE TABLE orchestration_v2_projection_provider_threads (thread_id TEXT)')
+    monkeypatch.setenv('KHIPU_T3_DB', str(nocol))
+    assert t3.session_thread_ids_result('x') == ([], True)
+    junk = tmp_path / 'junk.sqlite'
+    junk.write_text('not sqlite', encoding='utf-8')
+    monkeypatch.setenv('KHIPU_T3_DB', str(junk))
+    assert t3.session_thread_ids_result('x') == (None, False)
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'absent.sqlite'))
+    assert t3.session_thread_ids_result('x') == (None, False)
+
+
+def test_session_ids_on_a_locked_db_stay_unverified(tmp_path, monkeypatch):
+    path = tmp_path / 'locked-ids.sqlite'
+    con = sqlite3.connect(path)
+    con.execute('CREATE TABLE orchestration_v2_projection_provider_threads '
+                '(thread_id TEXT, payload_json TEXT, updated_at TEXT)')
+    con.commit()
+    con.execute('BEGIN EXCLUSIVE')
+    monkeypatch.setenv('KHIPU_T3_DB', str(path))
+    try:
+        assert t3.session_thread_ids_result('x') == (None, False)
+    finally:
+        con.rollback()
+        con.close()
+
+
 def test_locked_db_fails_open_quickly(tmp_path, monkeypatch):
     # Rollback-journal EXCLUSIVE is stronger than a normal WAL writer lock.
     path = tmp_path / 'locked.sqlite'

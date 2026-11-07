@@ -73,11 +73,14 @@ export function guideMeta(id: GuideId): GuideMeta {
   return g;
 }
 
-/** Title and aliases only match; an empty query shows everything. */
-export function filterGuides(query: string): GuideMeta[] {
+/** Title and aliases only match; an empty query shows everything. The T3 Code
+ *  row is dropped when the doctor reports no `t3` block (`hasT3` false): a user
+ *  without T3 has nothing to be "Covered". */
+export function filterGuides(query: string, hasT3 = true): GuideMeta[] {
   const q = query.trim().toLowerCase();
-  if (!q) return GUIDES;
-  return GUIDES.filter((g) => [g.title, g.blurb, ...g.aliases].join(" ").toLowerCase().includes(q));
+  const all = hasT3 ? GUIDES : GUIDES.filter((g) => g.id !== "t3");
+  if (!q) return all;
+  return all.filter((g) => [g.title, g.blurb, ...g.aliases].join(" ").toLowerCase().includes(q));
 }
 
 // ---------------------------------------------------------------------------

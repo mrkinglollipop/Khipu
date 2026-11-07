@@ -91,13 +91,13 @@ def subject(author: dict | None = None, *, environ: dict | None = None, cwd: str
     if known:
         if ids:
             if len(ids) != 1 or not isinstance(ids[0], str) or not ids[0]:
-                return None, "Khipu can't identify this T3 thread, so it uses normal pace."
+                return None, "Khipu can't identify this conversation, so it uses normal pace."
             return {"kind": "thread", "id": ids[0], "project": project, "mac": mac}, None
         # T3 answered and has no thread for this session: a native session.
     else:
         t3_store = Path(os.environ.get("KHIPU_T3_DB") or Path.home() / ".t3/userdata/statev2.sqlite")
         if t3_store.exists():
-            return None, "Khipu can't identify this T3 thread, so it uses normal pace."
+            return None, "Khipu can't identify this conversation, so it uses normal pace."
     return {"kind": "session", "id": _bare_session(session), "harness": harness, "project": project, "mac": mac}, None
 
 

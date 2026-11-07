@@ -86,6 +86,7 @@ export function GuidesPage({
   startItems,
   setupKnown = { prefs: true, signals: true },
   states,
+  hasT3 = true,
   open,
   onOpen,
   onBack,
@@ -98,6 +99,8 @@ export function GuidesPage({
    *  a count made of empty defaults. */
   setupKnown?: { prefs: boolean; signals: boolean };
   states: Record<GuideId, GuideState>;
+  /** False when the doctor reports no T3 block: the T3 Code row is not listed. */
+  hasT3?: boolean;
   /** The guide on screen, with the step to open it at (Grok Bot). */
   open: { id: GuideId; step?: number } | null;
   onOpen: (id: GuideId) => void;
@@ -156,7 +159,7 @@ export function GuidesPage({
     );
   }
 
-  const shown = filterGuides(query);
+  const shown = filterGuides(query, hasT3);
   return (
     <div className="gd-page">
       {!setupKnown.prefs ? null : prefs.startHidden ? (

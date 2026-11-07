@@ -174,6 +174,13 @@ describe("search", () => {
     expect(filterGuides("zzzz")).toEqual([]);
     expect(filterGuides("  ").length).toBeGreaterThan(10);
   });
+
+  it("drops the T3 Code row when the doctor reports no T3 block", () => {
+    expect(filterGuides("").map((g) => g.id)).toContain("t3");
+    expect(filterGuides("", false).map((g) => g.id)).not.toContain("t3");
+    expect(filterGuides("t3", false).map((g) => g.id)).not.toContain("t3");
+    expect(filterGuides("claude", false).map((g) => g.id)).toContain("claude_code");
+  });
 });
 
 describe("agent recall harness", () => {
