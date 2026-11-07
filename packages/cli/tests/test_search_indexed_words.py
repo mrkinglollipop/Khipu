@@ -90,6 +90,22 @@ def test_agent_session_identity(hub,monkeypatch):
             assert len(out['results'])==1 and out['results'][0]['exact_phrase']
 
 
+def test_hybrid_session_id_survives_the_relevance_floor(hub,monkeypatch):
+    # 2026-11-07: with relevance_floor on, hybrid abstained on a bare session id
+    # (no cosine, id not in the text as tokens) while literal returned the row.
+    configure_hub(monkeypatch,hub)
+    monkeypatch.setenv('KHIPU_FEATURE_RELEVANCE_FLOOR','1')
+    conn=hub.connect()
+    sid='claude_code:27916820-7db2-4539-918d-9eec66980f42'
+    conn.execute("INSERT INTO episodes (ts,summary,raw,session_id) VALUES (now(),'invented session','{}',%s)",(sid,)); conn.commit()
+    monkeypatch.setattr(embed,'_cosine_candidates',lambda *a,**k: [])
+    for q in (sid,sid.partition(':')[2]):
+        out=embed.hybrid_search(q,mode='hybrid')
+        assert len(out['results'])==1 and out['results'][0]['exact_phrase']
+        assert out['relevance_floor']['applied'] and not out['relevance_floor']['abstained']
+        assert out['relevance_floor']['evidence_rows']==1
+
+
 def test_quotes(hub,monkeypatch,tmp_path):
     configure_hub(monkeypatch,hub); install_words(hub,tmp_path)
     conn=hub.connect()

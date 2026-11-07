@@ -84,6 +84,20 @@ def test_a_row_with_neither_field_is_not_evidence():
     assert kept == [] and info["abstained"] is True
 
 
+def test_an_exact_phrase_row_is_evidence_without_cosine_or_keyword_hits():
+    # A session-id query has no cosine, and the id is not in the row text as
+    # tokens, so the row matched through an identity index: lexical_hits is 0.
+    row = {"kind": "episode", "id": "1", "exact_phrase": True, "lexical_hits": 0}
+    assert relevance.is_evidence(row, FLOOR, 3)
+    assert relevance.is_evidence({"exact_phrase": True}, FLOOR, 3)
+    assert relevance.is_evidence({"exact_phrase": True, "cosine": 0.1}, FLOOR, 3, {"p@1": 0.9})
+    for not_exact in (False, None, 1, "true"):
+        assert not relevance.is_evidence({"exact_phrase": not_exact, "lexical_hits": 0}, FLOOR, 3)
+    kept, info = relevance.gate([{"id": "a", "cosine": 0.1}, row], 3)
+    assert [r["id"] for r in kept] == ["a", "1"]
+    assert info["evidence_rows"] == 1 and info["abstained"] is False
+
+
 def test_the_list_comes_back_unchanged_when_any_row_is_evidence():
     rows = [{"id": "a", "cosine": 0.1}, {"id": "b"}, {"id": "c", "cosine": 0.9}, {"id": "d", "lexical_hits": 0}]
     kept, info = relevance.gate(rows, 3)
