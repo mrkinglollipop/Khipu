@@ -297,9 +297,10 @@ def test_a_t3_own_priority_request_needs_no_prior_question(t3world):
     assert out["applied"] and not routing.read_view()["priority"]["pending"], out
     ok, undone = owner_act.act("direction.undo", {"id": out["instant"]["owner_action"]})
     assert ok, undone
-    # Another own change in the thread, then a newer owner message: applied.
-    ok, paused = _t3_pause(t3world, "Codex")
-    assert ok and not paused.get("pending") and _state("Codex") == "paused", paused
+    # Another own change in the thread (an account outside the priority, so no hold choice), then a newer
+    # owner message: applied.
+    ok, paused = _t3_pause(t3world, "Claude")
+    assert ok and not paused.get("pending") and _state("Claude") == "paused", paused
     t3world["t3"].message(t3t.THREAD, time.time() - 3, text="loosen Codex a bit")
     t3t._t3_hook_turn()
     out = _amend_request("a bit")
