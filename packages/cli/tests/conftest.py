@@ -194,6 +194,33 @@ def _isolate_tombstone_registry(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_forget_fence_state(monkeypatch):
+    """The forget fence records its last outcome in two places that outlive a
+    test: ``tombstones._FENCE_LAST`` (a module global) and
+    ``forget_fence_state.json`` in the shared test data dir. A test that makes
+    the forget list unreadable leaves ``readable: false`` there, and doctor's
+    ``forget_list`` check (``forget_list_health``) then reads it as red for
+    every later test (``DoctorFoldsLauncherHealthTest`` returned rc 2 after
+    ``test_forget_fence_readers.py``). Each test starts and ends with no
+    recorded outcome, no memoised list and no state file."""
+    from khipu import tombstones
+
+    def _clear():
+        tombstones._FENCE_LAST = None
+        tombstones._HIDDEN_CACHE = None
+        try:
+            tombstones.fence_state_path().unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    _clear()
+    monkeypatch.setattr(tombstones, "_FENCE_LAST", None)
+    monkeypatch.setattr(tombstones, "_HIDDEN_CACHE", None)
+    yield
+    _clear()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_erasure_queue():
     """Every automatic push and search withholds an episode queued for
     erasure next to the replica. A test that leaves one queued in the shared
