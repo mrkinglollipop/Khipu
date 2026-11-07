@@ -4711,7 +4711,7 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
 def _outbox_span_covered(args: argparse.Namespace) -> int:
     """``khipu outbox span-covered``: a dry run by default, in plain words.
     ``--apply`` is the owner's: a yes typed on a terminal, or ``--owner-direction``
-    only in the replay of a request his answer confirmed (``owner_direction.CONFIRM_ONLY``),
+    only in the replay of a request his answer confirmed (``owner_direction.PLANNED_ASKS``),
     logged with its Undo either way. The drain never reaches this."""
     from khipu import outbox_span_covered, owner_direction, routing
 

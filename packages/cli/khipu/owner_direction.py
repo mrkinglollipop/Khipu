@@ -103,23 +103,37 @@ ACTIONS: frozenset[str] = frozenset({
     "outbox.span_covered",
 })
 
-# Actions a recent owner turn does not make: ``khipu_owner_act`` always holds
-# them with this question, and the command's ``--owner-direction`` passes only
+# Owner changes come in three classes (owner decision 2026-11-07). A: his own
+# direction, applied as soon as a turn proves he typed it, with a receipt and
+# an Undo, in every front end (T3 included). B: an answer to a request someone
+# else made (``ANSWER_ACTIONS``): he has to have been shown it first. C: a
+# change that can't be taken back (``CLASS_C``): ``khipu_owner_act`` holds it
+# with its own words for his yes even when he asked for it himself.
+# ``ledger.import`` is C only with ``catch_up``. Every action not named here
+# is A, so the C list is kept by hand.
+CLASS_C: frozenset[str] = frozenset({"forget.send", "forget.here", "forget.not_same", "ledger.purge",
+                                     "ledger.import"})
+
+
+def class_c(action: str, values: dict | None = None) -> bool:
+    """Whether ``action`` with ``values`` is a change that can't be taken back."""
+    if action not in CLASS_C:
+        return False
+    return action != "ledger.import" or bool((values or {}).get("catch_up"))
+
+
+# A clean-up an agent planned (B) with no Needs-you item of its own: always
+# held with these words, and the command's ``--owner-direction`` passes only
 # in the replay of a request ``confirm`` proved he answered (``replaying``).
-CONFIRM_ONLY: dict[str, str] = {
+PLANNED_ASKS: dict[str, str] = {
     "outbox.span_covered": ("Retire the dead outbox jobs `khipu outbox span-covered` counts? Each has a live episode "
                             "whose range contains its own and which holds every evidence field it carries. Summaries "
                             "are not compared and a range does not prove the same text, so each job's own summary "
                             "then stays only in the local record; nothing is written to the hub."),
 }
 
-# Routing changes that apply as soon as the owner types them (2026-11-03, owner
-# decision): account priority and its exceptions, standing rules, the note,
-# pauses, holds and lifts. They still need the check below (a provably owner
-# turn); a turn that fails it keeps today's refusal or hold. Forget, purge,
-# permissions and trust settings, secrets and every other action are not here,
-# so they keep the explicit confirm they need.
-ROUTING_INSTANT: frozenset[str] = frozenset({
+# The routing changes whose direction pushes a receipt to every conversation.
+RECEIPTED: frozenset[str] = frozenset({
     "route.pause", "route.lift", "route.note.set", "route.note.end", "route.rule.add", "route.rule.edit",
     "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
     "route.hold.add", "route.hold.end", "route.priority.set", "route.priority.amend", "route.priority.confirm",
@@ -139,27 +153,18 @@ SETTLE_ACTIONS: frozenset[str] = frozenset({
 # A conversation's override changes only that conversation's advice, so
 # nothing about it is pushed to the others (no receipt line, no push words).
 LOCAL_ONLY_ROUTING: frozenset[str] = frozenset({"route.override.grant", "route.override.end", "route.override.keep"})
-# The routing changes that answer a request waiting on the owner, not a change
-# of his own. His typed message can be the direction for a change of his own;
-# an answer needs him to have been shown what it answers, so in T3 it applies at
-# once only on a message newer than an ask in that thread showing it
-# (``_shown_read``). A conversation's own request applied on the owner's turn
-# (``REQUEST_APPLIED``) is the change he typed, and stays as it was.
+# Class B: answers to a request someone else made, never a change of the
+# owner's own. His typed message can be the direction for a change of his own;
+# an answer needs him to have been shown what it answers, so in T3 it applies
+# only on a message newer than a read in that thread showing it
+# (``_shown_read``), and is held and asked otherwise. A conversation's own
+# request applied on the owner's turn (``REQUEST_APPLIED``) is the change he
+# typed, and stays as it was.
 ANSWER_ACTIONS: frozenset[str] = frozenset({
     "route.priority.confirm", "route.priority.undo", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
+    "route.tier_table.confirm", "accounts.request.confirm", "accounts.request.undo", "config.answer_request.confirm",
+    "config.answer_request.undo", "owed.correct_job_origin.confirm", "project.merge", "project.keep_separate",
 })
-
-
-def instant_allowed(action: str, target: str | None = None) -> bool:
-    """Whether ``action`` is a routing change that applies as soon as the
-    owner types it. An Undo (``direction.undo``) counts only when it undoes
-    one of those: undoing a trust, permission or forget action never does."""
-    if action in ROUTING_INSTANT:
-        return True
-    if action == "direction.undo" and target:
-        line = _find(str(target))
-        return bool(line and line.get("action") in ROUTING_INSTANT)
-    return False
 
 
 # ---- the session --------------------------------------------------------------------------
@@ -187,7 +192,7 @@ def _title(name: str) -> str:
 # ---- the check ---------------------------------------------------------------------------
 
 
-def check(action: str, *, env=None, now: float | None = None, instant: bool = False, reading: bool = False) -> dict:
+def check(action: str, *, env=None, now: float | None = None, reading: bool = False) -> dict:
     """A recorded owner turn in this conversation, or the replay of its answer.
 
     T3 uses its owner-message rows. Native fronts use their recorded typed
@@ -223,24 +228,23 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
     except DirectionRefused:
         if any(t.get("entrypoint") in ("t3", "t3-unverified") for t in owner_turns.turns(session, now)):
             # A T3 conversation (or one whose hook could not read T3's record in
-            # time, which T3's record is asked again here): its turns never count directly, so the
-            # change is held for the owner to confirm (``hold``, ``confirm``).
-            # T3's own record decides whether it is a job (``_t3_bound``).
+            # time, which T3's record is asked again here): its hook turns never
+            # count directly; T3's own record of the owner's messages does
+            # (``_t3_turn``). T3's own record decides whether it is a job (``_t3_bound``).
             with t3.owner_read_budget():
                 _t3_bound(environ, session, now)
-                stamp = _instant_t3(environ, session, now, action) if instant else None
+                stamp = _t3_turn(environ, session, now, action)
             if stamp is not None:
                 return stamp
-            raise DirectionRefused("confirm_needed", _HOLD_WHY) from None
+            raise DirectionRefused("confirm_needed", _ANSWER_HOLD_WHY) from None
         raise
     if not reading and action in SETTLE_ACTIONS and not REQUEST_APPLIED.get():
         _not_the_reading_turn(session, turn)
     stamp = {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
              "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),
              "binding": "session" if turn.get("harness") in owner_turns.SESSION_ONLY_HARNESSES else "hook"}
-    if instant:
-        stamp["instant"] = {"source": "hook", "turn": turn["turn"], "turn_at": turn.get("at"),
-                            "window_h": conf["latest_window_h"]}
+    stamp["instant"] = {"source": "hook", "turn": turn["turn"], "turn_at": turn.get("at"),
+                        "window_h": conf["latest_window_h"]}
     return stamp
 
 
@@ -265,8 +269,10 @@ def _recent_turn(session: str, conf: dict, now: float, recorded: list[dict] | No
     return turn
 
 
-_HOLD_WHY = ("This is a T3 conversation, so the change waits for the owner to confirm it. Ask for it with "
-             "khipu_owner_act: Khipu holds it and tells you what to ask the owner.")
+_ANSWER_HOLD_WHY = ("This answers a request the owner has not been shown in this T3 conversation, so it waits for "
+                    "their yes. Ask for it with khipu_owner_act: Khipu holds it and tells you what to ask the owner.")
+_NO_T3_MESSAGE = ("T3's record shows no message the owner typed in this conversation, so it can't make an owner's "
+                  "change (a dispatched job or a relayed message never can). Nothing was changed.")
 _ASK_NOW = ("Not confirmed yet: no message the owner typed in this conversation since they were last asked, "
             "so nothing was changed. Ask the owner to confirm now, in this conversation, then call "
             "direction.confirm again.")
@@ -415,12 +421,16 @@ def _read_rows() -> list[dict]:
         return []
 
 
+def _thread_read(thread: str) -> dict | None:
+    """The latest read of the list in this T3 thread, when there was one."""
+    return next((row for row in _read_rows()
+                 if _t3_parts((row.get("t3_snapshots") or {}).get(thread)) is not None), None)
+
+
 def _shown_read(thread: str, answer: str | None) -> dict | None:
     """The read in this T3 thread that showed ``answer``, when one did."""
-    for row in _read_rows():
-        if _t3_parts((row.get("t3_snapshots") or {}).get(thread)) is not None:
-            return row if answer and answer in (row.get("shown") or []) else None
-    return None
+    row = _thread_read(thread)
+    return row if row is not None and answer and answer in (row.get("shown") or []) else None
 
 
 def _not_the_reading_turn(session: str, turn: dict) -> None:
@@ -812,59 +822,36 @@ def _t3_proof(environ, session: str, request: dict, now: float) -> dict | None:
     return _ASK_NOW
 
 
-def _t3_baseline(thread: str) -> tuple[str, dict] | None:
-    """(request id, snapshot) of the latest known ask boundary any held
-    request recorded for this T3 thread, or None when there is none. Only a
-    snapshot that bounds something counts (``_t3_parts``); a request Forget
-    scrubbed holds none."""
-    try:
-        rows = _read_requests(requests_path())
-    except OSError:
-        return None
-    best = None
-    for row in rows:
-        snapshots = row.get("t3_snapshots")
-        snapshot = snapshots.get(thread) if isinstance(snapshots, dict) else None
-        parts = _t3_parts(snapshot)
-        if parts is None:
-            continue
-        rank = parts[1] if parts[1] is not None else float("-inf")
-        if best is None or rank > best[0]:
-            best = (rank, str(row.get("id")), snapshot)
-    return None if best is None else (best[1], best[2])
+def _t3_turn(environ, session: str, now: float, action: str) -> dict | None:
+    """The owner's message in this T3 thread that makes ``action``,
+    independent of hook text.
 
-
-def _instant_t3(environ, session: str, now: float, action: str | None = None) -> dict | None:
-    """A T3 owner's message for an instant change, independent of hook text.
-
-    Existing answering actions use their shown ask. An own request keeps the
-    owner's interpretation tradeoff and needs no earlier question.
+    His own direction (class A) needs no earlier question: a message he typed
+    in the thread proves it, as it does for a conversation's own request
+    (``REQUEST_APPLIED``). A settle the list offers needs a message after this
+    thread's latest read of it, as outside T3 (``_not_the_reading_turn``). An
+    answer to someone else's request (``ANSWER_ACTIONS``) also needs that read
+    to have shown it: None when it did not or the owner has not replied, so it
+    is held and asked.
     """
-    from khipu import t3
-
-    try:
-        thread = _t3_thread_of(session)
-        answered = _shown_read(thread, ANSWERING.get()) if action in ANSWER_ACTIONS else None
-        if action in ANSWER_ACTIONS and not REQUEST_APPLIED.get() and answered is None:
-            return None
-        base = ((answered["id"], answered["t3_snapshots"][thread]) if answered is not None
-                else None if REQUEST_APPLIED.get() else _t3_baseline(thread))
-        if base is None:
-            if not REQUEST_APPLIED.get():
-                return None
-            # An own request needs the current typed message, not an earlier question.
-            request_id, snapshot = None, {"ids": [], "latest_ts": 0}
-        else:
-            request_id, snapshot = base
-        stamp = _t3_proof(environ, session, {"t3_snapshots": {thread: json.loads(json.dumps(snapshot))}}, now)
-    except DirectionRefused:
+    thread = _t3_thread_of(session)
+    own = REQUEST_APPLIED.get()
+    read = None if own or action not in SETTLE_ACTIONS | ANSWER_ACTIONS else _thread_read(thread)
+    answer = action in ANSWER_ACTIONS and not own
+    if answer and (read is None or _shown_read(thread, ANSWERING.get()) is None):
         return None
+    snapshot = read["t3_snapshots"][thread] if read is not None else {"ids": [], "latest_ts": 0}
+    stamp = _t3_proof(environ, session, {"t3_snapshots": {thread: json.loads(json.dumps(snapshot))}}, now)
     if not isinstance(stamp, dict):
-        return None
+        if answer:
+            return None
+        if read is not None:
+            raise DirectionRefused("not_confirmed", _SAME_TURN)
+        raise DirectionRefused("no_recorded_turn", _NO_T3_MESSAGE)
     proved = stamp.pop("confirmed")
     stamp["instant"] = {"source": "t3", "message": proved["message"], "message_at": proved["message_at"],
                         "message_sha256": proved["message_sha256"],
-                        **({"after_ask": request_id} if request_id is not None else {})}
+                        **({"after_ask": read["id"]} if read is not None else {})}
     return stamp
 
 
@@ -1900,7 +1887,7 @@ def gate(want: dict | None, *, env=None, now: float | None = None) -> dict:
         raise DirectionRefused("not_by_direction",
                                "That change can't be made by direction: it needs the Khipu app or a yes typed on a "
                                "terminal.")
-    stamp = check(want["action"], env=env, now=now, instant=instant_allowed(want["action"], want["target"]))
+    stamp = check(want["action"], env=env, now=now)
     want.pop("over_newer", None)
     want.pop("owner_words", None)
     before = _before(want)
@@ -2478,7 +2465,7 @@ def _receipt_text(want: dict, stamp: dict, line: dict, result, before=None) -> t
             what = "Undid: " + str(undone["receipt"]["what"])
         elif stamp.get("auth") != "direction":
             return None
-        elif action in ROUTING_INSTANT:
+        elif action in RECEIPTED:
             what = _receipt_what(want, result, before)
         else:
             return None

@@ -4,10 +4,11 @@ and a pause, hold, note or lift made through ``khipu_owner_act``, take effect on
 the owner's own turn, with a receipt in every conversation and a one-step Undo.
 
 They apply only when the turn is provably the owner's by the checks that
-already exist (``owner_direction.check``: an eligible hook turn, and in T3 the
-confirm's own proof against T3's record). Any turn that fails them keeps
-today's behaviour: held or pending. Forget, purge, permissions and trust
-settings are not routing changes and still need their explicit confirm.
+already exist (``owner_direction.check``: an eligible hook turn, and in T3 a
+message he typed in T3's record, with no earlier question). Any turn that
+fails them keeps today's behaviour: refused or pending. Since 2026-11-07 every
+owner change is class A this way except class C (``owner_direction.CLASS_C``:
+forget, purge and a catch-up import), which is held with its own words.
 
 Hermetic: a temp data dir and capture home, turns recorded the way the prompt
 hook records them, and a synthetic T3 database. Nothing here reads T3's real
@@ -250,55 +251,33 @@ def _t3_pause(t3w, account="Grok"):
     return owner_act.act("route.pause", {"account": account, "until": "6h"})
 
 
-def test_a_t3_turn_with_proof_applies_and_one_without_holds(t3world):
-    # No ask has been made in this thread yet, so there is nothing to prove a
-    # message against: the first change is held, exactly as before.
-    t3world["t3"].message(t3t.THREAD, time.time() - 30, text="pause Codex")
-    t3t._t3_hook_turn()
+def test_a_t3_owners_own_change_applies_with_no_earlier_question(t3world):
+    # Class A (2026-11-07): no ask made in this thread, and the owner's own message proves it.
+    mid = t3world["t3"].message(t3t.THREAD, time.time() - 30, text="pause Codex")
+    t3t._t3_hook_turn(prompt="pause Codex")
     ok, out = _t3_pause(t3world, "Codex")
-    assert ok and out["pending"] is True and out["applied"] is False, out
-    assert _state("Codex") != "paused" and _lines() == []
-    request = out["request"]
-    # The owner answers; the confirm applies it (as before) and leaves the ask boundary behind.
-    t3world["t3"].message(t3t.THREAD, time.time() - 5, text="yes")
-    t3t._t3_hook_turn()
-    ok, out = owner_act.act("direction.confirm", {"request": request})
-    assert ok, out
-    assert _state("Codex") == "paused"
-    # A later message the owner typed in that thread: the change applies at once.
-    mid = t3world["t3"].message(t3t.THREAD, time.time() - 2, text="pause Grok too")
-    t3t._t3_hook_turn(prompt="pause Grok too")
-    ok, out = _t3_pause(t3world, "Grok")
     assert ok and out["ok"] is True and "pending" not in out, out
-    assert _state("Grok") == "paused"
-    line = next(x for x in _lines() if x["target"] == "grok|")
-    assert line["auth"] == "direction" and line["binding"] == "t3"
+    assert _state("Codex") == "paused" and not owner_direction.requests_path().exists()
+    line = next(x for x in _lines() if x["target"] == "codex|")
+    assert line["auth"] == "direction" and line["binding"] == "t3" and line["receipt"]
     assert line["instant"]["source"] == "t3" and line["instant"]["message"] == mid
+    assert "after_ask" not in line["instant"]
 
 
-def test_a_t3_turn_without_a_new_owner_message_holds(t3world):
-    t3world["t3"].message(t3t.THREAD, time.time() - 30, text="pause Codex")
-    t3t._t3_hook_turn()
-    ok, out = _t3_pause(t3world, "Codex")
-    assert ok and out["pending"] is True
-    # A machine message (a wake) after the ask, with the hook turn still typed: no proof.
-    t3world["t3"].message(t3t.THREAD, time.time() + 1, text="Continue", by="agent", source="mcp",
+def test_a_t3_thread_the_owner_never_typed_in_is_refused_not_held(t3world):
+    # Only a machine message (a wake) in the thread: no owner message proves anything, and nothing is held.
+    t3world["t3"].message(t3t.THREAD, time.time() - 5, text="Continue", by="agent", source="mcp",
                           scheduledTaskId="task-1")
     t3t._t3_hook_turn()
     ok, out = _t3_pause(t3world, "Grok")
-    assert ok and out["pending"] is True and out["applied"] is False, out
-    assert _state("Grok") != "paused" and _lines() == []
+    assert not out.get("applied") and not out.get("pending"), out
+    assert "no message the owner typed" in json.dumps(out), out
+    assert _state("Grok") != "paused" and _lines() == [] and not owner_direction.requests_path().exists()
 
 
 def test_a_t3_message_does_not_expire_after_six_hours(t3world):
-    t3world["t3"].message(t3t.THREAD, time.time() - 30, text="pause Codex")
-    t3t._t3_hook_turn()
-    ok, out = _t3_pause(t3world, "Codex")
-    request = out["request"]
-    t3world["t3"].message(t3t.THREAD, time.time() - 5, text="yes")
-    t3t._t3_hook_turn()
-    assert owner_act.act("direction.confirm", {"request": request})[0]
-    # Seven hours on, with the owner's only newer message that old, and a typed hook turn.
+    t3world["t3"].message(t3t.THREAD, time.time() - 30, text="pause Grok later")
+    # Seven hours on, with the owner's only message that old, and a typed hook turn.
     later = owner_direction._clock() + 7 * 3600
     t3world["mp"].setattr(owner_direction, "_clock", lambda: later)
     t3t._t3_hook_turn()
@@ -318,9 +297,9 @@ def test_a_t3_own_priority_request_needs_no_prior_question(t3world):
     assert out["applied"] and not routing.read_view()["priority"]["pending"], out
     ok, undone = owner_act.act("direction.undo", {"id": out["instant"]["owner_action"]})
     assert ok, undone
-    # A prior ask in the thread, then a newer owner message: applied.
-    ok, held = _t3_pause(t3world, "Codex")
-    assert ok and held["pending"] is True
+    # Another own change in the thread, then a newer owner message: applied.
+    ok, paused = _t3_pause(t3world, "Codex")
+    assert ok and not paused.get("pending") and _state("Codex") == "paused", paused
     t3world["t3"].message(t3t.THREAD, time.time() - 3, text="loosen Codex a bit")
     t3t._t3_hook_turn()
     out = _amend_request("a bit")
@@ -388,50 +367,45 @@ def test_undo_by_the_cli_path_works_for_an_instant_change(plain):
 # ---- what stays explicit ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("action", ["forget.here", "forget.send", "forget.not_same", "ledger.purge", "direction.set",
-                                    "direction.off", "direction.on", "config.routing_setting",
-                                    "accounts.stop", "project.merge", "route.cap.set", "route.definition.set",
-                                    "route.clear", "route.priority.clear"])
-def test_these_are_not_instant(action):
-    assert action not in owner_direction.ROUTING_INSTANT
-    assert owner_direction.instant_allowed(action) is False
+def test_class_c_is_exactly_what_cant_be_taken_back():
+    assert owner_direction.CLASS_C == {"forget.send", "forget.here", "forget.not_same", "ledger.purge",
+                                       "ledger.import"}
+    assert owner_direction.class_c("ledger.import", {"file": "t.json"}) is False
+    assert owner_direction.class_c("ledger.import", {"file": "t.json", "catch_up": True}) is True
+    for action in ("direction.set", "direction.off", "direction.undo", "config.routing_setting", "accounts.stop",
+                   "route.cap.set", "route.definition.set", "route.clear", "route.priority.clear", "project.merge"):
+        assert owner_direction.class_c(action, {}) is False, action
+    assert "outbox.span_covered" in owner_direction.PLANNED_ASKS  # B, still always asked
 
 
-def test_undoing_a_permission_change_is_not_instant(plain):
+def test_a_trust_setting_applies_at_once_and_its_undo_too(plain):
+    # Decision 1 (2026-11-07): direction.set is class A, with its Undo.
     _say(plain)
     ok, out = owner_act.act("direction.set", {"key": "latest_window_h", "value": "12"})
-    assert ok, out
-    assert owner_direction.instant_allowed("direction.undo", out["owner_action"]) is False
+    assert ok and out["owner_action"] and not out.get("pending"), out
+    assert owner_turns.settings()["latest_window_h"] == 12
+    ok, undone = owner_act.act("direction.undo", {"id": out["owner_action"]})
+    assert ok, undone
+    assert owner_turns.settings()["latest_window_h"] != 12
 
 
-def test_in_t3_permissions_and_forget_are_held_even_with_proof(t3world):
-    t3world["t3"].message(t3t.THREAD, time.time() - 30, text="pause Codex")
+def test_in_t3_a_trust_setting_applies_and_a_forget_is_held(t3world):
+    t3world["t3"].message(t3t.THREAD, time.time() - 2, text="widen the window, and send the forgets")
     t3t._t3_hook_turn()
-    ok, out = _t3_pause(t3world, "Codex")
-    request = out["request"]
-    t3world["t3"].message(t3t.THREAD, time.time() - 5, text="yes")
-    t3t._t3_hook_turn()
-    assert owner_act.act("direction.confirm", {"request": request})[0]
-    t3world["t3"].message(t3t.THREAD, time.time() - 2, text="now loosen the rules on trust")
-    t3t._t3_hook_turn()
-    # Proof for a routing change exists right now ...
-    assert owner_direction.check("route.lift", instant=True)["instant"]["source"] == "t3"
-    # ... and it buys nothing for a permission, a forget, or a purge.
-    for action in ("direction.set", "forget.here", "ledger.purge", "direction.off", "direction.undo"):
-        with pytest.raises(owner_direction.DirectionRefused) as err:
-            owner_direction.check(action, instant=owner_direction.instant_allowed(action, "any"))
-        assert err.value.code == "confirm_needed", action
+    t3world["mp"].setenv("CLAUDE_CODE_SESSION_ID", t3t.T3_SESSION)
+    assert owner_direction.check("direction.set")["instant"]["source"] == "t3"
     ok, out = owner_act.act("direction.set", {"key": "latest_window_h", "value": "24"})
-    assert ok and out["pending"] is True and out["applied"] is False
-    assert owner_turns.settings()["latest_window_h"] != 24
+    assert ok and not out.get("pending") and owner_turns.settings()["latest_window_h"] == 24, out
+    ok, out = owner_act.act("forget.send", {})
+    assert ok and out["pending"] is True and out["applied"] is False and out["ask"], out
+    assert [x["action"] for x in _lines()] == ["direction.set"]
 
 
-def test_outside_t3_forget_still_goes_through_its_own_gate(plain):
-    # An instant routing change does not widen forget: the explicit forget actions have no instant path,
-    # and the check gives their stamp no ``instant`` evidence.
-    _say(plain)
-    assert "instant" not in owner_direction.check("forget.here", instant=owner_direction.instant_allowed("forget.here"))
-    assert "instant" in owner_direction.check("route.pause", instant=True)
+def test_outside_t3_a_forget_is_held_with_its_own_words_too(plain):
+    _say(plain, "send the forgets to the hub")
+    ok, out = owner_act.act("forget.send", {})
+    assert ok and out["pending"] is True and out["applied"] is False and out["ask"], out
+    assert _lines() == []
 
 
 # ---- the audit line carries its evidence -----------------------------------------------------------
@@ -519,12 +493,12 @@ def test_a_whole_priority_receipt_names_every_changed_account_with_its_words(pla
     assert 'Grok "ALL BUILDS NOW"' in receipt["text"] and "Codex" not in receipt["text"].split(", by your")[0]
 
 
-def test_clearing_the_whole_priority_keeps_its_confirm(plain):
+def test_clearing_the_whole_priority_is_the_owners_own_change_too(plain):
     _set_priority_by_the_owner()
     _say(plain)
-    assert "route.priority.clear" not in owner_direction.ROUTING_INSTANT
-    assert "instant" not in owner_direction.check("route.priority.clear",
-                                                  instant=owner_direction.instant_allowed("route.priority.clear"))
+    ok, out = owner_act.act("route.priority.clear", {"expect": routing.priority_version()})
+    assert ok and out["owner_action"] and not out.get("pending"), out
+    assert not routing.read_view()["priority"]
 
 
 def test_a_burst_of_receipts_never_pushes_other_owner_changes_out(plain):
