@@ -69,7 +69,7 @@ describe("the offline-copy row's icon matches its sentence", () => {
 describe("healthRows (pure)", () => {
   it("returns one row per _ok key, all green, when everything passes", () => {
     const rows = healthRows(fixture());
-    expect(rows).toHaveLength(19);
+    expect(rows).toHaveLength(16);
     expect(rows.every((r) => r.status === "ok")).toBe(true);
   });
 
@@ -163,12 +163,12 @@ describe("healthRows (pure)", () => {
 });
 
 describe("HealthReportRows", () => {
-  it("(a) renders 19 rows with a check mark and no raw JSON", () => {
+  it("(a) renders 16 rows with a check mark and no raw JSON", () => {
     const { container } = render(
       <HealthReportRows parsed={fixture()} attention={[]} />,
     );
-    expect(container.querySelectorAll(".row-item")).toHaveLength(19);
-    expect(container.querySelectorAll("svg.ok")).toHaveLength(19);
+    expect(container.querySelectorAll(".row-item")).toHaveLength(16);
+    expect(container.querySelectorAll("svg.ok")).toHaveLength(16);
     expect(container.querySelector("pre")).toBeNull();
   });
 

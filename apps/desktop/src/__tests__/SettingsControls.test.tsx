@@ -36,7 +36,7 @@ beforeEach(() => {
       memory_root: { value: "/Volumes/M/conversations", source: "file", exists: true },
       memory_repo: { value: null, source: "unset", exists: false },
       capture_v2: { value: "/x/capture_v2.py", source: "env:KHIPU_CAPTURE_V2", exists: true },
-      gemini_key_file: { value: null, source: "unset", exists: false },
+      gemini_key_file: { value: "/gone/gemini.key", source: "file", exists: false },
     },
     user_aliases: ["matt"],
     float_settings: {
