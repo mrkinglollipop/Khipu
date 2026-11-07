@@ -1,4 +1,3 @@
-# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
 """Duplicate captures (2026-11-02): one Cursor session stacked 20+ near-identical
 episodes (same project, same session_id, same ts, a fresh paraphrase each) and
 the day's embedding calls passed their cap.
@@ -141,7 +140,6 @@ def _drain_env(root: Path) -> dict:
 def _drain_patches(stack, extract, **extra):
     for patch in (
         mock.patch.object(sc, "_claim_process_start", return_value="kernel:fake"),
-        mock.patch.object(sc, "land_transcript_images", return_value={}),
         mock.patch("khipu.config.capture_mode", return_value="hub"),
         mock.patch("khipu.extract.extract_memory", extract),
         mock.patch("khipu.hub_snapshot.sync_decision_changes", return_value={"ok": True}),

@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Golden-query recall evaluation (W6.3) — ``khipu recall eval``.
 
 ``<config dir>/recall-golden.jsonl`` (maintainer-local; ``KHIPU_RECALL_GOLDEN`` overrides) holds hand- and evidence-derived queries with

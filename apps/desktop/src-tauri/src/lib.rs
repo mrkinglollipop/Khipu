@@ -241,8 +241,7 @@ fn python_version(path: &PathBuf) -> Option<(u32, u32)> {
 /// `KHIPU_PYTHON` / LSEnvironment is trusted as-is (the working happy path —
 /// do not add a version check there). Only the `which python3` fallback is
 /// gated: `/usr/bin/python3` is 3.9 on this Mac and the CLI needs 3.11+
-/// (`typing.TypeAlias` etc.) — see audit F6. Same rejection message shape as
-/// `ops/scripts/soak_probe.sh` uses for the same trap.
+/// (`typing.TypeAlias` etc.) — see audit F6.
 fn khipu_python() -> Result<PathBuf, String> {
     if let Some(v) = env_first(&["KHIPU_PYTHON", "ALZY_PYTHON"]) {
         let p = PathBuf::from(&v);
@@ -723,14 +722,12 @@ async fn khipu_capture_now() -> Result<String, String> {
 // read it as a flag). The gateway token travels on stdin. None of these verbs
 // join `ALLOWED_SUBCOMMANDS`.
 
-/// The ten switches in `khipu.features.FEATURES`.
+/// The eight switches in `khipu.features.FEATURES`.
 const FEATURE_NAMES: &[&str] = &[
     "validity_ranking",
     "time_interpretation",
     "relevance_floor",
     "rerank",
-    "reflect",
-    "briefs",
     "graph_candidates",
     "decision_details",
     "auto_supersede",
@@ -1049,9 +1046,6 @@ const ROUTING_SWITCH_KEYS: &[&str] = &[
     "routing_usage_login_cursor",
     "routing_usage_login_opencode",
 ];
-/// The owner's own dispatch scripts, by file name (phase 6).
-const ROUTING_DISPATCH_SCRIPTS_KEY: &str = "routing_dispatch_scripts";
-const ROUTING_DISPATCH_SCRIPTS_MAX: usize = 16;
 const ROUTING_RETRIES_KEY: &str = "routing_reset_check_retries";
 const ROUTING_SOURCES_KEY: &str = "routing_sources";
 const ROUTING_LANE_MAP_KEY: &str = "routing_lane_map";
@@ -1277,35 +1271,6 @@ fn routing_key(key: &str) -> bool {
         || key == ROUTING_SOURCES_KEY
         || key == ROUTING_LANE_MAP_KEY
         || key == ROUTING_TABLE_KEY
-        || key == ROUTING_DISPATCH_SCRIPTS_KEY
-}
-
-/// The dispatch scripts: a JSON list of file names only (letters, digits,
-/// dots, dashes and underscores; no folder), re-serialised.
-fn checked_dispatch_scripts(raw: &str) -> Result<String, String> {
-    let bad = || "dispatch scripts must be a JSON list of file names".to_string();
-    let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|_| bad())?;
-    let items = value.as_array().ok_or_else(bad)?;
-    if items.len() > ROUTING_DISPATCH_SCRIPTS_MAX {
-        return Err(format!("at most {ROUTING_DISPATCH_SCRIPTS_MAX} dispatch scripts"));
-    }
-    let mut out: Vec<String> = Vec::with_capacity(items.len());
-    for item in items {
-        let name = item.as_str().ok_or_else(bad)?.trim();
-        let plain = !name.is_empty()
-            && name.chars().count() <= 64
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-            && name != "."
-            && name != ".."
-            && !name.starts_with('-');
-        if !plain {
-            return Err(format!("{name:?} must be a file name only: letters, digits, dots, dashes and underscores"));
-        }
-        if !out.iter().any(|n| n == name) {
-            out.push(name.to_string());
-        }
-    }
-    serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
 /// A file's full path, one line, starting with `/` or `~/` (so never with
@@ -1402,9 +1367,6 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     }
     if key == ROUTING_TABLE_KEY {
         return checked_routing_path("the routing table file", v);
-    }
-    if key == ROUTING_DISPATCH_SCRIPTS_KEY {
-        return checked_dispatch_scripts(v);
     }
     if key == ROUTING_RETRIES_KEY {
         if has_control(v) { return Err("retry times must be one line".to_string()); }
@@ -3035,35 +2997,6 @@ fn ledger_restore_argv(project: &str, id: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
-/// The ledger inbox, `<data dir>/ledger-inbox/` (`paths.ledger_inbox`): where
-/// a project's orchestrator copies its old tracker, and where Choose file
-/// opens. Khipu never writes, moves or deletes the original.
-fn ledger_inbox_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("ledger-inbox")
-}
-
-/// A tracker file to import: one full path as the file dialog gives it, not
-/// trimmed, with no control character. The CLI's own reader (`safe_read`)
-/// decides the rest, the login-folder refusal included.
-fn checked_tracker_path(raw: &str) -> Result<String, String> {
-    if !raw.starts_with('/') || raw.len() > 4096 || raw.ends_with('/') || has_control(raw) {
-        return Err("choose the tracker file again; that is not a full path to one file".to_string());
-    }
-    Ok(raw.to_string())
-}
-
-/// `ledger import --json --from-app --project=P [--dry-run] -- PATH`: Check
-/// this file (a dry run, nothing written) and Import. The path travels after
-/// `--`, so it can never become a flag.
-fn ledger_import_argv(project: &str, path: &str, dry_run: bool) -> Result<Vec<String>, String> {
-    let mut argv = ledger_base("import", project, true)?;
-    if dry_run {
-        argv.push("--dry-run".to_string());
-    }
-    argv.extend(["--".to_string(), checked_tracker_path(path)?]);
-    Ok(argv)
-}
-
 /// `work hide|unhide -- ID`: Khipu's own record of a commitment hidden from
 /// Waiting on you until its words change.
 fn work_hide_argv(id: &str, hide: bool) -> Result<Vec<String>, String> {
@@ -3395,24 +3328,6 @@ async fn khipu_ledger_removed(project: String) -> Result<String, String> {
 #[tauri::command]
 async fn khipu_ledger_restore(project: String, id: String) -> Result<String, String> {
     run_khipu_cli_async(ledger_restore_argv(&project, &id)?).await
-}
-
-/// The ledger inbox's full path, made (owner only) when missing.
-#[tauri::command]
-async fn khipu_ledger_inbox() -> Result<String, String> {
-    let inbox = ledger_inbox_dir(&khipu_data_dir()?);
-    std::fs::create_dir_all(&inbox).map_err(|e| format!("Khipu couldn't make its ledger inbox: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o700));
-    }
-    Ok(inbox.to_string_lossy().into_owned())
-}
-
-#[tauri::command]
-async fn khipu_ledger_import(project: String, path: String, dry_run: bool) -> Result<String, String> {
-    run_khipu_cli_async(ledger_import_argv(&project, &path, dry_run)?).await
 }
 
 #[tauri::command]
@@ -5580,8 +5495,6 @@ pub fn run() {
             khipu_ledger_remove,
             khipu_ledger_removed,
             khipu_ledger_restore,
-            khipu_ledger_inbox,
-            khipu_ledger_import,
             khipu_work_hide,
             khipu_work_same,
             khipu_owed_change,
@@ -6485,23 +6398,12 @@ mod settings_command_tests {
             assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }
         assert_eq!(config_unset_argv("routing_reset_check").unwrap(), v(&["config", "--from-app", "--unset=routing_reset_check"]));
-        // Phase 6: the push before handing work to another agent, and the
-        // owner's dispatch scripts, by file name only.
+        // Phase 6: the push before handing work to another agent. The owner's
+        // dispatch scripts went with the shell half of the hook (2026-11-07).
         assert_eq!(config_set_argv("routing_push_delegation", "off").unwrap(), v(&["config", "--from-app", "--set", "routing_push_delegation", "off"]));
         assert_eq!(config_unset_argv("routing_push_delegation").unwrap(), v(&["config", "--from-app", "--unset=routing_push_delegation"]));
         assert!(config_set_argv("routing_push_delegation", "yes").is_err());
-        assert_eq!(
-            config_set_argv("routing_dispatch_scripts", r#"[" dispatch.py ", "run-job.sh", "dispatch.py"]"#).unwrap(),
-            v(&["config", "--from-app", "--set", "routing_dispatch_scripts", r#"["dispatch.py","run-job.sh"]"#])
-        );
-        assert_eq!(config_set_argv("routing_dispatch_scripts", "[]").unwrap(), v(&["config", "--from-app", "--set", "routing_dispatch_scripts", "[]"]));
-        assert_eq!(config_unset_argv("routing_dispatch_scripts").unwrap(), v(&["config", "--from-app", "--unset=routing_dispatch_scripts"]));
-        for bad in [r#"["/bin/dispatch.py"]"#, r#"["a b"]"#, r#"[".."]"#, r#"["-x"]"#, r#"["-c"]"#, r#"["a\nb"]"#, r#"[3]"#,
-                    "dispatch.py", r#"{"a": 1}"#] {
-            assert!(config_set_argv("routing_dispatch_scripts", bad).is_err(), "{bad}");
-        }
-        let many: Vec<String> = (0..17).map(|i| format!("\"s{i}.py\"")).collect();
-        assert!(config_set_argv("routing_dispatch_scripts", &format!("[{}]", many.join(","))).is_err());
+        assert!(config_set_argv("routing_dispatch_scripts", "[]").is_err());
         // Replication between Macs is an owner switch from the app.
         assert_eq!(config_set_argv("routing_replication_live", "on").unwrap(), v(&["config", "--from-app", "--set", "routing_replication_live", "on"]));
         assert_eq!(config_set_argv("routing_replication_live", "off").unwrap(), v(&["config", "--from-app", "--set", "routing_replication_live", "off"]));
@@ -6785,7 +6687,7 @@ mod settings_command_tests {
 
     #[test]
     fn every_switch_builds_an_on_and_an_off_argv() {
-        assert_eq!(FEATURE_NAMES.len(), 10);
+        assert_eq!(FEATURE_NAMES.len(), 8);
         for n in FEATURE_NAMES {
             assert_eq!(feature_set_argv(n, true).unwrap(), v(&["features", "--set", n, "on"]));
             assert_eq!(feature_set_argv(n, false).unwrap(), v(&["features", "--set", n, "off"]));
@@ -8502,37 +8404,6 @@ mod work_command_tests {
             ledger_restore_argv("atlas", "s-1").unwrap(),
             vec!["ledger", "restore", "--json", "--from-app", "--project=atlas", "--", "s-1"]
         );
-    }
-
-    #[test]
-    fn import_runs_the_fixed_argv_with_the_path_after_the_separator() {
-        assert_eq!(
-            ledger_import_argv("owner/atlas", "/data/ledger-inbox/tracker.json", true).unwrap(),
-            vec!["ledger", "import", "--json", "--from-app", "--project=owner/atlas", "--dry-run", "--",
-                 "/data/ledger-inbox/tracker.json"]
-        );
-        assert_eq!(
-            ledger_import_argv("atlas", "/data/ledger-inbox/tracker.json", false).unwrap(),
-            vec!["ledger", "import", "--json", "--from-app", "--project=atlas", "--", "/data/ledger-inbox/tracker.json"]
-        );
-        // A name that starts with a dash stays a path after `--`.
-        assert_eq!(ledger_import_argv("atlas", "/data/-x.json", false).unwrap().last().unwrap(), "/data/-x.json");
-    }
-
-    #[test]
-    fn import_refuses_a_path_that_is_not_one_full_path_and_a_bad_project() {
-        for bad in ["", "-x", "--dry-run", "tracker.json", "~/tracker.json", "/a\nb.json", "/a\u{0}b", " /a.json"] {
-            assert!(ledger_import_argv("atlas", bad, false).is_err(), "{bad:?}");
-        }
-        assert!(ledger_import_argv("atlas", &format!("/{}", "a".repeat(5000)), false).is_err());
-        for bad in ["", "a#b", "a\nb"] {
-            assert!(ledger_import_argv(bad, "/data/tracker.json", false).is_err(), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn the_ledger_inbox_is_a_folder_in_the_data_folder() {
-        assert_eq!(ledger_inbox_dir(Path::new("/data")), PathBuf::from("/data/ledger-inbox"));
     }
 
     #[test]

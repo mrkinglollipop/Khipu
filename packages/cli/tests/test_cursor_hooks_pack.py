@@ -82,7 +82,7 @@ class CursorHooksInstallTest(_Home):
         self.assertEqual(by["sessionStart"]["timeout"], integ.CURSOR_RECALL_TIMEOUT)
         self.assertEqual(by["beforeSubmitPrompt"]["timeout"], integ.PROMPT_RECALL_TIMEOUT)
         self.assertEqual(by["postToolUse"]["timeout"], integ.DELEGATION_TIMEOUT)
-        self.assertEqual(by["postToolUse"]["matcher"], "Task|Shell")
+        self.assertEqual(by["postToolUse"]["matcher"], "Task")
 
     def test_no_permission_style_hook_is_ever_written(self):
         """No preToolUse (or subagentStart) entry, and no entry of ours carries a
@@ -141,9 +141,26 @@ class CursorHooksInstallTest(_Home):
         (self.home / ".cursor" / "hooks.json").write_text(json.dumps(h))
         integ.install("cursor")
         h = self.hooks()["hooks"]
-        self.assertEqual(_khipu(h["postToolUse"])[0]["matcher"], "Task|Shell")
+        self.assertEqual(_khipu(h["postToolUse"])[0]["matcher"], "Task")
         self.assertEqual(_khipu(h["postToolUse"])[0]["timeout"], integ.DELEGATION_TIMEOUT)
         self.assertEqual(_khipu(h["beforeSubmitPrompt"])[0]["timeout"], integ.PROMPT_RECALL_TIMEOUT)
+
+    def test_a_repair_stops_the_hook_running_after_every_shell_command(self):
+        """An older install matched Task|Shell; the shell half is gone
+        (2026-11-07), so status asks for the repair and the repair narrows it."""
+        self.seed(copy.deepcopy(FOREIGN))
+        integ.install("cursor")
+        h = self.hooks()
+        _khipu(h["hooks"]["postToolUse"])[0]["matcher"] = "Task|Shell"
+        (self.home / ".cursor" / "hooks.json").write_text(json.dumps(h))
+        self.assertEqual(integ.status("cursor")["delegation_push"], "missing")
+        out = integ.install("cursor")
+        self.assertTrue(any("postToolUse" in c and "khipu-delegation-hook" in c for c in out["changes"]))
+        h = self.hooks()["hooks"]
+        self.assertEqual([e["matcher"] for e in _khipu(h["postToolUse"])], ["Task"])
+        self.assertIn(FOREIGN["postToolUse"][0], h["postToolUse"])  # the owner's own Shell hook stays
+        self.assertEqual(integ.status("cursor")["delegation_push"], "installed")
+        self.assertEqual(integ.install("cursor")["changes"], [])
 
     def test_the_stop_family_keeps_an_owner_edited_timeout(self):
         integ.install("cursor")

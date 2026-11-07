@@ -274,11 +274,14 @@ def _cycles(samples, window):
 
 
 # An unchanged window is stored this often (``should_sample``, from the polls that
-# run anyway), so its newest reading is inside a one-hour trailing window with
-# polls to spare. A quiet window's reading older than an hour has not come when
-# it should have.
+# run anyway). The polls themselves come about hourly when nothing moves, so a
+# quiet window's newest reading can be an hour old and a few minutes more; one
+# older than an hour and a half has not come when it should have.
 IDLE_SAMPLE_S = 50 * 60
-QUIET_READING_S = 3600
+QUIET_READING_S = 5400
+# A window its reader has not listed for this long, while the same Mac reads the
+# account's other windows, is not reported any more (``mark_not_reported``).
+NOT_REPORTED_S = 6 * 3600
 
 # Another Mac's readings count only when they read the same allowance. Both
 # name a reset still ahead and those resets lie further apart than one cycle's
@@ -296,7 +299,8 @@ def shared_readings(samples, mine, now, window):
     params = _sample_params(window, samples)
     if not mine or params is None or all(s.get("mac") == mine for s in samples):
         return samples
-    placed = _placed(samples, params, now)
+    # A window that has not started (``unstarted``) names no reset to compare.
+    placed = [s for s in _placed(samples, params, now) if s.get("reset") is not None]
     own = [s for s in placed if s.get("mac") == mine]
     if not own:
         return samples
@@ -332,7 +336,9 @@ def _after_a_fall(readings):
     or enough readings stay far enough below it to settle a new cycle."""
     keep, high, top, low, under = set(), None, None, [], False
     for at, s in enumerate(readings):
-        if at and abs((s["reset"] - readings[at - 1]["reset"]).total_seconds()) > 3600:
+        before = readings[at - 1]["reset"] if at else None
+        if at and ((s["reset"] is None) != (before is None) or (
+                s["reset"] is not None and abs((s["reset"] - before).total_seconds()) > 3600)):
             high, top, low, under = None, None, [], False  # another cycle has its own highest
         if high is None or s["used"] >= high:
             if under:
@@ -401,9 +407,10 @@ def next_change(samples, now, window, *, day=False):
             if isinstance(moment, datetime) and moment > now and (best is None or moment < best):
                 best = moment
     if newest is not None:
-        stale = min(newest, now) + timedelta(seconds=2 * params["sample_s"])
-        if stale > now and (best is None or stale < best):
-            best = stale
+        for wait in (2 * params["sample_s"], QUIET_READING_S, NOT_REPORTED_S):
+            stale = min(newest, now) + timedelta(seconds=wait)
+            if stale > now and (best is None or stale < best):
+                best = stale
     return best
 
 
@@ -453,6 +460,60 @@ def at(pace, now):
     return out
 
 
+def _not_started(pace, reading, params, now):
+    """``pace`` for a window whose newest reading says it has not started: 0%
+    used and no reset, because nothing has been used to start it. Fresh, it is
+    idle with nothing used and no reset to pace toward; old, it is as late as
+    any reading. Caps stay unknown: with no reset there is no allowance."""
+    age = (now - reading["t"]).total_seconds()
+    pace["used_pct"] = 0.0
+    pace["buckets"] = 1 if age <= params["trailing_s"] else 0
+    for field in ("pace_target", "check_pace_target"):
+        if pace.get(field):
+            pace[field] = dict(pace[field], used_pct=0.0, why="no reset time")
+    if age > max(2 * params["sample_s"], QUIET_READING_S):
+        pace["why"] = f"last reading {_hours(age / 3600)} h old"
+        return pace
+    pace.update(idle=True, not_started=True, rate_pct_per_h=0.0)
+    pace["plan"] = dict(pace["plan"], verdict="underpacing", unused_at_reset_pct=100.0)
+    return pace
+
+
+def mark_not_reported(paces, samples, now):
+    """Say which of one account's windows its reader no longer reports.
+
+    ``samples`` maps each window in ``paces`` to its readings. A window whose
+    newest reading is ``NOT_REPORTED_S`` old, and goes unknown for that, while
+    the Mac that last read it has read another of the account's windows within
+    ``QUIET_READING_S``, is not reported any more (Claude's five-hour window
+    after 2026-11-01): it says so instead of waiting on a reset forever. Only
+    the words change; every verdict stays as computed."""
+    newest = {}
+    for window, group in samples.items():
+        for s in group:
+            t = s.get("t")
+            if isinstance(t, datetime) and t <= now and ((window, s.get("mac")) not in newest
+                                                         or t > newest[(window, s.get("mac"))]):
+                newest[(window, s.get("mac"))] = t
+    for pace in paces:
+        why = pace.get("why") or ""
+        if not why.startswith(("reset passed", "last reading ")):
+            continue
+        readers = {m: t for (w, m), t in newest.items() if w == pace["window"]}
+        if not readers or (now - max(readers.values())).total_seconds() < NOT_REPORTED_S:
+            continue
+        if not any(w != pace["window"] and m in readers and (now - t).total_seconds() <= QUIET_READING_S
+                   for (w, m), t in newest.items()):
+            continue
+        last = max(readers.values())
+        pace["not_reported"] = True
+        pace["why"] = f"not reported since {last:%b} {last.day}: its reader no longer lists this window"
+        for field in ("pace_target", "check_pace_target"):
+            if isinstance(pace.get(field), dict) and pace[field].get("why") == why:
+                pace[field] = dict(pace[field], why=pace["why"])
+    return paces
+
+
 def compute_pace(samples, caps, now, window, *, failed_reader=None):
     """One window's pace object from sanitized sample dicts.
 
@@ -471,6 +532,9 @@ def compute_pace(samples, caps, now, window, *, failed_reader=None):
             "share_cap": None, "day_cap": None, "pace_target": None, "headline": "plan"}
     if window not in WINDOWS and params is not None:
         pace["window_s"] = params["window_s"]
+    # A window that has not started reads 0% with no reset (an idle GLM): the
+    # reading says nothing is used, not that the reset is unknown.
+    unstarted = [s for s in samples if s.get("unstarted") and s.get("reset") is None and _num(s.get("used")) == 0]
     samples = [s for s in samples if s.get("reset") is not None and _num(s.get("used")) is not None]
     targets = {("check_pace_target" if c.get("purpose", "job") == "check" else "pace_target"): c
                for c in caps if c.get("kind") == "pace_target"}
@@ -478,7 +542,7 @@ def compute_pace(samples, caps, now, window, *, failed_reader=None):
         pace[field] = {"revision": target_cap["revision"], "pct": target_cap["pct"],
                                "slack": target_cap["slack"], "allowance_pct": None, "used_pct": None,
                                "verdict": "unknown", "why": "no reading"}
-    if not samples:
+    if not samples and not unstarted:
         pace["why"] = no_reading
         return pace
     if params is None:
@@ -487,10 +551,16 @@ def compute_pace(samples, caps, now, window, *, failed_reader=None):
         return pace
     trailing = params["trailing_s"]
     samples = _placed(samples, params, now)
+    unstarted = _placed(unstarted, params, now) if unstarted else []
+    if unstarted and not failed_reader:
+        first = max(unstarted, key=lambda s: s["t"])
+        if not samples or first["t"] > max(s["t"] for s in samples):
+            return _not_started(pace, first, params, now)
     if not samples:
         pace["why"] = no_reading
         return pace
     _cycles(samples, window)
+    placed = samples
     # Only the windows the calculations read can matter: the trailing window
     # (a rolling day for a per-day cap), plus the newest reading before it
     # per witness and cycle, which anchors the interval straddling its start.
@@ -600,22 +670,45 @@ def compute_pace(samples, caps, now, window, *, failed_reader=None):
     still = [blist[-1]] if not blist[-1]["correction"] else []
     earlier = None
     for b in reversed(blist[:-1]):
-        if still and b["segment"] == still[-1]["segment"] and b["value"] == still[-1]["value"] and not b["correction"]:
+        # Nothing used on both sides of a reset is still nothing used: an idle
+        # five-hour window rolls over every five hours without moving.
+        if still and b["value"] == still[-1]["value"] and not b["correction"] and (
+                b["segment"] == still[-1]["segment"] or b["value"] == 0):
             still.append(b)
         else:
             earlier = b
             break
     newest_at, age = blist[-1]["time"], (now - blist[-1]["time"]).total_seconds()
+    if len(still) == 1 and newest_at < now - timedelta(seconds=trailing):
+        # On the quiet cadence a short window's newest reading can be older than
+        # its trailing hour, and only that one is kept from before it. Whether it
+        # stood still is the same witness's earlier readings' to say, a day back
+        # at most (``routing_compact`` keeps two days of readings): read for that, never for a rate.
+        last = next((s for s in placed if s["t"] == newest_at and s["used"] == still[0]["value"]), None)
+        for s in sorted(placed, key=lambda x: x["t"], reverse=True) if last else ():
+            if (s.get("mac"), s.get("source")) != (last.get("mac"), last.get("source")) or s["t"] >= newest_at:
+                continue
+            if (now - s["t"]).total_seconds() > 86400:
+                break
+            if s["used"] != last["used"] or s.get("_correction") or (
+                    s["_cycle_key"] != last["_cycle_key"] and s["used"] != 0):
+                if earlier is None or s["t"] > earlier["time"]:
+                    earlier = {"time": s["t"]}
+                break
+            still.append({"time": s["t"]})
     # Two readings an hour's quiet apart put the writer on its slower cadence, so
-    # one up to an hour old is not late. One reading alone says nothing of that.
+    # one up to an hour and a half old is not late. One reading alone says nothing of that.
     quiet = len(still) >= 2 and (earlier is None or (newest_at - earlier["time"]).total_seconds() >= QUIET_READING_S)
     fresh_enough = age <= 2 * params["sample_s"] or (quiet and age <= QUIET_READING_S)
     # No use to forecast: unchanged from before the trailing window to a reading
     # inside it, across real time.
-    idle = (fresh_enough and bool(in_window) and len(still) >= 2 and still[-1]["time"] <= start
+    # The quiet cadence can leave a short window's trailing hour without a reading.
+    idle = (fresh_enough and len(still) >= 2 and still[-1]["time"] <= start
             and (newest_at - still[-1]["time"]).total_seconds() >= min(trailing, IDLE_SAMPLE_S))
     gains, valid_dur, gap_time, disagree_time = clipped(start, now)
     rate = gains / (valid_dur / 3600) if valid_dur > 0 else None
+    if idle and rate is None:
+        rate = 0.0  # unchanged across a reset: nothing used, at no rate
     pace["rate_pct_per_h"] = rate
     pace["valid_pct"] = valid_dur / trailing * 100
     pace["observed_pct"] = max(0.0, (valid_dur - gap_time) / trailing * 100)
@@ -635,7 +728,7 @@ def compute_pace(samples, caps, now, window, *, failed_reader=None):
         why = "reset time disagrees between readings"
     elif ambiguous:
         why = "reset time spread over more than an hour"
-    elif secs_to_reset is not None and secs_to_reset <= 0:
+    elif secs_to_reset is not None and secs_to_reset <= 0 and not (idle and used == 0):
         why = "reset passed; waiting for a new reading"
     elif idle:
         pace["idle"] = True
@@ -849,7 +942,7 @@ def _unknown_words(why):
         return f"not enough history for a pace: {why}"
     if why.startswith("last reading "):
         return f"no fresh reading, its reader is failing or has not run: {why}"
-    if why.startswith("reader failed"):
+    if why.startswith(("reader failed", "not reported")):
         return why
     return f"pace unknown at the trailing average: {why}"
 
@@ -863,7 +956,28 @@ def _allowance_words(pace):
     return f"; {used:g}% used, {max(100 - used, 0):g}% left"
 
 
+# Under this much left, an account is nearly out whatever its rate: a 96% used
+# account at no rate has room in name only, never "plenty of time".
+NEARLY_OUT_LEFT_PCT = 10
+
+
+def nearly_out(used_pct):
+    """Whether a usage level leaves something, but under ``NEARLY_OUT_LEFT_PCT``."""
+    used = _num(used_pct)
+    return used is not None and 0 < 100 - used < NEARLY_OUT_LEFT_PCT
+
+
 def pace_line(label, pace, now):
+    line = _pace_line(label, pace, now)
+    if pace.get("why") or not nearly_out(pace.get("used_pct")) \
+            or (pace.get(pace.get("headline") or "plan") or {}).get("verdict") in ("limit_reached", "cap_reached"):
+        return line
+    head = f"{label} {_window_word(pace['window'])}: "
+    left = f"{max(100 - pace['used_pct'], 0):g}% left"
+    return (head + ("nearly out; " if left in line else f"nearly out, {left}; ") + line[len(head):])[:160]
+
+
+def _pace_line(label, pace, now):
     word = _window_word(pace["window"])
     rate = pace.get("rate_pct_per_h")
     rate_text = f"{_rate_words(rate)}%/h" if rate is not None else "no rate"
@@ -878,6 +992,8 @@ def pace_line(label, pace, now):
         allowance_text = f"{allowance:.2f}%" if isinstance(allowance, (int, float)) else "its allowance"
         return (f"{label} {word}: {target['verdict']} of its pace target "
                 f"({target.get('used_pct'):g}% used against a {allowance_text} allowance)")[:160]
+    if pace.get("not_started"):
+        return f"{label} {word}: idle, not started, nothing used"
     if pace.get("idle"):
         return f"{label} {word}: idle, no use to forecast{_allowance_words(pace)}"
     if verdict == "unknown" or pace.get("why"):

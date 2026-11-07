@@ -585,7 +585,7 @@ What the agent sees:
 
 - **Session start**: a block headed "Routing at HH:MMZ" offers a bounded summary (rules, accounts, holds, pace). It has a time budget of 1 second by default. Words that do not fit remain owed and arrive as revision-labelled continuation pages.
 - **Each prompt**: changes and owed pages arrive under "Routing changes at HH:MMZ", with a default 50 ms budget. A summary resend is offered when the session is 20 versions behind or 6 hours old. Prompt and resend delivery advance only through text actually shown and acknowledged.
-- **Delegation**: a hook watches the moment an agent hands work to another one (agent and task calls, `delegate_task`, and shell commands that start `claude -p`, `codex exec`, `grok` or `muse exec`, plus any dispatch scripts you name in settings). It adds the same changes block. A child receives a bounded routing snapshot at start. Claude Code subagents receive remaining pages on their own tool calls; Codex children receive remaining pages through their own Khipu pull calls under their own identity. Child receipts do not settle the parent's debt.
+- **Delegation**: a hook watches the moment an agent hands work to another one (agent and task calls, `spawn_agent` and `delegate_task`; shell commands are not watched, since a job started from a shell gets routing at its own session start). It adds the same changes block. A child receives a bounded routing snapshot at start. Claude Code subagents receive remaining pages on their own delegation tool calls; Codex children receive remaining pages through their own Khipu pull calls under their own identity. Child receipts do not settle the parent's debt.
 
 Default sizes are 1,500, 400 and 4,000 UTF-16 units for summary, prompt and child
 blocks, subject to hook ceilings. Paging uses a minimum effective cap of 200;
@@ -632,18 +632,6 @@ Checks and copies flags conflicting account states and structured directions,
 and rule upkeep: expired deadlines, overlapping rules, roles repeating rules
 and edits pending over 24 hours. Follow its links to edit owner state; checks
 themselves stop or change nothing.
-
-It also lists routing claims found in approved instruction and memory files,
-with file and line. Khipu marks them superseded by its record and never edits
-those files. The bounded report and quoted words stay local to the owner in
-`state/routing/scan-report.json`.
-
-The scan includes `~/.claude/CLAUDE.md`, `~/.claude/AGENTS.md`,
-`~/.codex/AGENTS.md`, `~/AGENTS.md`, root `CLAUDE.md` and `AGENTS.md` files for
-projects Khipu already knows, and imported memory notes. It never walks for
-arbitrary repositories. Files over 1,000,000 bytes are skipped, quotes are
-limited to 140 characters, and at most 50 hits per file and 500 total are shown,
-with omissions counted.
 
 The Home screen has a Routing card with one row per account, holds, your note, a priority headline, and attention items (a broken rule, a silent runner, two sources that disagree). It also has a Plans card for usage.
 

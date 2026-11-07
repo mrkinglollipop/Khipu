@@ -6,7 +6,7 @@
    you. Every write is a fixed-argv command (src-tauri lib.rs); the page reads
    again after each one instead of trusting what it sent. */
 
-import { type FormEvent, type ReactNode, useCallback, useEffect, useId, useRef, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useId, useRef, useState } from "react";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { type ConfigShape, callCli } from "./settingsCli";
 import { type LimitUnit, limitWords } from "./routingWords";
@@ -832,7 +832,7 @@ function HiddenSection({ items, error, w }: { items: HiddenItem[] | null; error:
 
 // ---- the page -----------------------------------------------------------------------
 
-export function WorkSettings({ active, work, importCard, projectNames }: { active: boolean; work: WorkState; importCard?: ReactNode; projectNames?: ProjectsList | null }) {
+export function WorkSettings({ active, work, projectNames }: { active: boolean; work: WorkState; projectNames?: ProjectsList | null }) {
   const [cfg, setCfg] = useState<WorkConfig | null>(null);
   const [cfgError, setCfgError] = useState<string | null>(null);
   const [projects, setProjects] = useState<LedgerProject[] | null>(null);
@@ -891,8 +891,6 @@ export function WorkSettings({ active, work, importCard, projectNames }: { activ
         </p>
       ) : null}
       <ProjectsSection projects={projects} error={projectsError} view={work.data ?? null} canonical={canonicalNames(projectNames)} w={w} />
-      {/* Import a tracker…, Last import and Old tracker files: the mock's second card. */}
-      {importCard}
       <SummarySection entries={entries} suggested={cfg?.work_suggested ?? []} boards={boards} projects={projects ?? []} w={w} write={writeEntries} />
       <div className="section-card">
         <div className="section-head">Limits</div>

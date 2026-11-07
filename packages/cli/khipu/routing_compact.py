@@ -335,8 +335,11 @@ def _sample_drops(groups: dict[tuple, list[tuple[datetime, int, dict]]], now: da
       * the writer's cadence (``routing_pace.should_sample``): the newest
         line of each witness, whatever it holds.
 
-    A line the fold ignores (no reset time) is read by none of this. Groups
-    whose readings carry cycle ids keep a whole extra window back."""
+    A line with no reset time is read by none of this, except a 0% one, which
+    the fold reads as a window not started (``routing.pace_sample``,
+    ``unstarted``): only the newest reading of all counts there, and the
+    newest line of each witness stays. Groups whose readings carry cycle ids
+    keep a whole extra window back."""
     from khipu import routing_pace
 
     drop: set[int] = set()

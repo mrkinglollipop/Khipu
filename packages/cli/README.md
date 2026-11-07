@@ -49,12 +49,12 @@ To point Khipu at a legacy file wiki, use `python3 -m khipu config --set memory_
 | Group | Commands |
 |---|---|
 | Health and data | `doctor`, `status`, `activity`, `revisions`, `reconcile`, `migrate`, `snapshot`, `outbox` |
-| Search and records | `search`, `get`, `graph`, `episode`, `topic`, `notes`, `owed`, `decisions`, `briefs`, `reflect`, `recall` |
-| Maintenance | `regen-memory`, `backfill`, `project`, `hygiene`, `topic-graph`, `git-sync` |
-| Embeddings and libraries | `embed`, `embed-backfill`, `embed-media-backfill`, `library`, `library-backfill`, `sources` |
+| Search and records | `search`, `get`, `graph`, `episode`, `topic`, `notes`, `owed`, `decisions`, `recall` |
+| Maintenance | `regen-memory`, `backfill`, `project`, `hygiene`, `git-sync` |
+| Embeddings and libraries | `embed`, `embed-backfill`, `library`, `library-backfill`, `sources` |
 | Models and limits | `models`, `budget`, `features`, `secrets`, `config` |
 | Setup and moving | `db`, `join`, `components`, `paths`, `backup-local`, `import-local` |
-| Harnesses and capture | `integrations`, `sessions` (older name `aegis`), `capture`, `gateway`, `grok-bot-config` |
+| Harnesses and capture | `integrations`, `sessions` (older name `aegis`), `capture`, `gateway` |
 | Jobs and deploy | `jobs`, `nightly`, `monthly`, `promote` |
 | Routing and plans | `route`, `usage` |
 

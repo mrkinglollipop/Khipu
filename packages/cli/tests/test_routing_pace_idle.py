@@ -68,17 +68,18 @@ def test_two_readings_too_close_together_are_not_real_time_at_rest():
 
 
 def test_readings_that_stopped_past_the_trailing_window_are_not_idle():
-    pace = five_hour([reading(130), reading(70)])
-    assert "idle" not in pace and pace["why"] == "last reading 1.2 h old"
+    # Quiet readings may be an hour and a half old (``QUIET_READING_S``); these are older.
+    pace = five_hour([reading(160), reading(100)])
+    assert "idle" not in pace and pace["why"] == "last reading 1.7 h old"
     assert routing_advice._pace_reading_unknown(pace)
 
 
 def test_a_reading_older_than_its_cadence_is_no_longer_idle():
-    pace = five_hour([reading(200), reading(140), reading(80)])
+    pace = five_hour([reading(230), reading(170), reading(110)])
     assert "idle" not in pace
-    assert pace["why"] == "last reading 1.3 h old"
+    assert pace["why"] == "last reading 1.8 h old"
     line = routing_pace.pace_line("Claude", pace, NOW)
-    assert line == ("Claude five-hour: no fresh reading, its reader is failing or has not run: last reading 1.3 h old")
+    assert line == ("Claude five-hour: no fresh reading, its reader is failing or has not run: last reading 1.8 h old")
     assert routing_advice._pace_reading_unknown(pace)
 
 

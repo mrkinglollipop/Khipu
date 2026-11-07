@@ -1,9 +1,9 @@
 """The one chokepoint for text that leaves this Mac for an embedding,
-summariser, reflect, rerank or graph provider.
+summariser, rerank or graph provider.
 
 Every function that calls a provider client must get its text from here:
 ``fenced_texts`` for text derived from stored episodes (embeddings of episodes,
-commitments and topics, briefs, reflect, rerank, hygiene judging) and
+commitments and topics, rerank, hygiene judging) and
 ``live_input`` for input that is not stored memory (a typed query, a probe, a
 transcript being captured, a library chunk, an image). The guard in
 ``tests/test_forget_fence.py`` fails any provider caller that calls neither.
@@ -29,7 +29,7 @@ _log = logging.getLogger("khipu.provider_text")
 
 # Text derived from stored episodes: each needs source episode ids.
 DERIVED_KINDS = frozenset({
-    "episode", "commitment", "topic", "brief", "reflect", "rerank", "decision",
+    "episode", "commitment", "topic", "rerank", "decision",
     "deliverable", "graph", "capture-edit", "capture-embed",
 })
 # Input that is not stored memory: nothing to fence by episode. "payload" is

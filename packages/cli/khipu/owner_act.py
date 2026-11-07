@@ -76,7 +76,6 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "config.answer_request.undo": (("key",), ("expect",)),
     "promote.gate_ignore": (("checks",), ()),
     "promote.gate_ignore.cancel": ((), ()),
-    "ledger.import": (("file",), ("project", "catch_up")),
     "ledger.restore": (("id",), ("project",)),
     "ledger.purge": (("id",), ("project",)),
     "ledger.project": (("project",), ("rename", "hide", "show")),
@@ -107,16 +106,12 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "forget.send": ((), ()),
     "forget.here": (("id",), ()),
     "forget.not_same": (("id",), ()),
-    # Undone through direction.undo with the id this returns.
-    "outbox.merge_preferences": ((), ("include_content", "include_decisions")),
-    # Always held (owner_direction.PLANNED_ASKS). Undone through direction.undo.
-    "outbox.span_covered": ((), ()),
 }
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
 _INTS = {"rule"}
 _RULE_ENTITY = re.compile(r"rule-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_FLAGS = {"keep_priority", "catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions", "indefinite", "helpers", "whole_folder"}
+_FLAGS = {"keep_priority", "hide", "show", "sensitive_only", "over_newer", "indefinite", "helpers", "whole_folder"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
             "change": ("close", "reopen", "reassign"), "to": ("user", "assistant", "agent"),
             "reason": ("machine-busy", "disk-low", "keep", "outage", "other")}
@@ -409,9 +404,9 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
             raise _bad("a project is hidden or shown, not both")
         return ["ledger", "project", "--json", *_opts(v, "project", "rename", "hide", "show")], []
     if action.startswith("ledger."):
-        keys = ("project", "catch_up", "title", "kind", "parent", "state", "evidence", "owner", "note", "link",
+        keys = ("project", "title", "kind", "parent", "state", "evidence", "owner", "note", "link",
                 "if_state", "children")
-        return ["ledger", verb, "--json", *_opts(v, *keys)], [v["file"] if verb == "import" else v["id"]]
+        return ["ledger", verb, "--json", *_opts(v, *keys)], [v["id"]]
     if action in ("work.hide", "work.unhide"):
         return ["work", verb], [v["commitment"]]
     if action == "owed.change":
@@ -464,10 +459,6 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["episode", "forget-pending", f"--forget-here={v['id']}"], []
     if action == "forget.not_same":
         return ["episode", "forget-pending", f"--not-same={v['id']}"], []
-    if action == "outbox.merge_preferences":
-        return ["outbox", "merge-line-preferences", "--apply", *_opts(v, "include_content", "include_decisions")], []
-    if action == "outbox.span_covered":
-        return ["outbox", "span-covered", "--apply", "--json"], []
     raise Refused("not_by_direction", "That change can't be made by direction.")
 
 

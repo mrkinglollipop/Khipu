@@ -138,15 +138,6 @@ def state_of(row: dict[str, Any]) -> str:
     return "current"
 
 
-def _stale_briefs(cur, decision_id: int) -> None:
-    """A brief's claims were built under the decision states of the moment;
-    any state change makes the briefs citing this decision's episode stale
-    (khipu.briefs). Fail-open."""
-    from khipu import briefs
-
-    briefs.mark_stale_for_decision(cur, decision_id)
-
-
 def _lock_decision_row(cur, decision_id: int) -> None:
     # forget-fence: decision writer or write check; returns ids or the write's outcome
     cur.execute("SELECT id, project, superseded_by FROM decisions WHERE id = %s FOR UPDATE",
@@ -699,8 +690,6 @@ def supersede(cur, old_id: int, new_id: int, *, source: str = "manual",
             provenance.project(cur, "decision", new_id)
     if ok and _links_ready(cur):
         _record_applied_link(cur, old_id, new_id, source=source, reason=reason)
-    if ok:
-        _stale_briefs(cur, old_id)
     return ok
 
 
@@ -733,8 +722,6 @@ def restore(cur, decision_id: int) -> bool:
             "WHERE old_id = %s AND new_id = %s AND kind = 'supersedes' AND state = 'applied'",
             (decision_id, new_id),
         )
-    if ok:
-        _stale_briefs(cur, decision_id)
     return ok
 
 
@@ -752,8 +739,6 @@ def retract(cur, decision_id: int, reason: str | None = None) -> bool:
         (reason, decision_id),
     )
     ok = cur.rowcount > 0
-    if ok:
-        _stale_briefs(cur, decision_id)
     return ok
 
 
@@ -766,8 +751,6 @@ def unretract(cur, decision_id: int) -> bool:
         (decision_id,),
     )
     ok = cur.rowcount > 0
-    if ok:
-        _stale_briefs(cur, decision_id)
     return ok
 
 
@@ -981,6 +964,63 @@ def resolve_link(cur, link_id: int, action: str, *, source: str = "manual") -> d
     return {"ok": True, "id": link_id, "action": "confirm", "applied": applied}
 
 
+def decision_rows_for_episodes(cur, episode_ids: list[int], *, with_text: bool = False) -> dict[int, list[dict[str, Any]]]:
+    # forget-fence source: decision rows for the episode ids its caller passes; callers fence those ids
+    """Decision rows per episode, each with its ``state`` (current |
+    superseded | retracted). Empty when the decisions table is absent."""
+    if not episode_ids or not _decisions_ready(cur):
+        return {}
+    retracted = "retracted_at" if _evidence_ready(cur) else "NULL"
+    text = "text" if with_text else "length(text)"
+    cur.execute(
+        f"SELECT episode_id, id, {text}, superseded_by, {retracted} "
+        "FROM decisions WHERE episode_id = ANY(%s::bigint[]) ORDER BY id",
+        (list(episode_ids),),
+    )
+    out: dict[int, list[dict[str, Any]]] = {}
+    for episode_id, did, body, superseded_by, retracted_at in cur.fetchall():
+        row = {"id": did, "superseded_by": superseded_by, "retracted_at": retracted_at}
+        row["text" if with_text else "chars"] = body
+        row["state"] = state_of(row)
+        out.setdefault(int(episode_id), []).append(row)
+    # Backfill deduplicates repeated strings into an earlier episode's row.
+    # Retracted rows stay visible even when their source episode was forgotten:
+    # forgetting the original must not resurrect a retracted restatement as
+    # "(validity unknown)" for a later episode that still carries the text.
+    body = "d.text" if with_text else "length(d.text)"
+    evidence = _evidence_ready(cur)
+    retracted = "d.retracted_at" if evidence else "NULL"
+    live = _not_forgotten_clause(cur, "d")
+    if live and evidence:
+        live = f"({live} OR d.retracted_at IS NOT NULL)"
+    cur.execute(
+        f"SELECT e.id, d.id, {body}, d.superseded_by, {retracted} "
+        "FROM episodes e CROSS JOIN LATERAL jsonb_array_elements_text(e.decisions) legacy(text) "
+        "JOIN LATERAL (SELECT d.* FROM decisions d "
+        "WHERE d.project IS NOT DISTINCT FROM e.project "
+        "AND lower(regexp_replace(trim(d.text), '\\s+', ' ', 'g')) = "
+        "lower(regexp_replace(trim(legacy.text), '\\s+', ' ', 'g')) "
+        "AND d.decided_at <= e.ts "
+        f"AND d.decided_at >= e.ts - interval '{DEDUP_WINDOW_DAYS} days' "
+        + (f"AND {live} " if live else "") +
+        "ORDER BY d.decided_at DESC, d.id DESC LIMIT 1) d ON true "
+        "WHERE e.id = ANY(%s::bigint[]) "
+        "AND NOT EXISTS (SELECT 1 FROM decisions own WHERE own.episode_id = e.id "
+        "AND lower(regexp_replace(trim(own.text), '\\s+', ' ', 'g')) = "
+        "lower(regexp_replace(trim(legacy.text), '\\s+', ' ', 'g'))) ORDER BY e.id, d.id",
+        (list(episode_ids),),
+    )
+    for episode_id, did, body, superseded_by, retracted_at in cur.fetchall():
+        mine = out.setdefault(int(episode_id), [])
+        if any(r["id"] == did for r in mine):
+            continue
+        row = {"id": did, "superseded_by": superseded_by, "retracted_at": retracted_at}
+        row["text" if with_text else "chars"] = body
+        row["state"] = state_of(row)
+        mine.append(row)
+    return out
+
+
 def decision_states_for_episode(episode_id: int) -> dict[str, Any]:
     # forget-fence: decision states for the one episode khipu_get has already fenced
     """``decision_states``/``validity`` for ``khipu_get``'s episode payload:
@@ -988,20 +1028,18 @@ def decision_states_for_episode(episode_id: int) -> dict[str, Any]:
     "validity": {"current": n, "superseded": n, "retracted": n}}``. Opens its
     own connection (same posture as ``khipu.activity.episode_detail``).
     Includes decisions capture deduplicated onto this episode (same attach
-    path as ``briefs._decision_rows``), so a restatement still shows state.
+    path as ``decision_rows_for_episodes``), so a restatement still shows state.
     Never raises; a pre-migration hub or an episode with no decisions gets
     empty/zeroed results."""
     empty = {"decision_states": [], "validity": {"current": 0, "superseded": 0, "retracted": 0}}
     from khipu.db import connect
 
     try:
-        from khipu import briefs
-
         with connect() as conn:
             with conn.cursor() as cur:
                 if not _decisions_ready(cur):
                     return empty
-                by_ep = briefs._decision_rows(cur, [int(episode_id)], with_text=True)
+                by_ep = decision_rows_for_episodes(cur, [int(episode_id)], with_text=True)
     except Exception as exc:  # noqa: BLE001 — additive enrichment, never blocks khipu_get
         _log(f"decision_states_for_episode failed ({type(exc).__name__}: {exc})")
         return empty

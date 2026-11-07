@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """The invariant that matters most (Phase 2, session B brief): with the
 ``validity_ranking`` switch off (its default) and no superseded or retracted
 decision in the data, every recall surface returns the same rows in the same

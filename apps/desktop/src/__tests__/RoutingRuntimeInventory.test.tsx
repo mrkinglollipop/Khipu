@@ -116,11 +116,11 @@ const probes: Probe[] = [
   async () => { const p = await home("Conversations"); expect(p.getByRole("list", { name: "Live conversations" })).toBeVisible(); expect(p.getByRole("list", { name: "What each kind of conversation hears" })).toBeVisible(); expect(p.getByText(/old.*routing off.*file/)).toBeVisible(); },
   async () => { const p = await home("Your Macs"); expect(p.getByRole("list", { name: "Other Macs and the cloud" })).toBeVisible(); },
   async () => { const p = await home("Conversations"); for (const name of ["Tell conversations about routing", "At the start of a conversation, and after it is compacted", "Before each prompt", "Before handing work to another agent"]) expect(p.getByRole("switch", { name })).toBeVisible(); },
-  async () => { const p = await rare("Sizes, timing and hand-off scripts"); expect(p.getByRole("button", { name: "Change your hand-off scripts" })).toBeVisible(); },
-  async () => buttons(await rare("Sizes, timing and hand-off scripts"), ["Longest summary at the start of a conversation", "Longest update before a prompt", "Longest routing block for a subagent at its start", "Longest line", "Longest standing rule", "Most standing rules", "Longest note", "Most of your rules, note and priority shown at the start of a conversation"]),
-  async () => buttons(await rare("Sizes, timing and hand-off scripts"), ["Send everything again when a conversation is this far behind", "Treat a report as out of date after", "How long a limit reported without a time lasts"]),
-  async () => buttons(await rare("Sizes, timing and hand-off scripts"), ["Warn when reading before a prompt is too slow on more than", "Warn when two reports disagree for", "Say the record is not refreshed after"]),
-  async () => buttons(await rare("Sizes, timing and hand-off scripts"), ["Time allowed before a prompt", "Time allowed at the start of a conversation", "Remove a conversation's delivery record after it is unused for"]),
+  async () => { const p = await rare("Sizes and timing"); expect(p.queryByRole("button", { name: "Change your hand-off scripts" })).toBeNull(); expect(p.queryByText("Your hand-off scripts")).toBeNull(); },
+  async () => buttons(await rare("Sizes and timing"), ["Longest summary at the start of a conversation", "Longest update before a prompt", "Longest routing block for a subagent at its start", "Longest line", "Longest standing rule", "Most standing rules", "Longest note", "Most of your rules, note and priority shown at the start of a conversation"]),
+  async () => buttons(await rare("Sizes and timing"), ["Send everything again when a conversation is this far behind", "Treat a report as out of date after", "How long a limit reported without a time lasts"]),
+  async () => buttons(await rare("Sizes and timing"), ["Warn when reading before a prompt is too slow on more than", "Warn when two reports disagree for", "Say the record is not refreshed after"]),
+  async () => buttons(await rare("Sizes and timing"), ["Time allowed before a prompt", "Time allowed at the start of a conversation", "Remove a conversation's delivery record after it is unused for"]),
   async () => { const p = await home("Your Macs"); expect(p.getByRole("switch", { name: "Copy routing between your Macs through the hub" })).toBeVisible(); expect(p.getByRole("switch", { name: "Share proposal words between your Macs" })).toBeVisible(); expect(p.getByRole("button", { name: "Retry cleanup" })).toBeVisible(); },
   async () => { const p = await rare("Checking accounts when they reset"); expect(p.getByRole("switch", { name: "Check an account at its reset time" })).toBeVisible(); buttons(p, ["Wait after the reset time"]); expect(p.getByLabelText("First retry in seconds")).toBeVisible(); expect(p.getByLabelText("Second retry in seconds")).toBeVisible(); },
   async () => { const p = await rare("Checking accounts when they reset"); fireEvent.click(p.getByRole("button", { name: "Change: Wait while the Mac is busy" })); for (const label of ["Load", "Wait", "Busy attempts"]) expect(within(p.getByRole("form", { name: "Change: Wait while the Mac is busy" })).getByLabelText(label)).toBeVisible(); },
@@ -188,11 +188,10 @@ describe("Runtime parity for every approved scope inventory row", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
     await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
-    const p = await rare("Sizes, timing and hand-off scripts");
+    const p = await rare("Sizes and timing");
     const row = (name: string) => p.getByRole("button", { name: `Change: ${name}` }).closest(".route-limit") as HTMLElement;
     expect(row("Longest line")).toHaveTextContent("Same on my Macs");
     expect(row("Time allowed before a prompt")).toHaveTextContent("This Mac only");
-    expect(p.getByRole("button", { name: "Change your hand-off scripts" }).closest(".route-limit")).toHaveTextContent("Same on my Macs");
   });
 
   it("lists copied old-file rules once under When you have time without asking for confirmation", async () => {

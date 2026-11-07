@@ -1,7 +1,6 @@
 """The forget fence (``tombstones.withhold``) on the explicit readers of
 episode-derived rows that trusted only the hub's ``deleted_at``: owed and
-decisions (MCP, CLI, the Work view), ``khipu activity``, and briefs (MCP,
-CLI, reflect, topic detail). A forget lands on this Mac's list before the hub
+decisions (MCP, CLI, the Work view), and ``khipu activity``. A forget lands on this Mac's list before the hub
 records it, so each reader drops the rows of a listed episode; with an
 unreadable list each drops every row tied to an episode. Kimi's round-2
 probes, 2026-10-30."""
@@ -15,7 +14,7 @@ from unittest import mock
 
 import pytest
 
-from khipu import activity, briefs, cli, commitments, decisions, mcp_server, tombstones
+from khipu import activity, cli, commitments, decisions, mcp_server, tombstones
 
 FORGOT = 902
 LIVE = 904
@@ -186,27 +185,3 @@ def test_khipu_activity_hides_a_forgotten_episode(forgotten):
 def test_khipu_activity_shows_no_episode_when_the_forget_list_is_unreadable():
     _corrupt_list()
     assert _activity() == []
-
-
-# ---- briefs ----------------------------------------------------------------
-
-def _brief_show():
-    cur = _Cursor({"FROM briefs": [(1, "FORGOTTEN-BRIEF", [], [FORGOT], "current",
-                                    briefs.DERIVATION_VERSION, "fake", None, 0)]})
-    with mock.patch.object(briefs, "_ready", return_value=True), \
-         mock.patch.object(briefs, "_has", return_value=False), \
-         mock.patch.object(briefs, "_current_row", return_value=None), \
-         mock.patch("khipu.db.connect", return_value=_Connection(cur)), \
-         contextlib.redirect_stdout(io.StringIO()) as out:
-        briefs.cli_main(argparse.Namespace(briefs_cmd="show", slug="secret-topic", limit=1))
-    return json.loads(out.getvalue())
-
-
-def test_a_brief_citing_a_forgotten_episode_is_withheld(forgotten):
-    shown = _brief_show()
-    assert shown["body"] == "" and shown["claims"] == [] and "withheld" in shown
-
-
-def test_a_brief_is_withheld_when_the_forget_list_is_unreadable():
-    _corrupt_list()
-    assert _brief_show()["body"] == ""

@@ -1,4 +1,3 @@
-# --bypass-harness (sonnet lane) — dispatched on-sub Sonnet build agent.
 """Tests for khipu.bundle_seal — the tripwire for the 0.3.15 "Khipu is
 damaged" incident (bundled Python wrote __pycache__ inside a signed .app,
 breaking the code signature; see khipu/bundle_seal.py docstring).

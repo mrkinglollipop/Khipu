@@ -33,7 +33,7 @@ In each home's `settings.json`:
 | Stop, PreCompact, SessionEnd, SubagentStop | `khipu-stop-hook` | 20 s |
 | SessionStart | `khipu-recall-hook` | 10 s |
 | UserPromptSubmit | `khipu-prompt-recall` | 3 s |
-| PreToolUse (delegation tools and shell commands) | `khipu-delegation-hook` | 3 s |
+| PreToolUse (delegation tools only: Agent, Task, `spawn_agent`, `delegate_task`) | `khipu-delegation-hook` | 3 s |
 | SubagentStart | `khipu-delegation-hook` | 10 s |
 
 The MCP server has id `khipu` and launcher `khipu-mcp`. The default Claude home uses `~/.claude.json`; homes named by `CLAUDE_CONFIG_DIR` or an explicit T3 home path use `<home>/.claude.json`. Installation writes the locations associated with each selected home.
@@ -92,7 +92,7 @@ Migration apply and gateway deploy remain separate operator steps.
 | `khipu-stop-hook` | Stop, PreCompact, SessionEnd, SubagentStop | Capture. Reads the transcript named in the hook payload and decides whether a capture is due. If so, it queues a job. It normally starts detached maintenance to drain the shared queue (summarise, write to the database, mirror, embed), replay the outbox, reconcile edited notes, do a bounded embedding catch-up and write a heartbeat per harness. This runs outside the blocking hook; `KHIPU_HOOK_INLINE=1` restores inline execution, and a failed detached start also falls back to inline maintenance. SubagentStop tracks the subagent's own transcript under a separate key. |
 | `khipu-recall-hook` | SessionStart | Pushes the recall rule, a project slice (open commitments, recent episodes, linked topics) and the routing summary into context, fitted to the harness's size budget. Helper sessions get nothing. `--cursor` emits Cursor's format. |
 | `khipu-prompt-recall` | UserPromptSubmit | Records the owner's turn before recall work, including when there are no memory hits. Recent eligible owner activity enables requested changes through `khipu_owner_act`, subject to trusted front-end/session checks. Under Aegis it then emits empty output. Elsewhere it runs a bounded search on the prompt. 1.2 s budget, top 3 hits under a "Prior work on this topic" heading, hard cap of 600 characters, relative score floor, dedup over the last 3 prompts, trivial prompts skipped. No summariser or chat model; on a query-vector cache miss with an embedding profile active it makes one embedding call, so the prompt goes to that provider. Returns `{}` on any error. |
-| `khipu-delegation-hook` | PreToolUse, SubagentStart | Before work is handed to another agent, adds routing changes as extra context. A starting subagent gets a bounded routing snapshot. Claude children receive remaining pages on their own tool calls; Codex children pull with their own conversation identity. Parent delivery state is separate. It never denies or alters a call. See [routing](routing.md). |
+| `khipu-delegation-hook` | PreToolUse, SubagentStart | Before work is handed to another agent, adds routing changes as extra context. A starting subagent gets a bounded routing snapshot. Claude children receive remaining pages on their own delegation tool calls; Codex children pull with their own conversation identity. Parent delivery state is separate. It never denies or alters a call. See [routing](routing.md). |
 | `khipu-aegis-capture` | Stop, PreCompact, SessionEnd (Aegis) | Queues the session for capture. Nothing else. |
 
 All hooks fail open: a Khipu problem must not block your agent. The recall and delegation pushes are controlled by feature switches (`khipu features`).

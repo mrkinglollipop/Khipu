@@ -474,7 +474,9 @@ def _wire_samples(local, now):
     groups = {}
     for event in local:
         if event.get("type") == "usage_sample" and event.get("id"):
-            parsed = routing.pace_sample(event)
+            # A window not started yet (0%, no reset) goes too: the other Mac
+            # reads it as idle, not as the old cycle's passed reset.
+            parsed = routing.pace_sample(event, unstarted=True)
             if parsed is not None:
                 sample = dict(parsed[1], _id=event["id"], window=parsed[0][1])
                 groups.setdefault((*parsed[0], sample["mac"], sample["source"]), []).append(sample)

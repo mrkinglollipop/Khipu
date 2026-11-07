@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Tests for the khipu_decisions / khipu_decisions_update MCP tool pair
 (Phase 2, session A) and the tool annotations every entry in TOOLS now
 carries. Separate file from test_mcp_server.py (a concurrent phase's
@@ -59,8 +56,8 @@ class ToolAnnotationsTest(unittest.TestCase):
 
     _EXPECTED_READ_ONLY = {
         "khipu_search", "khipu_get", "khipu_graph", "khipu_status",
-        "khipu_owed", "khipu_decisions", "khipu_brief", "khipu_reflect",
-        "khipu_usage", "khipu_route", "khipu_route_advise", "khipu_project",
+        "khipu_owed", "khipu_decisions",
+        "khipu_usage", "khipu_route", "khipu_route_advise",
         "khipu_needs_you",
     }
     _EXPECTED_WRITE = {

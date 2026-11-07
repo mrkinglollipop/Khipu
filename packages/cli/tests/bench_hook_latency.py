@@ -189,10 +189,12 @@ def main() -> int:
                   "prompt": "what did we decide about the recall hook latency budget"}
         results.append(summary("prompt_cold", *run(["/bin/sh", str(bin_dir / "khipu-prompt-recall")],
                                                    prompt, env, args.runs)))
+        # The hook is matched to delegation tools only since 2026-11-07, so the
+        # call it costs is an Agent call, not every shell command.
         tool = {"session_id": "bench-tool", "cwd": str(repo), "hook_event_name": "PreToolUse",
-                "tool_name": "Bash", "tool_input": {"command": "ls"}}
-        results.append(summary("delegation_bash", *run(["/bin/sh", str(bin_dir / "khipu-delegation-hook")],
-                                                       tool, env, args.runs)))
+                "tool_name": "Agent", "tool_input": {"prompt": "bench the delegation hook"}}
+        results.append(summary("delegation_agent", *run(["/bin/sh", str(bin_dir / "khipu-delegation-hook")],
+                                                        tool, env, args.runs)))
         log = Path(os.environ["HOME"]) / ".grok" / "khipu" / "logs" / "prompt-recall.log"
         inner = [float(line.rsplit("ms=", 1)[1]) for line in (log.read_text().splitlines() if log.exists() else [])
                  if "[khipu-session-start]" in line and "ms=" in line]

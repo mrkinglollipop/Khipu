@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """khipu.decisions — the evidence/lifecycle API added in Phase 2, session A
 (migration 0024: source_kind/evidence/superseded_at/supersede_source/
 supersede_reason/retracted_at/retract_reason on ``decisions``, plus the
@@ -798,7 +795,7 @@ class DecisionStatesForEpisodeTest(unittest.TestCase):
             {"id": 3, "text": "new", "state": "current", "superseded_by": None},
             {"id": 4, "text": "bad", "state": "retracted", "superseded_by": None},
         ]
-        with mock.patch("khipu.briefs._decision_rows", return_value={7: rows}), \
+        with mock.patch("khipu.decisions.decision_rows_for_episodes", return_value={7: rows}), \
                 mock.patch.object(de, "_decisions_ready", return_value=True), \
                 mock.patch("khipu.db.connect") as connect:
             fake_conn = connect.return_value.__enter__.return_value

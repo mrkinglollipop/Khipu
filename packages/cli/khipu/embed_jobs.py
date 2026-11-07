@@ -1,5 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
-# agent (brief: do not delegate); no further agent to route to.
 """Embedding jobs with receipts: the progress file a long backfill keeps, and
 the runner that gives a detached backfill a clean life cycle.
 

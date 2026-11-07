@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """khipu CLI entry — status / search / graph / doctor / regen-memory / reconcile."""
 
 from __future__ import annotations
@@ -1863,7 +1860,6 @@ def _cmd_embed_index(args: argparse.Namespace) -> int:
     return 0
 
 
-# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
 def _cmd_embed_profile_delete(args: argparse.Namespace) -> int:
     """`khipu embed profiles delete ID --yes`: delete a profile nothing uses and
     every vector it owns. Refuses (naming the users) when it is the active
@@ -1987,7 +1983,6 @@ def cmd_library(args: argparse.Namespace) -> int:
     from khipu import library
 
     cmd = args.library_cmd
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     if cmd == "backfill" and (getattr(args, "job", False) or getattr(args, "job_id", None)):
         return cmd_library_backfill_job(args)
     try:
@@ -2013,7 +2008,6 @@ def cmd_library(args: argparse.Namespace) -> int:
             elif cmd == "scan":
                 out = library.scan(conn, args.name, allow_rebuild=bool(getattr(args, "allow_rebuild", False)))
             elif cmd == "backfill":
-                # --bypass-harness (sonnet lane): dispatched agent, no delegation.
                 out = library.backfill(
                     conn, args.name, limit=args.limit, stale=bool(args.stale),
                     profile=getattr(args, "profile", None),
@@ -2032,37 +2026,6 @@ def cmd_library(args: argparse.Namespace) -> int:
         return _backfill_exit_code(out)
     if cmd == "import" and out.get("ok") is False:
         return 1
-    return 0
-
-
-def cmd_embed_media_backfill(args: argparse.Namespace) -> int:
-    """Top-level hyphenated job: native PNG/JPEG into gemini-embedding-2@768."""
-    from khipu.embed import backfill_media
-    from khipu.jobs import _write_job_state
-
-    dry_run = bool(getattr(args, "dry_run", False))
-    yes = bool(getattr(args, "yes", False))
-    try:
-        stats = backfill_media(
-            dry_run=dry_run,
-            yes=yes,
-            limit=getattr(args, "limit", None),
-            source_id=getattr(args, "source_id", None),
-            profile=getattr(args, "profile", None),
-        )
-    except Exception as e:  # noqa: BLE001
-        if not dry_run:
-            _write_job_state("embed_media_backfill", 1)
-        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
-        return 1
-    if stats.get("needs_yes"):
-        if not dry_run:
-            _write_job_state("embed_media_backfill", 2)
-        print(json.dumps({"ok": False, **stats}, indent=2))
-        return 2
-    if not dry_run:
-        _write_job_state("embed_media_backfill", 0)
-    print(json.dumps({"ok": True, **stats}, indent=2))
     return 0
 
 
@@ -2259,17 +2222,6 @@ def cmd_graph(args: argparse.Namespace) -> int:
         out = graph_neighbors_snapshot(args.id, args.hops, args.limit)
         out.update(stale_fields())
     print(json.dumps(out, indent=2, default=str))
-    return 0
-
-
-def cmd_topic_graph_backfill(args: argparse.Namespace) -> int:
-    from khipu.mirror import backfill_topic_graph
-
-    mem = _require_memory_root(args)
-    if mem is None:
-        return 2
-    stats = backfill_topic_graph(mem, dry_run=bool(getattr(args, "dry_run", False)))
-    print(json.dumps(stats, indent=2, default=str))
     return 0
 
 
@@ -3641,10 +3593,9 @@ def cmd_get(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
-        wiki = bool(getattr(args, "wiki", False))
         if getattr(args, "all", False):
-            return _get_topic_all(ident, offset, max_bytes, wiki=wiki)
-        row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
+            return _get_topic_all(ident, offset, max_bytes)
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
     if row is None:
         print(json.dumps({"ok": False, "error": f"{kind} not found: {ident}"}))
         return 1
@@ -3660,8 +3611,7 @@ def cmd_get(args: argparse.Namespace) -> int:
     return 0
 
 
-def _get_topic_all(ident: str, offset: int, max_bytes: int, *,
-                   wiki: bool = False) -> int:
+def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
     """`khipu get <topic> --all`: follow body_next_offset and write the body
     from ``offset`` to the end on stdout, raw, one page at a time. Stops with
     an error if the topic changes between pages (content_hash or updated_at),
@@ -3670,7 +3620,7 @@ def _get_topic_all(ident: str, offset: int, max_bytes: int, *,
 
     first = None
     while True:
-        row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
         if row is None:
             print(json.dumps({"ok": False, "error": f"topic not found: {ident}"}),
                   file=sys.stderr)
@@ -4547,147 +4497,10 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     if args.outbox_cmd == "retry-dead":
         print(json.dumps(outbox.retry_dead(), indent=2))
         return 0
-    if args.outbox_cmd == "merge-line-preferences":
-        return _outbox_merge_preferences(args)
-    if args.outbox_cmd == "span-covered":
-        return _outbox_span_covered(args)
     out = outbox.drain(limit=args.limit)
     out["remaining"] = outbox.status()["pending"]
     print(json.dumps(out, indent=2))
     return 0 if not out.get("failed") else 1
-
-
-def _outbox_merge_preferences(args: argparse.Namespace) -> int:
-    """``khipu outbox merge-line-preferences``: a dry run by default (counts
-    and redacted samples). ``--apply`` and ``--undo ID`` change the hub, so
-    each is the owner's: the app (``--from-app``), a yes typed on a terminal,
-    or ``--owner-direction``, as ``routing._owner_via`` checks them; logged
-    with its Undo either way."""
-    from khipu import outbox_preferences, owner_direction, routing
-
-    if args.apply and args.undo:
-        print(json.dumps({"ok": False, "error": "give --apply or --undo, not both"}))
-        return 2
-    if getattr(args, "include_unproven", False) and not args.undo:
-        print(json.dumps({"ok": False, "error": "--include-unproven goes with --undo"}))
-        return 2
-    if getattr(args, "include_unproven", False) and not getattr(args, "by_direction", False):
-        print(json.dumps({"ok": False, "code": "owner_only",
-                          "error": "--include-unproven needs --owner-direction (a conversation the owner typed "
-                                   "in); it is logged. Nothing was changed."}))
-        return 2
-    with_decisions = bool(getattr(args, "include_decisions", False))
-    content = bool(getattr(args, "include_content", False)) or with_decisions
-    if content and args.undo:
-        print(json.dumps({"ok": False, "error": "--include-content and --include-decisions go with a dry run or "
-                                                "--apply; --undo reads what the merge recorded"}))
-        return 2
-    if not (args.apply or args.undo):
-        print(json.dumps(outbox_preferences.dry_run(include_content=content, include_decisions=with_decisions),
-                         indent=2))
-        return 0
-    if args.undo:
-        line = owner_direction._find(args.undo)
-        if line is not None and line.get("action") != outbox_preferences.ACTION:
-            print(json.dumps({"ok": False, "code": "refused",
-                              "error": f"owner action {args.undo} is not a preference merge; nothing was changed"}))
-            return 2
-        why = owner_direction._undo_refusal(line, args.undo)
-        if why:
-            print(json.dumps({"ok": False, "code": "refused", "error": why + "; nothing was changed"}))
-            return 2
-        unproven = bool(getattr(args, "include_unproven", False))
-        want = owner_direction.intent("direction.undo", args.undo,
-                                      facts={"include_unproven": True} if unproven else None)
-    else:
-        facts = {"include_content": True} if content else {}
-        if with_decisions:
-            facts["include_decisions"] = True
-        want = owner_direction.intent(outbox_preferences.ACTION, "outbox", facts=facts or None)
-    refused = {"ok": False, "code": "owner_only",
-               "error": "Merging into the hub (or undoing a merge) is the owner's change: make it in the Khipu "
-                        "app, type yes on a terminal, or pass --owner-direction from a conversation the owner "
-                        "typed in. Nothing was changed."}
-    via = None
-    if getattr(args, "from_app", False):
-        caller = routing._caller()
-        if caller["app"]:
-            owner_direction.noted(want, {"auth": "app",
-                                         "auth_chain": " < ".join(caller["chain"] + [caller["where"]])})
-            via = "app"
-    elif getattr(args, "by_direction", False):
-        try:
-            owner_direction.gate(want)
-        except owner_direction.DirectionRefused as err:
-            print(json.dumps({**err.refusal(), "error": err.message + " Nothing was changed."}))
-            return 2
-        via = "direction"
-    elif routing.typed_yes(f"This changes preferences{' and topics' if content else ''}"
-                           f"{' and adds decision rows' if with_decisions else ''} on hub episodes "
-                           "(Undo puts them back). Type yes to confirm: "):
-        owner_direction.noted(want, {"auth": "terminal", "auth_chain": " < ".join(routing._caller()["chain"])})
-        via = "cli"
-    if via is None:
-        refused["error"] = routing.terminal_refusal(refused.get("error"))
-        print(json.dumps(refused))
-        return 2
-    try:
-        if args.undo:
-            res = owner_direction.undo(args.undo, via, include_unproven=unproven)
-        else:
-            res = outbox_preferences.apply(record=owner_direction.record_preference_merges,
-                                           record_resolutions=owner_direction.record_preference_resolutions,
-                                           record_committed=owner_direction.record_preference_commits,
-                                           include_content=content, include_decisions=with_decisions)
-    except BaseException:
-        owner_direction._abandon()
-        raise
-    res = owner_direction.finish(res, **({"state": "partial"} if res.get("unproven") else {})) or res
-    print(json.dumps(res, indent=2, default=str))
-    return 0 if res.get("ok") else 1
-
-
-def _outbox_span_covered(args: argparse.Namespace) -> int:
-    """``khipu outbox span-covered``: a dry run by default, in plain words.
-    ``--apply`` is the owner's: a yes typed on a terminal, or ``--owner-direction``
-    only in the replay of a request his answer confirmed (``owner_direction.PLANNED_ASKS``),
-    logged with its Undo either way. The drain never reaches this."""
-    from khipu import outbox_span_covered, owner_direction, routing
-
-    def show(out: dict) -> int:
-        print(json.dumps(out, indent=2, default=str) if args.json else outbox_span_covered.words(out))
-        return 0 if out.get("ok") else 1
-
-    if not args.apply:
-        return show(outbox_span_covered.dry_run())
-    want = owner_direction.intent(outbox_span_covered.ACTION, "outbox")
-    if getattr(args, "by_direction", False):
-        try:
-            if not owner_direction.replaying(outbox_span_covered.ACTION):
-                raise owner_direction.DirectionRefused(
-                    "confirm_needed", "This needs the owner's own yes: ask for it through khipu_owner_act, which "
-                                      "holds it until he answers.")
-            owner_direction.gate(want)
-        except owner_direction.DirectionRefused as err:
-            show({**err.refusal(), "error": err.message + " Nothing was changed."})
-            return 2
-    elif routing.typed_yes("This moves the dead jobs a dry run would retire to the outbox's resolved folder. Each "
-                           "job's own summary then stays only in that local record; nothing is written to the hub "
-                           "(Undo puts them back). Type yes to confirm: "):
-        from khipu import owner_act
-        _ok, started = owner_act.settle_terminal(outbox_span_covered.ACTION, {})
-        return show(started)
-    else:
-        show({"ok": False, "code": "owner_only",
-              "error": "Retiring dead jobs is the owner's change: type yes on a terminal, or ask for it through "
-                       "khipu_owner_act in a conversation the owner typed in. Nothing was changed."})
-        return 2
-    try:
-        res = outbox_span_covered.apply(record_resolutions=owner_direction.record_preference_resolutions)
-    except BaseException:
-        owner_direction._abandon()
-        raise
-    return show(owner_direction.finish(res) or res)
 
 
 def cmd_promote(args: argparse.Namespace) -> int:
@@ -5199,20 +5012,6 @@ def cmd_features(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_briefs(args: argparse.Namespace) -> int:
-    """`khipu briefs plan | build [--topic SLUG] [--limit N] | show SLUG`."""
-    from khipu import briefs
-
-    return briefs.cli_main(args)
-
-
-def cmd_reflect(args: argparse.Namespace) -> int:
-    """`khipu reflect "question" [--project P]`."""
-    from khipu import reflect
-
-    return reflect.cli_main(args)
-
-
 def cmd_paths(args: argparse.Namespace) -> int:
     from khipu.paths import paths_status, set_data_dir
 
@@ -5382,30 +5181,6 @@ def cmd_sources(args: argparse.Namespace) -> int:
         if action == "disable":
             sources.set_enabled(args.source_id, False)
             print(json.dumps({"ok": True, "id": args.source_id, "enabled": False}))
-            return 0
-        if action == "set-embed-media":
-            raw = str(getattr(args, "embed_media_value", "")).strip().lower()
-            if raw not in ("on", "off"):
-                print(
-                    json.dumps(
-                        {
-                            "ok": False,
-                            "error": "set-embed-media expects on|off",
-                        }
-                    )
-                )
-                return 2
-            on = raw == "on"
-            sources.set_embed_media(args.source_id, on)
-            print(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "id": args.source_id,
-                        "embed_media": on,
-                    }
-                )
-            )
             return 0
         if action == "remove":
             sources.remove_user_source(args.source_id)
@@ -5716,7 +5491,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile",
         help="Target profile id (default: active). e.g. gemini-embedding-2@768",
     )
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     bf.add_argument(
         "--stale", action="store_true",
         help="Accepted for symmetry with `library backfill`: memory backfill always "
@@ -5774,7 +5548,6 @@ def build_parser() -> argparse.ArgumentParser:
         "profiles", help="List embedding profiles or add one (provider adapter + record)"
     )
     pr_sub = pr.add_subparsers(dest="profiles_cmd", required=True)
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     pr_sub.add_parser(
         "list",
         help="Every profile: provider, model, dim, endpoint, rows per space, where it is used, "
@@ -5839,7 +5612,6 @@ def build_parser() -> argparse.ArgumentParser:
     lb = lib_sub.add_parser("backfill", help="Embed chunks that have no vector under the library's profile")
     lb.add_argument("name")
     lb.add_argument("--limit", type=int, default=None, help="Embed at most N chunks this run")
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     lb.add_argument(
         "--stale", action="store_true",
         help="Also re-embed chunks whose text changed since they were embedded",
@@ -5915,31 +5687,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mo.set_defaults(func=cmd_monthly)
 
-    emb = sub.add_parser(
-        "embed-media-backfill",
-        help="Embed PNG/JPEG under sources with embed_media (active Gemini Embedding 2)",
-    )
-    emb.add_argument("--dry-run", action="store_true", help="Count only; no API calls")
-    emb.add_argument(
-        "--yes",
-        action="store_true",
-        help=f"Required when more than {1000} images would be scanned",
-    )
-    emb.add_argument("--limit", type=int, default=None, help="Cap files this run")
-    emb.add_argument(
-        "--source-id",
-        dest="source_id",
-        default=None,
-        help="Only walk this source id (must have embed_media on + root)",
-    )
-    emb.add_argument(
-        "--profile",
-        default=None,
-        help="Profile id (default gemini-embedding-2@768)",
-    )
-    emb.set_defaults(func=cmd_embed_media_backfill)
-
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     # Detached-spawn wrappers (the desktop app's job pattern: one hyphenated
     # subcommand, output goes to a log, progress goes to <data_dir>/jobs/<id>.json).
     ebj = sub.add_parser(
@@ -6021,17 +5768,6 @@ def build_parser() -> argparse.ArgumentParser:
     dis = src_sub.add_parser("disable", help="Disable a source (does not purge PG)")
     dis.add_argument("source_id")
     dis.set_defaults(func=cmd_sources)
-    sem = src_sub.add_parser(
-        "set-embed-media",
-        help="Opt a source into native image embed (on|off; default off)",
-    )
-    sem.add_argument("source_id")
-    sem.add_argument(
-        "embed_media_value",
-        choices=("on", "off"),
-        help="on = walk PNG/JPEG under this source's root on embed-media-backfill",
-    )
-    sem.set_defaults(func=cmd_sources)
     rem = src_sub.add_parser("remove", help="Remove a user-added source row")
     rem.add_argument("source_id")
     rem.set_defaults(func=cmd_sources)
@@ -6688,10 +6424,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--all", action="store_true",
         help="Topics: write the whole body (from --offset) to stdout, page by page",
     )
-    gt.add_argument(
-        "--wiki", action="store_true",
-        help="Topics: return the raw wiki page even when a current brief exists",
-    )
     gt.set_defaults(func=cmd_get)
 
     mg = sub.add_parser(
@@ -7073,46 +6805,8 @@ def build_parser() -> argparse.ArgumentParser:
         "retry-dead",
         help="Move captures buried after KHIPU_OUTBOX_MAX_ATTEMPTS failures back into the queue. Jobs refused for "
              "not announcing their source identities stay held and are counted, since a retry may land them as "
-             "duplicates: `span-covered` counts them",
+             "duplicates",
     )
-    obs = ob_sub.add_parser(
-        "span-covered",
-        help="Dead jobs refused for not announcing their source identities, whose range sits inside another episode "
-             "of the session that holds their evidence fields: count them (default) or retire them with a record "
-             "(--apply), where a job's own summary then stays. Summaries are not compared. Writes nothing to the hub",
-    )
-    obs.add_argument("--apply", action="store_true",
-                     help="Retire them (the owner's: a typed yes, or his confirmed answer through khipu_owner_act)")
-    obs.add_argument("--json", action="store_true", help="Print the counts as JSON")
-    from khipu.owner_direction import add_owner_flags as _span_owner_flags
-
-    _span_owner_flags(obs)
-    obm = ob_sub.add_parser(
-        "merge-line-preferences",
-        help="Held memory-file lines that differ from the hub only by preferences it lacks: "
-             "count them (default), merge them (--apply) or undo a merge (--undo ID)",
-    )
-    obm.add_argument("--apply", action="store_true",
-                     help="Append the missing preferences to their hub episodes (the owner's: the app, a typed yes "
-                          "or --owner-direction)")
-    obm.add_argument("--undo", metavar="OWNER_ACTION", default=None,
-                     help="Put back the exact prior preferences of one merge (the owner's, as --apply)")
-    obm.add_argument("--include-content", action="store_true",
-                     help="Also append the topic items a held line carries that its hub episode lacks (where the "
-                          "hub's writer would put them), and archive lines that differ only by a kept hub scope; "
-                          "decisions are appended only with --include-decisions")
-    obm.add_argument("--include-decisions", action="store_true",
-                     help="Also store the decisions a held line carries that its hub episode lacks, through the "
-                          "capture's decision writer (own rows, dedup, reversal detection, fact claims), and "
-                          "append them to the episode (implies --include-content; Undo retracts the rows it "
-                          "created)")
-    obm.add_argument("--include-unproven", action="store_true",
-                     help="With --undo: also revert episodes whose commit Khipu could not prove (owner direction, "
-                          "logged)")
-    obm.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
-    from khipu.owner_direction import add_owner_flags as _merge_owner_flags
-
-    _merge_owner_flags(obm)
     ob.set_defaults(func=cmd_outbox)
 
     jb = sub.add_parser(
@@ -7246,41 +6940,6 @@ def build_parser() -> argparse.ArgumentParser:
     reval.add_argument("--seed", type=int, default=0, help="With --replay --sample: deterministic sampling seed")
     rc.set_defaults(func=cmd_recall)
 
-    tg = sub.add_parser(
-        "topic-graph",
-        help="Persist topic wiki/path graph (topics.links + Khipu-owned nodes/edges)",
-    )
-    tg_sub = tg.add_subparsers(dest="topic_graph_cmd", required=True)
-    tgb = tg_sub.add_parser(
-        "backfill",
-        help="Walk all topic .md files: UPDATE topics.links/frontmatter and mint topic:/path: edges",
-    )
-    tgb.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Report column updates + graph upserts; roll back writes",
-    )
-    tgb.add_argument("--memory-root", default=_memory_root_default())
-    tg.set_defaults(func=cmd_topic_graph_backfill)
-
-    gb = sub.add_parser(
-        "grok-bot-config",
-        help="Print the account-level Cursor cloud config (covers every repo) + the secret to add",
-    )
-    gb.set_defaults(
-        func=lambda a: (
-            print(
-                json.dumps(
-                    __import__(
-                        "khipu.integrations", fromlist=["x"]
-                    ).grok_bot_account_config(),
-                    indent=2,
-                )
-            )
-            or 0
-        )
-    )
-
     gw = sub.add_parser(
         "gateway",
         help="Khipu gateway bearer token: set / status (never prints the token)",
@@ -7314,23 +6973,6 @@ def build_parser() -> argparse.ArgumentParser:
     feat = sub.add_parser("features", help="Show or set feature switches")
     feat.add_argument("--set", nargs=2, metavar=("NAME", "VALUE"), default=None)
     feat.set_defaults(func=cmd_features)
-
-    br = sub.add_parser("briefs", help="Source-backed topic briefs: plan / build / show")
-    br_sub = br.add_subparsers(dest="briefs_cmd", required=True)
-    br_sub.add_parser("plan", help="Topics whose brief is missing or stale")
-    br_build = br_sub.add_parser(
-        "build", help="Build briefs for planned topics (needs the briefs switch on)"
-    )
-    br_build.add_argument("--topic", default=None, help="Build only this planned topic")
-    br_build.add_argument("--limit", type=int, default=5, help="Most topics to build (default 5)")
-    br_show = br_sub.add_parser("show", help="Print a topic's current brief")
-    br_show.add_argument("slug")
-    br.set_defaults(func=cmd_briefs)
-
-    rf = sub.add_parser("reflect", help="Answer a question from memory with cited evidence (needs the reflect switch on)")
-    rf.add_argument("question")
-    rf.add_argument("--project", default=None, help="Prefer sources from this project")
-    rf.set_defaults(func=cmd_reflect)
 
     comp = sub.add_parser(
         "components",

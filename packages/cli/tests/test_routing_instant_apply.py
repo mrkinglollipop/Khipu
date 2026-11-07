@@ -369,18 +369,15 @@ def test_undo_by_the_cli_path_works_for_an_instant_change(plain):
 
 
 def test_class_c_is_exactly_what_cant_be_taken_back():
-    assert owner_direction.CLASS_C == {"forget.send", "forget.here", "forget.not_same", "ledger.purge",
-                                       "ledger.import"}
-    assert owner_direction.class_c("ledger.import", {"file": "t.json"}) is False
-    assert owner_direction.class_c("ledger.import", {"file": "t.json", "catch_up": True}) is True
+    assert owner_direction.CLASS_C == {"forget.send", "forget.here", "forget.not_same", "ledger.purge"}
     for action in ("direction.set", "direction.off", "direction.undo", "config.routing_setting", "accounts.stop",
                    "route.cap.set", "route.definition.set", "route.clear", "route.priority.clear", "project.merge"):
         assert owner_direction.class_c(action, {}) is False, action
-    assert "outbox.span_covered" in owner_direction.PLANNED_ASKS  # B, still always asked
+    assert owner_direction.PLANNED_ASKS == {}  # no agent-planned clean-up is left
 
 
 def test_a_class_c_command_run_by_direction_is_refused_outside_a_confirmed_replay(monkeypatch):
-    # `khipu forget|ledger purge|ledger import --catch-up ... --owner-direction` must not skip the hold in
+    # `khipu forget|ledger purge ... --owner-direction` must not skip the hold in
     # khipu_owner_act.
     class Passed(Exception):
         pass
@@ -390,8 +387,7 @@ def test_a_class_c_command_run_by_direction_is_refused_outside_a_confirmed_repla
 
     monkeypatch.setattr(owner_direction, "check", reached_check)
     class_c_wants = ({"action": "forget.send", "facts": {}}, {"action": "forget.here", "facts": {}},
-                     {"action": "forget.not_same", "facts": {}}, {"action": "ledger.purge", "facts": {}},
-                     {"action": "ledger.import", "facts": {"project": "p", "catch_up": True}})
+                     {"action": "forget.not_same", "facts": {}}, {"action": "ledger.purge", "facts": {}})
     for want in class_c_wants:
         with pytest.raises(owner_direction.DirectionRefused) as err:
             owner_direction.gate(dict(want))
@@ -406,9 +402,8 @@ def test_a_class_c_command_run_by_direction_is_refused_outside_a_confirmed_repla
         with owner_direction.confirmed_replay("route.pause", stamp):
             with pytest.raises(owner_direction.DirectionRefused):
                 owner_direction.gate(dict(want))
-    # A plain import and an A action go on to the usual check.
-    for want in ({"action": "ledger.import", "facts": {"project": "p"}}, {"action": "ledger.import"},
-                 {"action": "route.pause", "facts": {}}):
+    # An A action goes on to the usual check.
+    for want in ({"action": "route.pause", "facts": {}},):
         with pytest.raises(Passed):
             owner_direction.gate(dict(want))
 

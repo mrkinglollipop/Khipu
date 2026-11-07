@@ -5,10 +5,8 @@ words, and never become a gate. Brief text is classified on this Mac only.
 """
 from __future__ import annotations
 
-import json
 import re
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 TASK_CLASSES = (
     "scope", "mock", "ruling", "hard-security", "failed-fix", "build",
@@ -54,7 +52,6 @@ _PHRASE = {
     "hard-security": "hard security", "failed-fix": "failed fixes", "build": "builds",
     "tests": "tests", "docs": "docs", "synthesis": "synthesis", "mechanical": "mechanical work",
 }
-_SETTINGS_MOST = 65536
 
 
 def valid_tiers(tiers) -> bool:
@@ -550,20 +547,3 @@ def dispatch_line(model: str | None, brief: str | None) -> str | None:
     confirmed table governs. Never a permission decision."""
     found = mismatch(model, brief)
     return format_line(found["task"], found["expected"], found["actual"], found["guessed"]) if found else None
-
-
-def settings_model(home: str) -> str | None:
-    """The ``model`` string in a Claude settings file, or None.
-
-    Only that field is kept. The file is size-capped. A missing or unreadable
-    file is no model, and its error text is not kept.
-    """
-    path = Path(home) / "settings.json"
-    try:
-        if not path.is_file() or path.stat().st_size > _SETTINGS_MOST:
-            return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    model = data.get("model") if isinstance(data, dict) else None
-    return model if isinstance(model, str) else None

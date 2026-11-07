@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Real-SQL integration tests against a separately provisioned disposable database.
 
 Require KHIPU_LIVE_TESTS=1, a 32-character lowercase hexadecimal

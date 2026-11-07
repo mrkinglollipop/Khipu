@@ -200,7 +200,7 @@ def test_khipu_search_drops_hub_episode_hits_when_the_registry_is_unreadable(mon
 
 
 # ---- hybrid_search and the budgeted hub lane: every other search route --------------
-# `khipu search`, khipu_reflect and the per-prompt recall push all read
+# `khipu search` and the per-prompt recall push both read
 # hybrid_search; khipu_status's prior work reads _hub_hits_budgeted.
 
 
@@ -245,7 +245,7 @@ def _fake_hub():
 
 
 def _routes(capsys) -> dict[str, str]:
-    from khipu import cli, embed, recall_prompt, reflect
+    from khipu import cli, embed, recall_prompt
 
     out = {}
     with _fake_hub():
@@ -255,7 +255,6 @@ def _routes(capsys) -> dict[str, str]:
         args = cli.build_parser().parse_args(["search", "widget batching endpoint"])
         args.func(args)
         out["khipu search"] = capsys.readouterr().out
-        out["khipu_reflect"] = json.dumps(reflect._search("widget batching endpoint", None, 8))
         out["prior work"] = json.dumps(recall_prompt._hub_hits_budgeted(
             "widget batching endpoint", ["widget", "batching", "endpoint"], project=None,
             budget_ms=2000, limit=8))

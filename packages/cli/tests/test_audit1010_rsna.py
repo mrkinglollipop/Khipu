@@ -122,10 +122,6 @@ class RegistryTest(unittest.TestCase):
             patch = mock.patch(target, return_value=value)
             patch.start()
             self.addCleanup(patch.stop)
-        for target in ("khipu.decisions._stale_briefs",):
-            patch = mock.patch(target)
-            patch.start()
-            self.addCleanup(patch.stop)
 
 
 class DecisionLifecycleTest(RegistryTest):
@@ -382,17 +378,3 @@ class ValidityBoundaryTest(unittest.TestCase):
                     out = rp.prior_work_for_prompt("what did we decide about alpha", session_id="rsna-restoration")
                 emitted.append(bool(out["context"]))
             self.assertEqual(emitted, [True, True, True])
-
-    @pytest.mark.xfail(reason="RSN-19 requires canonical fallback in briefs.py and reflect.py", strict=False)
-    def test_rsn19_retracted_canonical_choice_is_not_offered_from_repeat(self):
-        from khipu import briefs, reflect
-        from tests.test_reflect import _ReflectHub
-
-        hub = _ReflectHub()
-        for eid in (1, 2):
-            hub.episode(eid, "Discussion of widget options.", decisions=["Choose alpha"])
-        hub.decision(1, 1, "Choose alpha", retracted=True)
-        offered = briefs._gather(hub.cursor(), "alpha")["offered"]
-        sources = reflect._episode_sources(hub.cursor(), [1, 2])
-        self.assertEqual(sources[2]["decisions"], [])
-        self.assertFalse(any("Choose alpha" in item["text"] for item in offered))

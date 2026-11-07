@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
-# Sonnet build agent for Session C (brief: "do the work directly"); Cursor is
-# suspended for Claude Code sessions, so there is no further lane to route to.
 """Library search legs and ``khipu get`` for library ids (Session C).
 
 Scope: docs/plans/2026-10-07-library-sources-byoe.md ("What ships" item 4).
