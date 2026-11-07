@@ -74,6 +74,7 @@ def run_confirmed(world, action: str, args: dict, yes: str = "yes, go ahead") ->
     (the real held-request path; a C command by direction applies no other way)."""
     from khipu import owner_act, owner_background
 
+    world.say("go ahead with that")  # the ask needs a typed turn in this conversation
     ok, held = owner_act.act(action, args)
     assert ok and held["pending"] and held["applied"] is False, held
     world.say(yes)
