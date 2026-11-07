@@ -1043,7 +1043,7 @@ TOOLS: list[dict] = [
             "on a message the owner typed after the list that showed it. One reply answers the whole list: \"yes\" "
             "settles every item shown, \"yes except 2\" all but item 2, and \"no to 3\" takes item 3's undo; call "
             "this once per item. (C) What can't be taken back (forget.send, forget.here, forget.not_same, "
-            "ledger.purge, ledger.import with catch_up) is held with its own ask, never settled by a yes to a list. "
+            "ledger.purge) is held with its own ask, never settled by a yes to a list. "
             "direction.request holds any change on purpose. "
             "A held answer says pending: true and what to ask the owner; after their reply, call direction.confirm "
             "with {\"request\": id}, or direction.decline with it if they say no. "

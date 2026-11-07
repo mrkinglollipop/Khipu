@@ -272,7 +272,7 @@ def test_each_terminal_caller_shows_the_explanation(world,monkeypatch,capsys,cal
         assert 'cursor' in capsys.readouterr().out.lower()
     elif caller=='ledger':
         with pytest.raises(ledger.LedgerError) as exc:
-            ledger.require('ledger import')
+            ledger.require('ledger project')
         assert 'cursor' in str(exc.value).lower()
     elif caller=='project':
         rc=project_group._gate(SimpleNamespace(from_app=False,by_direction=False),

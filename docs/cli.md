@@ -112,7 +112,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | `provenance` | Fact provenance maintenance: `backfill` proves legacy restaters' claims; `index` indexes episode source identities and sweeps refused carriers. |
 | `outbox` | The offline queue for captures whose database write failed: `drain`, `status` and `retry-dead`. `retry-dead` leaves jobs refused for not announcing their source identities held. |
 
-`ledger` uses `--project` to select a project and `--json` for JSON output. Writes accept `--op-id` for safe retries. `ledger import FILE` supports `--dry-run` and `--catch-up`; `ledger export --tracker-json` exports the tracker shape. `ledger project` can rename, hide, or show a project.
+`ledger` uses `--project` to select a project and `--json` for JSON output. Writes accept `--op-id` for safe retries. `ledger export --tracker-json` exports the tracker shape. `ledger project` can rename, hide, or show a project.
 
 `owner-direction` supports `show`, `actions [--json]`, `on`, `off`, `acknowledge`, `set KEY VALUE`, and `undo ID`. Direction defaults on, with session binding on and a six-hour eligible-owner-turn window. Supported owner commands accept `--owner-direction` from a conversation with a recent hook-recorded eligible owner turn and verified prompt-hook provenance. The check does not inspect the owner's words; submit only changes the owner requested. Background and dispatched jobs are refused.
 

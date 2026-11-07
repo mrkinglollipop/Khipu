@@ -95,7 +95,7 @@ ACTIONS: frozenset[str] = frozenset({
     "route.tier_table.clear", "accounts.track", "accounts.rename", "accounts.stop",
     "accounts.move", "accounts.decline", "accounts.offer_again", "accounts.auto_track", "accounts.request.confirm",
     "accounts.request.undo", "config.usage_accounts", "config.routing_setting", "config.answer_request.confirm",
-    "config.answer_request.undo", "promote.gate_ignore", "promote.gate_ignore.cancel", "ledger.import",
+    "config.answer_request.undo", "promote.gate_ignore", "promote.gate_ignore.cancel",
     "ledger.restore", "ledger.purge", "ledger.project", "ledger.add", "ledger.set", "ledger.remove", "work.hide", "work.unhide",
     "work.same", "work.not_same", "owed.change", "owed.tidy", "direction.off", "direction.on", "direction.acknowledge", "direction.set",
     "direction.undo", "project.alias_add", "project.alias_remove", "project.merge", "project.keep_separate",
@@ -108,17 +108,13 @@ ACTIONS: frozenset[str] = frozenset({
 # else made (``ANSWER_ACTIONS``): he has to have been shown it first. C: a
 # change that can't be taken back (``CLASS_C``): ``khipu_owner_act`` holds it
 # with its own words for his yes even when he asked for it himself.
-# ``ledger.import`` is C only with ``catch_up``. Every action not named here
-# is A, so the C list is kept by hand.
-CLASS_C: frozenset[str] = frozenset({"forget.send", "forget.here", "forget.not_same", "ledger.purge",
-                                     "ledger.import"})
+# Every action not named here is A, so the C list is kept by hand.
+CLASS_C: frozenset[str] = frozenset({"forget.send", "forget.here", "forget.not_same", "ledger.purge"})
 
 
 def class_c(action: str, values: dict | None = None) -> bool:
     """Whether ``action`` with ``values`` is a change that can't be taken back."""
-    if action not in CLASS_C:
-        return False
-    return action != "ledger.import" or bool((values or {}).get("catch_up"))
+    return action in CLASS_C
 
 
 # A clean-up an agent planned (B) with no Needs-you item of its own: always
@@ -515,12 +511,12 @@ def reviewed_hold(request: dict) -> bool:
     args, files = request.get("args"), request.get("files")
     if not isinstance(args, dict):
         return False
-    key = {"ledger.import": "file", "owed.tidy": "plan"}.get(request.get("action"))
+    key = {"owed.tidy": "plan"}.get(request.get("action"))
     return not key or not args.get(key) or (isinstance(files, dict) and str(args[key]) in files)
 
 
 def _review_files(action: str, args: dict) -> dict:
-    key = {"ledger.import": "file", "owed.tidy": "plan"}.get(action)
+    key = {"owed.tidy": "plan"}.get(action)
     if not key or not args.get(key):
         return {}
     from khipu import safe_read
@@ -1001,13 +997,11 @@ _ASK_ALONE = ("Not confirmed: this can't be taken back, so a yes to a list never
 
 def permanent(request: dict) -> bool:
     """A held request that can't be taken back (class C), one mirrored from
-    another Mac included (its holder says so; a forget or a purge always is,
-    and so is any import, since an older holder may not say whether it is a
-    catch-up and the mirror has no args to tell)."""
+    another Mac included (its holder says so; a forget or a purge always is)."""
     remote = request.get("remote")
     if request.get("action") == "direction.remote" and isinstance(remote, dict):
         action = str(remote.get("action") or "")
-        return remote.get("permanent") is True or action == "ledger.import" or class_c(action, None)
+        return remote.get("permanent") is True or class_c(action, None)
     return class_c(request.get("action", ""), request.get("args"))
 
 
@@ -2098,19 +2092,6 @@ def record_owner_write(tool: str, args: dict) -> None:
     pend["owner_write"] = write
 
 
-def import_source(path, project: str, *, catch_up: bool = False) -> dict | None:
-    """The parsed tracker read by this import's gate; never stored in the log."""
-    pend = _PENDING.get()
-    if pend is None:
-        return None
-    want = pend["intent"]
-    facts = want.get("facts") or {}
-    if (want["action"] != "ledger.import" or want["target"] != str(path)
-            or facts.get("project") != project or catch_up):
-        return None
-    return want.get("_import_source")
-
-
 def _ahead_line(want: dict, stamp: dict, before) -> dict:
     """The line written before an owner change (state ``pending``): what it
     is, who asked and how, and ``before``, so Undo works whatever happens to
@@ -2297,7 +2278,7 @@ _PUSH_WORDS = {
     "direction.set": "Changed the owner-direction settings",
     "direction.acknowledge": "Acknowledged the owner-actions tamper alarm",
     "direction.undo": "Undid an owner change",
-    "ledger.import": "Imported a tracker into the ledger", "ledger.restore": "Brought back a removed ledger row",
+    "ledger.restore": "Brought back a removed ledger row",
     "ledger.purge": "Removed a ledger row for good", "ledger.project": "Changed a ledger project",
     "ledger.add": "Added a ledger row", "ledger.set": "Changed a ledger row", "ledger.remove": "Removed a ledger row",
     "work.hide": "Hid a work item", "work.unhide": "Showed a hidden work item",
@@ -2503,7 +2484,6 @@ _UNREADABLE = object()  # what it changes can't be read now: a direction is refu
 
 # Why a change has no undo, in words the app shows beside it.
 _NO_UNDO_WHY = {
-    "ledger.import": "A catch-up import can't be undone: it changes rows that were already there.",
     "forget.send": "A forget sent to the hub can't be undone: the hub keeps the episodes forgotten.",
     "forget.here": "A forget can't be undone: the hub keeps the episode forgotten.",
     "forget.not_same": "Not undone from its record line: forget that hub episode instead if it was the same one.",
@@ -2659,23 +2639,6 @@ def _before(want: dict):
         from khipu import promote
 
         return {"checks": list(promote.gate_ignore_status().get("value") or [])}
-    if action == "ledger.import":
-        facts = want.get("facts") or {}
-        if facts.get("catch_up") or not facts.get("project"):
-            return _NO_UNDO
-        from khipu import ledger_import
-
-        try:
-            source = ledger_import.read_tracker(target)
-        except Exception:  # noqa: BLE001 - the import itself says what is wrong with the file
-            return _UNREADABLE
-        digest = source["digest"]
-        try:
-            had = ledger_import.done_imports(facts["project"], digest)
-        except Exception:  # noqa: BLE001 - an import needs the database too
-            return _UNREADABLE
-        want["_import_source"] = source
-        return {"project": facts["project"], "digest": digest, "had": had}
     if action == "ledger.project":
         from khipu import ledger
 
@@ -3167,15 +3130,6 @@ def _undo_project_group(line, via):
     return project_group.run_undo(line["action"], line["target"], line.get("result"))
 
 
-def _undo_import(line, via):
-    from khipu import ledger_import
-
-    before = _b(line)
-    if not before.get("digest"):
-        raise ValueError("Khipu can't tell which import this was, so it can't undo it")
-    return ledger_import.undo_import(before["project"], before["digest"], before.get("had"))
-
-
 def _undo_owed_change(line, via):
     from khipu import owed_tidy
 
@@ -3320,7 +3274,6 @@ _UNDO = {
     "config.answer_request.undo": _undo_setting,
     "promote.gate_ignore": _undo_gate_ignore,
     "promote.gate_ignore.cancel": _undo_gate_ignore,
-    "ledger.import": _undo_import,
     "ledger.restore": _ledger_undo("remove"),
     "ledger.add": _ledger_undo("remove"),
     "ledger.set": _undo_ledger_set,

@@ -57,7 +57,6 @@ import { useRouting } from "./routing";
 import type { RouteDeliveryHealth } from "./routing";
 import { WorkView } from "./WorkView";
 import { WORK_LEDE, badgeLabel, shortProject, useWork } from "./work";
-import { LedgerImport } from "./LedgerImport";
 import type { DoctorSynthProvider } from "./SynthProvider";
 import { useModelVerify } from "./modelVerify";
 import { WorkingBanner } from "./WorkingBanner";
@@ -3709,14 +3708,6 @@ export default function App() {
   const owedProjects = Array.from(
     new Set(owedRows.map((c) => c.project).filter((p): p is string => Boolean(p))),
   ).sort();
-  // Import a tracker… offers the commitments' project keys first, then the
-  // ledger's projects.
-  const importProjects = Array.from(
-    new Set([
-      ...owedProjects,
-      ...(work.data?.projects ?? []).map((b) => b.project).filter((p): p is string => Boolean(p)),
-    ]),
-  );
   // Tidy this list… offers the projects that have open items.
   const owedOpenProjects = Array.from(
     new Set(owedOpenRows.map((c) => c.project).filter((p): p is string => Boolean(p))),
@@ -5730,10 +5721,6 @@ export default function App() {
             onOpenRouting={() => {
               setTab("routing");
             }}
-            onImportTracker={() => {
-              setSettingsSection("work");
-              setTab("settings");
-            }}
             onOpenWorkSettings={() => {
               setSettingsSection("work");
               setTab("settings");
@@ -6173,12 +6160,6 @@ export default function App() {
                     active={tab === "settings" && settingsSection === "work"}
                     work={work}
                     projectNames={projects.data}
-                    importCard={
-                      <LedgerImport
-                        active={tab === "settings" && settingsSection === "work"}
-                        projects={importProjects}
-                      />
-                    }
                   />
                 ) : null}
 

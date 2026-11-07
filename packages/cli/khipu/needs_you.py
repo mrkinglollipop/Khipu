@@ -66,7 +66,7 @@ ACTION_WORDS = {
     "config.answer_request.confirm": "keep a conversation's change to a routing setting",
     "config.answer_request.undo": "undo a conversation's change to a routing setting",
     "promote.gate_ignore": "update anyway past failed checks on the next promotion",
-    "promote.gate_ignore.cancel": "cancel updating anyway", "ledger.import": "import a tracker into the ledger",
+    "promote.gate_ignore.cancel": "cancel updating anyway",
     "ledger.restore": "bring back a removed ledger row", "ledger.purge": "remove a ledger row for good",
     "ledger.project": "change a ledger project", "ledger.add": "add a ledger row", "ledger.set": "change a ledger row",
     "ledger.remove": "remove a ledger row", "work.hide": "hide a work item", "work.unhide": "show a hidden work item",
