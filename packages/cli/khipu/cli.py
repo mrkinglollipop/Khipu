@@ -173,6 +173,14 @@ def _synth_provider_block(secrets: dict) -> tuple[dict, bool]:
                       "model": _synth["model_id"] if _provider == "local" else cloud_model_id(_synth),
                       "key_present": bool(_key_present)}
     synth_provider_ok = _provider == "local" or bool(_key_present)
+    if not _key_present and _provider not in CLI_PROVIDERS:
+        # A locked login Keychain (ssh, a fresh boot) hides a key it still lists.
+        # That is not a missing key: say it cannot be read right now, do not fail.
+        from khipu.keychain import held_but_unreadable
+
+        if held_but_unreadable(f"{_provider}_api_key"):
+            synth_provider.update(key_present=None, note="can't read the keychain right now")
+            synth_provider_ok = True
     if _provider in CLI_PROVIDERS:
         from khipu.synth_cli import binary
 

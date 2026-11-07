@@ -249,6 +249,46 @@ def test_doctor_selected_provider_key(provider, present, tmp_path):
         assert not doc['ok']
 
 
+@pytest.mark.parametrize('listed', [True, False])
+def test_doctor_locked_keychain_is_not_a_missing_key(listed):
+    """A Keychain that lists the key but cannot be read (locked, as over ssh) is not a failure."""
+    models.set_models_merge_role('synth', provider='gemini', model_id='m')
+    with ExitStack() as stack:
+        for patch in _green_doctor_patches():
+            if patch.attribute != 'secrets_status':
+                stack.enter_context(patch)
+        stack.enter_context(mock.patch.object(keychain, 'secrets_status', return_value={
+            'dsn_file': {'ok': True}, 'gemini_in_keychain': False}))
+        stack.enter_context(mock.patch.object(keychain, 'held_but_unreadable', return_value=listed))
+        stack.enter_context(mock.patch('khipu.probe.status', return_value={'ok': True}))
+        stack.enter_context(mock.patch('khipu.recall_prompt.prompt_recall_outcomes', return_value={'ok': True}))
+        stack.enter_context(mock.patch('khipu.drift.recall_quality', return_value={}))
+        output = stack.enter_context(redirect_stdout(io.StringIO()))
+        cli.cmd_doctor(cli.build_parser().parse_args(['doctor']))
+    doc = json.loads(output.getvalue())
+    assert doc['synth_provider_ok'] is listed
+    if listed:
+        assert doc['synth_provider']['key_present'] is None
+        assert doc['synth_provider']['note'] == "can't read the keychain right now"
+    else:
+        assert doc['synth_provider']['key_present'] is False and 'note' not in doc['synth_provider']
+
+
+def test_held_but_unreadable_asks_for_attributes_only():
+    done = mock.Mock(returncode=0)
+    with mock.patch.object(keychain, 'keychain_available', return_value=True), \
+         mock.patch.object(keychain, '_security', return_value=done) as run:
+        assert keychain.held_but_unreadable('gemini_api_key') is True
+    assert '-w' not in run.call_args.args and '-g' not in run.call_args.args
+    with mock.patch.object(keychain, 'keychain_available', return_value=True), \
+         mock.patch.object(keychain, '_security', return_value=mock.Mock(returncode=44)):
+        assert keychain.held_but_unreadable('gemini_api_key') is False
+    with mock.patch.object(keychain, 'keychain_available', return_value=False), \
+         mock.patch.object(keychain, '_security') as run:
+        assert keychain.held_but_unreadable('gemini_api_key') is False
+    run.assert_not_called()
+
+
 def test_empty_key_file_does_not_count_as_key(tmp_path):
     path = tmp_path / 'empty'
     path.write_text(' \n')

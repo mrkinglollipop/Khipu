@@ -194,8 +194,9 @@ AHEAD_SLACK_S = 300  # evidence dated further ahead than this is not from this c
 
 
 def unchecked(block) -> list[str]:
-    """What could not be read or published. No hook outcomes is only idle when no conversation is live."""
-    live = bool(block.get("identities"))
+    """What could not be read or published. No hook outcomes is only idle when no conversation is live;
+    identities that are all idle (no delivery point for an hour) are not live."""
+    live = any(isinstance(row, dict) and not row.get("idle") for row in block.get("identities") or [])
     return [m for m in block.get("missing") or ["routing check"] if m not in IDLE_MISSING
             or (live and m == "recent hook outcomes")]
 
