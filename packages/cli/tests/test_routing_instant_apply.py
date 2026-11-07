@@ -376,7 +376,7 @@ def test_class_c_is_exactly_what_cant_be_taken_back():
     for action in ("direction.set", "direction.off", "direction.undo", "config.routing_setting", "accounts.stop",
                    "route.cap.set", "route.definition.set", "route.clear", "route.priority.clear", "project.merge"):
         assert owner_direction.class_c(action, {}) is False, action
-    assert "outbox.span_covered" in owner_direction.PLANNED_ASKS  # B, still always asked
+    assert owner_direction.PLANNED_ASKS == {}  # no agent-planned clean-up is left
 
 
 def test_a_class_c_command_run_by_direction_is_refused_outside_a_confirmed_replay(monkeypatch):

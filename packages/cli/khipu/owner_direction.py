@@ -99,8 +99,7 @@ ACTIONS: frozenset[str] = frozenset({
     "ledger.restore", "ledger.purge", "ledger.project", "ledger.add", "ledger.set", "ledger.remove", "work.hide", "work.unhide",
     "work.same", "work.not_same", "owed.change", "owed.tidy", "direction.off", "direction.on", "direction.acknowledge", "direction.set",
     "direction.undo", "project.alias_add", "project.alias_remove", "project.merge", "project.keep_separate",
-    "project.separate", "forget.send", "forget.here", "forget.not_same", "outbox.merge_preferences",
-    "outbox.span_covered",
+    "project.separate", "forget.send", "forget.here", "forget.not_same",
 })
 
 # Owner changes come in three classes (owner decision 2026-11-07). A: his own
@@ -125,12 +124,7 @@ def class_c(action: str, values: dict | None = None) -> bool:
 # A clean-up an agent planned (B) with no Needs-you item of its own: always
 # held with these words, and the command's ``--owner-direction`` passes only
 # in the replay of a request ``confirm`` proved he answered (``replaying``).
-PLANNED_ASKS: dict[str, str] = {
-    "outbox.span_covered": ("Retire the dead outbox jobs `khipu outbox span-covered` counts? Each has a live episode "
-                            "whose range contains its own and which holds every evidence field it carries. Summaries "
-                            "are not compared and a range does not prove the same text, so each job's own summary "
-                            "then stays only in the local record; nothing is written to the hub."),
-}
+PLANNED_ASKS: dict[str, str] = {}
 
 # The routing changes whose direction pushes a receipt to every conversation.
 RECEIPTED: frozenset[str] = frozenset({
@@ -2032,54 +2026,6 @@ def record_owed_undo_scope(batch: str, ids: list[int]) -> None:
     pend["before"] = before
 
 
-def record_preference_merges(entries: list[dict]) -> None:
-    """Persist one transaction's preference additions (episode ids, exact
-    strings, prior lists) before it commits: the Undo of the merge."""
-    pend = _PENDING.get()
-    line = (pend or {}).get("line")
-    if not pend or pend["intent"]["action"] != "outbox.merge_preferences" or line is None:
-        raise OSError("the owner action must be recorded before preferences can be merged")
-    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
-             "state": "pending", "preference_merges": entries})
-
-
-_RESOLVING_ACTIONS = ("outbox.merge_preferences", "outbox.span_covered")
-
-
-def record_preference_resolutions(jobs: list[dict]) -> None:
-    """Persist the held jobs a merge is about to archive as resolved (record
-    id, job name, where it was held) before any moves: the Undo puts them
-    back."""
-    pend = _PENDING.get()
-    line = (pend or {}).get("line")
-    if not pend or pend["intent"]["action"] not in _RESOLVING_ACTIONS or line is None:
-        raise OSError("the owner action must be recorded before held lines can be resolved")
-    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
-             "state": "pending", "preference_resolutions": jobs})
-
-
-def record_preference_commits(episode_ids: list[int]) -> None:
-    """Mark one transaction's recorded additions committed, after its commit
-    returns: Undo reverts only entries proven committed."""
-    pend = _PENDING.get()
-    line = (pend or {}).get("line")
-    if not pend or pend["intent"]["action"] != "outbox.merge_preferences" or line is None:
-        raise OSError("the owner action must be recorded before a merge commit can be marked")
-    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
-             "state": "pending", "preference_commits": [{"episode_id": int(i)} for i in episode_ids]})
-
-
-def preference_merges(line_id: str, key: str = "preference_merges") -> list[dict]:
-    """Every addition a merge recorded (or, with ``preference_resolutions``,
-    every job it resolved), in log order. Read from the raw log: the merged
-    view keeps only the last state line's fields."""
-    out: list[dict] = []
-    for row in read_log():
-        if row.get("kind") == "state" and row.get("target") == line_id:
-            out += [e for e in row.get(key) or [] if isinstance(e, dict)]
-    return out
-
-
 def record_setting_before(key: str, data: dict) -> None:
     """Record the exact replaced state while the setter holds both locks."""
     from khipu import routing
@@ -2278,22 +2224,11 @@ def _abandon() -> None:
             state = _hub_write_state(write)
         elif pend["line"].get("inverse_writes"):
             state = _inverse_state(pend["line"]["inverse_writes"])
-        elif pend["intent"]["action"] in _RESOLVING_ACTIONS and _merge_recorded(pend["line"]["id"]):
-            # Batches before the failure committed and their Undo is logged:
-            # unconfirmed, so Undo still runs.
-            state = "pending"
         try:
             _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": pend["line"]["id"],
                      "state": state, **outcome})
         except OSError:
             pass
-
-
-def _merge_recorded(line_id: str) -> bool:
-    try:
-        return bool(preference_merges(line_id) or preference_merges(line_id, "preference_resolutions"))
-    except Exception:  # noqa: BLE001 - an unreadable log can't show a merge to undo
-        return False
 
 
 _INCOMPLETE = ("The change was made and its Undo is recorded, but Khipu could not write that it finished, so "
@@ -2382,8 +2317,6 @@ _PUSH_WORDS = {
     "forget.send": "Sent this Mac's forgets the hub lacked to the hub",
     "forget.here": "Forgot a hub episode this Mac had forgotten by id",
     "forget.not_same": "Marked a hub episode as not the one forgotten on this Mac",
-    "outbox.merge_preferences": "Merged preferences held only in memory-file lines into the hub",
-    "outbox.span_covered": "Retired dead outbox jobs whose range and evidence fields another episode holds",
 }
 
 
@@ -2788,13 +2721,6 @@ def _before(want: dict):
         facts = want.get("facts") or {}
         return {"project": target, "change": facts.get("change"), "batch": facts.get("batch"),
                 **({"ids": []} if facts.get("change") == "undo" else {})}
-    if action == "outbox.merge_preferences":
-        # Each transaction's additions are written ahead as their own state
-        # line (``record_preference_merges``) before it commits.
-        return {"change": "apply"}
-    if action == "outbox.span_covered":
-        # Each batch's jobs are written ahead (``record_preference_resolutions``).
-        return {"change": "apply"}
     if action in ("direction.off", "direction.on"):
         return {"enabled": owner_turns.settings()["enabled"]}
     if action == "direction.acknowledge":
@@ -3287,38 +3213,6 @@ def _undo_owed_tidy(line, via):
     return {"ok": True, **counted, "left_alone": out.get("left_alone") or []}
 
 
-_INCLUDE_UNPROVEN: contextvars.ContextVar[bool] = contextvars.ContextVar("khipu_include_unproven", default=False)
-
-
-def _undo_outbox_preferences(line, via):
-    from khipu import outbox_preferences
-
-    entries = preference_merges(line["id"])
-    resolved = preference_merges(line["id"], "preference_resolutions")
-    if not (entries or resolved):
-        result = line.get("result") or {}
-        if (int(result.get("episodes_merged") or 0) == 0 and int(result.get("lines_resolved") or 0) == 0
-                and line["state"] == "applied"):
-            return {"ok": True, "restored": 0, "left_alone": []}
-        raise ValueError("Khipu has no record of which preferences this merge added, so it can't undo it")
-    # Committed: a batch's own marker, or the finished result's episode list
-    # (written only after every batch committed).
-    committed = {int(c["episode_id"]) for c in preference_merges(line["id"], "preference_commits")}
-    committed |= {int(i) for i in (line.get("result") or {}).get("episode_ids") or []}
-    return outbox_preferences.undo(entries, resolved, committed, include_unproven=_INCLUDE_UNPROVEN.get(),
-                                   retract_reason=f"undo of owner action {line['id']} "
-                                                  "(outbox merge-line-preferences --include-decisions)")
-
-
-def _undo_span_covered(line, via):
-    from khipu import outbox_span_covered
-
-    entries = preference_merges(line["id"], "preference_resolutions")
-    if not entries and not (line["state"] == "applied" and not int((line.get("result") or {}).get("retired") or 0)):
-        raise ValueError("Khipu has no record of which jobs this retired, so it can't undo it")
-    return outbox_span_covered.undo(entries)
-
-
 def _ledger_undo(verb: str):
     def run(line, via):
         return _ledger_write(verb, line["target"])
@@ -3444,8 +3338,6 @@ _UNDO = {
     "owed.change": _undo_owed_change,
     "owed.tidy": _undo_owed_tidy,
     "owed.correct_job_origin.confirm": _undo_owed_change,
-    "outbox.merge_preferences": _undo_outbox_preferences,
-    "outbox.span_covered": _undo_span_covered,
     "direction.off": _undo_direction,
     "direction.on": _undo_direction,
     "direction.set": _undo_direction,
@@ -3984,18 +3876,12 @@ def _refuse_over_newer(line: dict, over_newer: bool) -> None:
         ahead["facts"] = facts
 
 
-def undo(line_id: str, via: str, *, holds: dict | None = None, over_newer: bool = False,
-         include_unproven: bool = False) -> dict:
+def undo(line_id: str, via: str, *, holds: dict | None = None, over_newer: bool = False) -> dict:
     """Apply the inverse of a logged action. Its ``undo`` line is written
     ahead by the owner gate (``gate``/``noted``) and completed by
     ``finish``. Refused (``NewerChange``) when a newer change touched the
-    same target, unless ``over_newer``. ``include_unproven`` (a preference
-    merge only) also reverts episodes whose commit was never proven."""
-    token = _INCLUDE_UNPROVEN.set(include_unproven)
-    try:
-        return _undo(line_id, via, holds, over_newer)
-    finally:
-        _INCLUDE_UNPROVEN.reset(token)
+    same target, unless ``over_newer``."""
+    return _undo(line_id, via, holds, over_newer)
 
 
 def _undo(line_id: str, via: str, holds: dict | None, over_newer: bool = False) -> dict:

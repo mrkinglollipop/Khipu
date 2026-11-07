@@ -70,7 +70,7 @@ Related commands:
 
 - `khipu status` prints row counts. `--sample 0` skips the file walk. `--drift` adds the drift sample.
 - `khipu reconcile` syncs files into PostgreSQL. It is safe to run again.
-- `khipu outbox status|drain|retry-dead` handles the offline write queue. `khipu outbox span-covered` is a dry run over dead jobs refused for not announcing their source identities. `retry-dead` leaves those jobs held.
+- `khipu outbox status|drain|retry-dead` handles the offline write queue. `retry-dead` leaves dead jobs refused for not announcing their source identities held.
 - `khipu sessions status|liveness|drain|sweep` handles the capture queue.
 - `khipu revisions` shows topic revisions, including edits that lost a last-write-wins conflict.
 

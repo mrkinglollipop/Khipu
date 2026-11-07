@@ -36,7 +36,6 @@ _ANSWERS = frozenset({
 })
 # A held request's action in words, for every action one can hold.
 ACTION_WORDS = {
-    "outbox.span_covered": "mark a queued conversation span as already captured",
     "owed.correct_job_origin": "ask Khipu to work out which Owed items a background job opened",
     "owed.correct_job_origin.confirm": "mark Owed items as opened by a background job, as previewed",
     "route.definition.set": "change a provider, account or lane definition",
@@ -82,7 +81,6 @@ ACTION_WORDS = {
     "project.separate": "separate a project's names", "forget.send": "send this Mac's forgets to the hub",
     "forget.here": "forget a hub conversation this Mac already forgot",
     "forget.not_same": "mark a hub conversation as not the one this Mac forgot",
-    "outbox.merge_preferences": "merge preferences held only in memory files into the hub",
 }
 MOST = 20  # items in one answer; the rest are counted and reachable by ``offset``
 _WORDS_MOST = 600  # characters of an item's words

@@ -110,7 +110,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | `reconcile` | Full sync of memory files into Postgres. |
 | `regen-memory` | Write the `MEMORY.from-khipu.md` sidecar from topics. `--index` rebuilds the live `MEMORY.md`. |
 | `provenance` | Fact provenance maintenance: `backfill` proves legacy restaters' claims; `index` indexes episode source identities and sweeps refused carriers. |
-| `outbox` | The offline queue for captures whose database write failed: `drain`, `status`, `retry-dead`, and `span-covered`, which counts (or with `--apply` retires) dead jobs whose range and evidence fields another episode holds; a retired job's own summary stays only in its local record. `retry-dead` leaves jobs refused for not announcing their source identities held. |
+| `outbox` | The offline queue for captures whose database write failed: `drain`, `status` and `retry-dead`. `retry-dead` leaves jobs refused for not announcing their source identities held. |
 
 `ledger` uses `--project` to select a project and `--json` for JSON output. Writes accept `--op-id` for safe retries. `ledger import FILE` supports `--dry-run` and `--catch-up`; `ledger export --tracker-json` exports the tracker shape. `ledger project` can rename, hide, or show a project.
 
@@ -293,4 +293,4 @@ These are launchers, not commands you normally run by hand. `khipu integrations 
 
 For the MCP tools these launchers serve, see [mcp-tools.md](mcp-tools.md). For the routing record, see [routing.md](routing.md). For jobs, backups and the gateway, see [operations.md](operations.md).
 
-Owner actions that scan or change batches return “Started; it will finish on its own.” after authorization. They run in a detached process, so closing or timing out the conversation does not stop them. Owner actions records the final outcome and counts, including how many dead outbox jobs were retired. `outbox span-covered` keeps its read-only dry run; `--apply` starts the confirmed work.
+Owner actions that scan or change batches return “Started; it will finish on its own.” after authorization. They run in a detached process, so closing or timing out the conversation does not stop them. Owner actions records the final outcome and counts.

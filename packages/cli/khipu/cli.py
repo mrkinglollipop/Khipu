@@ -4566,147 +4566,10 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     if args.outbox_cmd == "retry-dead":
         print(json.dumps(outbox.retry_dead(), indent=2))
         return 0
-    if args.outbox_cmd == "merge-line-preferences":
-        return _outbox_merge_preferences(args)
-    if args.outbox_cmd == "span-covered":
-        return _outbox_span_covered(args)
     out = outbox.drain(limit=args.limit)
     out["remaining"] = outbox.status()["pending"]
     print(json.dumps(out, indent=2))
     return 0 if not out.get("failed") else 1
-
-
-def _outbox_merge_preferences(args: argparse.Namespace) -> int:
-    """``khipu outbox merge-line-preferences``: a dry run by default (counts
-    and redacted samples). ``--apply`` and ``--undo ID`` change the hub, so
-    each is the owner's: the app (``--from-app``), a yes typed on a terminal,
-    or ``--owner-direction``, as ``routing._owner_via`` checks them; logged
-    with its Undo either way."""
-    from khipu import outbox_preferences, owner_direction, routing
-
-    if args.apply and args.undo:
-        print(json.dumps({"ok": False, "error": "give --apply or --undo, not both"}))
-        return 2
-    if getattr(args, "include_unproven", False) and not args.undo:
-        print(json.dumps({"ok": False, "error": "--include-unproven goes with --undo"}))
-        return 2
-    if getattr(args, "include_unproven", False) and not getattr(args, "by_direction", False):
-        print(json.dumps({"ok": False, "code": "owner_only",
-                          "error": "--include-unproven needs --owner-direction (a conversation the owner typed "
-                                   "in); it is logged. Nothing was changed."}))
-        return 2
-    with_decisions = bool(getattr(args, "include_decisions", False))
-    content = bool(getattr(args, "include_content", False)) or with_decisions
-    if content and args.undo:
-        print(json.dumps({"ok": False, "error": "--include-content and --include-decisions go with a dry run or "
-                                                "--apply; --undo reads what the merge recorded"}))
-        return 2
-    if not (args.apply or args.undo):
-        print(json.dumps(outbox_preferences.dry_run(include_content=content, include_decisions=with_decisions),
-                         indent=2))
-        return 0
-    if args.undo:
-        line = owner_direction._find(args.undo)
-        if line is not None and line.get("action") != outbox_preferences.ACTION:
-            print(json.dumps({"ok": False, "code": "refused",
-                              "error": f"owner action {args.undo} is not a preference merge; nothing was changed"}))
-            return 2
-        why = owner_direction._undo_refusal(line, args.undo)
-        if why:
-            print(json.dumps({"ok": False, "code": "refused", "error": why + "; nothing was changed"}))
-            return 2
-        unproven = bool(getattr(args, "include_unproven", False))
-        want = owner_direction.intent("direction.undo", args.undo,
-                                      facts={"include_unproven": True} if unproven else None)
-    else:
-        facts = {"include_content": True} if content else {}
-        if with_decisions:
-            facts["include_decisions"] = True
-        want = owner_direction.intent(outbox_preferences.ACTION, "outbox", facts=facts or None)
-    refused = {"ok": False, "code": "owner_only",
-               "error": "Merging into the hub (or undoing a merge) is the owner's change: make it in the Khipu "
-                        "app, type yes on a terminal, or pass --owner-direction from a conversation the owner "
-                        "typed in. Nothing was changed."}
-    via = None
-    if getattr(args, "from_app", False):
-        caller = routing._caller()
-        if caller["app"]:
-            owner_direction.noted(want, {"auth": "app",
-                                         "auth_chain": " < ".join(caller["chain"] + [caller["where"]])})
-            via = "app"
-    elif getattr(args, "by_direction", False):
-        try:
-            owner_direction.gate(want)
-        except owner_direction.DirectionRefused as err:
-            print(json.dumps({**err.refusal(), "error": err.message + " Nothing was changed."}))
-            return 2
-        via = "direction"
-    elif routing.typed_yes(f"This changes preferences{' and topics' if content else ''}"
-                           f"{' and adds decision rows' if with_decisions else ''} on hub episodes "
-                           "(Undo puts them back). Type yes to confirm: "):
-        owner_direction.noted(want, {"auth": "terminal", "auth_chain": " < ".join(routing._caller()["chain"])})
-        via = "cli"
-    if via is None:
-        refused["error"] = routing.terminal_refusal(refused.get("error"))
-        print(json.dumps(refused))
-        return 2
-    try:
-        if args.undo:
-            res = owner_direction.undo(args.undo, via, include_unproven=unproven)
-        else:
-            res = outbox_preferences.apply(record=owner_direction.record_preference_merges,
-                                           record_resolutions=owner_direction.record_preference_resolutions,
-                                           record_committed=owner_direction.record_preference_commits,
-                                           include_content=content, include_decisions=with_decisions)
-    except BaseException:
-        owner_direction._abandon()
-        raise
-    res = owner_direction.finish(res, **({"state": "partial"} if res.get("unproven") else {})) or res
-    print(json.dumps(res, indent=2, default=str))
-    return 0 if res.get("ok") else 1
-
-
-def _outbox_span_covered(args: argparse.Namespace) -> int:
-    """``khipu outbox span-covered``: a dry run by default, in plain words.
-    ``--apply`` is the owner's: a yes typed on a terminal, or ``--owner-direction``
-    only in the replay of a request his answer confirmed (``owner_direction.PLANNED_ASKS``),
-    logged with its Undo either way. The drain never reaches this."""
-    from khipu import outbox_span_covered, owner_direction, routing
-
-    def show(out: dict) -> int:
-        print(json.dumps(out, indent=2, default=str) if args.json else outbox_span_covered.words(out))
-        return 0 if out.get("ok") else 1
-
-    if not args.apply:
-        return show(outbox_span_covered.dry_run())
-    want = owner_direction.intent(outbox_span_covered.ACTION, "outbox")
-    if getattr(args, "by_direction", False):
-        try:
-            if not owner_direction.replaying(outbox_span_covered.ACTION):
-                raise owner_direction.DirectionRefused(
-                    "confirm_needed", "This needs the owner's own yes: ask for it through khipu_owner_act, which "
-                                      "holds it until he answers.")
-            owner_direction.gate(want)
-        except owner_direction.DirectionRefused as err:
-            show({**err.refusal(), "error": err.message + " Nothing was changed."})
-            return 2
-    elif routing.typed_yes("This moves the dead jobs a dry run would retire to the outbox's resolved folder. Each "
-                           "job's own summary then stays only in that local record; nothing is written to the hub "
-                           "(Undo puts them back). Type yes to confirm: "):
-        from khipu import owner_act
-        _ok, started = owner_act.settle_terminal(outbox_span_covered.ACTION, {})
-        return show(started)
-    else:
-        show({"ok": False, "code": "owner_only",
-              "error": "Retiring dead jobs is the owner's change: type yes on a terminal, or ask for it through "
-                       "khipu_owner_act in a conversation the owner typed in. Nothing was changed."})
-        return 2
-    try:
-        res = outbox_span_covered.apply(record_resolutions=owner_direction.record_preference_resolutions)
-    except BaseException:
-        owner_direction._abandon()
-        raise
-    return show(owner_direction.finish(res) or res)
 
 
 def cmd_promote(args: argparse.Namespace) -> int:
@@ -7144,46 +7007,8 @@ def build_parser() -> argparse.ArgumentParser:
         "retry-dead",
         help="Move captures buried after KHIPU_OUTBOX_MAX_ATTEMPTS failures back into the queue. Jobs refused for "
              "not announcing their source identities stay held and are counted, since a retry may land them as "
-             "duplicates: `span-covered` counts them",
+             "duplicates",
     )
-    obs = ob_sub.add_parser(
-        "span-covered",
-        help="Dead jobs refused for not announcing their source identities, whose range sits inside another episode "
-             "of the session that holds their evidence fields: count them (default) or retire them with a record "
-             "(--apply), where a job's own summary then stays. Summaries are not compared. Writes nothing to the hub",
-    )
-    obs.add_argument("--apply", action="store_true",
-                     help="Retire them (the owner's: a typed yes, or his confirmed answer through khipu_owner_act)")
-    obs.add_argument("--json", action="store_true", help="Print the counts as JSON")
-    from khipu.owner_direction import add_owner_flags as _span_owner_flags
-
-    _span_owner_flags(obs)
-    obm = ob_sub.add_parser(
-        "merge-line-preferences",
-        help="Held memory-file lines that differ from the hub only by preferences it lacks: "
-             "count them (default), merge them (--apply) or undo a merge (--undo ID)",
-    )
-    obm.add_argument("--apply", action="store_true",
-                     help="Append the missing preferences to their hub episodes (the owner's: the app, a typed yes "
-                          "or --owner-direction)")
-    obm.add_argument("--undo", metavar="OWNER_ACTION", default=None,
-                     help="Put back the exact prior preferences of one merge (the owner's, as --apply)")
-    obm.add_argument("--include-content", action="store_true",
-                     help="Also append the topic items a held line carries that its hub episode lacks (where the "
-                          "hub's writer would put them), and archive lines that differ only by a kept hub scope; "
-                          "decisions are appended only with --include-decisions")
-    obm.add_argument("--include-decisions", action="store_true",
-                     help="Also store the decisions a held line carries that its hub episode lacks, through the "
-                          "capture's decision writer (own rows, dedup, reversal detection, fact claims), and "
-                          "append them to the episode (implies --include-content; Undo retracts the rows it "
-                          "created)")
-    obm.add_argument("--include-unproven", action="store_true",
-                     help="With --undo: also revert episodes whose commit Khipu could not prove (owner direction, "
-                          "logged)")
-    obm.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
-    from khipu.owner_direction import add_owner_flags as _merge_owner_flags
-
-    _merge_owner_flags(obm)
     ob.set_defaults(func=cmd_outbox)
 
     jb = sub.add_parser(

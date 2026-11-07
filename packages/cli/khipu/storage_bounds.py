@@ -286,8 +286,7 @@ def warnings(counts: dict[str, int] | None = None, threshold: int = HELD_WARN_CO
     retry = "Run `khipu outbox retry-dead` or look at them."
     refused = counts.get("outbox_announce_refused", 0)
     dead_step = retry if not refused else (
-        f"{refused} of them were refused for not announcing source identities: start with `khipu outbox span-covered`, "
-        "a dry run that changes nothing and counts those whose range and evidence fields another episode holds. "
+        f"{refused} of them were refused for not announcing source identities. "
         "`khipu outbox retry-dead` leaves those held, since it could land them as duplicates.")
     for key, where, next_step in (("outbox_dead", "the outbox's dead folder", dead_step),
                                   ("capture_held", "the capture queue", retry)):

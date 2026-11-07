@@ -107,10 +107,6 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "forget.send": ((), ()),
     "forget.here": (("id",), ()),
     "forget.not_same": (("id",), ()),
-    # Undone through direction.undo with the id this returns.
-    "outbox.merge_preferences": ((), ("include_content", "include_decisions")),
-    # Always held (owner_direction.PLANNED_ASKS). Undone through direction.undo.
-    "outbox.span_covered": ((), ()),
 }
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
@@ -464,10 +460,6 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["episode", "forget-pending", f"--forget-here={v['id']}"], []
     if action == "forget.not_same":
         return ["episode", "forget-pending", f"--not-same={v['id']}"], []
-    if action == "outbox.merge_preferences":
-        return ["outbox", "merge-line-preferences", "--apply", *_opts(v, "include_content", "include_decisions")], []
-    if action == "outbox.span_covered":
-        return ["outbox", "span-covered", "--apply", "--json"], []
     raise Refused("not_by_direction", "That change can't be made by direction.")
 
 
