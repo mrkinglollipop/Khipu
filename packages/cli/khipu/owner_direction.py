@@ -1887,6 +1887,14 @@ def gate(want: dict | None, *, env=None, now: float | None = None) -> dict:
         raise DirectionRefused("not_by_direction",
                                "That change can't be made by direction: it needs the Khipu app or a yes typed on a "
                                "terminal.")
+    confirmed = _CONFIRMED.get()
+    if class_c(want["action"], want.get("facts")) and (confirmed is None or confirmed["action"] != want["action"]):
+        # C can't be taken back: by direction it applies only as the replay of
+        # a held request the owner answered (``khipu_owner_act`` holds it),
+        # never straight from a command run with ``--owner-direction``.
+        raise DirectionRefused("class_c",
+                               "That can't be undone, so it needs its own yes: ask for it through khipu_owner_act, "
+                               "which shows the owner its words first. Nothing was changed.")
     stamp = check(want["action"], env=env, now=now)
     want.pop("over_newer", None)
     want.pop("owner_words", None)

@@ -379,6 +379,36 @@ def test_class_c_is_exactly_what_cant_be_taken_back():
     assert "outbox.span_covered" in owner_direction.PLANNED_ASKS  # B, still always asked
 
 
+def test_a_class_c_command_run_by_direction_is_refused_outside_a_confirmed_replay(monkeypatch):
+    # `khipu forget ... --owner-direction` must not skip the C hold in khipu_owner_act.
+    class Passed(Exception):
+        pass
+
+    def reached_check(*_a, **_k):
+        raise Passed()
+
+    monkeypatch.setattr(owner_direction, "check", reached_check)
+    for want in ({"action": "forget.send", "facts": {}},
+                 {"action": "ledger.purge", "facts": {}},
+                 {"action": "ledger.import", "facts": {"file": "t.json", "catch_up": True}}):
+        with pytest.raises(owner_direction.DirectionRefused) as err:
+            owner_direction.gate(dict(want))
+        assert err.value.code == "class_c", want
+    # The replay of a request the owner confirmed goes on to the usual check.
+    stamp = {"auth": "terminal", "binding": "owner_cli", "session": "x", "confirmed": {"request": "req-test"}}
+    with owner_direction.confirmed_replay("forget.send", stamp):
+        with pytest.raises(Passed):
+            owner_direction.gate({"action": "forget.send", "facts": {}})
+    # A replay for another action does not open C.
+    with owner_direction.confirmed_replay("route.pause", stamp):
+        with pytest.raises(owner_direction.DirectionRefused):
+            owner_direction.gate({"action": "forget.send", "facts": {}})
+    # Not C: a plain import and an A action go on to the usual check.
+    for want in ({"action": "ledger.import", "facts": {"file": "t.json"}}, {"action": "route.pause", "facts": {}}):
+        with pytest.raises(Passed):
+            owner_direction.gate(dict(want))
+
+
 def test_a_trust_setting_applies_at_once_and_its_undo_too(plain):
     # Decision 1 (2026-11-07): direction.set is class A, with its Undo.
     _say(plain)
