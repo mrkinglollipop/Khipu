@@ -32,7 +32,7 @@ Packs:
                ~/.cursor/hooks.json hooks.beforeSubmitPrompt += khipu-prompt-recall
                  (always records the owner's turn; its additional_context may be
                  dropped by Cursor; "not-seen" in the CLI and T3 on 2026-10-27, IDE untested)
-               ~/.cursor/hooks.json hooks.postToolUse (matcher Task|Shell) +=
+               ~/.cursor/hooks.json hooks.postToolUse (matcher Task) +=
                  khipu-delegation-hook (routing at delegation; never a permission
                  field, never a preToolUse entry)
                Every command is the SAME string the claude_code pack writes, no
@@ -361,11 +361,14 @@ def codex_sessionend_hook() -> str:
 
 
 # The routing push at the moment of delegation (routing truth, phase 6): one
-# launcher for PreToolUse, matched to the tools a delegation can go through
-# (the hook itself then looks at the call and stays silent for the rest), and
-# SubagentStart. PreToolUse holds the call, so its timeout is the per-prompt
-# hook's; the hook never denies, whatever happens.
-DELEGATION_MATCHER = "Agent|Task|spawn_agent|Bash|shell|shell_command|exec_command|local_shell|delegate_task"
+# launcher for PreToolUse, matched to the delegation tools only, and
+# SubagentStart. Shell tools are not matched: the hook ran before every shell
+# command to spot agent launches and was removed on 2026-11-07 (18,270 runs in
+# 22 h, none a launch). An install or repair narrows an older entry's matcher
+# in place, and status reports that older entry as missing until it does.
+# PreToolUse holds the call, so its timeout is the per-prompt hook's; the hook
+# never denies, whatever happens.
+DELEGATION_MATCHER = "Agent|Task|spawn_agent|delegate_task"
 DELEGATION_TIMEOUT = PROMPT_RECALL_TIMEOUT
 SUBAGENT_START_TIMEOUT = 10
 DELEGATION_EVENTS = ("PreToolUse", "SubagentStart")
@@ -379,6 +382,22 @@ def delegation_hook() -> str:
 
 def _is_our_delegation(cmd: Any) -> bool:
     return _is_launcher_command(cmd, "khipu-delegation-hook")
+
+
+def _delegation_current(hooks: dict) -> bool:
+    """Whether a Claude-shaped ``hooks`` block runs Khipu's delegation hook on
+    both events, its PreToolUse entry matched to the current tools only (an
+    older install's entry also matched every shell command)."""
+    def entries(event: str) -> list[dict]:
+        found = hooks.get(event) if isinstance(hooks, dict) else None
+        return [e for e in found if isinstance(e, dict)] if isinstance(found, list) else []
+
+    def ours(entry: dict) -> bool:
+        return any(isinstance(h, dict) and _is_our_delegation(h.get("command")) for h in entry.get("hooks") or [])
+
+    pre = [e for e in entries("PreToolUse") if ours(e)]
+    start = [e for e in entries("SubagentStart") if ours(e)]
+    return bool(pre) and bool(start) and all(e.get("matcher") == DELEGATION_MATCHER for e in pre)
 
 
 def _install_delegation_hooks(hooks: dict, path: Path, changes: list[str]) -> bool:
@@ -923,7 +942,7 @@ def _claude_home_status(h: _homes.ClaudeHome) -> tuple[dict, dict]:
         hook_sessionend=sessionend is not None, hook_subagentstop=subagentstop is not None,
         recall_rule="installed" if rule else "missing",
         prompt_recall="installed" if prompt_recall else "missing",
-        delegation_push="installed" if delegation and subagent_start else "missing",
+        delegation_push="installed" if _delegation_current(s.get("hooks") or {}) else "missing",
         memory_tools_ok=mcp_ok, launcher_ok=launch["launcher_ok"],
     )
     row["hooks_ok"] = all((stop, precompact, sessionend, subagentstop, rule, prompt_recall))
@@ -1029,12 +1048,14 @@ def _cursor_rule_path(project: str | None) -> Path | None:
     return Path(project).expanduser() / ".cursor" / "rules" / CURSOR_RULE_NAME if project else None
 
 
-# Cursor runs a hook by its tool name, not Claude's: Task is the subagent tool,
-# Shell the shell. postToolUse is the only delegation event Khipu installs
+# Cursor runs a hook by its tool name, not Claude's: Task is the subagent tool.
+# Shell (the shell) is no longer matched since the shell half of the hook was
+# removed on 2026-11-07; the enforced matcher narrows an older entry on the
+# next install. postToolUse is the only delegation event Khipu installs
 # (docs: additional_context is accepted there). A preToolUse entry is added only
 # if a real run proves its context reaches the model (slice C), and then never
 # with a permission field: the hook answers context and nothing else.
-CURSOR_DELEGATION_MATCHER = "Task|Shell"
+CURSOR_DELEGATION_MATCHER = "Task"
 
 # What a real run has shown, per function, for `status()["proof"]`: "hermetic"
 # (the round trip in tests only), "real-run <date>" (seen working in the
@@ -1231,7 +1252,10 @@ def _cursor_status() -> dict:
             "hook_sessionstart": has("sessionStart", _is_our_recall),
             "recall_rule": "project_scoped",
             "prompt_recall": "installed" if has("beforeSubmitPrompt", _is_our_prompt_recall) else "missing",
-            "delegation_push": "installed" if has("postToolUse", _is_our_delegation) else "missing",
+            "delegation_push": ("installed" if any(_is_our_delegation(e.get("command"))
+                                                   and e.get("matcher") == CURSOR_DELEGATION_MATCHER
+                                                   for e in h.get("hooks", {}).get("postToolUse", []))
+                                else "missing"),
             "extract": "installed" if has("stop") and has("preCompact") else "missing",
             "proof": dict(CURSOR_PROOF),
             "third_party_import": _cursor_third_party_import(h)}
@@ -2726,8 +2750,7 @@ def _codex_status() -> dict:
             "hook_subagentstop": has("SubagentStop", _is_ours),
             "recall_rule": "installed" if has("SessionStart", _is_our_recall) else "missing",
             "prompt_recall": "installed" if has("UserPromptSubmit", _is_our_prompt_recall) else "missing",
-            "delegation_push": ("installed" if has("PreToolUse", _is_our_delegation)
-                                and has("SubagentStart", _is_our_delegation) else "missing"),
+            "delegation_push": "installed" if _delegation_current(h.get("hooks") or {}) else "missing",
             "extract": "installed" if has("Stop", _is_ours) and has("PreCompact", _is_ours) else "missing"}
     def _cmd(ev: str, pred) -> str | None:
         for e in h.get("hooks", {}).get(ev, []):

@@ -52,8 +52,9 @@ def test_model_facts_reach_mcp_both_pushes_and_advisory(replay, monkeypatch):
         assert field in ' '.join(routing_delegation.provider_advisory(payload))
     assert routing_delegation.provider_advisory({'tool_name': 'spawn_agent', 'tool_input': {
         'provider': 'muse', 'model': 'muse-wonder-full-1.0'}}) == []
+    # A shell command is no longer read for its provider (2026-11-07).
     assert routing_delegation.provider_advisory({'tool_name': 'Bash', 'tool_input': {
-        'command': 'muse exec --model other "do the task"'}})
+        'command': 'muse exec --model other "do the task"'}}) == []
     agent_view.prepare_routing_table(refresh=True)
     changed = routing.prompt_push({'version': 0}, budget=1.0, now=T0)
     assert 'models_allowed' in changed['text']
