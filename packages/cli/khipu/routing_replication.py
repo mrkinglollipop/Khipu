@@ -238,15 +238,27 @@ def _apply_remote_settings(state):
         was_set = row.get("value_set") is True
         from khipu.config import load_config
 
-        here = routing.synced_value(load_config(), key) if key in routing.SYNCED_FEATURES else routing.settings()[key]
-        if here != value:
+        config = load_config()
+        here = routing.synced_value(config, key) if key in routing.SYNCED_FEATURES else routing.settings(config)[key]
+        # A conversation here asked for this same value: the owner's change there
+        # answers it too, so it is not asked again on this Mac.
+        same_ask = here == value and key in routing._setting_requests(config)
+        if here != value or same_ask:
             where = mac_label(row.get("mac"))
             stamp = {"auth": "other_mac", "words": f"the same change made on {where}"}
             owner_direction.noted(owner_direction.intent("config.routing_setting", key, facts={"from": where}), stamp)
             try:
                 with routing._lock(), mutate_config() as data:
                     owner_direction.record_setting_before(key, data)
+                    asks = routing._setting_requests(data)
+                    answered = key in asks and routing.settings(data)[key] == value
                     routing.store_setting(data, key, value, was_set)
+                    if answered:
+                        asks.pop(key)
+                        if asks:
+                            data[routing.SETTINGS_REQUEST_KEY] = asks
+                        else:
+                            data.pop(routing.SETTINGS_REQUEST_KEY, None)
             except Exception:
                 owner_direction.finish({"ok": False})
                 raise
@@ -635,6 +647,47 @@ def publish_requests():
         if sent or stale_format:
             state.setdefault("mac", routing._local_mac())
             _save(state)
+
+
+def refresh_for_owner(*, force=False):
+    """Before the owner is shown, or answers, something another Mac could
+    have settled: pull what the other Macs said (one bounded ``sync``; with
+    ``force`` false, none when one finished within ``POLL_SECONDS``), so a
+    request already settled there drops off here instead of being asked
+    again. Quiet on any failure: the record is then read as it stands."""
+    if not routing._replication_live() or not routing._hub_configured():
+        return
+    with contextlib.suppress(Exception):
+        sync() if force else sync_if_due()
+
+
+def settled_elsewhere(request_id):
+    """A mirrored request the holder settled before the owner answered it here
+    (``mirror_remote_requests``): the answer to give instead of sending his,
+    or None. A pending mirror is checked against the hub first."""
+    from khipu import owner_direction
+
+    def row():
+        try:
+            rows = owner_direction._read_requests(owner_direction.requests_path())
+        except (OSError, ValueError):
+            return None
+        return next((r for r in rows if r.get("id") == request_id and r.get("remote")), None)
+
+    mirror = row()
+    if mirror is None:
+        return None
+    if mirror.get("state") == "pending":
+        refresh_for_owner(force=True)
+        mirror = row()
+    # Answered here first ("answered", or a later state with this Mac's answer on it) is not this case.
+    if mirror is None or mirror.get("state") in ("pending", "answered") \
+            or mirror.get("confirmed") or mirror.get("declined"):
+        return None
+    where = mac_label((mirror.get("remote") or {}).get("mac"))
+    said = mirror.get("receipt") or f"It was already settled on {where}."
+    return {"ok": True, "applied": False, "sent": False, "already_settled": True, "request": request_id,
+            "line": f"{said} Your answer changed nothing, and nothing was sent to {where}."}
 
 
 def answer_remote(request, stamp, answer):

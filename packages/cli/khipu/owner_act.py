@@ -801,6 +801,9 @@ def _confirm(args, *, terminal: bool = False) -> tuple[bool, dict]:
 
     if not isinstance(args, dict) or set(args) != {"request"} or not isinstance(args["request"], str):
         return False, _bad(f"{CONFIRM} takes request, the held request's id").refusal()
+    settled = _settled_elsewhere(args["request"])
+    if settled:
+        return True, settled
     try:
         request, stamp = owner_direction.confirm(args["request"], terminal=terminal)
     except owner_direction.DirectionRefused as refused:
@@ -812,6 +815,16 @@ def _confirm(args, *, terminal: bool = False) -> tuple[bool, dict]:
     if owner_background.is_long(request["action"], request.get("args") or {}):
         return owner_background.start(request)
     return _apply_confirmed(request, stamp)
+
+
+def _settled_elsewhere(request_id: str) -> dict | None:
+    """A request another Mac holds and already settled: the owner's answer here
+    changes nothing and is not sent (``routing_replication.settled_elsewhere``)."""
+    if not request_id.startswith("rm-"):
+        return None
+    from khipu import routing_replication
+
+    return routing_replication.settled_elsewhere(request_id)
 
 
 def _apply_confirmed(request: dict, stamp: dict) -> tuple[bool, dict]:
@@ -867,6 +880,9 @@ def _decline(args, *, terminal: bool = False) -> tuple[bool, dict]:
 
     if not isinstance(args, dict) or set(args) != {"request"} or not isinstance(args["request"], str):
         return False, _bad(f"{DECLINE} takes request, the held request's id").refusal()
+    settled = _settled_elsewhere(args["request"])
+    if settled:
+        return True, settled
     try:
         request = owner_direction.decline(args["request"], terminal=terminal)
     except owner_direction.DirectionRefused as refused:
