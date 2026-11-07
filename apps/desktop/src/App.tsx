@@ -859,7 +859,6 @@ type DoctorJobs = {
   nightly?: JobEntry;
   monthly?: JobEntry;
   graph_build?: JobEntry;
-  embed_media_backfill?: JobEntry;
 };
 
 // graph_backup / graph_offsite from khipu.graph_backup.local_health() /
@@ -2729,7 +2728,6 @@ export default function App() {
       kind: string;
       enabled?: boolean;
       root?: string;
-      embed_media?: boolean;
     }>
   >([]);
   const [graphSourcesResolved, setGraphSourcesResolved] = useState<{
@@ -3056,7 +3054,6 @@ export default function App() {
           kind: string;
           enabled?: boolean;
           root?: string;
-          embed_media?: boolean;
         }>;
         resolved?: { unreachable?: Array<{ id?: string; root?: string }> };
         graph_producer?: boolean;
@@ -3173,30 +3170,6 @@ export default function App() {
         const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
         if (!parsed?.ok) {
           setGraphSourcesMsg(parsed?.error ?? "sources command failed");
-          return;
-        }
-        await loadGraphSources();
-      } catch (e) {
-        setGraphSourcesMsg(String(e));
-      }
-    },
-    [graphSourcesProducer, loadGraphSources],
-  );
-
-  const toggleEmbedMedia = useCallback(
-    async (id: string, embedMedia: boolean) => {
-      if (!graphSourcesProducer) return;
-      setGraphSourcesMsg(null);
-      try {
-        const raw = await runKhipu([
-          "sources",
-          "set-embed-media",
-          id,
-          embedMedia ? "on" : "off",
-        ]);
-        const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
-        if (!parsed?.ok) {
-          setGraphSourcesMsg(parsed?.error ?? "set-embed-media failed");
           return;
         }
         await loadGraphSources();
@@ -4014,24 +3987,6 @@ export default function App() {
     );
   };
 
-  const renderOnDemandJobRow = (
-    label: string,
-    entry: JobEntry | undefined,
-  ) => (
-    <div key={label} className="row-item">
-      <span className="row-main">{label}</span>
-      <span className="row-meta">
-        on demand
-        {entry?.last_run_iso
-          ? ` · last ${formatTs(entry.last_run_iso)}`
-          : " · never"}
-        {entry?.last_exit != null && entry.last_exit !== 0
-          ? ` · exit ${entry.last_exit}`
-          : ""}
-      </span>
-    </div>
-  );
-
   const renderJobRow = (
     label: string,
     entry: JobEntry | undefined,
@@ -4518,11 +4473,6 @@ export default function App() {
                   {renderJobRow("Nightly consolidate", doctorJobs.nightly, "nightly")}
                   {renderJobRow("Graph build", doctorJobs.graph_build, "graph-build")}
                   {renderJobRow("Monthly consolidate", doctorJobs.monthly, "monthly")}
-                  <div className="rows-head">On demand</div>
-                  {renderOnDemandJobRow(
-                    "Embed media backfill",
-                    doctorJobs.embed_media_backfill,
-                  )}
                 </div>
               ) : null}
               {jobSpawnMsg ? <pre className="code">{jobSpawnMsg}</pre> : null}
@@ -6523,9 +6473,7 @@ export default function App() {
                         <p className="muted">
                           Which local folders the graph builder reads on its next
                           run. Turning one off skips it next time; nothing already
-                          in the database is deleted. &quot;Embed images&quot;
-                          includes PNG and JPEG files from a folder in the search
-                          index.
+                          in the database is deleted.
                         </p>
                         {!graphSourcesProducer ? (
                           <p className="muted">
@@ -6544,7 +6492,6 @@ export default function App() {
                                 : "On";
                             const userCode =
                               row.kind === "code_ast" && row.id !== "code:claude";
-                            const hasRoot = Boolean(row.root);
                             return (
                               <div key={row.id} className="row-item">
                                 <label className="row-main">
@@ -6561,21 +6508,6 @@ export default function App() {
                                     <span className="muted mono"> {row.root}</span>
                                   ) : null}
                                 </label>
-                                {hasRoot ? (
-                                  <label className="row-meta">
-                                    <input
-                                      type="checkbox"
-                                      checked={Boolean(row.embed_media)}
-                                      disabled={!graphSourcesProducer}
-                                      onChange={(e) =>
-                                        void toggleEmbedMedia(row.id, e.target.checked)
-                                      }
-                                    />{" "}
-                                    Embed images
-                                  </label>
-                                ) : (
-                                  <span className="row-meta muted">no folder</span>
-                                )}
                                 <span className="row-meta">{status}</span>
                                 {graphSourcesProducer && userCode ? (
                                   <button

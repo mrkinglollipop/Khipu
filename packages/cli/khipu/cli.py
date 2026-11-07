@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """khipu CLI entry — status / search / graph / doctor / regen-memory / reconcile."""
 
 from __future__ import annotations
@@ -1917,7 +1914,6 @@ def _cmd_embed_index(args: argparse.Namespace) -> int:
     return 0
 
 
-# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
 def _cmd_embed_profile_delete(args: argparse.Namespace) -> int:
     """`khipu embed profiles delete ID --yes`: delete a profile nothing uses and
     every vector it owns. Refuses (naming the users) when it is the active
@@ -2041,7 +2037,6 @@ def cmd_library(args: argparse.Namespace) -> int:
     from khipu import library
 
     cmd = args.library_cmd
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     if cmd == "backfill" and (getattr(args, "job", False) or getattr(args, "job_id", None)):
         return cmd_library_backfill_job(args)
     try:
@@ -2067,7 +2062,6 @@ def cmd_library(args: argparse.Namespace) -> int:
             elif cmd == "scan":
                 out = library.scan(conn, args.name, allow_rebuild=bool(getattr(args, "allow_rebuild", False)))
             elif cmd == "backfill":
-                # --bypass-harness (sonnet lane): dispatched agent, no delegation.
                 out = library.backfill(
                     conn, args.name, limit=args.limit, stale=bool(args.stale),
                     profile=getattr(args, "profile", None),
@@ -2086,37 +2080,6 @@ def cmd_library(args: argparse.Namespace) -> int:
         return _backfill_exit_code(out)
     if cmd == "import" and out.get("ok") is False:
         return 1
-    return 0
-
-
-def cmd_embed_media_backfill(args: argparse.Namespace) -> int:
-    """Top-level hyphenated job: native PNG/JPEG into gemini-embedding-2@768."""
-    from khipu.embed import backfill_media
-    from khipu.jobs import _write_job_state
-
-    dry_run = bool(getattr(args, "dry_run", False))
-    yes = bool(getattr(args, "yes", False))
-    try:
-        stats = backfill_media(
-            dry_run=dry_run,
-            yes=yes,
-            limit=getattr(args, "limit", None),
-            source_id=getattr(args, "source_id", None),
-            profile=getattr(args, "profile", None),
-        )
-    except Exception as e:  # noqa: BLE001
-        if not dry_run:
-            _write_job_state("embed_media_backfill", 1)
-        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
-        return 1
-    if stats.get("needs_yes"):
-        if not dry_run:
-            _write_job_state("embed_media_backfill", 2)
-        print(json.dumps({"ok": False, **stats}, indent=2))
-        return 2
-    if not dry_run:
-        _write_job_state("embed_media_backfill", 0)
-    print(json.dumps({"ok": True, **stats}, indent=2))
     return 0
 
 
@@ -2313,17 +2276,6 @@ def cmd_graph(args: argparse.Namespace) -> int:
         out = graph_neighbors_snapshot(args.id, args.hops, args.limit)
         out.update(stale_fields())
     print(json.dumps(out, indent=2, default=str))
-    return 0
-
-
-def cmd_topic_graph_backfill(args: argparse.Namespace) -> int:
-    from khipu.mirror import backfill_topic_graph
-
-    mem = _require_memory_root(args)
-    if mem is None:
-        return 2
-    stats = backfill_topic_graph(mem, dry_run=bool(getattr(args, "dry_run", False)))
-    print(json.dumps(stats, indent=2, default=str))
     return 0
 
 
@@ -5460,30 +5412,6 @@ def cmd_sources(args: argparse.Namespace) -> int:
             sources.set_enabled(args.source_id, False)
             print(json.dumps({"ok": True, "id": args.source_id, "enabled": False}))
             return 0
-        if action == "set-embed-media":
-            raw = str(getattr(args, "embed_media_value", "")).strip().lower()
-            if raw not in ("on", "off"):
-                print(
-                    json.dumps(
-                        {
-                            "ok": False,
-                            "error": "set-embed-media expects on|off",
-                        }
-                    )
-                )
-                return 2
-            on = raw == "on"
-            sources.set_embed_media(args.source_id, on)
-            print(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "id": args.source_id,
-                        "embed_media": on,
-                    }
-                )
-            )
-            return 0
         if action == "add":
             sources.add_code_root(Path(args.root))
             print(json.dumps({"ok": True, "root": args.root}))
@@ -5847,7 +5775,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile",
         help="Target profile id (default: active). e.g. gemini-embedding-2@768",
     )
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     bf.add_argument(
         "--stale", action="store_true",
         help="Accepted for symmetry with `library backfill`: memory backfill always "
@@ -5905,7 +5832,6 @@ def build_parser() -> argparse.ArgumentParser:
         "profiles", help="List embedding profiles or add one (provider adapter + record)"
     )
     pr_sub = pr.add_subparsers(dest="profiles_cmd", required=True)
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     pr_sub.add_parser(
         "list",
         help="Every profile: provider, model, dim, endpoint, rows per space, where it is used, "
@@ -5970,7 +5896,6 @@ def build_parser() -> argparse.ArgumentParser:
     lb = lib_sub.add_parser("backfill", help="Embed chunks that have no vector under the library's profile")
     lb.add_argument("name")
     lb.add_argument("--limit", type=int, default=None, help="Embed at most N chunks this run")
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     lb.add_argument(
         "--stale", action="store_true",
         help="Also re-embed chunks whose text changed since they were embedded",
@@ -6051,31 +5976,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gb.set_defaults(func=cmd_graph_build)
 
-    emb = sub.add_parser(
-        "embed-media-backfill",
-        help="Embed PNG/JPEG under sources with embed_media (active Gemini Embedding 2)",
-    )
-    emb.add_argument("--dry-run", action="store_true", help="Count only; no API calls")
-    emb.add_argument(
-        "--yes",
-        action="store_true",
-        help=f"Required when more than {1000} images would be scanned",
-    )
-    emb.add_argument("--limit", type=int, default=None, help="Cap files this run")
-    emb.add_argument(
-        "--source-id",
-        dest="source_id",
-        default=None,
-        help="Only walk this source id (must have embed_media on + root)",
-    )
-    emb.add_argument(
-        "--profile",
-        default=None,
-        help="Profile id (default gemini-embedding-2@768)",
-    )
-    emb.set_defaults(func=cmd_embed_media_backfill)
-
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     # Detached-spawn wrappers (the desktop app's job pattern: one hyphenated
     # subcommand, output goes to a log, progress goes to <data_dir>/jobs/<id>.json).
     ebj = sub.add_parser(
@@ -6159,17 +6059,6 @@ def build_parser() -> argparse.ArgumentParser:
     dis = src_sub.add_parser("disable", help="Disable a source (does not purge PG)")
     dis.add_argument("source_id")
     dis.set_defaults(func=cmd_sources)
-    sem = src_sub.add_parser(
-        "set-embed-media",
-        help="Opt a source into native image embed (on|off; default off)",
-    )
-    sem.add_argument("source_id")
-    sem.add_argument(
-        "embed_media_value",
-        choices=("on", "off"),
-        help="on = walk PNG/JPEG under this source's root on embed-media-backfill",
-    )
-    sem.set_defaults(func=cmd_sources)
     add = src_sub.add_parser("add", help="Add a code_ast root (absolute path)")
     add.add_argument("--root", required=True, dest="root", help="Absolute code root")
     add.set_defaults(func=cmd_sources)
@@ -7427,41 +7316,6 @@ def build_parser() -> argparse.ArgumentParser:
     reval.add_argument("--sample", type=int, default=None, help="With --replay: cap to N entries")
     reval.add_argument("--seed", type=int, default=0, help="With --replay --sample: deterministic sampling seed")
     rc.set_defaults(func=cmd_recall)
-
-    tg = sub.add_parser(
-        "topic-graph",
-        help="Persist topic wiki/path graph (topics.links + Khipu-owned nodes/edges)",
-    )
-    tg_sub = tg.add_subparsers(dest="topic_graph_cmd", required=True)
-    tgb = tg_sub.add_parser(
-        "backfill",
-        help="Walk all topic .md files: UPDATE topics.links/frontmatter and mint topic:/path: edges",
-    )
-    tgb.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Report column updates + graph upserts; roll back writes",
-    )
-    tgb.add_argument("--memory-root", default=_memory_root_default())
-    tg.set_defaults(func=cmd_topic_graph_backfill)
-
-    gb = sub.add_parser(
-        "grok-bot-config",
-        help="Print the account-level Cursor cloud config (covers every repo) + the secret to add",
-    )
-    gb.set_defaults(
-        func=lambda a: (
-            print(
-                json.dumps(
-                    __import__(
-                        "khipu.integrations", fromlist=["x"]
-                    ).grok_bot_account_config(),
-                    indent=2,
-                )
-            )
-            or 0
-        )
-    )
 
     gw = sub.add_parser(
         "gateway",

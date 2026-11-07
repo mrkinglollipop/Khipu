@@ -236,7 +236,7 @@ def _offline(vectors: dict[str, list[float]] | None = None):
     targets: list[tuple[Any, str, Any]] = [
         (hub_snapshot, "try_hub_connect", hub), (db, "connect", hub),
         (embed, "embed_one", no_embed), (embed, "embed_batch", no_embed),
-        (embed, "embed_batch_images", no_embed), (embed, "_post_json", no_embed),
+        (embed, "_post_json", no_embed),
         (hub_reach, "note_unreachable", lambda *_a, **_k: None),
         (hub_reach, "note_reachable", lambda *_a, **_k: None),
     ]

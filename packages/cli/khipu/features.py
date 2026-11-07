@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Khipu's switch registry and capability signal (Phase 0, session B).
 
 A closed set of named switches for every optional behavior the memory-

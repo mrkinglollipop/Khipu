@@ -45,7 +45,7 @@ Use mode: "literal" for exact words or session ids; semantic for paraphrases. Fi
 `khipu_owed` lists commitments; `khipu_owed_update` files an ask with action=ask, requester, question, yes, no. Close your promises when kept.
 `khipu_capture` locally flags the session for next Stop/PreCompact/SessionEnd; summary becomes verbatim.note. Without hooks it writes immediately: give a summary and stable harness:session id.
 `khipu_route` reads which accounts are open; `khipu_route_advise` advises; `khipu_route_report` records limits; `khipu_route_rule` / `khipu_route_priority` propose changes. Khipu reports; you route.
-Other tools: `khipu_project`, `khipu_decisions`, `khipu_decisions_update`. `khipu_forget` hides episodes; hub and replicas keep
+Other tools: `khipu_decisions`, `khipu_decisions_update`. `khipu_forget` hides episodes; hub and replicas keep
   its text marked forgotten; no command purges or restores it yet. Topic graph
   nodes stay.
 """

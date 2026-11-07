@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """The one absolute relevance gate, behind the ``relevance_floor`` switch.
 
 ``recall_prompt._apply_score_floor`` is relative to the top row, so a prompt

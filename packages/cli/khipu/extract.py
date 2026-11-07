@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Transcript → durable-memory extraction (the LLM step of capture).
 
 Khipu's role in the harnesses that already have a legacy extractor (Claude Code,

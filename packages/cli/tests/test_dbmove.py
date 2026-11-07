@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane): authored by a dispatched on-sub
-# Agent(model="sonnet") subagent for Phase 1 of docs/plans/2026-09-05-
-# setup-that-cannot-strand-you.md.
 """khipu.dbmove — copy the database to another host, verify, and switch.
 
 Fake source/target connections throughout; nothing here touches a real

@@ -241,8 +241,7 @@ fn python_version(path: &PathBuf) -> Option<(u32, u32)> {
 /// `KHIPU_PYTHON` / LSEnvironment is trusted as-is (the working happy path —
 /// do not add a version check there). Only the `which python3` fallback is
 /// gated: `/usr/bin/python3` is 3.9 on this Mac and the CLI needs 3.11+
-/// (`typing.TypeAlias` etc.) — see audit F6. Same rejection message shape as
-/// `ops/scripts/soak_probe.sh` uses for the same trap.
+/// (`typing.TypeAlias` etc.) — see audit F6.
 fn khipu_python() -> Result<PathBuf, String> {
     if let Some(v) = env_first(&["KHIPU_PYTHON", "ALZY_PYTHON"]) {
         let p = PathBuf::from(&v);

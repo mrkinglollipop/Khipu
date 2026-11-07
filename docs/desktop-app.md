@@ -160,7 +160,7 @@ Backup zips the Mac-local data folder. Restore reads a zip or folder back into i
 
 ### Components
 
-The database and the graph builder upgrade on their own, apart from the app. **What feeds the graph** lists the local folders the graph builder reads on its next run. Turning one off skips it next time and deletes nothing. Each folder with a path can opt in to **Embed images** (PNG and JPEG). You can add or remove a code folder. On a Mac that does not build the graph, the list is read-only.
+The database and the graph builder upgrade on their own, apart from the app. **What feeds the graph** lists the local folders the graph builder reads on its next run. Turning one off skips it next time and deletes nothing. You can add or remove a code folder. On a Mac that does not build the graph, the list is read-only.
 
 ### Advanced
 

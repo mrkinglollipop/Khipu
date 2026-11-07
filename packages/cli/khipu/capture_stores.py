@@ -199,10 +199,11 @@ STORES: tuple[Store, ...] = (
           "state/routing/scan-report.json, not by forgetting an episode",
           _w("routing_scan_report._write_report")),
     Store("conversation media", "data folder media/conversation_memory/<sha256>.<ext>",
-          "images found in transcripts, shared by content hash",
+          "images found in transcripts, shared by content hash (nothing writes them any more; "
+          "files already there stay)",
           "kept: images are content-addressed and can belong to several episodes; a known "
           "boundary in the scope doc",
-          _w("session_capture.land_transcript_images"),
+          _w(),
           Restore(("media/conversation_memory/*",), "content addressed")),
     Store("extraction scratch", "data folder state/synth-cli/work-*/ and its output temp",
           "a model call's working folder and output, removed when the call returns",

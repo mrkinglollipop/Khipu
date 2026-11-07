@@ -1,5 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
-# Sonnet build agent (brief: do not delegate); no further agent to route to.
 """khipu.library and `khipu library ...` (library sources + BYO embeddings,
 Session B). An in-memory fake hub stands in for Postgres (it answers exactly
 the statements library.py issues), a fake transport stands in for the

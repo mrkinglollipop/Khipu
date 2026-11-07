@@ -432,7 +432,7 @@ def test_the_guard_finds_a_reader_by_what_it_reads(tmp_path):
 # their callers.
 LIVE_KINDS = {"query", "probe", "transcript", "library", "payload", "media"}
 PROVIDER_CLIENTS = {
-    "embed_batch", "embed_one", "embed_batch_images", "embed_text", "_embed_query_local",
+    "embed_batch", "embed_one", "embed_text", "_embed_query_local",
     "_generate", "_generate_local", "_generate_gemini", "_generate_cloud", "_generate_api",
     "_generate_anthropic", "_generate_openai", "_generate_openrouter", "_generate_claude_cli",
     "_generate_codex_cli", "_call_model", "_call_within",

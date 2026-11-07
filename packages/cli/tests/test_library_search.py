@@ -1,5 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
-# Sonnet build agent (brief: do not delegate); no further agent to route to.
 """Library search and `khipu get library:...` (Session C).
 
 A fake hub cursor answers exactly the statements ``khipu.library_search``

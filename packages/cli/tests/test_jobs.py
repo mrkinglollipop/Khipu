@@ -573,7 +573,7 @@ class JobsMetadataTest(unittest.TestCase):
         self.assertEqual(
             set(out),
             {"nightly", "monthly", "graph_build", "notes_watch", "queue_drain",
-             "recall_daemon", "replica_refresh", "embed_media_backfill"},
+             "recall_daemon", "replica_refresh"},
         )
 
 

@@ -183,9 +183,7 @@ The schema migrations extend through `0044`, including ledger, episode origin, f
 |---|---|
 | Commitments | Things you still owe on a project (see section 4) |
 | Decisions | A registry with a lifecycle and links between decisions (see section 4) |
-| Briefs | Source-backed summaries of a topic (see section 4) |
 | Library sources | Folders of text and Markdown files, indexed as a search space (see section 3) |
-| Media assets | PNG and JPEG files embedded for search |
 | Embedding profiles | Which model and size produce vectors, and which profile is active |
 | Episode sources | Where each episode came from (capture identity, above) |
 | Ledger | Project work rows, their vocabulary and change history |
@@ -280,7 +278,7 @@ Use `khipu owed` (list, `--close`, `--reopen`, `--snooze`), Owed within the Work
 
 ### Work and project names
 
-The project ledger tracks work rows and their history. The Work screen includes Owed, project ledger boards, Waiting on you, Running now and Accounts. Use `khipu ledger` or `khipu_ledger` to read and update rows. Project-name groups keep renamed projects together and expose merge and keep-separate questions to the owner; `khipu_project` shows their names, evidence and counts.
+The project ledger tracks work rows and their history. The Work screen includes Owed, project ledger boards, Waiting on you, Running now and Accounts. Use `khipu ledger` or `khipu_ledger` to read and update rows. Project-name groups keep renamed projects together and expose merge and keep-separate questions to the owner; `khipu project show` shows their names, evidence and counts.
 
 ### Decisions
 

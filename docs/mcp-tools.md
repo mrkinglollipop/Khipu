@@ -1,6 +1,6 @@
 # MCP tools
 
-Khipu exposes 20 tools locally and 18 through the HTTPS gateway, which omits `khipu_owner_act` and `khipu_needs_you`, through one MCP server (server id `khipu`). Agents call them to read memory, write to it, manage commitments and decisions, and read the routing record, and take an owner action the owner asked for.
+Khipu exposes 19 tools locally and 17 through the HTTPS gateway, which omits `khipu_owner_act` and `khipu_needs_you`, through one MCP server (server id `khipu`). Agents call them to read memory, write to it, manage commitments and decisions, and read the routing record, and take an owner action the owner asked for.
 
 The tool list is returned verbatim by the server's `tools/list`. This page groups the tools by job. For the exact schema of any tool, ask the server.
 
@@ -268,10 +268,6 @@ It lists a conversation's waiting change to the priority, a standing rule, a rou
 Each item has `kind`, `words` (one or two plain sentences, no ids), `asked_by` (`who`, `at`, `when`), `confirm_does`, `undo_does` and `settle` (`confirm` and `undo`, each the exact `khipu_owner_act` `action` and `args`, with its `expect` pin; `null` where no such action exists, and `do` says what to do). An item carries `cut: true` when its words are shortened, and `read_full` is the `key` read that gives them whole; `permanent: true` when its confirm can't be undone. The answer has `line`, `total`, `counts`, `more` and `more_line` (at most 20 items an answer), `how_to_settle`, `here` (what a yes in this conversation does now) and `unread` (anything it could not read: it says nothing is waiting only when all of it was read).
 
 Reading it confirms nothing and records no rule or priority as shown, but it is the ask: Khipu records where the conversation stood and which answers the read showed whole, and only what the owner types after that can answer. Nothing typed before it counts, the question included. In T3, one typed message newer than the read settles an item shown in it, routing kinds at once and held kinds by the same call; a turn Khipu can't prove stays held, with nothing changed. Outside T3 an answer is refused in the same turn as the read, but an agent that never read the list still passes on a recent typed turn. Khipu proves a new typed message and doesn't read it, so it can't tell a yes from "thanks". `direction.decline` drops a held request on the owner's no, on the same proof as `direction.confirm`, and is logged. `key` reads one item with its words whole. Owed items that need the owner are a separate list: `khipu_owed`.
-
-### khipu_project
-
-Read one project’s canonical name, grouped names, evidence and dates, counts per name and in total, and same-project pairs awaiting an answer or kept separate. Parameter: `name` (required). The answer is the same for every grouped name. Project merges and keep-separate choices belong to the owner, through `khipu_owner_act` actions `project.merge` and `project.keep_separate`.
 
 ## Work
 

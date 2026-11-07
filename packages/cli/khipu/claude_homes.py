@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """The Claude Code config homes Khipu installs into.
 
 Claude Code keeps its settings, hooks, transcripts and (since 2026) its

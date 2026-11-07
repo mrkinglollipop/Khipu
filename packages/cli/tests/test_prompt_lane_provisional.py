@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this change (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """The per-prompt lane's keyword-only result: published as soon as the keyword
 leg finishes, returned when the outer limit passes first, and never a reason
 to change what a search that finishes in time returns.

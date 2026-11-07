@@ -110,7 +110,6 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | `reconcile` | Full sync of memory files into Postgres. |
 | `regen-memory` | Write the `MEMORY.from-khipu.md` sidecar from topics. `--index` rebuilds the live `MEMORY.md`. |
 | `provenance` | Fact provenance maintenance: `backfill` proves legacy restaters' claims; `index` indexes episode source identities and sweeps refused carriers. |
-| `topic-graph` | `topic-graph backfill` updates topic links and graph edges from topic files. |
 | `outbox` | The offline queue for captures whose database write failed: `drain`, `status`, `retry-dead`, and `span-covered`, which counts (or with `--apply` retires) dead jobs whose range and evidence fields another episode holds; a retired job's own summary stays only in its local record. `retry-dead` leaves jobs refused for not announcing their source identities held. |
 
 `ledger` uses `--project` to select a project and `--json` for JSON output. Writes accept `--op-id` for safe retries. `ledger import FILE` supports `--dry-run` and `--catch-up`; `ledger export --tracker-json` exports the tracker shape. `ledger project` can rename, hide, or show a project.
@@ -123,11 +122,10 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | --- | --- |
 | `embed` | Vectors and embedding profiles. |
 | `library` | Folders of `.txt` and `.md` files indexed as a search space. |
-| `embed-media-backfill` | Embed PNG and JPEG files under sources that have `embed_media` on. `--dry-run`, `--yes` (needed over 1000 images), `--limit`, `--source-id`, `--profile`. |
 | `embed-backfill` | Job-mode alias for `embed backfill --job`. |
 | `library-backfill NAME` | Job-mode alias for `library backfill NAME --job`. |
 | `models` | Per-role model settings: `show`, `set`, `welcome`. |
-| `sources` | Graph membership: `list`, `enable`, `disable`, `set-embed-media`, `add`, `remove`, `export`. |
+| `sources` | Graph membership: `list`, `enable`, `disable`, `add`, `remove`, `export`. |
 
 ### embed
 
@@ -243,7 +241,6 @@ Zero is setting-specific: `replica_refresh_after=0` refreshes at every check; `h
 | `sessions` | Session capture queue: `drain`, `sweep`, `status`, `liveness`. |
 | `aegis` | Older name for `sessions`. Same queue, same drain. Its `status` defaults to `--harness aegis`, where `sessions status` defaults to `all`. |
 | `gateway` | `gateway token set` and `gateway token status` for the gateway bearer token. |
-| `grok-bot-config` | Prints the account-level cloud-agent config and the secret name to add. |
 | `t3` | Khipu for providers inside T3 Code. `t3 antigravity add\|remove --project DIR [--dry-run]` writes or removes Khipu's `.agents/` files in one project (the same files `integrations install antigravity --project` writes), `status --project DIR` reports them, and `list` shows every project added and the runtime version. |
 
 - Harness choices for `integrations`: `all`, `claude_code`, `cursor`, `aegis`, `codex`, `grok_build`, `grok_bot`, `antigravity`. Flags: `--dry-run`, `--home`, `--project`, `--no-verify`. There is no top-level `install` command.

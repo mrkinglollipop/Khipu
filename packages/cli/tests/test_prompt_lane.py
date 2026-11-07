@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Phase 0 session C (finding B10, docs/research/hindsight-plan-review-
 2026-09-28.md): the deadline-aware local recall lane, its sqlite
 query-embedding cache, and the doctor check on its real outcome rate.

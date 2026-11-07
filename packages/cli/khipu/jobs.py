@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Scheduled memory/graph jobs — thin wrappers around legacy consolidate/graphify scripts.
 
 Khipu owns the launchd labels and CLI entrypoints; the engines stay unchanged.
@@ -300,28 +297,6 @@ def _job_lock(name: str):
                 yield True
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
-
-
-def _on_demand_job_entry(name: str) -> dict[str, Any]:
-    """Receipt-only job status (no launchd / _JOB_SPECS).
-
-    Maps receipt ``ts`` → ``last_run_iso`` and ``exit`` → ``last_exit`` so the
-    desktop On-demand row can show last run without clock/agent copy.
-    """
-    state = _read_job_state(name)
-    ts = state.get("ts") if state else None
-    return {
-        "plist_label": None,
-        "log_path": None,
-        "err_log_path": None,
-        "last_run_mtime": None,
-        "last_run_iso": ts,
-        "plist_loaded": None,
-        "next_schedule": None,
-        "last_exit": state.get("exit") if state else None,
-        "last_exit_ts": ts,
-        "on_demand": True,
-    }
 
 
 def _run_script(
@@ -1885,7 +1860,6 @@ def job_status() -> dict[str, Any]:
         "queue_drain": _job_entry("queue_drain"),
         "recall_daemon": _job_entry("recall_daemon"),
         "replica_refresh": _job_entry("replica_refresh"),
-        "embed_media_backfill": _on_demand_job_entry("embed_media_backfill"),
     }
 
 

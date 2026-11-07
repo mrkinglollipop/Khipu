@@ -196,7 +196,6 @@ def test_capture_stamp_reaches_persisted_raw(t3_db, tmp_path, monkeypatch, sid, 
     payloads = []
     with mock.patch('khipu.extract.extract_memory', return_value={'summary':'Thread capture'}), \
          mock.patch('khipu.capture.capture', side_effect=lambda p, **kw: payloads.append(p) or 0), \
-         mock.patch('khipu.session_capture.land_transcript_images', return_value={}), \
          mock.patch('khipu.hub_snapshot.sync_decision_changes', return_value={'ok':True}):
         drained = sc.drain()
     assert drained['captured'] == 1

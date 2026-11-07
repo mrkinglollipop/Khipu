@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """khipu-prompt-recall — per-prompt recall push (Phase 1, R1/R9/R11).
 
 Recall used to be entirely on-demand: the model was told (``recall_rule.

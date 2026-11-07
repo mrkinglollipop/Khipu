@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """khipu.decisions — the evidence/lifecycle API added in Phase 2, session A
 (migration 0024: source_kind/evidence/superseded_at/supersede_source/
 supersede_reason/retracted_at/retract_reason on ``decisions``, plus the
