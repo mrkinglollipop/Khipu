@@ -56,7 +56,7 @@ def _replica(tmp_path, monkeypatch, *, episodes=(), topics=(), cosine=()):
         text[("episode", str(eid))] = " ".join([summary, *decisions])
     for slug, title, body, status, project, ts in topics:
         # Through the replica writer's own metadata pass, which records the size.
-        prepared = hs._topic_routing_metadata(
+        prepared = hs._topic_page_metadata(
             {"slug": slug, "body": body, "frontmatter": {"project": project} if project else None})
         con.execute("INSERT INTO topics(slug,title,body,status,updated_at,frontmatter) "
                     "VALUES(?,?,?,?,?,?)",
@@ -109,7 +109,7 @@ def test_replica_records_body_size_without_search_reading_the_body(tmp_path):
     con = sqlite3.connect(tmp_path / "r.sqlite")
     hs._create_schema(con)
     body = "x" * 40_000
-    prepared = hs._topic_routing_metadata({"slug": "note:big", "body": body, "frontmatter": None})
+    prepared = hs._topic_page_metadata({"slug": "note:big", "body": body, "frontmatter": None})
     con.execute("INSERT INTO topics(slug,body,status,frontmatter) VALUES('note:big',?,'active',?)",
                 (body, json.dumps(prepared["frontmatter"])))
 

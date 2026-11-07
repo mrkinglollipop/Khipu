@@ -2553,21 +2553,17 @@ def _apply_search_filters(
         cur.execute(
             "SELECT slug, COALESCE(event_at, updated_at, created_at), status, "
             "frontmatter->>'project', frontmatter->>'type', superseded_by, "
-            "frontmatter->'_routing_state_claim', frontmatter->'_page_chars' "
+            "frontmatter->'_page_chars' "
             "FROM topics WHERE deleted_at IS NULL AND slug = ANY(%s)",
             (topic_ids,),
         )
         for row in cur.fetchall():
             slug, ts, status, proj, note_type, superseded_by = row[:6]
-            # The advisory mark is additive; older metadata adapters return
-            # only the six source-validity fields. Absence is not a claim.
-            routing_claim = row[6] if len(row) > 6 else None
             meta[("topic", slug)] = {
                 "ts": ts, "status": status, "project": proj,
                 "type": note_type, "superseded_by": superseded_by,
-                "_routing_state_claim": routing_claim,
                 # Written by the mirror; search never reads the body itself.
-                "page_chars": row[7] if len(row) > 7 else None,
+                "page_chars": row[6] if len(row) > 6 else None,
             }
     if node_ids:
         cur.execute("SELECT id, built_at FROM nodes WHERE id = ANY(%s)", (node_ids,))
@@ -2647,8 +2643,6 @@ def _apply_search_filters(
             superseded_by = (m.get("superseded_by") or "").strip()
             if superseded_by:
                 r["superseded_by"] = superseded_by
-            if type(m.get("_routing_state_claim")) is bool:
-                r["_routing_state_claim"] = m["_routing_state_claim"]
             # Body length, so recency.is_broad_page can de-rank catch-all pages.
             if type(m.get("page_chars")) is int:
                 r["page_chars"] = m["page_chars"]

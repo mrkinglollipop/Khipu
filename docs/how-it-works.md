@@ -212,7 +212,7 @@ Hooks put prior work in front of the agent before it acts.
 - **Aegis** gets no push. Its hooks run as observers and their output is discarded. Aegis agents pull with `khipu_status` and `khipu_owed`.
 - **Cursor** gets the session-start push and a project rule file, but no per-prompt hook.
 
-With `routing_push` enabled, routing updates can arrive at session start, before prompts and at delegation. `routing_push_start`, `routing_push_prompt` and `routing_push_delegation` each default on within that feature; the master feature defaults off. Recall can also label imported topic text whose routing claims may have been superseded.
+With `routing_push` enabled, routing updates can arrive at session start, before prompts and at delegation. `routing_push_start`, `routing_push_prompt` and `routing_push_delegation` each default on within that feature; the master feature defaults off.
 
 A warm local recall service (`khipu recall serve`) answers the per-prompt hook over a socket so each prompt skips a cold Python start. It is an optional launch job. Without it the hook uses a one-shot path.
 

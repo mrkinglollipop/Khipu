@@ -190,14 +190,6 @@ STORES: tuple[Store, ...] = (
           "and bounded gateway health metadata; no words",
           "none: publication bookkeeping holds no capture text",
           _w("routing_gateway_copy._save")),
-    Store("routing scan report", "data folder state/routing/scan-report.json, written atomically "
-          "through a unique temp file in the same folder",
-          "routing copies found in files: file paths shown relative to home or their repo root, "
-          "line numbers and clipped quoted owner words, plus hit counts and too-large file names",
-          "kept: routing copies have no episode provenance; they are the scanner's report of "
-          "words in the owner's own files, replaced on the next scan and removed by deleting "
-          "state/routing/scan-report.json, not by forgetting an episode",
-          _w("routing_scan_report._write_report")),
     Store("conversation media", "data folder media/conversation_memory/<sha256>.<ext>",
           "images found in transcripts, shared by content hash (nothing writes them any more; "
           "files already there stay)",

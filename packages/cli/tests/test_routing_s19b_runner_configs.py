@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from khipu import routing, routing_scanner, usage
+from khipu import routing, routing_runner_caps, usage
 
 NOW = datetime(2026, 10, 20, 16, tzinfo=timezone.utc)
 MAIN = "claude|"
@@ -255,7 +255,7 @@ def test_a_login_key_never_appears_in_a_runner_cap_flag(mac):
 def test_a_login_key_shaped_label_is_never_echoed():
     accounts = [{"key": DEEPSEEK, "label": DEEPSEEK, "caps": []}]
     declared = [{"runner": "r", "account": DEEPSEEK, "kind": "share", "window": "weekly", "pct": 91.0}]
-    (flag,) = routing_scanner.compare_runner_caps(declared, accounts)
+    (flag,) = routing_runner_caps.compare_runner_caps(declared, accounts)
     assert DEEPSEEK not in json.dumps(flag) and "/logins/" not in json.dumps(flag)
 
 
@@ -263,7 +263,7 @@ def test_an_unknown_letters_only_name_is_never_echoed():
     accounts = [{"key": MAIN, "label": "Main", "caps": []}]
     declared = [{"runner": "r", "account": "LettersOnlySecretName", "kind": "share",
                  "window": "weekly", "pct": 91.0}]
-    (flag,) = routing_scanner.compare_runner_caps(declared, accounts)
+    (flag,) = routing_runner_caps.compare_runner_caps(declared, accounts)
     assert flag["status"] == "no_account" and flag["account"] is None
     assert "LettersOnlySecretName" not in json.dumps(flag)
     assert flag["account_words"] == "an unnamed account"
@@ -277,7 +277,7 @@ def test_compare_is_pure_and_takes_no_view(mac):
     accounts = [{"key": MAIN, "label": "Main", "caps": [
         {"kind": "share", "window": "weekly", "pct": 76.0, "revision": "r1"}]}]
     declared = [{"runner": "r", "account": "Main", "kind": "share", "window": "weekly", "pct": 91.0}]
-    assert routing_scanner.compare_runner_caps(declared, accounts)[0]["status"] == "disagrees"
+    assert routing_runner_caps.compare_runner_caps(declared, accounts)[0]["status"] == "disagrees"
     assert accounts[0]["caps"][0]["pct"] == 76.0
 
 
