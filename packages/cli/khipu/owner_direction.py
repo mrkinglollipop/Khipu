@@ -1007,10 +1007,13 @@ _ASK_ALONE = ("Not confirmed: this can't be taken back, so a yes to a list never
 
 def permanent(request: dict) -> bool:
     """A held request that can't be taken back (class C), one mirrored from
-    another Mac included (its holder says so; a forget or a purge always is)."""
+    another Mac included (its holder says so; a forget or a purge always is,
+    and so is any import, since an older holder may not say whether it is a
+    catch-up and the mirror has no args to tell)."""
     remote = request.get("remote")
     if request.get("action") == "direction.remote" and isinstance(remote, dict):
-        return remote.get("permanent") is True or class_c(str(remote.get("action") or ""), None)
+        action = str(remote.get("action") or "")
+        return remote.get("permanent") is True or action == "ledger.import" or class_c(action, None)
     return class_c(request.get("action", ""), request.get("args"))
 
 

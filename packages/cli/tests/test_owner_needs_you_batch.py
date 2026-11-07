@@ -203,3 +203,22 @@ def test_one_conversations_own_ask_never_clears_another_conversations_list_read(
     ok, done = _confirm(held["request"])
     assert ok, done
     assert ran and ran[0][0] == "forget.here"
+
+
+def test_a_mirrored_request_is_permanent_without_its_holders_flag():
+    # An older holder sends no req_permanent: a mirrored forget, purge or any
+    # import still never settles from a list; an A action mirrored stays A.
+    from khipu import owner_direction
+
+    def mirror(action, flag=None):
+        remote = {"action": action}
+        if flag is not None:
+            remote["permanent"] = flag
+        return {"action": "direction.remote", "remote": remote}
+
+    for action in ("forget.send", "forget.here", "forget.not_same", "ledger.purge", "ledger.import"):
+        assert owner_direction.permanent(mirror(action)), action
+        assert owner_direction.permanent(mirror(action, False)), action
+    assert owner_direction.permanent(mirror("route.pause", True))
+    assert not owner_direction.permanent(mirror("route.pause"))
+    assert not owner_direction.permanent(mirror("route.rule.confirm"))
