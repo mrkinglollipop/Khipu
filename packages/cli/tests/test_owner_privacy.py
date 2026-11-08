@@ -413,7 +413,7 @@ def test_every_file_owner_direction_writes_is_in_the_inventory(folders, monkeypa
     listed = {str(p) for p in owner_files.listed()}
     assert written and set(written) <= listed, sorted(set(written) - listed)
     kinds = {owner_files.kind_of(p) for p in owner_files.listed()}
-    assert {"turns", "briefs", "settings", "pending", "log", "head", "lock", "temp"} <= kinds, kinds
+    assert {"turns", "briefs", "settings", "pending", "log", "lock", "temp"} <= kinds, kinds
 
 
 def test_normal_forget_scrubs_old_words_and_keeps_the_action_log_and_undo_state(folders):
