@@ -1,5 +1,7 @@
 # Memory-reasoning acceptance checklist — every harness, every added capability
 
+> Historical plan or research. Registry extraction and standalone registry tools were retired; see [current memory behavior](../explicit-memory-lists.md).
+
 Revision under test: `<branch>`, HEAD `<sha>` (fill in at verification time — this
 document ships with the capability rows and matrix pre-built and every cell
 **PENDING**; it carries no result yet). Gateway build under test:
@@ -17,7 +19,7 @@ be mistaken for a fresh one.
 For each harness: one scripted or live session that (1) asks a topical question naming
 a stored decision or topic, (2) asks an explicit-reversal question ("didn't we decide
 X, then change it?"), (3) asks a historical/as-of question, (4) triggers a capture with
-a deferred commitment, (5) triggers `khipu_decisions`/`khipu decisions supersede` where
+a deferred commitment, (5) triggers the retired registry/the retired supersession command where
 that harness can reach it, and (6) forces the local replica stale and confirms
 reconnection. Evidence for each row is the tool/hook output itself (a log line, a
 payload, a rendered block) — never a claim without a pasted artifact, same discipline
@@ -42,7 +44,7 @@ live and broken, with the fix noted. **N/A** — not exercised, exact reason giv
 | Per-prompt recall lane answers inside its budget | PENDING | PENDING | PENDING | PENDING | PENDING |
 | Capability signal (`contract.version`/`capabilities` on `initialize` and status) | PENDING | PENDING | PENDING | PENDING | PENDING |
 | Forgetting is complete (no reader returns a forgotten episode; cascades to decisions/deliverables) | PENDING | PENDING | PENDING | PENDING | PENDING |
-| Decisions tools (`khipu_decisions` read, `khipu_decisions_update` supersede/restore/retract) | PENDING | PENDING | PENDING | PENDING | PENDING |
+| Decisions tools (the retired registry read, the retired registry writer supersede/restore/retract) | PENDING | PENDING | PENDING | PENDING | PENDING |
 | Validity honored in search results | PENDING | PENDING | PENDING | PENDING | PENDING |
 | Validity honored in the rendered prompt block | PENDING | PENDING | PENDING | PENDING | PENDING |
 | Validity honored in `khipu_status` | PENDING | PENDING | PENDING | PENDING | PENDING |

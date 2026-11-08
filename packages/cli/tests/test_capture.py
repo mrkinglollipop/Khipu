@@ -376,6 +376,12 @@ class _EpisodesFakeCursor:
         s = " ".join(sql.split())
         params = params or ()
         self.calls.append((s, params))
+        if s == "SELECT to_regclass('public.fact_claims') IS NOT NULL":
+            self._result = [(False,)]
+            return
+        if s.startswith("SELECT set_config"):
+            self._result = [("on",)]
+            return
         if s == "SELECT pg_advisory_xact_lock(%s)":
             assert len(params) == 1 and -(1 << 63) <= params[0] < (1 << 63)
             self._result = [(None,)]
@@ -769,63 +775,6 @@ class WritePgOrchestrationTest(unittest.TestCase):
         self.assertEqual(len(merged["raw"]["merged_from"]), 1)
         self.assertEqual(merged["raw"]["merged_from"][0]["session_id"], "claude_code:c631b166")
 
-    def test_a_merge_unions_people_and_tags_opens_commitments_and_reembeds(self):
-        """Audit 2026-09-04: the merge folded topics/decisions/preferences and
-        dropped everything else. ``people``/``tags`` from the merged capture
-        vanished, its ``open_loops`` never became commitments (the insert path
-        opens them), and the target row kept vectors built from its pre-merge
-        text."""
-        existing = {1: {
-            "ts": "2026-09-03T00:00:00Z", "session_id": "claude_code:fb929043",
-            "summary": "one conversation captured twice",
-            "topics": ["performance"], "decisions": [], "preferences": [],
-            "people": ["matt"], "tags": ["recap-chip"], "raw": {},
-            "harness": "claude_code", "repo_root": "/r", "project": "acme/widget",
-            "parent_session_id": None, "transcript_range": "0:100",
-        }}
-        cur = _EpisodesFakeCursor(existing)
-        conn = _FakeConn(cur)
-        original_refresh = cap._refresh_merged_episode
-
-        def refresh_after_commit(cursor, episode_id):
-            self.assertGreater(conn.commits, 0, "embedding must read committed target metadata")
-            return original_refresh(cursor, episode_id)
-
-        payload = {
-            "ts": "2026-09-03T00:02:00Z", "session_id": "claude_code:c631b166",
-            "summary": "one conversation captured twice",
-            "people": ["matt", "ana"], "tags": ["followup-chip"],
-            "open_loops": [{"text": "ship the merge fix", "kind": "followup"}],
-            "harness": "claude_code", "transcript_range": "50:200", "project": "acme/widget",
-        }
-        opened: list[tuple] = []
-        reembedded: list[tuple] = []
-        with mock.patch("khipu.db.connect", return_value=conn), \
-                mock.patch("khipu.hygiene.classify_topics", return_value=([], [], False)), \
-                mock.patch("khipu.commitments.open_from_episode",
-                           side_effect=lambda c, pl, eid: opened.append((pl, eid)) or 1), \
-                mock.patch("khipu.commitments.auto_close", return_value=0), \
-                mock.patch.object(cap, "_refresh_merged_episode", side_effect=refresh_after_commit), \
-                mock.patch.object(cap, "_reembed_merged_episode",
-                                  side_effect=lambda ts, sm, m, episode_id=None:
-                                  reembedded.append((ts, sm, m, episode_id))), \
-                mock.patch.object(cap, "_dedup_text", side_effect=lambda p: p.get("summary") or ""):
-            stats = cap.write_pg(payload)
-        self.assertEqual(stats["dedup"]["action"], "merge")
-        merged = cur.episodes[1]
-        self.assertEqual(merged["people"], ["matt", "ana"])
-        self.assertEqual(merged["tags"], ["recap-chip", "followup-chip"])
-        # Commitments opened for the MERGED payload against the TARGET id.
-        self.assertEqual(len(opened), 1)
-        self.assertEqual(opened[0][1], 1)
-        self.assertEqual(opened[0][0]["open_loops"], payload["open_loops"])
-        # And the target row is re-embedded from its post-merge text.
-        self.assertEqual(len(reembedded), 1)
-        self.assertEqual(reembedded[0][0], "2026-09-03T00:00:00Z")
-        self.assertEqual(reembedded[0][2]["people"], ["matt", "ana"])
-        self.assertEqual(reembedded[0][2]["session_id"], existing[1]["session_id"])
-        self.assertEqual(reembedded[0][3], 1, "the target is re-embedded by its id")
-        self.assertEqual(reembedded[0][2]["project"], "acme/widget")
 
     def test_a_path_like_scope_is_normalised_to_null_on_insert(self):
         """K6: a worktree path or a run-on scope never lands in the column
@@ -935,34 +884,6 @@ class WritePgOrchestrationTest(unittest.TestCase):
         self.assertEqual(cur.episodes[eid]["topics"], ["real-topic"])
         self.assertEqual(cur.episodes[eid]["tags"], ["dangling-slug"])
 
-    def test_commitments_wired_in_with_the_real_episode_id_after_insert(self):
-        cur = _EpisodesFakeCursor()
-        payload = {
-            "ts": "2026-09-03T00:00:00Z", "session_id": "s1", "summary": "did a thing",
-            "open_loops": [{"text": "follow up", "kind": "followup"}],
-        }
-        calls = []
-        with self._connect(cur), \
-                mock.patch("khipu.hygiene.classify_topics", return_value=([], [], False)), \
-                mock.patch("khipu.commitments.open_from_episode",
-                            side_effect=lambda c, p, eid: calls.append(("open", eid)) or 1), \
-                mock.patch("khipu.commitments.auto_close",
-                            side_effect=lambda c, p, eid: calls.append(("close", eid)) or 0):
-            stats = cap.write_pg(payload)
-        eid = stats["episode_id"]
-        self.assertIsNotNone(eid)
-        self.assertEqual(calls, [("open", eid), ("close", eid)])
-
-    def test_commitments_failure_does_not_lose_the_episode(self):
-        cur = _EpisodesFakeCursor()
-        payload = {"ts": "2026-09-03T00:00:00Z", "session_id": "s1", "summary": "did a thing"}
-        with self._connect(cur), \
-                mock.patch("khipu.hygiene.classify_topics", return_value=([], [], False)), \
-                mock.patch("khipu.commitments.open_from_episode", side_effect=RuntimeError("boom")):
-            stats = cap.write_pg(payload)
-        self.assertTrue(stats["episode_inserted"])
-        self.assertEqual(len(cur.episodes), 1)
-
 
 class HygieneSavepointGateTest(unittest.TestCase):
     """fix 2: hygiene.classify_topics is gated on topic_aliases + episodes.
@@ -1042,32 +963,14 @@ class HygieneSavepointGateTest(unittest.TestCase):
 
 
 class DecisionDetectionSavepointGateTest(unittest.TestCase):
-    """Phase 2, session C: detect_reversals_from_episode runs right after
-    insert_decisions_from_episode, in its own SAVEPOINT — a raising
+    """Phase 2, session C: historical reversal detection runs right after
+    historical decision extraction, in its own SAVEPOINT — a raising
     detection step must not lose the episode or the decisions step already
     wrote, same posture as HygieneSavepointGateTest above."""
 
     def _connect(self, cur):
         return mock.patch("khipu.db.connect", return_value=_FakeConn(cur))
 
-    def test_a_raising_detection_step_leaves_the_episode_and_its_decisions_written(self):
-        cur = _EpisodesFakeCursor()
-        payload = {
-            "ts": "2026-09-20T00:00:00Z", "session_id": "s1", "summary": "did a thing",
-            "decisions": ["Use rolling deploys"],
-        }
-        with self._connect(cur), \
-                mock.patch("khipu.decisions.insert_decisions_from_episode", return_value=1), \
-                mock.patch("khipu.decisions.detect_reversals_from_episode",
-                            side_effect=RuntimeError("boom")):
-            stats = cap.write_pg(payload)
-        self.assertTrue(stats["episode_inserted"])
-        eid = stats["episode_id"]
-        self.assertIn(eid, cur.episodes)
-        self.assertEqual(cur.episodes[eid]["decisions"], ["Use rolling deploys"])
-        statements = [s for s, _ in cur.calls]
-        self.assertIn("SAVEPOINT capture_decision_detection", statements)
-        self.assertIn("ROLLBACK TO SAVEPOINT capture_decision_detection", statements)
 
 
 class ProjectInheritanceAndDedupGroupingTest(unittest.TestCase):

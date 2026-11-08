@@ -1,9 +1,8 @@
 """Legacy persistence and same-turn owner request regressions; synthetic state only."""
 import json
 
-import pytest
 
-from khipu import accounts, needs_you, owed_tidy, owner_act, owner_direction, routing
+from khipu import accounts, needs_you, owner_act, owner_direction, routing
 from tests.test_owner_needs_you import (
     _accounts_request, _cap_request, _earlier_ask, _owner_types, _priority_request,
     _rule_added, _rule_changed, _setting_request, _tier_request,
@@ -13,7 +12,7 @@ from tests.test_t3_owner_confirm import world
 assert world
 
 KINDS = ('priority', 'priority_undo', 'rule', 'rule_undo', 'proposal', 'setting', 'tier',
-         'seeded_rule_undo', 'owed_plan', 'cap_proposal')
+         'seeded_rule_undo', 'cap_proposal')
 
 
 def _legacy(world, monkeypatch, kind):
@@ -46,7 +45,7 @@ def _legacy(world, monkeypatch, kind):
     else:
         path = world['tmp'] / (kind + '.json')
         path.write_text(json.dumps({'project': 'p', 'items': []}))
-        action, args = 'owed.tidy', {'project': 'p', 'plan': str(path)}
+        raise AssertionError(f'unknown fixture kind {kind}')
     _owner_types(world, 'prepare the old change')
     # Produce the old persisted shape: no content pins, review seal or disclosure metadata.
     row = owner_direction.hold(action, args, ask=owner_direction.ask_line(action, args))
@@ -59,23 +58,6 @@ def _legacy(world, monkeypatch, kind):
     return row
 
 
-@pytest.mark.parametrize('kind', ['owed_plan'])
-def test_legacy_hold_never_applies_after_a_full_read_and_later_yes(world, monkeypatch, kind):
-    row = _legacy(world, monkeypatch, kind)
-    seen = []
-    if kind == 'owed_plan':
-        monkeypatch.setattr(owed_tidy, 'apply', lambda doc, **kw: seen.append(doc) or {'ok': True})
-    before_events = routing.read_events()[0]
-    from khipu.config import load_config
-    before_config = load_config()
-    _owner_types(world, 'show the whole held change')
-    needs_you.waiting(key='held:' + row['id'])
-    _owner_types(world, 'yes')
-    ok, out = owner_act.act('direction.confirm', {'request': row['id']})
-    assert not ok, {'kind': kind, 'result': out, 'sink': seen}
-    assert not seen
-    assert routing.read_events()[0] == before_events
-    assert load_config() == before_config
 
 
 def _own_request(kind):

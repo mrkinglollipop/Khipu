@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 from khipu import mcp_server as ms
-from khipu.mcp_server import LATEST_PROTOCOL, TOOLS, _tool_get, handle_message
+from khipu.mcp_server import LATEST_PROTOCOL, _tool_get, handle_message
 
 
 def _pg_available() -> bool:
@@ -88,39 +88,6 @@ class ProtocolTest(unittest.TestCase):
         out = handle_message(_req(1, "initialize", {"protocolVersion": "1999-01-01"}))
         self.assertEqual(out["result"]["protocolVersion"], LATEST_PROTOCOL)
 
-    def test_tools_list_names(self):
-        out = handle_message(_req(2, "tools/list"))
-        names = {t["name"] for t in out["result"]["tools"]}
-        self.assertEqual(
-            names,
-            {t["name"] for t in TOOLS},
-        )
-        self.assertEqual(
-            names,
-            {
-                "khipu_search",
-                "khipu_get",
-                "khipu_graph",
-                "khipu_status",
-                "khipu_owed_update",
-                "khipu_forget",
-                "khipu_capture",
-                "khipu_owed",
-                "khipu_decisions",
-                "khipu_decisions_update",
-                "khipu_usage",
-                "khipu_route",
-                "khipu_route_advise",
-                "khipu_route_report",
-                "khipu_route_rule",
-                "khipu_route_priority",
-                "khipu_ledger",
-                "khipu_owner_act",
-                "khipu_needs_you",
-            },
-        )
-        for tool in out["result"]["tools"]:
-            self.assertIn("inputSchema", tool)
 
     def test_notification_returns_none(self):
         self.assertIsNone(

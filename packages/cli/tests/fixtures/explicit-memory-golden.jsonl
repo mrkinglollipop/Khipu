@@ -1,0 +1,4 @@
+{"query":"Recorded mobile followup task","expect":["10"],"k":3,"cwd":"/khipu/worktree","fixture_summary":"Recorded the mobile followup task for the phone app","fixture_decisions":[]}
+{"query":"Store all scopes explicitly","expect":["10"],"k":3,"cwd":"/khipu/worktree","fixture_summary":"Recorded owner direction","fixture_decisions":["Store all scopes explicitly in the capture payload"]}
+{"query":"Prefer local nightly snapshots","expect":["10"],"k":3,"cwd":"/khipu/worktree","fixture_summary":"Recorded the memory choice","fixture_decisions":["Prefer local nightly snapshots to network-only recovery"]}
+{"query":"Preserve multilingual café quotes","expect":["10"],"k":3,"cwd":"/khipu/worktree","fixture_summary":"Preserve multilingual café quotes exactly","fixture_decisions":[]}

@@ -148,44 +148,12 @@ def test_08K01_is_plain_operational_error_and_old_code_reads_it_as_hub_away(migr
     "UPDATE deliverables SET episode_id = %(b)s WHERE id = %(v)s",
     "INSERT INTO commitments (text, project, opened_episode, content_hash) VALUES ('new', 'khipu', %(b)s, 'hx')",
     "INSERT INTO decisions (project, text, episode_id) VALUES ('khipu', 'new', %(b)s)",
-    "INSERT INTO decisions (project, text) VALUES ('khipu', 'an old create_decision')",
+    "INSERT INTO decisions (project, text) VALUES ('khipu', 'an old historical owner decision writer')",
     "INSERT INTO deliverables (project, kind, path, episode_id) VALUES ('khipu', 'file', 'b.py', %(b)s)",
 ])
 def test_a_direct_wording_write_is_refused_at_commit(migrated, sql):
     exc = _refused(migrated.conn, [(sql, migrated.ids)])
     assert getattr(exc, "sqlstate", None) == "08K01", exc
-
-
-def test_an_old_dedup_is_refused_whole_savepoints_included(migrated):
-    """main's dedup (commitments.py open_from_episode): touch seen, overwrite
-    latest_text, union prs, keep refs, inside the capture's fail-open
-    savepoint, after the episode insert. COMMIT refuses all of it, so no
-    episode lands without its claims."""
-    conn = migrated.conn
-    c = migrated.ids["c"]
-    with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM episodes")
-        before = cur.fetchone()[0]
-        _episode(cur, "the restater")
-        cur.execute("SAVEPOINT commitments_step")
-        cur.execute("UPDATE commitments SET last_seen_at = now(), seen_count = seen_count + 1 WHERE id = %s", (c,))
-        cur.execute("UPDATE commitments SET latest_text = %s WHERE id = %s", ("ship the gate today", c))
-        cur.execute("UPDATE commitments SET prs = ARRAY(SELECT DISTINCT n FROM "
-                    "unnest(COALESCE(prs, '{}'::int[]) || %s::int[]) AS n ORDER BY n) WHERE id = %s", ([41], c))
-        cur.execute("UPDATE commitments SET pr_check = %s::jsonb WHERE id = %s",
-                    (json.dumps({"refs": ["acme/app#41"]}), c))
-        cur.execute("RELEASE SAVEPOINT commitments_step")
-    import psycopg
-
-    with pytest.raises(psycopg.OperationalError) as caught:
-        conn.commit()
-    assert caught.value.sqlstate == "08K01"
-    conn.rollback()
-    with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM episodes")
-        assert cur.fetchone()[0] == before
-        cur.execute("SELECT latest_text, prs, pr_check, seen_count FROM commitments WHERE id = %s", (c,))
-        assert cur.fetchone() == (None, [], None, 1)
 
 
 def test_an_old_forget_of_a_claimed_episode_is_refused(migrated):
@@ -493,38 +461,6 @@ PR_TEXTS = [
 ]
 
 
-def test_sql_pr_parse_is_never_more_than_parse_prs(migrated):
-    from khipu.close_rules import parse_prs
-
-    conn = migrated.conn
-    disagree = []
-    with conn.cursor() as cur:
-        for t in PR_TEXTS:
-            cur.execute("SELECT khipu_text_prs(%s)", (t,))
-            sql = set(cur.fetchone()[0])
-            py = set(parse_prs(t))
-            assert sql <= py, (t, sql, py)
-            if sql != py:
-                disagree.append(t)
-    conn.rollback()
-    # Only texts with a non-ASCII neighbour or space may read stricter.
-    assert all(re.search(r"[^\x00-\x7f]", t) for t in disagree), disagree
-
-
-def test_sql_pull_refs_are_the_qualified_labels_of_pull_links(migrated):
-    from khipu.close_rules import pr_requirement_labels
-
-    conn = migrated.conn
-    with conn.cursor() as cur:
-        for t in PR_TEXTS:
-            cur.execute("SELECT khipu_text_pull_refs(%s)", (t,))
-            sql = set(cur.fetchone()[0])
-            py = set(pr_requirement_labels(t, None))
-            assert sql <= py, (t, sql, py)
-            assert sql == py or re.search(r"[^\x00-\x7f]", t), (t, sql, py)
-    conn.rollback()
-
-
 # ---- The single-writer inventory section 4's proof rests on ---------------------
 
 _TABLES = ("commitments", "decisions", "deliverables")
@@ -543,17 +479,9 @@ WORDING_WRITERS = {
     # manual) claim, then project in the same owner-write transaction.
     ("explicit_asks", "_write_ask", "INSERT INTO commitments"),
     # prs from the anchor's own text (rows from before 0034).
-    ("close_rules", "backfill_prs", "UPDATE commitments"),
     # pr_check notes; keeps refs as they were (and drops needs_owner: phase 3).
-    ("close_rules", "_pr_rule", "UPDATE commitments"),
-    ("commitments", "_keep_pr_refs", "UPDATE commitments"),
-    ("commitments", "open_from_episode", "INSERT INTO commitments"),
-    ("commitments", "open_from_episode", "UPDATE commitments"),
     # Owner columns only (owner, owner_label, lineage, reassigned_at).
-    ("commitments", "auto_reassign", "UPDATE commitments dynamic"),
     ("commitments", "reassign", "UPDATE commitments dynamic"),
-    ("decisions", "create_decision", "INSERT INTO decisions"),
-    ("decisions", "insert_decisions_from_episode", "INSERT INTO decisions"),
     ("deliverables", "insert_deliverables_from_episode", "INSERT INTO deliverables"),
 }
 

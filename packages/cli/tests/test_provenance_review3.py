@@ -49,6 +49,9 @@ def test_nonanchor_claimant_source_is_fenced(pg, replica, method):
     bpayload = _payload(loop=ALT)
     b = capture.write_pg(dict(bpayload))["episode_id"]
     with pg.connect() as c:
+        from tests.fact_seed import archived_facts
+        cid = c.execute("SELECT id FROM commitments WHERE opened_episode = %s", (a,)).fetchone()[0]
+        archived_facts(c.cursor(), bpayload, b, restates=cid)
         before = c.execute("SELECT opened_episode, text, latest_text FROM commitments").fetchall()
     assert before == [(a, CANON, ALT)], before
     assert a != b
@@ -101,14 +104,14 @@ def test_recovery_same_legacy_key_keeps_each_fact(pg, method):
 @pytest.mark.parametrize("method", ["sync_recent_episodes", "reconcile_memory_root"])
 def test_recovery_deferral_preserves_unknown_origin(pg, monkeypatch, method):
     pg.memory.mkdir()
-    a = _payload(loop=None, decision="Use recovery line alpha")
-    b = _payload(loop=None, decision="Use recovery line beta")
+    a = _payload(loop=None, decision="Use recovery line alpha", title="Alpha proof", path="docs/alpha.md")
+    b = _payload(loop=None, decision="Use recovery line beta", title="Beta proof", path="docs/beta.md")
     (pg.memory / "episodes.jsonl").write_text(json.dumps(a) + "\n" + json.dumps(b) + "\n")
     real = provenance.record_claim
     fired = []
 
     def once(cur, kind, *args, **kw):
-        if kind == "decision" and not fired:
+        if kind == "deliverable" and not fired:
             fired.append(True)
             raise psycopg.errors.QueryCanceled("synthetic per-line timeout")
         return real(cur, kind, *args, **kw)
@@ -123,8 +126,8 @@ def test_recovery_deferral_preserves_unknown_origin(pg, monkeypatch, method):
         outbox.drain()
     with pg.connect() as c:
         rows = c.execute("SELECT summary, origin FROM episodes ORDER BY summary").fetchall()
-        facts = c.execute("SELECT text FROM decisions").fetchall()
-    assert len(rows) == 2 and len(facts) == 2 and not outbox.jobs()
+        facts = c.execute("SELECT title FROM deliverables").fetchall()
+    assert fired and len(rows) == 2 and len(facts) == 2 and not outbox.jobs()
     assert all(r[1] is None for r in rows), "retry attributed a historical line to the recovery caller"
 
 
@@ -132,26 +135,20 @@ def test_recovery_deferral_preserves_unknown_origin(pg, monkeypatch, method):
 
 
 def test_decision_gap_replay_keeps_reversal_evidence(pg):
+    """A retired step keeps its original evidence without rerunning extraction."""
     old = "Use blue-green deploys for rollout"
     new = "Use rolling deploys for rollout"
     _capture(loop=None, decision=old)
     payload = _payload(loop=None, decision=new, decision_details=[{"text": new, "by": "user", "reverses": old}])
-    real = provenance.record_claim
-
-    def broken(cur, kind, *args, **kw):
-        if kind == "decision":
-            raise RuntimeError("synthetic insert step failure")
-        return real(cur, kind, *args, **kw)
-
-    with mock.patch.object(provenance, "record_claim", broken):
-        capture.write_pg(payload)
+    eid = capture.write_pg(payload)["episode_id"]
     with pg.connect() as c:
-        assert c.execute("SELECT step FROM fact_gaps WHERE resolved_at IS NULL").fetchall() == [("decisions",)]
+        c.execute("INSERT INTO fact_gaps(episode_id, step, error) VALUES (%s, 'decisions', 'archived failure')", (eid,))
         result = provenance.replay_gaps(c)
-        links = c.execute("SELECT kind FROM decision_links").fetchall()
-        unresolved = c.execute("SELECT count(*) FROM fact_gaps WHERE resolved_at IS NULL").fetchone()[0]
-    assert result["replayed"] == 1 and unresolved == 0, result
-    assert links == [("supersedes",)], "replay resolved all gaps but omitted derivable reversal evidence"
+        assert c.execute("SELECT text FROM decisions").fetchall() == [(old,)]
+        assert c.execute("SELECT count(*) FROM decision_links").fetchone() == (0,)
+        assert c.execute("SELECT step FROM fact_gaps WHERE resolved_at IS NULL").fetchall() == [("decisions",)]
+        assert c.execute("SELECT decisions, raw->'decision_details' FROM episodes WHERE id=%s", (eid,)).fetchone() == (payload["decisions"], payload["decision_details"])
+    assert result["replayed"] == 0
 
 
 # ---- 5. P2 replica lock waits and the changed-registry scrub --------------------

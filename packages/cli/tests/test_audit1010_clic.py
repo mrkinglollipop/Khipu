@@ -73,20 +73,6 @@ class EmbedBackfillRegressionTest(unittest.TestCase):
         ):
             self.assertFalse(jobs._embed_backfill()["ok"])
 
-    def test_drain_failure_overrides_and_persists_driver_success(self) -> None:
-        with (
-            mock.patch.object(jobs, "_drain_sessions", return_value={"ok": False, "failed": 1}),
-            mock.patch.object(jobs, "_run_script", return_value=0),
-            mock.patch.object(jobs, "_record_nightly_step"),
-            mock.patch.object(jobs, "_reconcile_notes_if_due", return_value={"ok": True}),
-            mock.patch.object(jobs, "_embed_backfill", return_value={"ok": True}),
-            mock.patch.object(jobs, "_prune_query_cache", return_value={"ok": True}),
-            mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True}),
-            mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}),
-            mock.patch.object(jobs, "_write_job_state") as write_state,
-        ):
-            self.assertEqual(jobs.run_nightly(), 1)
-        write_state.assert_called_once_with("nightly", 1)
 
 
 class EmbedProviderIntegrationRegressionTest(unittest.TestCase):
@@ -111,22 +97,6 @@ class EmbedProviderIntegrationRegressionTest(unittest.TestCase):
         self.assertEqual(out["failed_chunks"], 1)
         self.assertFalse(out["ok"])
 
-    def test_drain_failure_return_and_persisted_receipt_agree(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            with (
-                mock.patch.object(jobs, "ensure_data_dir", return_value=Path(tmp)),
-                mock.patch.object(jobs, "_drain_sessions", return_value={"ok": False, "failed": 1}),
-                mock.patch.object(jobs, "_run_script", return_value=0),
-                mock.patch.object(jobs, "_reconcile_notes_if_due", return_value={"ok": True}),
-                mock.patch.object(jobs, "_embed_backfill", return_value={"ok": True}),
-                mock.patch.object(jobs, "_prune_query_cache", return_value={"ok": True}),
-                mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True}),
-                mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}),
-            ):
-                rc = jobs.run_nightly()
-                state = jobs._read_job_state("nightly")
-        self.assertEqual(rc, 1)
-        self.assertEqual(state["exit"], rc)
 
 
 class SetupPreflightRegressionTest(unittest.TestCase):

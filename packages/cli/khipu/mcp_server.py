@@ -505,7 +505,8 @@ TOOLS: list[dict] = [
             "no capture hook: CALL THIS when you finish a substantive piece of "
             "work — a decision, a fix, a finding worth recalling later — with a "
             "1-3 sentence summary, short lowercase topic slugs, and any "
-            "decisions/preferences; set session_id to '<harness>:<stable id>' "
+            "decisions/preferences; legacy loop fields stay episode memory and never change Owed. "
+            "File deliberate asks with khipu_owed_update action=ask; set session_id to '<harness>:<stable id>' "
             "(e.g. 'grokbot:<repo>:<task>'). Local Mac with khipu-stop-hook or "
             "khipu-aegis-capture (capture_mode=hub or dual): this does NOT write "
             "directly — the hook is the writer and a direct MCP write would "
@@ -552,7 +553,6 @@ TOOLS: list[dict] = [
                                    "text; a commitment_id is ignored.",
                 },
                 "deliverables": {"type": "array"},
-                "decision_details": {"type": "array"},
                 "verbatim": {"type": "object"},
             },
             "required": ["summary"],
@@ -677,79 +677,6 @@ TOOLS: list[dict] = [
                              "description": "Ledger rows with children only: remove them too, or move them up"},
             },
             "required": ["id"],
-        },
-    },
-    {
-        "name": "khipu_decisions",
-        "annotations": {"readOnlyHint": True, "openWorldHint": False},
-        "description": (
-            "List decisions for a project, with their validity state. Call this "
-            "before answering what was decided or whether a choice is still "
-            "current. status='standing' (default) excludes anything superseded "
-            "or retracted; 'superseded'/'retracted'/'all' widen it; "
-            "'conflicts' instead returns unresolved candidate links (both "
-            "sides' text) that a person or agent has not yet confirmed or "
-            "rejected. Supersede the moment the user reverses or replaces an "
-            "earlier decision (khipu_decisions_update) — never for a mere "
-            "refinement."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "project": {"type": "string", "description": "Filter to one project"},
-                "status": {
-                    "type": "string",
-                    "description": "standing (default) | superseded | retracted | conflicts | all",
-                },
-                "since": {"type": "string", "description": "ISO date or relative, e.g. '7d', '24h'"},
-                "limit": {"type": "integer", "description": "Default 20, cap 100"},
-            },
-        },
-    },
-    {
-        "name": "khipu_decisions_update",
-        "annotations": {"readOnlyHint": False, "idempotentHint": True},
-        "description": (
-            "Supersede, restore, retract, confirm or reject one decision (ids "
-            "come from khipu_decisions). action='supersede' takes id and "
-            "EITHER by (an existing decision id) OR new_text (the replacement, "
-            "in the user's own words — a new decision row is created for it) "
-            "plus an optional reason; call it the moment the user reverses or "
-            "replaces an earlier decision, never for a mere refinement, and "
-            "give the reason in the user's own words. action='restore' undoes "
-            "a supersession. action='retract' marks a decision wrong outright "
-            "(not merely replaced) — takes id and an optional reason. "
-            "action='confirm'/'reject' resolve a candidate link from "
-            "khipu_decisions(status='conflicts') — take link_id, not id. "
-            "Before migration 0024 this still supersedes (today's column) and "
-            "the result says evidence fields were not recorded."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "description": "supersede | restore | retract | confirm | reject",
-                },
-                "id": {"type": ["integer", "string"], "description": "Decision id (supersede/restore/retract); integer or decimal string"},
-                "link_id": {"type": ["integer", "string"], "description": "Link id (confirm/reject); integer or decimal string"},
-                "by": {"type": ["integer", "string"], "description": "supersede: an existing decision id; integer or decimal string"},
-                "new_text": {"type": "string", "description": "supersede: replacement decision text"},
-                "source_kind": {
-                    "type": "string",
-                    "description": "supersede with new_text: user | assistant | tool (default assistant)",
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "supersede/retract: the reason, in the user's own words",
-                },
-                "project": {"type": "string", "description": "supersede with new_text: project for the new row"},
-                "session_id": {
-                    "type": "string",
-                    "description": "supersede with new_text: session id for the new row",
-                },
-            },
-            "required": ["action"],
         },
     },
     {
@@ -1053,9 +980,6 @@ TOOLS: list[dict] = [
             "Actions: route.pause, route.lift, the note, holds, rules, route.definition.set (definition plus a "
             "structured value), route.tier_table.set (a tiers object naming every task class), tracked accounts, a "
             "routing setting, ledger rows, owed.change for several Owed items at once (\"close those\"), and "
-            "owed.tidy after showing the plan's summary (undo takes project, batch and optionally ids). "
-            "owed.correct_job_origin (optional project) only returns a preview and leaves it pending: confirm it with "
-            "owed.correct_job_origin.confirm and its request id, here or in the app, never with a terminal yes. "
             "forget.list reads the forgets this Mac holds that the hub lacks, with each hub summary, and changes "
             "nothing; forget.here and forget.not_same take {\"id\": N} from it. "
             "For one account's priority entry use route.priority.amend (account, expect, append or role, optional "
@@ -1150,7 +1074,7 @@ TOOLS: list[dict] = [
             },
             "required": ["verb"],
         },
-    },
+    }
 ]
 
 
@@ -1839,7 +1763,7 @@ def _tool_capture(args: dict) -> dict:
     from khipu.commitments import _payload_event, SESSION_END_EVENTS
 
     # Only declared keys pass. A session end is the hook's to declare
-    # (close_session_plan would close the open items of a session_id the
+    # (the archived writer could close the open items of a session_id the
     # caller names), and lineage, owners, decision authors and commitment ids
     # are the hook's and the owner's to set, never a tool caller's.
     schema = next(t["inputSchema"] for t in TOOLS if t["name"] == "khipu_capture")
@@ -1876,57 +1800,11 @@ def _tool_capture(args: dict) -> dict:
     episode_id = _captured_episode_id(written)
     if episode_id is not None:
         out["episode_id"] = episode_id
-    out.update(_capture_commitment_answer(args, written))
+    if written.get("fact_gaps"):
+        out.update(partial=True, fact_gaps=written["fact_gaps"])
     return out
 
 
-def _capture_commitment_answer(args: dict, written: dict) -> dict:
-    """What became of the open/closed loops the caller sent, from write_pg's
-    ``commitments`` report. The episode is stored either way, so ``ok`` stays
-    true (as a mixed batch of owed changes does); ``dropped`` names each loop
-    that did not take effect with the reason, and ``partial`` says there are
-    some. ``commitments`` carries the counts."""
-    facts = written.get("commitments") if isinstance(written.get("commitments"), dict) else {}
-    given = {"open_loop": args.get("open_loops"), "closed_loop": args.get("closed_loops")}
-    sent = any(isinstance(v, list) and v for v in given.values())
-    dropped: list[dict] = []
-    answer: dict = {}
-    if facts.get("step_failed"):
-        # The commitment steps rolled back whole: every loop sent is unkept.
-        for kind, items in given.items():
-            for item in items if isinstance(items, list) else []:
-                text = item.get("text") if isinstance(item, dict) else item
-                dropped.append({"kind": kind, "text": str(text)[:300],
-                                "reason": f"the commitment step failed and was rolled back: {facts['step_failed']}"})
-        answer["commitments"] = {"step_failed": facts["step_failed"]}
-    else:
-        dropped = list(facts.get("rejected") or []) + list(facts.get("not_closed") or [])
-        if facts:
-            answer["commitments"] = {k: int(facts.get(k) or 0) for k in ("opened", "restated", "closed")}
-        elif sent:
-            dedup = written.get("dedup") if isinstance(written.get("dedup"), dict) else {}
-            if dedup.get("action") == "skip" and dedup.get("match") == "identity":
-                # An exact replay: its loops were handled by the first write.
-                answer["commitments"] = {
-                    "not_processed": "this capture was already recorded; its loops were handled then"}
-            elif dedup.get("action") in ("skip", "merge"):
-                # Matched on resemblance (or a receipt of one): no fact step ran
-                # for this payload, so its loops were not stored.
-                why = f"capture matched episode {written.get('episode_id')}; loops not stored"
-                for kind, items in given.items():
-                    for item in items if isinstance(items, list) else []:
-                        text = item.get("text") if isinstance(item, dict) else item
-                        dropped.append({"kind": kind, "text": str(text)[:300], "reason": why})
-                answer["commitments"] = {"not_processed": why}
-    answer["dropped"] = dropped
-    gaps = facts.get("fact_gaps")
-    if gaps:
-        # Other fact steps (decisions, close rules, deliverables) that failed
-        # and were rolled back; the episode itself is stored.
-        answer["fact_gaps"] = gaps
-    if dropped or gaps:
-        answer["partial"] = True
-    return answer
 
 
 def _captured_episode_id(written: dict) -> int | None:
@@ -2137,7 +2015,7 @@ def _tool_owed_update(args: dict) -> dict:
     action = (args.get("action") or "").strip().lower()
     _ensure_path()
     from khipu import commitments, owner_writes
-    from khipu.owed_tidy import BULK_ACTIONS
+    from khipu.owed_changes import BULK_ACTIONS
 
     if action == "ask":
         from khipu import explicit_asks
@@ -2349,7 +2227,7 @@ def _owed_change_on_hub(args: dict) -> dict:
     from khipu import commitments, offline, owner_writes
     from khipu.db import connect
 
-    from khipu import owed_tidy
+    from khipu import owed_changes
 
     echo = {"ids": ids, "action": action}
     reason = str(args.get("reason") or "") or None
@@ -2384,14 +2262,14 @@ def _owed_change_on_hub(args: dict) -> dict:
 
                 batches: list[str] = []
                 live = [cid for cid in ids if cid in rows]
-                batch_ready = len(ids) > 1 and owed_tidy._ready(cur)
+                batch_ready = len(ids) > 1 and owed_changes._ready(cur)
                 if len(ids) > 1 and args.get("owner_gate") == "direction" and not batch_ready:
-                    return {"ok": False, "changed": 0, "error": owed_tidy.NOT_READY, **echo}
+                    return {"ok": False, "changed": 0, "error": owed_changes.NOT_READY, **echo}
                 if batch_ready:
                     # Every bulk action is kept with its reason and each
                     # item's state before (owner, status, due date), so
-                    # `khipu owed tidy --undo BATCH` restores them exactly.
-                    done, batches = owed_tidy.bulk_batch(cur, live, action, change, reason=reason or "",
+                    # `owner-action Undo` restores them exactly.
+                    done, batches = owed_changes.bulk_batch(cur, live, action, change, reason=reason or "",
                                                          gate=args.get("owner_gate"))
                 else:
                     done = {cid: change(cid) for cid in live}
@@ -2488,154 +2366,10 @@ def _tool_forget(args: dict) -> dict:
     return out
 
 
-def _tool_decisions(args: dict) -> dict:
-    """Read half of the decisions tool pair (khipu_decisions). Reachable
-    through stdio and the gateway exactly like khipu_owed. When the hub is
-    away it answers from this Mac's replica, marked stale (conflicts need the
-    hub); with no replica to read the hub's own error stands. Rows with a
-    write still waiting to sync say so (``pending_sync``)."""
-    status = (args.get("status") or "standing").strip().lower()
-    valid_status = ("standing", "superseded", "retracted", "conflicts", "all")
-    if status not in valid_status:
-        raise ValueError(f"status must be one of {valid_status}")
-    limit = min(max(1, int(args.get("limit") or 20)), 100)
-    project = args.get("project") or None
-    since_raw = (args.get("since") or "").strip()
-    since = None
-    if since_raw:
-        from khipu.search_text import parse_time_filter
-
-        since = parse_time_filter(since_raw)
-    _ensure_path()
-    from khipu import decisions as _decisions
-    from khipu import offline, offline_reads, owner_writes
-    from khipu.db import connect
-    from khipu.hub_snapshot import hub_connection_failed
-
-    try:
-        with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
-            with conn.cursor() as cur:
-                if status == "conflicts":
-                    results = _decisions.list_links(cur, state="candidate", project=project, since=since, limit=limit)
-                else:
-                    results = _decisions.list_decisions(
-                        cur, project=project, since=since, limit=limit, status=status,
-                    )
-        out = {"status": status, "project": project, "results": results}
-    except Exception as exc:  # noqa: BLE001
-        if not hub_connection_failed(exc):
-            raise
-        out = offline_reads.decisions(project, since, status, limit)
-        if out is None:
-            raise
-    from khipu.tombstones import withhold
-
-    # The hub learns of a forget after this Mac's list does; an unreadable
-    # list shows no decision tied to an episode.
-    out["results"] = withhold(out["results"], fail_closed=False)
-    if status != "conflicts":
-        out.update(owner_writes.annotate(out["results"], "decisions_update"))
-    return out
 
 
-def _tool_decisions_update(args: dict) -> dict:
-    """Write half of the decisions tool pair. supersede/restore/retract take
-    a decision id; confirm/reject take a link_id (from
-    khipu_decisions(status='conflicts')). Every write here records its
-    source as 'agent'. Every argument is validated before a connection is
-    opened, same posture as ``_tool_owed_update``."""
-    args = _validate_tool_args("khipu_decisions_update", args)
-    action = (args.get("action") or "").strip().lower()
-    valid_actions = ("supersede", "restore", "retract", "confirm", "reject")
-    if action not in valid_actions:
-        raise ValueError(f"action must be one of {valid_actions}")
-
-    if action in ("confirm", "reject"):
-        _positive_id(args.get("link_id"), "link_id")
-    else:
-        _positive_id(args.get("id"), "id")
-    if action == "supersede":
-        by, new_text = args.get("by"), args.get("new_text")
-        if (by is None) == (not new_text):
-            raise ValueError("supersede needs exactly one of 'by' or 'new_text'")
-        if by is not None:
-            _positive_id(by, "by")
-
-    _ensure_path()
-    from khipu import owner_writes
-
-    return owner_writes.run("decisions_update", dict(args), queue_ok=not _via_https_gateway())
 
 
-def _decisions_update_on_hub(args: dict) -> dict:
-    """The hub half of ``_tool_decisions_update`` (validated already), also
-    what a queued write replays."""
-    action = (args.get("action") or "").strip().lower()
-    if action in ("confirm", "reject"):
-        link_id = _positive_id(args.get("link_id"), "link_id")
-    else:
-        decision_id = _positive_id(args.get("id"), "id")
-    new_id_arg = _positive_id(args["by"], "by") if action == "supersede" and args.get("by") is not None else None
-    new_text = args.get("new_text")
-    if new_text is not None and (not isinstance(new_text, str) or not new_text.strip()):
-        raise ValueError("new_text must be non-empty text")
-    _ensure_path()
-    from khipu import decisions as _decisions
-    from khipu import offline, owner_writes
-    from khipu.db import connect
-    from khipu.redact import redact_secrets
-
-    reason = redact_secrets(str(args.get("reason") or ""))[0] or None
-
-    key = "link_id" if action in ("confirm", "reject") else "id"
-    echo = {"action": action, key: link_id if key == "link_id" else decision_id}
-
-    with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
-        with conn.cursor() as cur:
-            # A reply with ok false is a refusal: apply_on_hub undoes the
-            # write (a decision made for new_text included) and records it.
-            def write() -> dict:
-                evidence_ready = _decisions._evidence_ready(cur)
-                degrade_note = (
-                    None if evidence_ready
-                    else "evidence fields were not recorded (migration 0024 not applied)"
-                )
-                if action in ("confirm", "reject"):
-                    return _decisions.resolve_link(cur, link_id, action, source="agent")
-                if action == "restore":
-                    ok = _decisions.restore(cur, decision_id)
-                    return {"ok": ok, "id": decision_id, "action": "restore"}
-                if action == "retract":
-                    ok = _decisions.retract(cur, decision_id, reason)
-                    out = {"ok": ok, "id": decision_id, "action": "retract"}
-                    if degrade_note:
-                        out["note"] = degrade_note
-                    return out
-                # action == "supersede"
-                if new_id_arg is not None:
-                    new_id = new_id_arg
-                else:
-                    original = _decisions._fetch_decision_row(cur, decision_id)
-                    if original is None:
-                        raise ValueError(f"no such decision: {decision_id}")
-                    if original.get("superseded_by") is not None:
-                        return {"ok": False, "id": decision_id,
-                                "superseded_by": original["superseded_by"], "action": "supersede"}
-                    new_id = _decisions.create_decision(
-                        cur, project=args.get("project") or original.get("project"),
-                        text=redact_secrets(new_text)[0],
-                        session_id=args.get("session_id") or None,
-                        source_kind=args.get("source_kind") or "assistant",
-                    )
-                ok = _decisions.supersede(cur, decision_id, new_id, source="agent", reason=reason)
-                out = {"ok": ok, "id": decision_id, "action": "supersede"}
-                if ok or new_id_arg is not None:
-                    out["superseded_by"] = new_id
-                if degrade_note:
-                    out["note"] = degrade_note
-                return out
-
-            return owner_writes.apply_on_hub(conn, cur, "decisions_update", args, write, echo)
 
 
 USAGE_GATEWAY_REASON = (
@@ -3205,8 +2939,6 @@ TOOL_FUNCS = {
     "khipu_owed": _tool_owed,
     "khipu_owed_update": _tool_owed_update,
     "khipu_forget": _tool_forget,
-    "khipu_decisions": _tool_decisions,
-    "khipu_decisions_update": _tool_decisions_update,
     "khipu_usage": _tool_usage,
     "khipu_route": _tool_route,
     "khipu_route_advise": _tool_route_advise,
@@ -3473,7 +3205,7 @@ def _dispatch_message(msg: dict) -> dict | None:
                     payload = func(arguments)
             else:
                 payload = func(arguments)
-            if name in {"khipu_owed_update", "khipu_decisions_update"} and payload.get("ok") is False:
+            if name in {"khipu_owed_update"} and payload.get("ok") is False:
                 if not payload.get("error"):
                     payload = {**payload, "error": f"{name} refused the requested change; no matching item could be changed"}
                 raise _ToolFailure(payload)

@@ -185,22 +185,3 @@ def test_owner_write_exception_fails_cli_drain(monkeypatch):
     assert 'synthetic owner write fault' in result['owner_writes']['error']
 
 
-def test_missing_driver_continues_independent_maintenance(tmp_path, monkeypatch):
-    from khipu import jobs
-    monkeypatch.setattr(jobs, 'CONSOLIDATE_NIGHTLY', tmp_path / 'missing.py')
-    monkeypatch.setattr(jobs, '_drain_sessions', lambda: {'ok': True})
-    later = ['_reconcile_notes_if_due', '_embed_backfill', '_prune_query_cache',
-        '_mark_stale_commitments', '_provenance_nightly',
-        '_ledger_nightly', '_project_renames_sweep', '_refresh_snapshot']
-    mocks = []
-    for name in later:
-        fn = Mock(return_value={'ok': True})
-        monkeypatch.setattr(jobs, name, fn)
-        mocks.append(fn)
-    rc = jobs.run_nightly()
-    assert rc != 0
-    for fn in mocks: fn.assert_called_once()
-    steps = jobs.nightly_last()['steps']
-    step = next(s for s in steps if s['name'] == 'consolidate_nightly')
-    assert not step['ok']
-    assert 'FileNotFoundError' in step['error']

@@ -432,8 +432,7 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         err = f"{type(e).__name__}: {e}"
         nightly_steps = {
             k: {"ok": False, "applicable": True, "error": err}
-            for k in ("notes_reconcile_ok", "embed_provider_ok",
-                      "mark_stale_ok")
+            for k in ("notes_reconcile_ok", "embed_provider_ok")
         }
     # A step that has never been recorded is skipped, not red — a fresh
     # install or a Mac that just updated has nothing in nightly-last.json
@@ -933,13 +932,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         features_block = {"error": f"{type(e).__name__}: {e}"}
     rerank_block, rerank_warnings = _doctor_rerank()
     # Phase 2, session C: candidate supersession links awaiting review —
-    # visibility only, same posture as features_block above; never gates `ok`.
-    try:
-        from khipu import decisions as _decisions
-
-        decision_links_block = _decisions.candidate_link_count()
-    except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
-        decision_links_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # The worker threads' answers, joined in the order their not_configured
     # names and liveness rows used to be added.
     local = local_future.result()
@@ -1075,7 +1067,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         **({"project_renames": project_renames_block} if project_renames_block is not None else {}),
         "features": features_block,
         "rerank": rerank_block,
-        "decision_links": decision_links_block,
         "plan_usage": plan_usage_block,
         "routing": routing_block,
         # The routing log's size against its bound: green, yellow (compaction
@@ -1120,7 +1111,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "forget_list_ok": bool(forget_list_block.get("ok")),
         "notes_reconcile_ok": bool(nightly_steps.get("notes_reconcile_ok", {}).get("ok")),
         "embed_provider_ok": bool(nightly_steps.get("embed_provider_ok", {}).get("ok")),
-        "mark_stale_ok": bool(nightly_steps.get("mark_stale_ok", {}).get("ok")),
         "topics_embed_lag_ok": bool(topics_lag.get("ok")),
         "degraded_rate_ok": bool(degraded_rate.get("ok")),
         "launchers_ok": bool(launchers.get("ok")),
@@ -2565,118 +2555,6 @@ def cmd_owed(args: argparse.Namespace) -> int:
     return _owed_page_cli(args, getattr(args, "project", None), getattr(args, "status", None) or "open")
 
 
-def cmd_owed_tidy(args: argparse.Namespace) -> int:
-    """`khipu owed tidy --project P`: plan the clean-up (writes nothing),
-    `--apply PLAN` apply a plan in one batch, `--undo BATCH` undo one. Plain
-    JSON out, like the other owed commands (khipu.owed_tidy). With
-    ``--owner-direction`` an apply or undo passes the owner gate on the
-    owner's direction in this conversation, logged with an Undo, or is
-    refused with nothing changed."""
-    from khipu import offline, owed_tidy
-    from khipu.db import connect
-
-    project = args.project
-    if args.apply and args.undo:
-        print(json.dumps({"ok": False, "error": "give --apply or --undo, not both"}))
-        return 2
-    if getattr(args, "ids", None) is not None:
-        try:
-            if not args.undo:
-                raise ValueError
-            args.undo_ids = _owed_ids_arg(args.ids)
-        except (TypeError, ValueError):
-            print(json.dumps({"ok": False, "error": "--ids requires --undo and positive commitment IDs; "
-                                                    "nothing was changed"}))
-            return 2
-    if getattr(args, "by_direction", False):
-        if not (args.apply or args.undo):
-            print(json.dumps({"ok": False, "error": "--owner-direction applies or undoes a clean-up; "
-                                                    "planning one needs no direction"}))
-            return 2
-        return _owed_tidy_by_direction(args, project)
-    if args.apply:
-        try:
-            doc = json.loads(Path(args.apply).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            print(json.dumps({"ok": False, "error": f"could not read the plan: {type(exc).__name__}"}))
-            return 2
-        if isinstance(doc, dict) and doc.get("project") != project:
-            print(json.dumps({"ok": False, "error": f"this plan is for project {doc.get('project')!r}, "
-                                                    f"not {project!r}; nothing was changed"}))
-            return 2
-        res = owed_tidy.apply(doc)
-        print(json.dumps(res, indent=2, default=str))
-        return 0 if res.get("ok") else 1
-    if args.undo:
-        # The batch's project is checked before anything changes, as --apply
-        # checks the plan's; undo checks it again under its lock.
-        try:
-            owner_project = owed_tidy.batch_project(args.undo)
-        except Exception as exc:  # noqa: BLE001 — not checked means not undone
-            print(json.dumps({"ok": False, "error": f"could not read the batch ({type(exc).__name__}); "
-                                                    "nothing was changed"}))
-            return 2
-        if owner_project != project:
-            why = (f"no clean-up batch {args.undo!r}" if owner_project is None
-                   else f"batch {args.undo!r} is for project {owner_project!r}, not {project!r}")
-            print(json.dumps({"ok": False, "error": why + "; nothing was changed"}))
-            return 2
-        res = owed_tidy.undo(args.undo, project=project, **(
-            {"ids": args.undo_ids} if getattr(args, "ids", None) is not None else {}))
-        print(json.dumps(res, indent=2, default=str))
-        return 0 if res.get("ok") else 1
-    with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
-        with conn.cursor() as cur:
-            doc = owed_tidy.plan(cur, project, use_model=not args.no_model)
-    if args.plan_out:
-        Path(args.plan_out).write_text(json.dumps(doc, indent=2, default=str) + "\n", encoding="utf-8")
-        print(json.dumps({"ok": True, "plan_out": args.plan_out, "project": project,
-                          "totals": doc["totals"], "model": doc["model"], "notes": doc["notes"]},
-                         indent=2, default=str))
-    else:
-        print(json.dumps(doc, indent=2, default=str))
-    return 0
-
-
-def _owed_tidy_by_direction(args: argparse.Namespace, project: str) -> int:
-    """``owed tidy --apply/--undo --owner-direction``: the owner-direction
-    check (action ``owed.tidy``) before anything is read or changed, then the
-    same apply or undo with the gate passed as ``direction``."""
-    from khipu import owed_tidy, owner_direction
-
-    change = "apply" if args.apply else "undo"
-    facts = {"change": change, **({"plan": args.apply} if args.apply else {"batch": args.undo})}
-    if getattr(args, "ids", None) is not None:
-        facts["ids"] = args.undo_ids
-    want = owner_direction.intent("owed.tidy", project, facts=facts)
-    try:
-        owner_direction.gate(want)
-    except owner_direction.DirectionRefused as err:
-        print(json.dumps({**err.refusal(), "error": err.message + " Nothing was changed."}))
-        return 2
-    try:
-        if args.apply:
-            try:
-                frozen = owner_direction.reviewed_file(args.apply)
-                doc = json.loads(frozen.decode("utf-8") if frozen is not None else Path(args.apply).read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                res = {"ok": False, "error": f"could not read the plan: {type(exc).__name__}"}
-            else:
-                res = ({"ok": False, "error": f"this plan is for project {doc.get('project')!r}, not "
-                                              f"{project!r}; nothing was changed"}
-                       if isinstance(doc, dict) and doc.get("project") != project
-                       else owed_tidy.apply(doc, owner_gate="direction"))
-        else:
-            res = owed_tidy.undo(args.undo, project=project, owner_gate="direction", **(
-                {"ids": args.undo_ids} if getattr(args, "ids", None) is not None else {}))
-    except BaseException:
-        owner_direction._abandon()
-        raise
-    res = owner_direction.finish(res) or res
-    print(json.dumps(res, indent=2, default=str))
-    return 0 if res.get("ok") else 1
-
-
 def _owed_ids_arg(raw: str) -> list[int]:
     ids: list[int] = []
     for part in str(raw).split(","):
@@ -2747,116 +2625,6 @@ def _owed_page_cli(args: argparse.Namespace, project: str | None, status: str) -
     return 0
 
 
-def cmd_decisions(args: argparse.Namespace) -> int:
-    """O2 / Phase 2A: `khipu decisions list [--project] [--since] [--standing|
-    --superseded|--retracted|--all]`, `supersede OLD NEW [--reason] [--force]`,
-    `restore ID`, `retract ID --reason`, `links [--state]`, `confirm LINK_ID`,
-    `reject LINK_ID`, `backfill [--dry-run|--apply]`."""
-    from khipu.db import connect
-    from khipu import decisions as _decisions
-
-    sub_cmd = getattr(args, "decisions_cmd", None)
-
-    if sub_cmd == "supersede":
-        old_id, new_id = int(args.old_id), int(args.new_id)
-        reason = getattr(args, "reason", None)
-        force = bool(getattr(args, "force", False))
-        with connect() as conn:
-            with conn.cursor() as cur:
-                try:
-                    ok = _decisions.supersede(cur, old_id, new_id, reason=reason, force=force)
-                except ValueError as exc:
-                    print(json.dumps({"ok": False, "error": str(exc)}))
-                    return 1
-            conn.commit()
-        print(json.dumps({"ok": ok, "old_id": old_id, "new_id": new_id}))
-        return 0 if ok else 1
-
-    if sub_cmd == "restore":
-        decision_id = int(args.id)
-        with connect() as conn:
-            with conn.cursor() as cur:
-                try:
-                    ok = _decisions.restore(cur, decision_id)
-                except ValueError as exc:
-                    print(json.dumps({"ok": False, "error": str(exc)}))
-                    return 1
-            conn.commit()
-        print(json.dumps({"ok": ok, "id": decision_id}))
-        return 0 if ok else 1
-
-    if sub_cmd == "retract":
-        decision_id = int(args.id)
-        with connect() as conn:
-            with conn.cursor() as cur:
-                ok = _decisions.retract(cur, decision_id, getattr(args, "reason", None))
-            conn.commit()
-        print(json.dumps({"ok": ok, "id": decision_id}))
-        return 0 if ok else 1
-
-    if sub_cmd == "links":
-        with connect() as conn:
-            with conn.cursor() as cur:
-                rows = _decisions.list_links(
-                    cur, state=getattr(args, "state", None) or None,
-                    project=getattr(args, "project", None),
-                )
-        print(json.dumps(rows, indent=2, default=str))
-        return 0
-
-    if sub_cmd in ("confirm", "reject"):
-        link_id = int(args.link_id)
-        with connect() as conn:
-            with conn.cursor() as cur:
-                try:
-                    out = _decisions.resolve_link(cur, link_id, sub_cmd)
-                except ValueError as exc:
-                    print(json.dumps({"ok": False, "error": str(exc)}))
-                    return 1
-            conn.commit()
-        print(json.dumps(out, indent=2, default=str))
-        return 0 if out.get("ok") else 1
-
-    if sub_cmd == "backfill":
-        apply = bool(getattr(args, "apply", False))
-        with connect() as conn:
-            with conn.cursor() as cur:
-                report = _decisions.backfill_decisions(
-                    cur, apply=apply, limit=getattr(args, "limit", None)
-                )
-            if apply:
-                conn.commit()
-        print(json.dumps(report, indent=2, default=str))
-        return 0 if report.get("ok", True) else 1
-
-    # "list" (default)
-    since_raw = (getattr(args, "since", None) or "").strip()
-    since_dt = None
-    if since_raw:
-        from khipu.search_text import parse_time_filter
-
-        try:
-            since_dt = parse_time_filter(since_raw)
-        except ValueError as exc:
-            print(json.dumps({"ok": False, "error": f"--since: {exc}"}))
-            return 2
-    status = None
-    if getattr(args, "standing", False):
-        status = "standing"
-    elif getattr(args, "superseded", False):
-        status = "superseded"
-    elif getattr(args, "retracted", False):
-        status = "retracted"
-    elif getattr(args, "all", False):
-        status = "all"
-    with connect() as conn:
-        with conn.cursor() as cur:
-            rows = _decisions.list_decisions(
-                cur, project=getattr(args, "project", None), since=since_dt,
-                limit=int(getattr(args, "limit", None) or 50), status=status,
-            )
-    print(json.dumps(rows, indent=2, default=str))
-    return 0
 
 
 def _reembed_episode(cur, episode_id: int) -> bool:
@@ -3212,67 +2980,13 @@ def cmd_project_alias(args: argparse.Namespace) -> int:
     return 2
 
 
-def cmd_hygiene_commitments(args: argparse.Namespace) -> int:
-    """`khipu hygiene commitments [--session-ended] [--dry-run|--apply]
-    [--project X] [--limit N]`.
-
-    Default pass: re-judges every OPEN commitment against the one commitment
-    definition (``khipu.commitments.COMMITMENT_DEFINITION``) — deterministic
-    filter first, then the summariser model in batches — and drops the rejects
-    / merges the paraphrase duplicates.
-
-    ``--session-ended``: the model-free ownership pass (2026-09-04). Infers
-    ``owner``/``future_trigger`` for every open row with the same
-    deterministic rules capture uses, closes the assistant-owned rows with no
-    cross-session trigger whose session has ended, and drops within-session
-    reporting duties.
-
-    Both are dry runs by default and print every verdict, so a human reads the
-    list before anything is written. ``--apply`` takes a binary-COPY backup of
-    the whole table first and never DELETEs a row.
-    """
-    from khipu import hygiene
-    from khipu.db import connect
-
-    apply = bool(getattr(args, "apply", False))
-    project = getattr(args, "project", None)
-    limit = getattr(args, "limit", None)
-    session_ended = bool(getattr(args, "session_ended", False))
-    max_calls = int(getattr(args, "max_calls", None) or hygiene.MAX_JUDGE_CALLS)
-    backup_dir = None
-    with connect() as conn:
-        if apply:
-            backup_dir = hygiene.backup_commitments(conn)
-        with conn.cursor() as cur:
-            if session_ended:
-                report = hygiene.run_session_ended_pass(
-                    cur, apply=apply, project=project,
-                    limit=int(limit) if limit else None,
-                    hours=int(getattr(args, "ended_after_hours", None)
-                              or hygiene.SESSION_ENDED_HOURS),
-                )
-            else:
-                report = hygiene.run_commitments_hygiene(
-                    cur, apply=apply, project=project,
-                    limit=int(limit) if limit else None, max_calls=max_calls,
-                )
-        if apply:
-            conn.commit()
-    if backup_dir is not None:
-        report["backup"] = str(backup_dir)
-    print(json.dumps(report, indent=2, default=str))
-    return 0
-
-
 def cmd_hygiene(args: argparse.Namespace) -> int:
     """W5.2: `khipu hygiene paths [--dry-run|--apply]`, plus
-    `khipu hygiene commitments` (Owed quality, 2026-09-04)."""
-    if getattr(args, "hygiene_cmd", None) == "commitments":
-        return cmd_hygiene_commitments(args)
+    `historical commitment cleanup` (Owed quality, 2026-09-04)."""
     if getattr(args, "hygiene_cmd", None) != "paths":
         print(json.dumps({
             "ok": False,
-            "error": "usage: khipu hygiene paths|commitments [--dry-run|--apply]",
+            "error": "usage: khipu hygiene paths [--dry-run|--apply]",
         }))
         return 2
     from khipu.db import connect
@@ -4006,7 +3720,7 @@ def cmd_config(args: argparse.Namespace) -> int:
                           "config_file": str(path)}))
         return 0
     if args.set and args.set[0] in FLOAT_SETTINGS:
-        # dedup_similarity / commitment_close_similarity are floats, not paths.
+        # dedup_similarity are floats, not paths.
         # `--set` routed every key through set_path_setting, which stored them
         # as expanduser()'d STRINGS — float_setting then ignored the stored
         # value (it accepts int/float only) and silently kept the default, so
@@ -5807,26 +5521,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--envelope", action="store_true",
         help="Always include stale, snapshot_refreshed_at and waiting_to_sync with the page",
     )
-    owed_sub = owed.add_subparsers(dest="owed_cmd")
-    from khipu import owed_origin
-
-    owed_origin.add_parser(owed_sub)
-    from khipu import owed_reset
-
-    owed_reset.add_parser(owed_sub)
-    tidy = owed_sub.add_parser(
-        "tidy", help="Plan the one-time clean-up of a project's Owed list; apply or undo a plan")
-    tidy.add_argument("--project", required=True)
-    tidy.add_argument("--plan-out", metavar="FILE", default=None,
-                      help="Write the plan to FILE and print only its totals")
-    tidy.add_argument("--apply", metavar="PLAN", default=None, help="Apply the plan in the file PLAN")
-    tidy.add_argument("--undo", metavar="BATCH", default=None, help="Undo the applied batch BATCH")
-    tidy.add_argument("--ids", metavar="ID,ID", default=None,
-                      help="With --undo, restore only these commitment IDs from the batch")
-    tidy.add_argument("--no-model", action="store_true",
-                      help="Rules only: no model pass for the items the rules cannot sort")
-    _owed_owner_flags(tidy)
-    tidy.set_defaults(func=cmd_owed_tidy)
     owed.set_defaults(func=cmd_owed)
 
     us = sub.add_parser(
@@ -6099,52 +5793,7 @@ def build_parser() -> argparse.ArgumentParser:
     for writer in (hold, rpause, rlift, rclear, rnote, rprio, rrule, rdef, rtier, rcap):
         writer.add_argument("--op", default=None, help="Retry identity; reuse for the same change")
 
-    dec = sub.add_parser(
-        "decisions", help="Decisions registry: list / supersede / restore / retract / links (O2, Phase 2A)"
-    )
-    dec_sub = dec.add_subparsers(dest="decisions_cmd", required=True)
-    dec_list = dec_sub.add_parser("list", help="List decisions")
-    dec_list.add_argument("--project", default=None)
-    dec_list.add_argument("--since", default=None, help="ISO date or a window (7d, 24h)")
-    dec_list.add_argument("--limit", type=int, default=50)
-    dec_list_status = dec_list.add_mutually_exclusive_group()
-    dec_list_status.add_argument("--standing", action="store_true", help="Exclude superseded and retracted")
-    dec_list_status.add_argument("--superseded", action="store_true", help="Superseded only")
-    dec_list_status.add_argument("--retracted", action="store_true", help="Retracted only")
-    dec_list_status.add_argument("--all", action="store_true", help="Every row (default)")
-    dec_sup = dec_sub.add_parser("supersede", help="Mark OLD decision superseded by NEW")
-    dec_sup.add_argument("old_id", type=int)
-    dec_sup.add_argument("new_id", type=int)
-    dec_sup.add_argument("--reason", default=None, help="Why, in the user's own words")
-    dec_sup.add_argument(
-        "--force", action="store_true",
-        help="Allow superseding across different projects",
-    )
-    dec_restore = dec_sub.add_parser("restore", help="Undo a supersession")
-    dec_restore.add_argument("id", type=int)
-    dec_retract = dec_sub.add_parser("retract", help="Mark a decision wrong outright (not merely replaced)")
-    dec_retract.add_argument("id", type=int)
-    dec_retract.add_argument("--reason", default=None)
-    dec_links = dec_sub.add_parser("links", help="List supersede/conflict candidate links")
-    dec_links.add_argument("--project", default=None)
-    dec_links.add_argument(
-        "--state", default=None,
-        help="candidate | applied | rejected | restored (omit for every state)",
-    )
-    dec_confirm = dec_sub.add_parser("confirm", help="Confirm a candidate link, applying it")
-    dec_confirm.add_argument("link_id", type=int)
-    dec_reject = dec_sub.add_parser("reject", help="Reject a candidate link")
-    dec_reject.add_argument("link_id", type=int)
-    dec_bf = dec_sub.add_parser(
-        "backfill", help="Backfill the decisions table from existing episodes.decisions"
-    )
-    dec_bf.add_argument("--dry-run", dest="apply", action="store_false", default=False)
-    dec_bf.add_argument(
-        "--apply", dest="apply", action="store_true",
-        help="Actually write the backfill (idempotent; safe to re-run)",
-    )
-    dec_bf.add_argument("--limit", type=int, default=None)
-    dec.set_defaults(func=cmd_decisions)
+
 
     ep = sub.add_parser("episode", help="Episode maintenance (memory reliability W5.6)")
     ep_sub = ep.add_subparsers(dest="episode_cmd", required=True)
@@ -6257,32 +5906,6 @@ def build_parser() -> argparse.ArgumentParser:
     hy_paths.add_argument(
         "--apply", dest="apply", action="store_true",
         help="Actually delete the failing path: nodes (destructive; needs an explicit go)",
-    )
-    hy_com = hy_sub.add_parser(
-        "commitments",
-        help="Re-judge open commitments: drop non-commitments, merge paraphrase duplicates",
-    )
-    hy_com.add_argument("--dry-run", dest="apply", action="store_false", default=False)
-    hy_com.add_argument(
-        "--apply", dest="apply", action="store_true",
-        help="Actually drop/merge (backs the table up first; never DELETEs)",
-    )
-    hy_com.add_argument("--project", default=None, help="Limit to one project")
-    hy_com.add_argument("--limit", type=int, default=None, help="Max open commitments to judge")
-    hy_com.add_argument(
-        "--max-calls", dest="max_calls", type=int, default=None,
-        help="Cost guard: max summariser calls per run (default 8, ~40 items each)",
-    )
-    hy_com.add_argument(
-        "--session-ended", dest="session_ended", action="store_true",
-        help="Model-free ownership pass: fill owner/future_trigger, close "
-             "assistant commitments with no cross-session trigger whose "
-             "session has ended, drop within-session reporting duties",
-    )
-    hy_com.add_argument(
-        "--ended-after-hours", dest="ended_after_hours", type=int, default=None,
-        help="With --session-ended: silence (hours) after which a session counts "
-             "as ended (default 6)",
     )
     hy.set_defaults(func=cmd_hygiene)
 
@@ -6581,7 +6204,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("KEY", "VALUE"),
         help="Persist a machine-specific path (memory_root, memory_repo, "
         "capture_v2, gemini_key_file), a 0-1 similarity knob "
-        "(dedup_similarity, commitment_close_similarity), the relevance "
+        "(dedup_similarity), the relevance "
         "floor (relevance.cosine_floor, above 0 up to 1; per embedding profile "
         "relevance.cosine_floor_by_profile.<profile>), a daily call "
         "ceiling (synth_daily_calls, embed_daily_calls, "

@@ -228,6 +228,8 @@ def test_pr_and_owner_contributors_are_fenced_per_value(pg, replica):
         facts = c.execute("SELECT id FROM commitments").fetchall()
         assert len(facts) == 1, facts
         fid = facts[0][0]
+        from tests.fact_seed import archived_facts
+        archived_facts(c.cursor(), payload, forgotten, restates=fid)
         # The supported claim API supplies owner support for exactly PR 7.
         provenance.record_claim(c.cursor(), "commitment", fid, "pr", "7", claimant="owner")
         provenance.project(c.cursor(), "commitment", fid)

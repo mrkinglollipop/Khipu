@@ -1,10 +1,11 @@
+# ruff: noqa: F811 - pytest fixtures imported from hermetic_pg
 """Real disposable Postgres -> refresh scrub -> incremental pull -> public readers."""
 import json
 import sqlite3
 
 import pytest
 from tests import fact_seed
-from tests.hermetic_pg import hub, pg_cluster
+from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from khipu import db, hub_snapshot as hs, offline_reads, tombstones
 from tests.fact_seed import announce
 from tests.replica_copy import certify
@@ -45,11 +46,13 @@ def test_pull_cannot_restore_derivatives_of_scrubbed_source(hub, tmp_path, monke
         assert refreshed['counts']['forgotten_scrubbed'] == 1
     assert hs.episode_detail_snapshot(eid) is None
     assert offline_reads.owed_rows(None, 'open') == []
-    assert offline_reads.decisions(None, None, 'standing', 20)['results'] == []
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        assert hs._decision_states_for_episode_snapshot(con, eid)['decision_states'] == []
     pulled = hs.pull_changes(include_ledger=False)
     assert pulled['ok'], pulled
     owed = offline_reads.owed_rows(None, 'open')
-    decisions = offline_reads.decisions(None, None, 'standing', 20)['results']
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        decisions = hs._decision_states_for_episode_snapshot(con, eid)['decision_states']
     print('PULL', pulled)
     print('VISIBLE OWED', [r['text'] for r in owed])
     print('VISIBLE DECISIONS', [r['text'] for r in decisions])
@@ -71,5 +74,5 @@ def test_rejected_source_keeps_missing_and_unlinked_controls(tmp_path, monkeypat
         assert hs._write_commitment_rows(con, ['id', 'text', 'opened_episode', 'status'],
                                         [(r['id'], r['text'], r['episode_id'], 'open') for r in rows]) == 2
     assert {r['text'] for r in offline_reads.owed_rows(None, 'open')} == {'unlinked', 'partial replica'}
-    assert {r['text'] for r in offline_reads.decisions(None, None, 'standing', 20)['results']} == {
-        'partial replica', 'unlinked'}
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        assert {r[0] for r in con.execute('SELECT text FROM decisions')} == {'partial replica', 'unlinked'}

@@ -79,7 +79,7 @@ Only for some agents.
 If you use neither Aegis nor a cloud agent, skip the gateway. See [operations.md](operations.md).
 
 **What do the MCP tools cover?**
-The local MCP server exposes 19 tools, including route advice, owner actions, what is waiting on you and the work ledger. Owner actions and what is waiting on you are not advertised through the gateway. Usage and routing write/advice tools remain unavailable through the gateway, but `khipu_route` serves the owner-enabled published cloud routing copy, with a hub timestamp, stale status and persistent pull receipts. See [mcp-tools.md](mcp-tools.md).
+The local MCP server exposes 17 tools, including route advice, owner actions, what is waiting on you and the work ledger. Owner actions and what is waiting on you are not advertised through the gateway. Usage and routing write/advice tools remain unavailable through the gateway, but `khipu_route` serves the owner-enabled published cloud routing copy, with a hub timestamp, stale status and persistent pull receipts. See [mcp-tools.md](mcp-tools.md).
 
 **Does Khipu route my work between accounts?**
 No. It reports each account's state and plan headroom, and the choice stays with you. See [routing.md](routing.md).

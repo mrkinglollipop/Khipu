@@ -90,7 +90,9 @@ def test_the_slice_reads_exactly_what_it_read_with_every_lookup_repeated(slice_h
     assert {e["summary"] for e in fast["episodes"]} >= {"episode 1 in o/old-name", "episode 0 in o/canon"}
     assert fast["commitments"] == []
     assert not any("FROM commitments" in s for s in sent)
-    assert [d["text"] for d in fast["decisions"]] == ["decided for canon"]
+    assert fast["decisions"] == []
+    with slice_hub.connect() as conn:
+        assert conn.execute("SELECT text FROM decisions").fetchall() == [("decided for canon",)]
     assert fast["pairs"] and fast["topics"]
 
 

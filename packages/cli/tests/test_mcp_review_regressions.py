@@ -31,7 +31,6 @@ def payload(response):
     ("khipu_route", {}, "session_id"), ("khipu_route", {}, "account"),
     ("khipu_owed", {}, "project"), ("khipu_owed", {}, "query"),
     ("khipu_search", {"query": "fixture"}, "project"),
-    ("khipu_decisions", {}, "project"), ("khipu_get", {"id": "fixture"}, "kind"),
     ("khipu_route_report", {}, "text"),
     ("khipu_capture", {"summary": "fixture"}, "project"),
     ("khipu_capture", {"summary": "fixture"}, "session_id"),

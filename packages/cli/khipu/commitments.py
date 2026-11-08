@@ -1,38 +1,19 @@
-"""First-class commitments (W3) — open loops that outlive a single episode.
-
-``decisions`` today are immutable strings in a JSONB array: nothing can be
-opened, closed, superseded (root cause D). This module gives capture-time
-``open_loops`` / ``closed_loops`` a lifecycle in the ``commitments`` table
-(migration 0009): opened by an episode, auto-closed by a later episode's
-closed_loop / decision / explicit ``done:`` prefix in the same project, or
-aged into ``stale`` after 30 days untouched.
-
-Every function here is called from the capture write path
-(``khipu.capture.write_pg``) and must stay fail-open: an exception here must
-never take down an episode insert that already succeeded.
-"""
+"""Explicit asks, manual commitment updates and archived commitment reads."""
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import threading
-from contextlib import contextmanager
 from datetime import datetime
 from functools import lru_cache
 from typing import Any
 
-from khipu.capture import _jaccard  # shared with capture's own dedup (no byte copy)
 
 VALID_KINDS = ("followup", "blocker", "question", "promise")
 STALE_AFTER_DAYS = 30           # blockers / questions: a long-lived shape
 STALE_AFTER_DAYS_SOFT = 14      # followups / promises with no due date
-DONE_MATCH_MIN_SCORE = 0.2  # fix 4: a minimal bar even for an explicit "done:" close
-NEAR_DUP_MIN_SCORE = 0.5    # quality: token-containment bar for "already open"
 # A lost ON CONFLICT insert whose winner retired before it was locked is
 # retried this many times in all, then the capture defers (scope 3.4, I4).
-_CONFLICT_INSERT_ATTEMPTS = 3
 # Kind → sort rank for `khipu owed` (0 = most urgent). Surfaced as the row's
 # `priority` so the desktop sorts without re-deriving the rule.
 KIND_PRIORITY = {"blocker": 0, "question": 1, "promise": 2, "followup": 3}
@@ -88,24 +69,9 @@ def _log(msg: str) -> None:
 # HERE — the other two import this text so they cannot drift apart.
 # ---------------------------------------------------------------------------
 
-COMMITMENT_DEFINITION = """A commitment is ONLY one of:
-  (a) something the USER must decide, provide, approve, or do; or
-  (b) something the ASSISTANT explicitly promised to do in a FUTURE session
-      and cannot finish in this one.
-Everything else is NOT a commitment. In particular, never record:
-  - in-progress status of any kind: "is running", "still building", "pending",
-    "in flight", "waiting on/for", "awaiting";
-  - anything about agents, subagents, drives, notifications, reports arriving,
-    verdicts, or polling;
-  - inter-session or inter-agent coordination: "send/receive ... message",
-    "screen free/busy", "ping the session";
-  - steps of the assistant's own plan for THIS session (it will finish them
-    before the session ends);
-  - anything this same window reports as already completed;
-  - vague items with no concrete action or actor."""
 
 # Each rule is (reason, pattern). The reason is reported verbatim by
-# `khipu hygiene commitments` so a human reviewing a dry run can see WHY.
+# `historical commitment cleanup` so a human reviewing a dry run can see WHY.
 _IN_PROGRESS_RE = re.compile(
     r"\b(?:is|are|was|were|remains?|stays?)\s+"
     r"(?:still\s+|currently\s+|now\s+|already\s+)?"
@@ -206,7 +172,7 @@ _OBLIGATION_RE = re.compile(
 #                          condition ("when Matt says …", "next session",
 #                          "after the wave merges", "if attempt six …").
 # An assistant commitment with no future trigger dies with its session
-# (:func:`close_session_plan`). Detection is DETERMINISTIC here; the extractor
+# (the archived session-close pass). Detection is DETERMINISTIC here; the extractor
 # prompt asks the model for both fields too, but the regex result wins on
 # conflict — a model that mislabels an item cannot keep noise alive.
 # ---------------------------------------------------------------------------
@@ -789,7 +755,7 @@ def rejection_reason(text: str, *, owner: str | None = None,
     """Why this text is NOT a commitment, or None when it passes.
 
     The deterministic half of the precision fix: it runs before every insert
-    (``open_from_episode``) and again in the hygiene re-judge, so a model that
+    (the archived capture writer) and again in the hygiene re-judge, so a model that
     ignores the prompt still cannot fill the table with status chatter.
 
     ``owner`` is the resolved owner (:func:`resolve_owner`) — derived from the
@@ -834,7 +800,7 @@ def is_commitment_worthy(text: str, *, owner: str | None = None,
 def is_session_plan_text(text: str) -> bool:
     """True when the text is in-flight status / agent chatter / coordination —
     the shapes a session finishes (or abandons) on its own. Used by
-    :func:`close_session_plan` to retire anything of that shape that a
+    the archived session-close pass to retire anything of that shape that a
     pre-filter build already opened, once its session ends."""
     s = (text or "").strip()
     if not s:
@@ -911,7 +877,6 @@ def _parse_due_after(raw: Any) -> tuple[str, Any]:
     return "NULL", None
 
 
-_REPORT = threading.local()
 
 REJECTION_WORDS = {
     "empty": "the text is empty",
@@ -919,154 +884,6 @@ REJECTION_WORDS = {
     "too-short": f"fewer than {MIN_COMMITMENT_WORDS} words, too vague to be a commitment",
     "no-action": "it names no action to take",
 }
-
-
-@contextmanager
-def collecting(report: dict[str, Any]):
-    """Collect what this capture's commitment steps did with the loops it was
-    given into ``report`` (``opened``, ``restated``, ``closed``, and the
-    ``rejected`` / ``not_closed`` lists of ``{kind, text, reason}``), so the
-    caller can answer with it. Outside this context the steps record nothing."""
-    previous = getattr(_REPORT, "current", None)
-    _REPORT.current = report
-    try:
-        yield report
-    finally:
-        _REPORT.current = previous
-
-
-def _report_count(key: str, n: int = 1) -> None:
-    report = getattr(_REPORT, "current", None)
-    if report is not None:
-        report[key] = int(report.get(key) or 0) + n
-
-
-def _report_item(key: str, kind: str, text: str, reason: str, row: int | None = None) -> None:
-    report = getattr(_REPORT, "current", None)
-    if report is not None:
-        # ``_row`` is the commitment the item was matched to; it is dropped
-        # from the answer by :func:`finish_report` once the later steps ran.
-        report.setdefault(key, []).append(
-            {"kind": kind, "text": text[:300], "reason": reason, **({"_row": row} if row else {})})
-
-
-def _report_closed_row(row_id: int) -> None:
-    report = getattr(_REPORT, "current", None)
-    if report is not None:
-        report.setdefault("_closed_rows", []).append(row_id)
-
-
-def _loop_label(payload: dict[str, Any], text: str) -> str:
-    """``closed_loop``, or ``decision`` for a ``done:`` decision that closed (or
-    tried to close) a commitment through the same matcher."""
-    loops = {_DONE_PREFIX_RE.sub("", str(i.get("text") if isinstance(i, dict) else i or "").strip())
-             for i in payload.get("closed_loops") or []}
-    return "closed_loop" if text in loops else "decision"
-
-
-def _short_error(exc: BaseException) -> str:
-    """The exception class and a short plain message: a database error shows
-    its class and SQLSTATE only (its text names tables, columns and SQL)."""
-    name = type(exc).__name__
-    if type(exc).__module__.split(".")[0] == "psycopg":
-        state = getattr(exc, "sqlstate", None)
-        return f"{name} (sqlstate {state})" if state else name
-    first = (str(exc).strip().splitlines() or [""])[0][:100]
-    return f"{name}: {first}" if first else name
-
-
-def finish_report(report: dict[str, Any]) -> dict[str, Any]:
-    """Settle a capture's report once every commitment step ran: a loop the
-    close step could not close but a later step (the session plan) did is not
-    reported as unclosed, and the internal row ids are removed."""
-    closed_rows = set(report.pop("_closed_rows", ()))
-    if report.get("not_closed"):
-        report["not_closed"] = [{k: v for k, v in item.items() if k != "_row"}
-                                for item in report["not_closed"] if item.get("_row") not in closed_rows]
-        if not report["not_closed"]:
-            del report["not_closed"]
-    return report
-
-
-def report_step_failed(exc: BaseException, step: str = "commitments") -> None:
-    """A fact step was rolled back whole. For the commitment steps nothing they
-    were given landed, whatever they had counted before the error; any other
-    step (decisions, close rules, deliverables) is listed under ``fact_gaps``."""
-    report = getattr(_REPORT, "current", None)
-    if report is None:
-        return
-    error = _short_error(exc)
-    if step.endswith("commitments"):
-        gaps = report.get("fact_gaps")
-        report.clear()
-        report["step_failed"] = error
-        if gaps:
-            report["fact_gaps"] = gaps
-    else:
-        report.setdefault("fact_gaps", []).append({"step": step, "error": error})
-
-
-def _normalize_open_loop(item: Any) -> dict[str, Any] | None:
-    if isinstance(item, str):
-        text = item.strip()
-        if not text:
-            return None
-        return {"text": text, "kind": "followup", "due_after": None, "owner": None,
-                "owner_label": None, "future_trigger": None}
-    if not isinstance(item, dict):
-        return None
-    text = str(item.get("text") or "").strip()
-    if not text:
-        return None
-    kind = str(item.get("kind") or "followup").strip().lower()
-    if kind not in VALID_KINDS:
-        kind = "followup"
-    return {
-        "text": text,
-        "kind": kind,
-        "due_after": item.get("due_after") or None,
-        "owner": item.get("owner") or None,
-        "owner_label": item.get("owner_label") or None,
-        # Asked for in the prompt, kept for the record — the deterministic
-        # detector decides the stored value (see resolve_owner/has_future_trigger).
-        "future_trigger": item.get("future_trigger"),
-    }
-
-
-def _open_id_for_hash(cur, scope: str | None, content_h: str) -> int | None:
-    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
-    """id of the open commitment with this exact content hash in this scope.
-
-    fix 3: the partial unique index ``uq_commitments_open_content(project,
-    content_hash)`` cannot dedup a NULL ``project`` (standard SQL NULL != NULL
-    means ON CONFLICT never fires for two NULL-scoped rows) — this in-code
-    check is the fallback for exactly that case. It now returns the id rather
-    than a bool so the caller can record the restatement (``last_seen_at`` /
-    ``seen_count``) instead of silently dropping it.
-    """
-    # Alias-group members share one open-hash scope (Q3 projects).
-    if scope is None:
-        project_sql, project_param = "project IS NOT DISTINCT FROM %s", None
-    else:
-        from khipu.identity import project_group
-
-        group = project_group(cur, scope)
-        if len(group) == 1:
-            project_sql, project_param = "project IS NOT DISTINCT FROM %s", group[0]
-        else:
-            project_sql, project_param = "project = ANY(%s)", group
-    cur.execute(
-        "SELECT id FROM commitments WHERE status = 'open' AND content_hash = %s "
-        f"AND {project_sql} "
-        f"AND {_not_forgotten_clause(cur)} LIMIT 1",
-        (content_h, project_param),
-    )
-    row = cur.fetchone()
-    return int(row[0]) if row else None
-
-
-def _has_open_duplicate(cur, scope: str | None, content_h: str) -> bool:
-    return _open_id_for_hash(cur, scope, content_h) is not None
 
 
 def _seen_columns_ready(cur) -> bool:
@@ -1163,64 +980,6 @@ def _close_columns_ready(cur) -> bool:
         return False
 
 
-def _touch_seen(cur, commitment_id: int) -> None:
-    """Record that a later capture restated an already-open commitment.
-
-    This is what makes ``mark_stale`` an expiry-by-SILENCE rule rather than an
-    expiry-by-age one: a commitment that keeps being restated stays open, and
-    only one nobody has mentioned for the window ages out.
-    """
-    try:
-        cur.execute(
-            "UPDATE commitments SET last_seen_at = now(), seen_count = seen_count + 1 "
-            f"WHERE id = %s AND status = 'open' AND {_not_forgotten_clause(cur)}",
-            (commitment_id,),
-        )
-    except Exception as exc:  # noqa: BLE001 — never fail a capture over a touch
-        _log(f"seen touch failed for {commitment_id} ({type(exc).__name__}: {exc})")
-
-
-def _near_duplicate_open(cur, scope: str | None, text: str, *,
-                         payload: dict[str, Any] | None = None,
-                         episode_id: int | None = None,
-                         rows: list[dict[str, Any]] | None = None) -> int | None:
-    """id of an already-OPEN commitment in the same scope that says the same
-    thing, or None.
-
-    Zero exact duplicates were measured on the live hub — the noise is
-    PARAPHRASE: successive captures of one session restate the same item in
-    slightly different words, and ``content_hash`` (an exact-text hash) never
-    fires. Token containment via the existing ``_match_score`` is the cheap
-    signal; cosine against the stored commitment embeddings is the semantic
-    one, at the same bar ``auto_close`` uses to close on a paraphrase.
-    """
-    if rows is None:
-        rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id)
-    if not rows:
-        return None
-    best_id, best_score = None, 0.0
-    for row in rows:
-        # Score the original wording and any restatement: a later capture that
-        # adds another repo's PR must match the current words, not only the
-        # first open (asymmetric containment no longer equates base ⊂ URL).
-        score = _row_near_dup_score(text, row)
-        if score >= NEAR_DUP_MIN_SCORE and score > best_score:
-            best_id, best_score = row["id"], score
-    if best_id is not None:
-        return best_id
-    ids = [r["id"] for r in rows]
-    if not _has_commitment_embeddings(cur, ids):
-        return None
-    from khipu.config import float_setting
-
-    threshold = float_setting("commitment_close_similarity")
-    cosine = _cosine_scores(cur, text, ids, episode_id)
-    for cid, score in sorted(cosine.items(), key=lambda kv: -kv[1]):
-        if score >= threshold:
-            return cid
-    return None
-
-
 def _provenance_ready(cur) -> bool:
     """Whether the hub records fact claims (migration 0047). Positive-only
     (``provenance.ready``); a probe that fails reads as not ready, and the
@@ -1245,639 +1004,13 @@ def _lock_open(cur, commitment_id: int) -> bool:
     return cur.fetchone() is not None
 
 
-def _claim_opened(cur, commitment_id: int, episode_id: int, stored_text: str, text: str) -> None:
-    """The opening episode's claims on the item it inserted: the stored text
-    and the PR numbers its words name, then the projection."""
-    from khipu import provenance
-    from khipu.close_rules import parse_prs
-
-    provenance.record_claim(cur, "commitment", commitment_id, "text", stored_text, episode_id=episode_id)
-    for n in parse_prs(text):
-        provenance.record_claim(cur, "commitment", commitment_id, "pr", n, episode_id=episode_id)
-    provenance.project(cur, "commitment", commitment_id)
-
-
-def _claim_restatement(cur, commitment_id: int, episode_id: int, text: str, project: str | None) -> None:
-    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
-    """A later episode restating an open item claims it: its own words as a
-    restatement (the projection shows the newest one that differs from the
-    text as ``latest_text``), the PR numbers and repository refs those words
-    name. The refs the current ``latest_text`` names are kept too, each
-    claimed by whoever supplied that wording, as the pre-provenance writer
-    kept them. Then the projection; nothing else writes the wording."""
-    from khipu import provenance
-    from khipu.close_rules import parse_prs, pr_requirement_labels
-
-    cur.execute("SELECT prs IS NULL FROM commitments WHERE id = %s", (commitment_id,))
-    if cur.fetchone()[0]:
-        # Never parsed (a row from before 0034): the item's own numbers first,
-        # as close_rules.backfill_prs would store them, so this restatement's
-        # numbers add to them rather than stand in for them.
-        from khipu.close_rules import claim_text_prs
-
-        claim_text_prs(cur, commitment_id)
-    provenance.record_claim(cur, "commitment", commitment_id, "restatement", text, episode_id=episode_id)
-    for n in parse_prs(text):
-        provenance.record_claim(cur, "commitment", commitment_id, "pr", n, episode_id=episode_id)
-    for label in pr_requirement_labels(text, project):
-        provenance.record_claim(cur, "commitment", commitment_id, "pr_ref", label, episode_id=episode_id)
-    cur.execute(
-        "SELECT fc.claimant, fc.episode_id, fc.value FROM commitments c "
-        "JOIN fact_claims fc ON fc.kind = 'commitment' AND fc.fact_id = c.id "
-        "AND fc.field = 'restatement' AND fc.value = c.latest_text "
-        "AND fc.claimant IN ('episode', 'owner') "
-        "LEFT JOIN episodes e ON e.id = fc.episode_id "
-        "WHERE c.id = %s AND (fc.claimant = 'owner' OR (e.id IS NOT NULL AND e.deleted_at IS NULL))",
-        (commitment_id,),
-    )
-    for claimant, by, value in cur.fetchall():
-        for label in pr_requirement_labels(value or "", project):
-            # The fact row is locked already, so a claim on file is not
-            # re-inserted: its claim trigger would lock the other episode's
-            # row after the fact's, the reverse of forget's order (seventh
-            # Astra review #2). A missing one takes that row NOWAIT, so a
-            # forget holding it defers this capture instead of deadlocking.
-            cur.execute(
-                "SELECT 1 FROM fact_claims WHERE kind = 'commitment' AND fact_id = %s "
-                "AND field = 'pr_ref' AND md5(value) = md5(%s) "
-                "AND coalesce(episode_id, 0) = coalesce(%s::bigint, 0) AND claimant = %s",
-                (commitment_id, label, by, claimant),
-            )
-            if cur.fetchone() is not None:
-                continue
-            if by is not None:
-                cur.execute("SELECT 1 FROM episodes WHERE id = %s FOR SHARE NOWAIT", (by,))
-            provenance.record_claim(cur, "commitment", commitment_id, "pr_ref", label,
-                                    episode_id=by, claimant=claimant)
-    provenance.project(cur, "commitment", commitment_id)
-
-
-def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
-    """Insert one open commitment per ``open_loops`` item. Returns the count
-    actually inserted.
-
-    Three gates, cheapest first: the deterministic precision filter
-    (:func:`rejection_reason` — status chatter, agent/coordination noise and
-    vague items never reach the table at all), the exact ``(scope,
-    content_hash)`` dedup, and the paraphrase dedup
-    (:func:`_near_duplicate_open`). A skip on either dedup is not a no-op: it
-    touches ``last_seen_at``/``seen_count`` on the row already open, so the
-    restatement is recorded without a second row.
-
-    Projectless rows keep a NULL display project; dedup and closure use
-    their session lineage, falling back to their own episode.
-    """
-    items = payload.get("open_loops") or []
-    if not isinstance(items, list) or not items:
-        return 0
-    scope = _coalesce_scope(payload)
-    seen_ready = _seen_columns_ready(cur)
-    trigger_ready = _future_trigger_ready(cur)
-    trigger_text_ready = _trigger_text_ready(cur)
-    owner_ready = _owner_columns_ready(cur)
-    close_ready = _close_columns_ready(cur)
-    lineage_ready = _lineage_columns_ready(cur)
-    # Fact provenance (migration 0047): every wording value this capture
-    # supplies is recorded as this episode's claim and the fact is projected
-    # from its claims. Without the table this step behaves exactly as before.
-    prov = _provenance_ready(cur)
-    origin = capture_origin(payload)
-    if prov:
-        from khipu import provenance
-
-        provenance.declare_writer(cur)  # 0047's writer gate (scope 3.1)
-    inserted = 0
-    rejected = 0
-    relayed = 0
-    for raw in items:
-        norm = _normalize_open_loop(raw)
-        if norm is None:
-            rejected += 1
-            _report_item("rejected", "open_loop", str(raw), "not usable: it is not text, or is empty")
-            continue
-        # Owner and future_trigger are decided HERE, deterministically, before
-        # anything else looks at the item: the reporting rule (rule 3) is
-        # owner-dependent, and both fields are stored on the row.
-        trigger = has_future_trigger(norm["text"])
-        owner, owner_label = resolve_owner_and_label(
-            norm["text"], kind=norm["kind"], declared=norm["owner"], future_trigger=trigger,
-            origin=origin, declared_label=norm.get("owner_label"), new_item=True,
-        )
-        reason = rejection_reason(norm["text"], owner=owner, kind=norm["kind"])
-        if reason is not None:
-            rejected += 1
-            _log(f"rejected open_loop ({reason}): {norm['text'][:120]!r}")
-            _report_item("rejected", "open_loop", norm["text"],
-                         f"{reason}: {REJECTION_WORDS.get(reason, 'not a commitment')}")
-            continue
-        # content_hash and dedup key off the UNDECORATED text — the due
-        # phrase is presentational, not part of the commitment's identity.
-        lifecycle_scope = scope
-        if lifecycle_scope is None:
-            lineage = payload.get("parent_session_id") or payload.get("session_id")
-            lifecycle_scope = f"session:{lineage}" if lineage else f"episode:{episode_id}"
-        h = content_hash(lifecycle_scope, norm["text"])
-        # The relay (owed scope, design (a)): a conversation's item that says
-        # what an open JOB item of the same project says is the orchestrator
-        # relaying it. The conversation's item is kept as its own row; the
-        # job's is closed as relayed by it. Dedup for a conversation item
-        # therefore looks at conversation rows only. Never the other way: a
-        # job item that matches a conversation item is folded into it, as
-        # before.
-        #
-        # Dedup never merges two items with different owners: a near
-        # duplicate is looked for among the open items the SAME owner owes
-        # only. A similar item another owner owes stays, and the two are
-        # linked (migration 0037).
-        relay_ids: list[int] = []
-        relay = owner_ready and scope is not None and origin == ORIGIN_CONVERSATION
-        rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id,
-                                 with_origin=owner_ready, with_owner=True)
-        job_rows = [r for r in rows if r.get("origin") == ORIGIN_JOB] if relay else []
-        pool = [r for r in rows if r.get("origin") != ORIGIN_JOB] if relay else rows
-        same = [r for r in pool if (r["owner"], r.get("owner_label")) == (owner, owner_label)]
-        others = [r for r in pool if (r["owner"], r.get("owner_label")) != (owner, owner_label)]
-        exact = _open_id_for_hash(cur, scope, h)
-        existing = exact if any(r["id"] == exact for r in same) else None
-        if exact is not None and not any(r["id"] == exact for r in rows):
-            existing = exact  # open but outside what this capture reads: as before, never a second row
-        if existing is None:
-            existing = _near_duplicate_open(cur, scope, norm["text"], rows=same)
-        if existing is None and job_rows:
-            relay_ids = _relay_matches(cur, norm["text"], exact, scope, job_rows)
-        if existing is not None and prov and not _lock_open(cur, existing):
-            # The target retired (closed, or its last claimant forgotten)
-            # since it was read: this item takes the insert path.
-            if exact == existing:
-                exact = None
-            existing = None
-        if existing is not None and prov:
-            if seen_ready:
-                _touch_seen(cur, existing)
-            _claim_restatement(cur, existing, episode_id, norm["text"], payload.get("project"))
-            _report_count("restated")
-            continue
-        if existing is not None:
-            if seen_ready:
-                _touch_seen(cur, existing)
-            row = next((r for r in same if r["id"] == existing), None)
-            if row is not None and lineage_ready and norm["text"] != row["text"]:
-                # A restatement in other words keeps the newer wording.
-                cur.execute("UPDATE commitments SET latest_text = %s WHERE id = %s", (norm["text"], existing))
-            if close_ready:
-                from khipu.close_rules import pr_requirement_labels, parse_prs
-
-                added = parse_prs(norm["text"])
-                if added:
-                    # The PR list auto-close reads is everything the item was
-                    # ever said to need, never the older list alone.
-                    cur.execute(
-                        "UPDATE commitments SET prs = ARRAY(SELECT DISTINCT n FROM "
-                        "unnest(COALESCE(prs, '{}'::int[]) || %s::int[]) AS n ORDER BY n) WHERE id = %s",
-                        (added, existing))
-                labels = pr_requirement_labels(norm["text"], payload.get("project"))
-                if row is not None:
-                    # Retain the previous wording too when upgrading rows
-                    # whose history stored only other repositories' refs.
-                    labels += pr_requirement_labels(row.get("latest_text") or "", payload.get("project"))
-                if labels:
-                    _keep_pr_refs(cur, existing, labels)
-            _report_count("restated")
-            continue
-        # Existing owner facts still need wording witnesses, PR unions and
-        # seen-count updates above. Only creating NEW owner work is removed.
-        # Do not relay/close job twins on behalf of an unfiled owner ask.
-        if owner == OWNER_USER:
-            rejected += 1
-            _report_item("rejected", "open_loop", norm["text"],
-                         "owner ask not filed explicitly: summary extraction cannot create owner work")
-            continue
-        linked = [r["id"] for r in others
-                  if r["id"] == exact or _row_near_dup_score(norm["text"], r) >= NEAR_DUP_MIN_SCORE]
-        closed_relays: list[int] = []
-        for rid in relay_ids:
-            # Closed before the insert: an identical text shares the open
-            # (project, content_hash) slot the unique index guards. The
-            # reason names the new row once it exists (below).
-            if close_by_rule(cur, rid, rule="relay",
-                             reason="relayed-by a conversation item",
-                             key=evidence_key("relayed-by", norm["text"]), episode=episode_id,
-                             evidence={"rule": "relayed-by", "text": norm["text"][:300]}):
-                closed_relays.append(rid)
-        relay_ids = closed_relays
-        if exact is not None and exact not in relay_ids:
-            # The same words are still open in another item this one does not
-            # fold into: another owner's, or a relayed job item the owner
-            # reopened (the same evidence never closes it again). That item
-            # keeps the open (project, content_hash) slot, so this one takes a
-            # hash of its own and both stay.
-            h = content_hash(lifecycle_scope, f"{norm['text']}\x00owner:{owner}:{owner_label or ''}")
-        due_sql, due_param = _parse_due_after(norm["due_after"])
-        stored_text = norm["text"]
-        due_phrase = str(norm["due_after"] or "").strip()
-        if due_sql == "NULL" and due_phrase:
-            # fix 1: the phrase didn't parse to a real date — never bind it
-            # into the timestamptz column, but don't lose it either; it
-            # survives as a parenthetical on the commitment's own text.
-            stored_text = f"{stored_text} (due: {due_phrase})"
-        base = [stored_text, scope, owner, norm["kind"], episode_id]
-        params = (*base, due_param, h) if due_param is not None else (*base, h)
-        cols = "text, project, owner, kind, opened_episode, due_after, content_hash"
-        vals = f"%s, %s, %s, %s, %s, {due_sql}, %s"
-        if trigger_ready:
-            cols += ", future_trigger"
-            vals += ", %s"
-            params = (*params, trigger)
-        if trigger_text_ready:
-            cols += ", trigger_text"
-            vals += ", %s"
-            params = (*params, trigger_clause(norm["text"]) if trigger else None)
-        if owner_ready:
-            cols += ", origin, owner_label"
-            vals += ", %s, %s"
-            params = (*params, origin, owner_label)
-        if close_ready:
-            from khipu.close_rules import parse_prs
-
-            cols += ", prs"
-            vals += ", %s"
-            params = (*params, parse_prs(norm["text"]))
-        returning = " RETURNING id" if owner_ready or prov else ""
-        attempts = 0
-        while True:
-            attempts += 1
-            cur.execute(
-                f"""
-                INSERT INTO commitments
-                  ({cols})
-                VALUES ({vals})
-                ON CONFLICT (project, content_hash) WHERE status = 'open' DO NOTHING{returning}
-                """,
-                params,
-            )
-            landed = cur.rowcount > 0
-            if landed or not prov:
-                if not landed:
-                    # The same words were already open: nothing new was stored.
-                    _report_count("restated")
-                break
-            # The same words were opened by a concurrent capture after this
-            # one read the table: this episode claims that item instead.
-            other = _open_id_for_hash(cur, scope, h)
-            if other is not None and _lock_open(cur, other):
-                if seen_ready:
-                    _touch_seen(cur, other)
-                _claim_restatement(cur, other, episode_id, norm["text"], payload.get("project"))
-                _report_count("restated")
-                break
-            # The winner retired (closed, or forgotten) before it could be
-            # locked: its open slot is free again, so this item takes the
-            # insert path once more (scope 3.4). Never return without a claim:
-            # a winner that keeps vanishing defers the whole capture.
-            if attempts >= _CONFLICT_INSERT_ATTEMPTS:
-                from khipu.capture import FactStepDeferred
-
-                raise FactStepDeferred(
-                    "commitments: the open item this capture restates kept retiring; retry")
-        if landed:
-            inserted += 1
-            _report_count("opened")
-            if prov:
-                row = cur.fetchone()
-                _claim_opened(cur, int(row[0]), episode_id, stored_text, norm["text"])
-            else:
-                row = cur.fetchone() if (relay_ids or (linked and lineage_ready)) and owner_ready else None
-            if relay_ids:
-                if row:
-                    cur.execute("UPDATE commitments SET close_reason = %s WHERE id = ANY(%s)",
-                                (f"relayed-by {int(row[0])}", relay_ids))
-                relayed += len(relay_ids)
-            if row and linked and lineage_ready:
-                new_id = int(row[0])
-                cur.execute("UPDATE commitments SET linked_ids = %s WHERE id = %s", (linked, new_id))
-                cur.execute("UPDATE commitments SET linked_ids = array_append(linked_ids, %s) "
-                            "WHERE id = ANY(%s) AND NOT (%s = ANY(linked_ids))", (new_id, linked, new_id))
-    if inserted or rejected:
-        _log(
-            f"opened {inserted} commitment(s), rejected {rejected}, relayed {relayed}, for "
-            f"episode {episode_id} (scope={scope!r}, origin={origin})"
-        )
-    return inserted
-
-
-def _keep_pr_refs(cur, commitment_id: int, labels: list[str]) -> None:
-    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
-    """Add ``owner/repo#N`` labels to the item's ``pr_check["refs"]``, the
-    repository/number pairs ``khipu.close_rules.item_refs`` requires."""
-    cur.execute("SELECT pr_check FROM commitments WHERE id = %s FOR UPDATE", (commitment_id,))
-    got = cur.fetchone()
-    check = got[0] if got and isinstance(got[0], dict) else {}
-    refs = list(check.get("refs") or [])
-    new = list(dict.fromkeys(label for label in labels if label not in refs))
-    if new:
-        cur.execute("UPDATE commitments SET pr_check = %s::jsonb WHERE id = %s",
-                    (json.dumps({**check, "refs": refs + new}), commitment_id))
-
-
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
-
-
-def _url_as_token(text: str) -> str:
-    """``text`` with each URL reduced to one token. A pull URL is six or so
-    tokens (``https github com owner repo pull N``) of boilerplate; left
-    whole, two different items that cite the same link (or two links into
-    one repository) clear the near-dup bar on the link alone."""
-    return _URL_RE.sub(lambda m: " url" + re.sub(r"[^a-z0-9]", "", m.group().lower().rstrip(".,;:)]}'\"")) + " ",
-                       text)
-
-
-def _row_near_dup_score(text: str, row: dict[str, Any]) -> float:
-    """Near-dup score against a row's opening text and, when present, its
-    latest restatement — so a third wording that drifts from the original
-    but tracks the current phrasing still folds into the same item. Links
-    count as one token each (:func:`_url_as_token`), so the words, not a
-    shared URL, carry the match."""
-    probe = _url_as_token(text)
-    score = _match_score(probe, _url_as_token(row["text"]))
-    latest = row.get("latest_text")
-    if latest and latest != row["text"]:
-        score = max(score, _match_score(probe, _url_as_token(latest)))
-    return score
-
-
-def _relay_matches(cur, text: str, exact: int | None, scope: str | None,
-                   job_rows: list[dict[str, Any]]) -> list[int]:
-    """Open job items this conversation item restates: the exact text, or
-    every one at or above today's near-duplicate bar, or else the best
-    cosine match at ``commitment_close_similarity`` (the same test
-    :func:`_near_duplicate_open` uses)."""
-    if exact is not None and any(r["id"] == exact for r in job_rows):
-        return [exact]
-    hits = [r["id"] for r in job_rows if _row_near_dup_score(text, r) >= NEAR_DUP_MIN_SCORE]
-    if hits:
-        return hits
-    best = _near_duplicate_open(cur, scope, text, rows=job_rows)
-    return [best] if best is not None else []
-
-
-def _open_commitments(cur, scope: str | None, *, payload: dict[str, Any] | None = None,
-                      episode_id: int | None = None,
-                      with_origin: bool = False, with_owner: bool = False) -> list[dict[str, Any]]:
-    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
-    """The open items in ``scope``'s lineage: ``id`` and ``text``, with
-    ``origin`` and, for ``with_owner``, the columns :func:`row_owner` reads
-    (``owner`` and ``owner_label`` as it gives them)."""
-    lineage, params = _lineage_clause(cur, payload or {"project": scope}, episode_id)
-    cols = ["id", "text"] + (["origin"] if with_origin else [])
-    # Near-dup / relay need latest_text even when owner columns are unused.
-    if _lineage_columns_ready(cur):
-        cols.append("latest_text")
-    if with_owner:
-        cols += ["owner", "kind"]
-        if _owner_columns_ready(cur):
-            cols += [c for c in ("origin", "owner_label") if c not in cols]
-        if _close_columns_ready(cur):
-            cols += ["prs", "pr_check"]
-    cur.execute(
-        f"SELECT {', '.join(cols)} FROM commitments WHERE status = 'open' AND project IS NOT DISTINCT FROM %s "
-        f"AND {lineage} AND {_not_forgotten_clause(cur)}",
-        (scope, *params),
-    )
-    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-    if with_owner:
-        for row in rows:
-            row["owner"], row["owner_label"] = row_owner(row)
-    return rows
-
-
-def _candidate_close_texts(payload: dict[str, Any]) -> list[tuple[str, str, int | None]]:
-    """(text, kind, commitment_id) from closed_loops and decisions, where kind is
-    ``"done"`` (a ``done:``-prefixed statement — matched by text only, never
-    an API call) or ``"loop"`` (a closed_loop the extractor listed as a loop
-    that closed — matched by text OR, when commitments are embedded, by
-    cosine). Only ``done:``-prefixed decisions are candidates; a plain
-    decision never closes a commitment so an unrelated decision cannot close
-    one on a text or paraphrase fluke."""
-    out: list[tuple[str, str, int | None]] = []
-    for item in payload.get("closed_loops") or []:
-        text = item.get("text") if isinstance(item, dict) else item
-        text = str(text or "").strip()
-        if not text:
-            continue
-        reference = item.get("commitment_id") if isinstance(item, dict) else None
-        if reference is not None:
-            try:
-                reference = int(str(reference))
-            except ValueError:
-                reference = 0  # An invalid explicit target must not fall back to another row.
-        m = _DONE_PREFIX_RE.match(text)
-        out.append((_DONE_PREFIX_RE.sub("", text), "done" if m else "loop", reference))
-    for item in payload.get("decisions") or []:
-        text = str(item or "").strip()
-        if not text:
-            continue
-        if _DONE_PREFIX_RE.match(text):
-            out.append((_DONE_PREFIX_RE.sub("", text), "done", None))
-    return out
-
-
-def _match_score(a: str, b: str) -> float:
-    """Best of Jaccard and substring/containment (fix 4) — used for the
-    explicit ``done: <text>`` close, which has no similarity config of its
-    own but must still match the CLOSED text against candidate commitment
-    text rather than closing an arbitrary open row.
-
-    Near-dup and relay treat containment as identity only when the longer
-    side adds no tokens (token cover) or the strings are nearly the same
-    length; a shorter phrase inside a longer distinct one is not a match.
-    Explicit ``done:`` still allows asymmetric containment in
-    :func:`completion_match`."""
-    al, bl = a.strip().lower(), b.strip().lower()
-    if al and bl and (al in bl or bl in al):
-        shorter, longer = (al, bl) if len(al) <= len(bl) else (bl, al)
-        short_toks = set(re.findall(r"[a-z0-9]+", shorter))
-        long_toks = set(re.findall(r"[a-z0-9]+", longer))
-        # Token cover or near-equal length → identity. Otherwise Jaccard still
-        # scores paraphrases ("…seal fix" / "…seal fix or waits"); do not
-        # zero out and skip the fallback.
-        if long_toks <= short_toks or len(shorter) / max(len(longer), 1) >= 0.9:
-            return 1.0
-    return _jaccard(a, b)
-
-
-def _completion_text(text: str) -> str:
-    text = " ".join(text.lower().split())
-    # Only the leading action changes tense; task qualifiers retain their words.
-    def action(match):
-        token = match.group()
-        stems = (*_stems(token), token[:-3] + "y" if token.endswith("ied") else token)
-        return next((stem for stem in stems if stem in _ACTION_STEMS), token)
-    return re.sub(r"^[a-z]+", action, text, count=1)
-
-
-def _has_commitment_embeddings(cur, commitment_ids: list[int]) -> bool:
-    """Cheap existence check (fix 5b): skip the embed API call entirely when
-    no candidate commitment has a stored embedding yet — the embed catch-up
-    (embed.embed_recent_missing) populates these out of band, not here."""
-    if not commitment_ids:
-        return False
-    try:
-        from khipu.embed import _active_profile
-
-        profile = _active_profile(cur)
-        cur.execute(
-            "SELECT 1 FROM memory_embeddings WHERE profile = %s AND kind = 'commitment' "
-            "AND chunk_idx = 0 AND ref = ANY(%s) LIMIT 1",
-            (profile, [str(i) for i in commitment_ids]),
-        )
-        return cur.fetchone() is not None
-    except Exception:  # noqa: BLE001 — fail-open to "no embeddings, use Jaccard"
-        return False
-
-
-def _cosine_scores(cur, text: str, commitment_ids: list[int],
-                   episode_id: int | None = None) -> dict[int, float]:
-    """Best-effort cosine between ``text`` and each open commitment's stored
-    embedding. ``text`` derives from ``episode_id``'s capture; with no episode
-    or a forgotten one it is withheld from the provider. Returns {} on any
-    failure (no key, no embeddings yet, PG error, withheld) so the caller
-    falls back to Jaccard — never raises."""
-    if not commitment_ids:
-        return {}
-    try:
-        from khipu import provider_text
-        from khipu.embed import _active_profile, _vec_literal, embed_one
-
-        profile = _active_profile(cur)
-        [sendable] = provider_text.fenced_texts(
-            [text], [None if episode_id is None else [episode_id]], "commitment")
-        if sendable is None:
-            return {}
-        vec = embed_one(sendable, profile=profile, recheck=provider_text.recheck_texts(
-            [text], [[episode_id]], "commitment"))
-        cur.execute(
-            """
-            SELECT ref, 1 - (embedding <=> %s::vector) AS score
-            FROM memory_embeddings
-            WHERE profile = %s AND kind = 'commitment' AND chunk_idx = 0
-              AND ref = ANY(%s)
-            """,
-            (_vec_literal(vec), profile, [str(i) for i in commitment_ids]),
-        )
-        return {int(ref): float(score) for ref, score in cur.fetchall() if score is not None}
-    except Exception:  # noqa: BLE001 — fail-open to Jaccard
-        return {}
-
-
-def completion_match(text: str, row_text: str, *, kind: str, threshold: float,
-                     cos: float | None = None) -> tuple[float, str, bool]:
-    """``(score, via, semantic)``: how ``text`` (a closed loop, a ``done:``
-    statement, or a decision) completes an item reading ``row_text``. ``via``
-    is empty when it does not reach the bar. The one test :func:`auto_close`
-    and the decision rule (``khipu.close_rules``) both use."""
-    completion = _completion_text(text)
-    tokens = set(re.findall(r"[\w./-]+", completion))
-    target = _completion_text(row_text)
-    exact = completion == target
-    if not exact and len(tokens) < 3:
-        return 0.0, "", False
-    # Ordinary completion must preserve the full lexical evidence;
-    # substring containment is reserved for an explicit done statement
-    # (including asymmetric containment the near-dup bar rejects).
-    if kind == "done":
-        al, bl = text.strip().lower(), row_text.strip().lower()
-        if al and bl and (al in bl or bl in al):
-            text_score = 1.0
-        else:
-            text_score = _match_score(text, row_text)
-    else:
-        text_score = _jaccard(completion, target)
-    covers = set(re.findall(r"[\w./-]+", target)) <= tokens
-    score = 0.0
-    via = ""
-    text_threshold = DONE_MATCH_MIN_SCORE if kind == "done" else threshold
-    if text_score >= text_threshold and (kind == "done" or covers):
-        score = text_score
-        via = "explicit done (best match)" if kind == "done" else "text"
-    # High overlap with missing words can mean a changed qualifier
-    # (staging versus production); cosine must not erase that evidence.
-    if cos is not None and cos >= threshold and cos > score \
-            and (covers or text_score < NEAR_DUP_MIN_SCORE):
-        return cos, "cosine", True
-    return score, via, False
-
-
-def evidence_key(rule: str, text: str) -> str:
-    """A close rule key for evidence that is a piece of text: the same words
-    give the same key, so a reopened item is not closed again by them."""
-    norm = re.sub(r"\s+", " ", str(text or "").strip().lower())
-    return f"{rule}:{hashlib.sha256(norm.encode('utf-8')).hexdigest()[:16]}"
-
-
-def evidence_problem(text: str, item_text: str = "", project: str | None = None, *,
-                     item: dict[str, Any] | None = None) -> str | None:
-    """Why ``text`` is not evidence that closes an item reading
-    ``item_text`` in ``project`` (``khipu.close_rules.evidence_problem``, the
-    one check every close path shares), or None. With ``item`` (its row),
-    every pull request it was ever said to need is required."""
-    from khipu.close_rules import evidence_problem as check
-
-    return check(text, item_text, project, item=item)
 
 
 # ---- the owner's own items --------------------------------------------------
 #
-# The invariant (Matt, 2026-10-17: "Suggest, don't close"): an item the owner
-# owes (``row_owner`` gives ``user``) is never closed, merged, hidden or
-# reassigned by anything automatic, by any rule. Every automatic rule is named
-# here with what it becomes for his item, and every automatic change goes
-# through the one write each kind of change has: :func:`close_by_rule` for a
-# close, a drop or a merge, :func:`auto_reassign` for an owner change and
-# :func:`mark_stale` for staleness. Each reads the owner under the row lock at
-# the moment of the write (never the caller's earlier read) and the write
-# itself repeats the check. A close refused for his item becomes a "Looks
-# done" suggestion on it (``settle_suggestion``) for him to close; an owner
-# change stays a proposal in the clean-up's preview; staleness lists it as
-# quiet. The owner's own changes are :func:`set_status` and :func:`reassign`;
-# a forgotten episode's items are closed by ``khipu.forget``.
-PROPOSE_LOOKS_DONE = "looks-done"
-PROPOSE_TIDY = "tidy"
-PROPOSE_QUIET = "quiet"
-AUTOMATIC_RULES: dict[str, str] = {
-    "pr": PROPOSE_LOOKS_DONE,        # every PR the item names is merged or closed
-    "loop": PROPOSE_LOOKS_DONE,      # a closed loop or "done:" line of a later capture
-    "decision": PROPOSE_LOOKS_DONE,  # a later decision settles it
-    "relay": PROPOSE_LOOKS_DONE,     # a conversation item restates a job's item
-    "duplicate": PROPOSE_LOOKS_DONE,  # dedup, in the hygiene pass or the clean-up
-    "session-ended": PROPOSE_TIDY,   # its session ended
-    "session-plan": PROPOSE_TIDY,    # a plan-shaped row the session mentioned as finished
-    "drop": PROPOSE_TIDY,            # the hygiene re-judge: not a commitment
-    "owner-rules": PROPOSE_TIDY,     # the owner rules re-run (clean-up, hygiene)
-    "model": PROPOSE_TIDY,           # the clean-up's model pass
-    "stale": PROPOSE_QUIET,          # weeks of silence: his items show as quiet instead
-}
-OWNER_GUARD_WORDS = "the owner's own item: an automatic {rule} may suggest a change to it, never make it"
+# Historical owner guards still protect explicit bulk Undo.
 LOOKS_DONE = "Looks done"
-
-
-def owner_guard(owner: str | None, rule: str) -> str | None:
-    """Why the automatic ``rule`` may not change an item owned by ``owner``,
-    or None when it may: every rule is refused for the owner's own item, none
-    for anyone else's. The writes pass the stored owner (:func:`row_guard`)."""
-    if rule not in AUTOMATIC_RULES:
-        raise ValueError(f"not an automatic rule Khipu knows: {rule!r}")
-    if str(owner or "").strip().lower() != OWNER_USER:
-        return None
-    return OWNER_GUARD_WORDS.format(rule=rule)
-
-
-def row_guard(row: dict[str, Any], rule: str) -> str | None:
-    """:func:`owner_guard` for a row :func:`row_at_write` read. The stored
-    owner decides: the owner rules infer an owner only when an item is first
-    captured, and a stored owner moves only by the owner or by an explicit
-    reassignment of someone else's item, so an item stored as the user's is
-    his however its text reads now."""
-    return owner_guard(guarded_owner(row), rule)
 
 
 def guarded_owner(row: dict[str, Any]) -> str:
@@ -1907,7 +1040,7 @@ def _owner_cols(cur) -> list[str]:
     if _reassigned_column_ready(cur):
         cols.append("owner_reassigned_at")
     if _close_columns_ready(cur):
-        # What close_by_rule's pull request check reads (migration 0034).
+        # What historical close rule's pull request check reads (migration 0034).
         cols += ["project", "prs", "pr_check"]
         if _lineage_columns_ready(cur):
             cols.append("latest_text")
@@ -2013,266 +1146,8 @@ def close_reason_sql(cur, table: str = "commitments") -> str:
     return f"CASE WHEN EXISTS ({forgotten}) THEN 'forgotten' ELSE {col} END"
 
 
-def suggest_looks_done(cur, commitment_id: int, *, rule: str, reason: str, key: str,
-                       evidence: dict | None = None, episode: int | None = None) -> bool:
-    """Keep a refused close on the owner's item as a "Looks done" suggestion
-    (``settle_suggestion``) with its rule, reason and evidence, for him to
-    close. Evidence he already reopened against (``reopened_rule_keys``) is
-    never suggested again, and the same key is not rewritten unless the old
-    one quotes a decision without its source episode (readers hide that one,
-    :func:`settle_suggestion_sql`). A PR suggestion has no episode to name."""
-    if not _close_columns_ready(cur):
-        return False
-    doc = {"looks_done": True, "rule": rule, "reason": str(reason or "")[:300], "key": key,
-           "evidence": evidence or {}, "episode": episode}
-    cur.execute(
-        "UPDATE commitments SET settle_suggestion = %s::jsonb WHERE id = %s AND status = 'open' "
-        "AND NOT (%s = ANY(reopened_rule_keys)) "
-        "AND (settle_suggestion IS NULL OR settle_suggestion->>'key' IS DISTINCT FROM %s "
-        "OR (settle_suggestion->>'episode' IS NULL AND (settle_suggestion->>'decision_id' IS NOT NULL "
-        "OR settle_suggestion->'evidence'->>'decision_id' IS NOT NULL)))",
-        (json.dumps(doc, default=str), commitment_id, key, key),
-    )
-    return cur.rowcount > 0
 
 
-def close_by_rule(cur, commitment_id: int, *, rule: str, reason: str, key: str,
-                  evidence: dict | None = None, episode: int | None = None,
-                  status: str = "closed", set_extra: str = "", extra_params: tuple = (),
-                  proof: str | None = None) -> bool:
-    """The one write every automatic close goes through (the PR and decision
-    rules, the closed-loop match, the session-end close, the relay close, the
-    hygiene re-judge and dedup, and the clean-up's apply). It reads the item
-    under the row lock (:func:`row_at_write`); :func:`row_guard` refuses
-    the owner's own item, by its stored owner, for every rule, and a refused
-    close of the
-    :data:`PROPOSE_LOOKS_DONE` rules becomes a "Looks done" suggestion
-    (:func:`suggest_looks_done`). Otherwise it records the reason, who
-    closed it (:data:`BY_RULE`), the rule ``key`` and the ``evidence``, and
-    it refuses an item the owner reopened after that same key closed it
-    (``reopened_rule_keys``). ``status`` is ``closed``, or ``dropped`` for the
-    hygiene re-judge. On a hub before migration 0034 there is no key to
-    remember, so only the reason is written. From 0034 on, any other item
-    closes only when every pull request it was ever said to need is merged
-    or closed, as the PR rule's ``evidence["prs"]`` or the git or gh lines of
-    ``proof`` (the evidence text; ``evidence["text"]`` without it) show;
-    until then the PR rule closes it."""
-    if status not in ("closed", "dropped"):
-        raise ValueError(f"an automatic close sets closed or dropped, not {status!r}")
-    row = row_at_write(cur, commitment_id)
-    if row is None or row.get("status") != "open":
-        return False
-    why = row_guard(row, rule)
-    if why:
-        _log(f"kept commitment {commitment_id} as it is: {why}")
-        if AUTOMATIC_RULES[rule] == PROPOSE_LOOKS_DONE:
-            suggest_looks_done(cur, commitment_id, rule=rule, reason=reason, key=key, evidence=evidence,
-                               episode=episode)
-        return False
-    from khipu.close_rules import unfinished_problem
-
-    evidence = evidence or {}
-    why = "pr_check" in row and unfinished_problem(
-        row, row.get("project"), text=str(proof if proof is not None else evidence.get("text") or ""),
-        records=evidence.get("prs") if rule == "pr" else None)
-    if why:
-        _log(f"kept commitment {commitment_id} open: {why}")
-        return False
-    reason = str(reason or "")[:300]
-    same, same_params = _owner_unchanged(cur, row)
-    if _close_columns_ready(cur):
-        cur.execute(
-            f"UPDATE commitments SET status = '{status}', closed_at = now(), closed_episode = %s, "
-            f"close_reason = %s, closed_by = %s, close_rule_key = %s, close_evidence = %s::jsonb{set_extra} "
-            "WHERE id = %s AND status = 'open' AND NOT (%s = ANY(reopened_rule_keys)) "
-            f"AND {_not_forgotten_clause(cur)}{same}",
-            (episode, reason, BY_RULE, key, json.dumps(evidence or {}), *extra_params, commitment_id, key,
-             *same_params),
-        )
-    else:
-        cur.execute(
-            f"UPDATE commitments SET status = '{status}', closed_at = now(), closed_episode = %s, "
-            f"close_reason = %s{set_extra} WHERE id = %s AND status = 'open' "
-            f"AND {_not_forgotten_clause(cur)}{same}",
-            (episode, reason, *extra_params, commitment_id, *same_params),
-        )
-    return cur.rowcount > 0
-
-
-def auto_reassign(cur, commitment_id: int, *, rule: str, sets: list[str], params: tuple) -> bool:
-    """The one write every owner change the owner did not make himself goes
-    through (the clean-up's apply, an explicit reassignment of someone
-    else's item): ``UPDATE commitments SET <sets>`` for one item, read under
-    the row lock (:func:`row_at_write`) and refused by :func:`row_guard`
-    when the item is stored as the owner's own. The owner's own move is
-    :func:`reassign`."""
-    row = row_at_write(cur, commitment_id)
-    if row is None:
-        return False
-    why = row_guard(row, rule)
-    if why:
-        _log(f"kept commitment {commitment_id}'s owner as it is: {why}")
-        return False
-    same, same_params = _owner_unchanged(cur, row)
-    cur.execute(f"UPDATE commitments SET {', '.join(sets)} WHERE id = %s{same}",
-                (*params, commitment_id, *same_params))
-    return cur.rowcount > 0
-
-
-def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
-    """Match every closed_loop / done-decision against this scope's open
-    commitments (``scope``: project, else parent_session_id/session_id — fix
-    3); close the best match at or above the configured similarity, or for
-    an explicit ``done:`` prefix, the best text match at or above
-    ``DONE_MATCH_MIN_SCORE`` (fix 4 — never the first unordered row, and
-    never anything if nothing clears the bar). Returns count closed.
-    """
-    scope = _coalesce_scope(payload)
-    candidates = _candidate_close_texts(payload)
-    if not candidates:
-        return 0
-    open_rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id, with_owner=True)
-    if not open_rows:
-        for text, _kind, _reference in candidates:
-            _report_item("not_closed", _loop_label(payload, text), text,
-                         "no open commitment in this scope to close")
-        return 0
-    from khipu.config import float_setting
-
-    threshold = float_setting("commitment_close_similarity")
-    origin = capture_origin(payload)
-    ids = [r["id"] for r in open_rows]
-    already_closed: set[int] = set()
-    closed = 0
-    for text, kind, reference in candidates:
-        remaining_ids = [i for i in ids if i not in already_closed]
-        # Cosine (semantic paraphrase) is available for a closed_loop when the
-        # scope's commitments are embedded; a "done:" close is text-only (fix
-        # 5a) and never spends an API call, and with no stored commitment
-        # embeddings (fix 5b) there is nothing to score against.
-        if reference is None and kind != "done" and remaining_ids and _has_commitment_embeddings(cur, remaining_ids):
-            cosine = _cosine_scores(cur, text, remaining_ids, episode_id)
-        else:
-            cosine: dict[int, float] = {}
-        best_id = None
-        best_score = 0.0
-        best_via = ""
-        tied = False
-        tied_ids: list[int] = []
-        semantic_matches = 0
-        for row in open_rows:
-            cid = row["id"]
-            if cid in already_closed:
-                continue
-            if reference is not None:
-                if cid == reference:
-                    best_id, best_score, best_via = cid, 1.0, "commitment id"
-                continue
-            score, via, semantic = completion_match(text, row["text"], kind=kind, threshold=threshold,
-                                                    cos=cosine.get(cid))
-            if semantic:
-                semantic_matches += 1
-            if via and score > best_score:
-                best_id, best_score, best_via = cid, score, via
-                tied, tied_ids = False, [cid]
-            elif via and abs(score - best_score) < 1e-9:
-                tied = True
-                tied_ids.append(cid)
-        if tied and best_via != "cosine":
-            # Items of different owners that say the same thing both stay
-            # open (dedup never merges them), so they tie. The evidence
-            # closes the one whose owner its own session would give it.
-            mine = resolve_owner_and_label(text, origin=origin)
-            own = [r["id"] for r in open_rows
-                   if r["id"] in tied_ids and (r.get("owner"), r.get("owner_label")) == mine]
-            if len(own) == 1:
-                best_id, tied = own[0], False
-        if best_id is None or tied or (best_via == "cosine" and semantic_matches > 1):
-            _report_item("not_closed", _loop_label(payload, text), text,
-                         "it matched more than one open commitment equally, so none was closed"
-                         if (tied or best_id is not None)
-                         else "it matched no open commitment in this scope")
-            continue
-        best = next(r for r in open_rows if r["id"] == best_id)
-        # Every pull request the item was ever said to need counts, not only
-        # those of its first wording.
-        why_not = evidence_problem(text, best["text"], payload.get("project"), item=best)
-        if why_not:
-            _log(f"kept commitment {best_id} open: {why_not}")
-            _report_item("not_closed", _loop_label(payload, text), text,
-                         f"commitment {best_id} kept open: {why_not}", row=best_id)
-            continue
-        if close_by_rule(cur, best_id, rule="loop",
-                         reason=f"{best_via} match ({best_score:.2f}): {text[:200]!r}",
-                         key=evidence_key("loop", text), episode=episode_id, proof=text,
-                         evidence={"rule": "loop", "text": text[:300], "match": best_via,
-                                   "score": round(best_score, 3)}):
-            already_closed.add(best_id)
-            closed += 1
-            _report_count("closed")
-            _report_closed_row(best_id)
-            _log(f"closed commitment {best_id} via {best_via} ({best_score:.2f}) at episode {episode_id}")
-        else:
-            _report_item("not_closed", _loop_label(payload, text), text,
-                         f"commitment {best_id} matched but was not closed: its rules keep it open "
-                         "(the owner's own item, or its evidence is incomplete)", row=best_id)
-    return closed
-
-
-def stale_sql(*, has_last_seen: bool) -> str:
-    """The expiry-by-SILENCE UPDATE, as text so it can be unit-tested without
-    a database.
-
-    Three rules, all in one statement:
-      * a ``due_after`` still in the FUTURE is never stale — the commitment is
-        parked on purpose (that is what ``khipu owed --snooze`` writes);
-      * followups and promises with no live due date expire after
-        ``STALE_AFTER_DAYS_SOFT`` (14) days of silence;
-      * blockers and questions get ``STALE_AFTER_DAYS`` (30) — they outlive a
-        fortnight of quiet far more often than a followup does.
-    "Silence" is measured from ``last_seen_at`` when migration 0012 is in
-    (each restatement pushes it forward), else from ``opened_at``.
-    """
-    return f"""
-        UPDATE commitments
-        SET status = 'stale'
-        WHERE {_stale_where(has_last_seen)}
-        """
-
-
-def _stale_where(has_last_seen: bool) -> str:
-    seen = "COALESCE(last_seen_at, opened_at)" if has_last_seen else "opened_at"
-    seen = f"GREATEST({seen}, due_after)"
-    return f"""status = 'open'
-          AND (due_after IS NULL OR due_after <= now())
-          AND {seen} < now() - (
-              CASE WHEN kind IN ('followup', 'promise')
-                   THEN interval '{STALE_AFTER_DAYS_SOFT} days'
-                   ELSE interval '{STALE_AFTER_DAYS} days'
-              END)"""
-
-
-def mark_stale(cur) -> int:
-    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
-    """Flip silent open commitments to 'stale' (see :func:`stale_sql`). Never
-    silently dropped — stale stays queryable via `khipu owed --status stale`.
-    Staleness is an automatic rule: each item is read again under its row
-    lock (:func:`row_at_write`) and :func:`row_guard` keeps the items stored
-    as the owner's open; they list as quiet (``quiet_weeks``) instead.
-    """
-    has_seen = _seen_columns_ready(cur)
-    forgotten = _not_forgotten_clause(cur)
-    cur.execute(f"SELECT id FROM commitments WHERE {_stale_where(has_seen)} AND {forgotten} ORDER BY id")
-    n = 0
-    for (cid,) in cur.fetchall():
-        row = row_at_write(cur, int(cid))
-        if row is None or row_guard(row, "stale"):
-            continue
-        same, same_params = _owner_unchanged(cur, row)
-        cur.execute(stale_sql(has_last_seen=has_seen) + f" AND {forgotten} AND id = %s{same}",
-                    (int(cid), *same_params))
-        n += max(0, cur.rowcount or 0)
-    return n
 
 
 def _as_utc(value: Any) -> datetime | None:
@@ -2291,7 +1166,7 @@ def _as_utc(value: Any) -> datetime | None:
 def quiet_weeks(row: dict[str, Any], now: datetime | None = None) -> int | None:
     """Whole weeks an open item of the owner's has gone unmentioned, once
     that is past the window that would make anyone else's item stale; None
-    otherwise. His items never go stale (:func:`mark_stale`); this is how a
+    otherwise. His items never go stale (:func:`historical aging`); this is how a
     list shows the quiet ones, after the active ones, instead of hiding them."""
     from datetime import timezone
 
@@ -2319,144 +1194,11 @@ def quiet_label(weeks: int | None) -> str | None:
 # Session-plan closure. Before the precision filter shipped, a session's own
 # plan steps and in-flight status lines were opened as commitments; they are
 # finished (or abandoned) when the session ends, and no later capture ever
-# says "done: <phrase>" about them, so auto_close never fires. Retire them
+# says "done: <phrase>" about them, so archived commitment matching never fires. Retire them
 # when their OWN session ends.
 # ---------------------------------------------------------------------------
 
 SESSION_END_EVENTS = frozenset({"sessionend", "session_end", "sessionended", "session-end"})
-
-
-def _payload_event(payload: dict[str, Any]) -> str:
-    """Normalized capture event. Queued jobs carry it as ``event``; older
-    payloads only encoded it into ``scope`` ("claude sessionend")."""
-    ev = str(payload.get("event") or "").strip().lower()
-    if ev:
-        return ev
-    scope = str(payload.get("scope") or "").strip().lower()
-    for candidate in SESSION_END_EVENTS:
-        if scope.endswith(candidate):
-            return candidate
-    return ""
-
-
-def _session_open_commitments(cur, session_id: str) -> list[dict[str, Any]]:
-    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
-    """Open commitments opened by an episode of THIS session.
-
-    Joined through ``episodes`` rather than a new column so rows written
-    before this change are covered too. ``latest_text`` is included when
-    migration lineage columns exist so a restatement's future-trigger wording
-    is visible to :func:`close_session_plan`. ``last_seen_at`` / ``seen_count``
-    come along when migration 0012 is present so a later session's restatement
-    can block the opening session's session-ended close.
-    """
-    latest = ", c.latest_text" if _lineage_columns_ready(cur) else ""
-    seen = ", c.last_seen_at, c.seen_count" if _seen_columns_ready(cur) else ""
-    cur.execute(
-        f"""
-        SELECT c.id, c.text, c.kind, c.owner{latest}{seen}
-        FROM commitments c
-        JOIN episodes e ON e.id = c.opened_episode
-        WHERE c.status = 'open' AND e.session_id = %s
-          AND {_not_forgotten_clause(cur).replace('commitments.opened_episode', 'c.opened_episode')}
-        """,
-        (session_id,),
-    )
-    rows = []
-    for r in cur.fetchall():
-        item = {"id": r[0], "text": r[1], "kind": r[2], "owner": r[3]}
-        i = 4
-        if latest:
-            item["latest_text"] = r[i]
-            i += 1
-        if seen:
-            item["last_seen_at"] = r[i]
-            item["seen_count"] = r[i + 1]
-        rows.append(item)
-    return rows
-
-
-def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
-    """Close this session's own commitments when the session ends.
-
-    Two rules, both scoped to commitments opened by an episode of THIS
-    session:
-
-    * **session-ended** (2026-09-04, second pass) — on a ``sessionend``
-      capture, every open commitment with ``owner = assistant`` and
-      ``future_trigger = false`` is closed with ``close_reason
-      'session-ended'``. That is the whole point of the two fields: an
-      assistant promise with no explicit cross-session trigger cannot outlive
-      the window it was made in. User-owed rows and future-trigger rows are
-      NEVER closed this way.
-    * **session-plan** (first pass, kept) — an in-flight / agent /
-      coordination shaped row (:func:`is_session_plan_text`) is also closed
-      when this same payload's ``closed_loops`` / ``decisions`` mention it,
-      without waiting for the sessionend.
-
-    Returns the count closed.
-    """
-    session_id = str(payload.get("session_id") or "").strip()
-    if not session_id:
-        return 0
-    is_end = _payload_event(payload) in SESSION_END_EVENTS
-    mentions = [t for t, _, _ in _candidate_close_texts(payload)]
-    if not is_end and not mentions:
-        return 0
-    try:
-        rows = _session_open_commitments(cur, session_id)
-    except Exception as exc:  # noqa: BLE001 — additive; never break a capture
-        _log(f"session-plan lookup failed ({type(exc).__name__}: {exc})")
-        return 0
-    closed = 0
-    for row in rows:
-        # Restatements store newer wording in latest_text; a folded
-        # "… next session" must keep the row open through sessionend.
-        trigger = (has_future_trigger(row["text"] or "")
-                   or has_future_trigger(row.get("latest_text") or ""))
-        owner, _label = row_owner(row)
-        # Only the assistant's own items die with its session: the user's,
-        # an agent's (a job's item for its orchestrator) and any question
-        # outlive it.
-        if str(row.get("kind") or "").lower() == "question" or owner != OWNER_ASSISTANT:
-            continue
-        if is_end and not trigger:
-            # A later capture restating this row bumps seen_count; the opening
-            # session alone must not retire it (same posture as the nightly
-            # recently_restated guard).
-            if int(row.get("seen_count") or 1) > 1:
-                continue
-            # The session-ended rule: an assistant promise with no explicit
-            # cross-session trigger dies with its session, whatever shape its
-            # text has.
-            reason = "session-ended"
-        elif is_session_plan_text(row["text"]):
-            # Mid-session: only a plan-shaped row this payload explicitly
-            # mentions as finished is retired. A future-trigger row is never
-            # closed by the sessionend itself.
-            hit = next(
-                (m for m in mentions if _match_score(m, row["text"]) >= DONE_MATCH_MIN_SCORE
-                 and not evidence_problem(m, row["text"], row.get("project") or payload.get("project"),
-                                          item=row)),
-                None,
-            )
-            if hit is None:
-                continue
-            reason = f"session-plan (mentioned): {hit[:150]!r}"
-            key, evidence = evidence_key("session-plan", hit), {"rule": "session-plan", "text": hit[:300]}
-        else:
-            continue
-        rule = "session-ended" if reason == "session-ended" else "session-plan"
-        if reason == "session-ended":
-            key, evidence = f"session-ended:{session_id}", {"rule": "session-ended", "session_id": session_id}
-        if close_by_rule(cur, row["id"], rule=rule, reason=reason, key=key, evidence=evidence,
-                         episode=episode_id, proof=hit if rule == "session-plan" else None):
-            closed += 1
-            _report_count("closed")
-            _report_closed_row(row["id"])
-    if closed:
-        _log(f"closed {closed} session-end commitment(s) for {session_id}")
-    return closed
 
 
 def list_owed(cur, *, project: str | None = None, parent_session_id: str | None = None,
@@ -2474,7 +1216,7 @@ def fetch_owed_rows(cur, *, project: str | None = None, parent_session_id: str |
                     hide_snoozed: bool = False) -> list[dict[str, Any]]:
     """Every raw row of one scope, newest first, owners not yet resolved.
     ``project`` if given, else ``parent_session_id``/``session_id`` (fix
-    3) — the same coalesced key ``open_from_episode``/``auto_close`` store
+    3) — the same coalesced key the archived writer store
     commitments under, so a caller with only session context (no resolved
     project) can still find its own scope's commitments.
 
@@ -2665,7 +1407,7 @@ def set_status(cur, commitment_id: int, status: str, *, reason: str | None = Non
     ``reason`` (default "closed by hand") and, once migration 0034 is in,
     ``by`` (:data:`BY_APP`, :data:`BY_CONVERSATION`). A reopen restores the
     item and remembers the rule key that closed it, so the same rule and
-    evidence never close it again (``khipu.close_rules``)."""
+    evidence never close it again (historical closure evidence)."""
     if status not in ("open", "closed", "stale", "dropped"):
         raise ValueError(f"status must be open/closed/stale/dropped, got {status!r}")
     close_ready = _close_columns_ready(cur)
@@ -2811,7 +1553,7 @@ def decode_cursor(raw: str) -> tuple[int, Any, tuple[int, Any]]:
 def _row_prs(row: dict[str, Any]) -> list[int]:
     if isinstance(row.get("prs"), list):
         return [int(n) for n in row["prs"]]
-    from khipu.close_rules import parse_prs
+    from khipu.pr_refs import parse_prs
 
     return parse_prs(row.get("text") or "")
 
@@ -2947,3 +1689,41 @@ def bulk_owner_gate(count: int) -> str | None:
                          "Type yes to confirm: "):
         return "terminal"
     return None
+
+def _normalize_open_loop(item: Any) -> dict[str, Any] | None:
+    if isinstance(item, str):
+        text = item.strip()
+        if not text:
+            return None
+        return {"text": text, "kind": "followup", "due_after": None, "owner": None,
+                "owner_label": None, "future_trigger": None}
+    if not isinstance(item, dict):
+        return None
+    text = str(item.get("text") or "").strip()
+    if not text:
+        return None
+    kind = str(item.get("kind") or "followup").strip().lower()
+    if kind not in VALID_KINDS:
+        kind = "followup"
+    return {
+        "text": text,
+        "kind": kind,
+        "due_after": item.get("due_after") or None,
+        "owner": item.get("owner") or None,
+        "owner_label": item.get("owner_label") or None,
+        # Asked for in the prompt, kept for the record — the deterministic
+        # detector decides the stored value (see resolve_owner/has_future_trigger).
+        "future_trigger": item.get("future_trigger"),
+    }
+
+def _payload_event(payload: dict[str, Any]) -> str:
+    """Normalized capture event. Queued jobs carry it as ``event``; older
+    payloads only encoded it into ``scope`` ("claude sessionend")."""
+    ev = str(payload.get("event") or "").strip().lower()
+    if ev:
+        return ev
+    scope = str(payload.get("scope") or "").strip().lower()
+    for candidate in SESSION_END_EVENTS:
+        if scope.endswith(candidate):
+            return candidate
+    return ""

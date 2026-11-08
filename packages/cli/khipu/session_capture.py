@@ -3487,7 +3487,7 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         # The trigger itself, not just its trace in `scope`: commitments'
         # session-plan closure retires a session's own in-flight/plan items
         # when that session ENDS, and it needs to know that this capture is
-        # the sessionend one (khipu.commitments.close_session_plan).
+        # the sessionend one (historical session closing).
         payload["event"] = job.get("event")
         # The session's own time, not the drain's — a job may sit queued for hours.
         payload["ts"] = job.get("ts") or _mint_ts()

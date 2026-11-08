@@ -13,7 +13,7 @@ python3 -m khipu <command>
 
 Most commands need the Python dependencies on `PYTHONPATH` first; [packages/cli/README.md](../packages/cli/README.md) shows the one-time setup. To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
 
-There are 57 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
+There are 56 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
 
 ## Health and status
 
@@ -71,31 +71,19 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 - `recall zero-results [--days]` (default 7): lists queries that found nothing.
 - `recall eval`: scores a golden set. Flags: `--golden`, `--path explicit|prompt|status|all` (default `explicit`), `--budget-ms`, `--record`, `--compare`, `--allow-changes`, `--replay`, `--rerank on|off`, `--relevance-floor on|off`, `--sample`, `--seed`.
 
-## Commitments and decisions
+## Explicit asks and archived commitments
 
 | Command | What it does |
 | --- | --- |
 | `needs-you` | Show what waits on the owner. `--json` prints structured output; `--item KEY_OR_NUMBER` shows one whole item. `--yes KEY_OR_NUMBER` and `--no KEY_OR_NUMBER` display it and ask once for a typed yes in a real owner terminal. Conversation shells answer in the conversation or app. |
-| `owed` | List, close, reopen, snooze or reassign commitments, dismiss routing directions, and plan a one-time cleanup. |
+| `owed` | List, close, reopen, snooze or reassign commitments, dismiss routing directions. |
 | `work` | Project progress, running jobs, and Waiting on you; see below for summary checks and owner answers. |
-| `decisions` | The decisions registry. |
 
 `owed` listing flags: `--project`, `--status open|closed|stale`, `--limit` (default 50), `--owner user|assistant|agent|all`, `--kind followup|blocker|question|promise|routing_direction`, `--origin conversation|job`, `--query WORDS`, `--pr NUMBER`, and `--looks-done`. Follow `next_cursor` with `--cursor`; `--envelope` always includes stale, snapshot freshness, and waiting-to-sync metadata. `owed_page_max` caps pages at 200 by default; 0 removes the cap.
 
 `--close ID[,ID...]`, `--reopen ID[,ID...]`, and `--reassign ID[,ID...]` accept comma-separated ids. Reassignment needs `--to user|assistant|agent` and accepts `--label` for an agent. Multiple ids require `--reason` and default to a 500-item cap (`owed_bulk_max`; 0 unlimited). A multi-item change including the owner's items requires owner authorization. `--dismiss ID[,ID...]` dismisses `rd-...` routing directions. `--snooze ID --until WINDOW` takes a date or a window like `7d` or `2w`.
 
-`owed tidy --project PROJECT` plans a one-time cleanup. `--plan-out FILE` writes the plan, `--apply PLAN` applies it, and `--undo BATCH` reverses an applied batch. `--no-model` uses rules only; otherwise the model-call ceiling is `owed_tidy_calls` (25 by default). Owner-directed apply/undo uses `--owner-direction`.
-
 `work [--json]` shows the Work view. `work check FILE` validates a runner summary; `hidden`, `hide ID`, and `unhide ID` manage hidden commitments. `same ROW COMMITMENT` and `not-same ROW COMMITMENT` answer a proposed match, with ROW written as `<project>#<row id>`. Hide/unhide and match answers support `--owner-direction`.
-
-`decisions` subcommands:
-
-- `list`: `--project`, `--since`, `--limit`, and one of `--standing`, `--superseded`, `--retracted`, `--all`.
-- `supersede OLD NEW`: `--reason`, `--force`.
-- `restore`, `retract` (`--reason`).
-- `links`: candidate links between decisions. `--project`, `--state`.
-- `confirm LINK`, `reject LINK`: settle a candidate link.
-- `backfill`: `--dry-run`, `--apply`, `--limit`.
 
 ## Writing and editing memory
 
@@ -226,7 +214,7 @@ Configuration includes these shipped defaults. Duration values below are shown i
 | Storage | `disk_warn_free_gb=10`, `disk_warn_free_percent=5`, `disk_fail_free_gb=3`, `disk_fail_free_percent=2`, `commitments_backup_keep_days=30`, `synth_usage_keep_days=90`, `log_max_mb=5` |
 | Ledger | `ledger_id_chars=80`, `ledger_title_chars=2000`, `ledger_evidence_chars=1000`, `ledger_stale_after=7d`, `ledger_purge_after=30d`, `ledger_owner_word="NEEDS OWNER"` |
 | Work | `work_projects=[]`, `work_file_max_bytes=262144`, `work_max_jobs=50`, `work_max_prs=200`, `work_max_trains=20`, `work_max_runs=20`, `work_line_chars=200`, `work_stale_after="auto"`, `work_job_quiet_after=900s`, `work_gone_after=86400s`, `work_finished_for=1800s`, `work_merged_for=7d`, `work_clock_slack=300s`, `work_refresh=5s` |
-| Owed | `owed_orchestrator_slice_max=3`, `owed_page_max=200`, `owed_bulk_max=500`, `owed_tidy_calls=25` |
+| Owed | `owed_page_max=200`, `owed_bulk_max=500` |
 | CLI paths | `cli_path.claude`, `cli_path.codex`, `cli_path.grok`, `cli_path.muse`, `node_folder`; no configured path by default |
 
 Zero is setting-specific: `replica_refresh_after=0` refreshes at every check; `hub_down_memo_for=0` never skips a connection attempt. Timeouts, retention, and display limits each define their own zero meaning in `khipu config`; there is no blanket unlimited rule.
@@ -255,7 +243,7 @@ Zero is setting-specific: `replica_refresh_after=0` refreshes at every check; `h
 | `monthly` | Run the monthly wiki classification once. |
 | `backfill` | `backfill identity` derives repo and project for episodes. `--dry-run`, `--apply`, `--limit`. |
 | `project` | Project identity: backfill, alias add/list/remove, show NAME, list, merge A B --show-as NAME, keep-separate A B, separate NAME, and renames check. Grouped names read as one project; owner merge/separation decisions control grouping. |
-| `hygiene` | `hygiene paths` finds and purges bad path graph nodes. `hygiene commitments` re-judges open commitments. |
+| `hygiene` | `hygiene paths` finds and purges bad path graph nodes. Archived commitments are not re-judged. |
 
 ### jobs
 

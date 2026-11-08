@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import copy
 import json
-from contextlib import nullcontext
-from datetime import datetime, timezone
 from unittest import mock
 
 import psycopg.errors
@@ -83,8 +81,6 @@ def test_arguments_must_be_an_object_even_when_falsey(monkeypatch, args):
 @pytest.mark.parametrize("name,args", [
     ("khipu_capture", {"summary": "fixture", "topics": [], "people": [], "decisions": [], "preferences": []}),
     ("khipu_owed_update", {"action": "close", "id": "12"}),
-    ("khipu_decisions_update", {"action": "supersede", "id": "12", "by": "13"}),
-    ("khipu_decisions_update", {"action": "confirm", "link_id": "12"}),
     ("khipu_route", {"since": 12}),
     ("khipu_status", {}),
 ])
@@ -104,12 +100,6 @@ def test_f01_invalid_report_action_never_reaches_writer(value):
     writer.assert_not_called()
 
 
-@pytest.mark.parametrize("value", [{"madeup": 123}, 1, True, [], "", "  "])
-def test_f02_replacement_text_rejected_before_owner_write(value):
-    with mock.patch("khipu.owner_writes.run") as writer:
-        with pytest.raises(ValueError):
-            ms._tool_decisions_update({"action": "supersede", "id": 10, "new_text": value})
-    writer.assert_not_called()
 
 
 class Cursor:
@@ -226,22 +216,11 @@ def test_f06_missing_direction_returns_tool_error():
     assert failed and out.get("error")
 
 
-def test_f07_conflicts_since_reaches_sql():
-    from khipu import decisions
-    cur = Cursor()
-    cutoff = datetime(2099, 1, 1, tzinfo=timezone.utc)
-    with mock.patch("khipu.db.connect", return_value=Connection(cur)), \
-            mock.patch.object(decisions, "_links_ready", return_value=True):
-        ms._tool_decisions({"status": "conflicts", "since": "2099-01-01"})
-    sql, params = cur.sql[-1]
-    assert "l.created_at >=" in sql
-    assert cutoff in params
 
 
 @pytest.mark.parametrize("tool,args", [
     ("khipu_owed_update", {"action": "close", "id": 1}),
     ("khipu_owed_update", {"action": "close", "ids": [1, 2], "reason": "fixture done"}),
-    ("khipu_decisions_update", {"action": "restore", "id": 123}),
 ])
 def test_f08_terminal_refusals_are_tool_errors(tool, args):
     with mock.patch("khipu.owner_writes.run", return_value={"ok": False, "needs_owner": [1, 2]}), \
@@ -259,10 +238,6 @@ def test_f08_owner_gate_refusal_is_tool_error():
     writer.assert_not_called()
 
 
-def test_f08_queued_result_is_still_success():
-    with mock.patch("khipu.owner_writes.run", return_value={"ok": True, "waiting_to_sync": True}):
-        failed, out = call("khipu_decisions_update", {"action": "restore", "id": 123})
-    assert not failed and out["waiting_to_sync"]
 
 
 def test_f09_trivial_capture_skips_before_hook_queue_or_write():

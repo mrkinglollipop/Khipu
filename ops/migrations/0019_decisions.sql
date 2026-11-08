@@ -5,9 +5,8 @@
 -- replaced an earlier one — a reversal ranks beside the original forever
 -- (measured live: 36,967 decision strings across 6,815 episodes, no
 -- decisions table at all). This table gives each decision string its own
--- row with a lifecycle; khipu.decisions writes/reads it. Additive only —
--- episodes.decisions is untouched and stays the source `khipu decisions
--- backfill` walks.
+-- row with a lifecycle. Archived validity readers retain this table;
+-- episodes.decisions remains searchable episode memory.
 
 CREATE TABLE IF NOT EXISTS decisions (
     id              BIGSERIAL PRIMARY KEY,
@@ -30,7 +29,7 @@ CREATE INDEX IF NOT EXISTS idx_decisions_episode
 CREATE INDEX IF NOT EXISTS idx_decisions_superseded_by
     ON decisions (superseded_by) WHERE superseded_by IS NOT NULL;
 
--- khipu.decisions.insert_decisions_from_episode dedups by (project,
+-- the historical decision extractor dedups by (project,
 -- normalised text, 30-day window) in application code (a plain unique index
 -- cannot express the time-window part), so this index only speeds that
 -- lookup — it enforces nothing on its own.

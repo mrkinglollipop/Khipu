@@ -88,11 +88,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "work.not_same": (("row", "commitment"), ()),
     # ``why`` is the change's reason (``reason`` is a hold's, from a fixed list).
     "owed.change": (("ids", "change", "why"), ("to", "label")),
-    # The clean-up: ``plan`` (a file from ``khipu owed tidy --plan-out``, shown
+    # The clean-up: ``plan`` (a file from ``the archived clean-up plan``, shown
     # to the owner first) to apply, or ``batch`` to undo; one, not both.
-    "owed.tidy": (("project",), ("plan", "batch", "ids")),
-    "owed.correct_job_origin": ((), ("project",)),
-    "owed.correct_job_origin.confirm": (("request",), ()),
     "project.alias_add": (("alias", "canonical"), ()),
     "project.alias_remove": (("alias",), ()),
     "project.merge": (("a", "b", "show_as"), ()),
@@ -413,18 +410,6 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
             raise _bad("a reassign names the new owner (to); close and reopen take none")
         return ["owed", f"--{v['change']}={','.join(str(c) for c in v['ids'])}", f"--reason={v['why']}",
                 *_opts(v, "to", "label")], []
-    if action == "owed.correct_job_origin":
-        return ["owed", "correct-job-origin", "--request", *_opts(v, "project")], []
-    if action == "owed.correct_job_origin.confirm":
-        return ["owed", "correct-job-origin", f"--confirm={v['request']}"], []
-    if action == "owed.tidy":
-        if ("plan" in v) == ("batch" in v):
-            raise _bad("owed.tidy names the plan to apply or the batch to undo, one of the two")
-        if "ids" in v and "batch" not in v:
-            raise _bad("owed.tidy ids select items to undo and require a batch")
-        return ["owed", "tidy", *_opts(v, "project"), f"--apply={v['plan']}" if "plan" in v
-                else f"--undo={v['batch']}", *([f"--ids={','.join(str(c) for c in v['ids'])}"]
-                                             if "ids" in v else [])], []
     if action in ("work.same", "work.not_same"):
         return ["work", verb.replace("_", "-")], [v["row"], v["commitment"]]
     if action.startswith("project."):

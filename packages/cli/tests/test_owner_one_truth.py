@@ -111,20 +111,6 @@ def test_capture_still_decides_the_owner_from_the_aliases_it_has(monkeypatch, tm
     assert co.resolve_owner("Matt to decide whether the release ships") == "user"
 
 
-def test_a_close_is_refused_for_an_assistant_row_whose_words_name_the_user_as_the_actor(monkeypatch, tmp_path):
-    """The display owner is the stored one, but an automatic close stays conservative,
-    the same on every Mac."""
-    row = {"text": "Matt reviews and merges the stack himself", "kind": "followup", "owner": "ASSISTANT",
-           "origin": "conversation"}
-    plain = {"text": "Rebuild the search index", "kind": "followup", "owner": "ASSISTANT",
-             "origin": "conversation"}
-    for machine in sorted(MACHINES):
-        _machine(monkeypatch, tmp_path, **MACHINES[machine])
-        assert co.row_owner(dict(row)) == ("assistant", None)
-        assert co.row_guard(dict(row), "session-ended")
-        assert co.row_guard(dict(plain), "session-ended") is None
-        # An owner's own reassignment to the assistant is honoured.
-        assert co.row_guard(dict(row, owner_reassigned_at="2026-10-20T10:00:00+00:00"), "session-ended") is None
 
 
 def test_an_agent_label_is_the_stored_one_never_read_from_the_text():

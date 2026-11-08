@@ -85,7 +85,7 @@ Transcript windows go to whichever provider you configure. One default to know: 
 
 - The **capture queue** holds sessions that are not summarised yet.
 - The **outbox** holds summaries whose database write failed. They replay when the database is back.
-- The separate **owner-writes queue** holds offline owed and decision changes in order. Replay uses hub outcome receipts to avoid applying a write twice.
+- The separate **owner-writes queue** holds offline explicit commitment changes in order. Replay uses hub outcome receipts to avoid applying a write twice.
 
 `khipu doctor` reports red while anything sits in the outbox, so a silent backlog is not possible.
 
@@ -181,15 +181,15 @@ The schema migrations extend through `0044`, including ledger, episode origin, f
 
 | Record | What it is |
 |---|---|
-| Commitments | Things you still owe on a project (see section 4) |
-| Decisions | A registry with a lifecycle and links between decisions (see section 4) |
+| Commitments | Explicit asks and archived work items |
+| Decisions | Archived decision history, read for validity in search |
 | Library sources | Folders of text and Markdown files, indexed as a search space (see section 3) |
 | Embedding profiles | Which model and size produce vectors, and which profile is active |
 | Episode sources | Where each episode came from (capture identity, above) |
 | Ledger | Project work rows, their vocabulary and change history |
 | Project names | Aliases and evidence grouping renamed projects |
 | Forgotten sources | Durable identities that prevent forgotten captures returning |
-| Owner-write receipts | Outcomes for queued owed and decision changes |
+| Owner-write receipts | Outcomes for queued explicit commitment changes |
 
 ### Embedding profiles
 
@@ -207,7 +207,7 @@ Topics and episodes are never silently dropped. Both carry a `deleted_at` column
 
 Hooks put prior work in front of the agent before it acts.
 
-- **Session start** (Claude Code, Codex, Cursor): the recall rule plus a slice scoped to the current project (open commitments, recent episodes, linked topics), plus, when the `routing_push` switch is on (it is off by default), the routing summary. See [routing.md](routing.md). The slice also lists standing decisions from the last 14 days.
+- **Session start** (Claude Code, Codex, Cursor): the recall rule plus a slice scoped to the current project (recent episodes and linked topics), plus, when the `routing_push` switch is on (it is off by default), the routing summary. See [routing.md](routing.md). 
 - **Every prompt** (Claude Code and Codex): a bounded search on the prompt itself. It pushes at most three hits under a "Prior work on this topic" heading, capped at 600 characters. It has a 1.2 second budget, skips trivial prompts, and skips hits already shown in the last three prompts. It calls no summariser or chat model. When an embedding profile is active and the prompt's vector is not already cached, it makes one embedding call (secrets masked first), so the prompt text goes to that profile's embedding provider. It reads the local replica first and does not search libraries. If anything fails it returns nothing.
 - **Aegis** gets no push. Its hooks run as observers and their output is discarded. Aegis agents pull with `khipu_status` and `khipu_owed`.
 - **Cursor** gets the session-start push and a project rule file, but no per-prompt hook.
@@ -261,30 +261,18 @@ When the database is unreachable, reads fall back to a local SQLite copy (`hub_s
 How it stays fresh:
 
 1. A nightly job rebuilds it. You can also run `khipu snapshot refresh`.
-2. Between rebuilds, captures, decision changes and forgets update it as they happen. Incremental pulls also bring episode edits and topic tombstones, so they need not wait for a full dump. Topic purge attempts to remove this Mac’s copy immediately after the hub commit and reports local cleanup failure separately.
+2. Between rebuilds, captures and forgets update it as they happen. Incremental pulls also bring episode edits and topic tombstones, so they need not wait for a full dump. Topic purge attempts to remove this Mac’s copy immediately after the hub commit and reports local cleanup failure separately.
 3. `doctor` and `status` report freshness per table as fresh, behind, stale or unknown. Only stale turns `doctor` red. A stale result carries a `stale: true` flag.
 
 The `replica_refresh` job runs `khipu snapshot heal`. It checks every 5 minutes by default and updates copies at least 15 minutes old, with incremental pulls falling back to full dumps as needed. `replica_check_every` and `replica_refresh_after` change those intervals.
 
-Local state lives under Khipu’s configured data directory, normally `~/.config/khipu`. `owner-writes/` holds queued owed and decision changes, `state/replica-heal.json` records healing, `state/replica-wake` requests a check, and `forgotten_sources.json` prevents forgotten sources returning. Owed and decision hub statements default to a 30-second timeout; dead connections and app CLI calls default to 60 seconds. The corresponding settings are `hub_statement_timeout` (0 for no limit), `hub_dead_connection_after` (0 to wait for the system) and `app_cli_timeout` (0 for no limit).
+Local state lives under Khipu’s configured data directory, normally `~/.config/khipu`. `owner-writes/` holds queued explicit commitment changes, `state/replica-heal.json` records healing, `state/replica-wake` requests a check, and `forgotten_sources.json` prevents forgotten sources returning. Explicit commitment hub statements default to a 30-second timeout; dead connections and app CLI calls default to 60 seconds. The corresponding settings are `hub_statement_timeout` (0 for no limit), `hub_dead_connection_after` (0 to wait for the system) and `app_cli_timeout` (0 for no limit).
 
 ## 4. What Khipu tracks beyond episodes
 
-### Owed (commitments)
+### Explicit asks and archived lists
 
-Open loops from a capture become commitments: follow-up, blocker, question or promise. A later capture in the same project can close eligible assistant or agent items (a closed loop, a decision, or a "done:" line). Eligible follow-ups and promises with no due date go stale after 14 days; blockers and questions go stale after 30. A snoozed commitment is never stale before its date. The owner’s own items remain open instead of being automatically closed or made stale, with Quiet for N weeks or Looks done suggestions for the owner to resolve.
-
-Use `khipu owed` (list, `--close`, `--reopen`, `--snooze`), Owed within the Work screen, or the `khipu_owed` tools. Nightly steps mark stale ones and re-judge open ones.
-
-### Work and project names
-
-The project ledger tracks work rows and their history. The Work screen includes Owed, project ledger boards, Waiting on you, Running now and Accounts. Use `khipu ledger` or `khipu_ledger` to read and update rows. Project-name groups keep renamed projects together and expose merge and keep-separate questions to the owner; `khipu project show` shows their names, evidence and counts.
-
-### Decisions
-
-Decisions are a registry with a lifecycle: supersede, restore, retract. Possible links between decisions wait as candidates until you confirm or reject them. Each decision keeps its evidence and reasons.
-
-One validity module gives each result a state: current, mixed, superseded, retracted or unknown. Topics marked superseded, retired or abandoned rank lower. They are not excluded. Use `khipu decisions` or the `khipu_decisions` tools. Automatic supersession (`auto_supersede`) and validity ranking (`validity_ranking`) are feature switches and default off.
+Only deliberately filed asks create new Owed rows. Captures retain their episode decision strings and summaries for search, without creating a separate decision list or closing commitments. Existing lists and their provenance remain archived; search still reads archived validity. See [Explicit memory lists](explicit-memory-lists.md).
 
 ### Forget
 

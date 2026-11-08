@@ -1,9 +1,9 @@
 """Tests for khipu.commitments — W3 first-class open loops.
 
 No live database: a small fake cursor backs an in-memory commitments table
-so open_from_episode / auto_close / mark_stale / list_owed / set_status can
+so historical commitment capture / historical closing / historical aging / list_owed / set_status can
 be exercised deterministically. Cosine matching is forced to fail (no key in
-tests) so auto_close falls back to the pure-Python Jaccard path, same as the
+tests) so historical closing falls back to the pure-Python Jaccard path, same as the
 capture.py dedup tests.
 """
 from __future__ import annotations
@@ -67,8 +67,8 @@ class _CommitmentsCursor:
     def _seed(self, text, *, project="acme/widget", kind="followup", owner=_CAPTURE,
               episode=1, session_id=None, status="open", future_trigger=False,
               due_after=None, opened_at="t0"):
-        """Insert a row WITHOUT going through open_from_episode's filter — for
-        tests about auto_close / stale / listing, whose fixtures predate the
+        """Insert a row WITHOUT going through historical commitment capture's filter — for
+        tests about historical closing / stale / listing, whose fixtures predate the
         precision filter and are not what those tests are about. The stored
         owner is the one capture would have decided for the text, unless the
         test gives one (``None`` stores none, like a legacy row)."""
@@ -210,7 +210,7 @@ class _CommitmentsCursor:
                 self.rowcount = 0
             return
         if s.startswith("SELECT id FROM commitments WHERE") and "due_after <= now()" in s:
-            # mark_stale's candidates; this fake ignores the silence window.
+            # historical aging's candidates; this fake ignores the silence window.
             self._result = [(r["id"],) for r in self.rows.values() if r["status"] == "open"]
             return
         if s.startswith("UPDATE commitments") and "'stale'" in s:
@@ -302,42 +302,7 @@ def _has_embeddings(cur, ids):
 
 
 class OpenFromEpisodeTest(unittest.TestCase):
-    def test_string_and_object_open_loops_are_opened(self):
-        cur = _CommitmentsCursor()
-        payload = {"project": "acme/widget", "open_loops": [
-            "follow up with Matt",
-            {"text": "check the deploy plan with Matt", "kind": "blocker", "owner": "assistant"},
-        ]}
-        n = co.open_from_episode(cur, payload, 42)
-        self.assertEqual(n, 2)
-        texts = {r["text"] for r in cur.rows.values()}
-        self.assertEqual(texts, {"follow up with Matt", "check the deploy plan with Matt"})
-        blocker = next(r for r in cur.rows.values() if r["text"] == "check the deploy plan with Matt")
-        self.assertEqual(blocker["kind"], "blocker")
-        self.assertEqual(blocker["opened_episode"], 42)
-
-    def test_dedup_by_content_hash_within_project(self):
-        cur = _CommitmentsCursor()
-        payload = {"project": "acme/widget", "open_loops": ["Follow Up With Matt "]}
-        co.open_from_episode(cur, payload, 1)
-        n2 = co.open_from_episode(cur, payload, 2)
-        self.assertEqual(n2, 0)
-        self.assertEqual(len(cur.rows), 1)
-
-    def test_no_open_loops_is_a_noop(self):
-        cur = _CommitmentsCursor()
-        self.assertEqual(co.open_from_episode(cur, {}, 1), 0)
-        self.assertEqual(cur.rows, {})
-
-    def test_blank_and_bad_kind_are_handled(self):
-        cur = _CommitmentsCursor()
-        payload = {"project": "p", "open_loops": [
-            {"text": "  "}, {"text": "review the migration checklist", "kind": "nonsense"},
-        ]}
-        n = co.open_from_episode(cur, payload, 1)
-        self.assertEqual(n, 1)
-        self.assertEqual(list(cur.rows.values())[0]["kind"], "followup")
-
+    pass
 
 class DueAfterParsingTest(unittest.TestCase):
     """fix 1: due_after is free text from the model — lenient parsing, and
@@ -379,92 +344,14 @@ class DueAfterParsingTest(unittest.TestCase):
         self.assertEqual(co._parse_due_after(""), ("NULL", None))
         self.assertEqual(co._parse_due_after(None), ("NULL", None))
 
-    def test_open_from_episode_never_raises_on_free_text_due_after(self):
-        """Integration: the exact reproduction shape — a model-written
-        due_after phrase that is not a date must not blow up the insert."""
-        cur = _CommitmentsCursor()
-        payload = {"project": "acme/widget", "open_loops": [
-            {"text": "ship the release notes", "due_after": "after the release"},
-        ]}
-        n = co.open_from_episode(cur, payload, 11308)
-        self.assertEqual(n, 1)
-        row = list(cur.rows.values())[0]
-        self.assertIsNone(row["due_after"])
-        # The original phrase is not lost — it survives on the commitment text.
-        self.assertIn("after the release", row["text"])
-
-    def test_open_from_episode_stores_relative_interval_marker(self):
-        cur = _CommitmentsCursor()
-        payload = {"project": "acme/widget", "open_loops": [
-            {"text": "follow up with Matt on pricing", "due_after": "in 5 days"},
-        ]}
-        co.open_from_episode(cur, payload, 1)
-        row = list(cur.rows.values())[0]
-        self.assertEqual(row["due_after"], "interval")
-        self.assertNotIn("(due:", row["text"], "a parsed due date is not appended to text")
-
-    def test_open_from_episode_binds_iso_date_as_the_due_after_value(self):
-        cur = _CommitmentsCursor()
-        payload = {"project": "acme/widget", "open_loops": [
-            {"text": "renew the TLS cert for the hub", "due_after": "2026-12-01"},
-        ]}
-        co.open_from_episode(cur, payload, 1)
-        row = list(cur.rows.values())[0]
-        self.assertEqual(row["due_after"], "2026-12-01")
-
 
 class ScopeCoalescingTest(unittest.TestCase):
     """K6 (2026-09-14): the scope key is the episode's resolved ``project``
-    ONLY — a session id is not a project, so open/dedup/auto_close/list never
+    ONLY — a session id is not a project, so open/dedup/historical closing/list never
     fall back to parent_session_id/session_id any more. A NULL project stays
     NULL (real behaviour: a capture with no resolved project groups with
     every other such capture, not with itself alone by session lineage)."""
 
-    def test_a_null_project_stays_null_even_with_a_parent_session_id(self):
-        cur = _CommitmentsCursor()
-        payload = {"parent_session_id": "claude_code:host-1", "open_loops": ["follow up with Matt on pricing"]}
-        co.open_from_episode(cur, payload, 1)
-        row = list(cur.rows.values())[0]
-        self.assertIsNone(row["project"])
-
-    def test_a_null_project_stays_null_even_with_only_a_session_id(self):
-        cur = _CommitmentsCursor()
-        payload = {"session_id": "claude_code:abc123", "open_loops": ["follow up with Matt on pricing"]}
-        co.open_from_episode(cur, payload, 1)
-        row = list(cur.rows.values())[0]
-        self.assertIsNone(row["project"])
-
-    def test_auto_close_matches_using_the_resolved_project_only(self):
-        cur = _CommitmentsCursor()
-        cur._seed("ship the fix", project="acme/widget")
-        payload = {"project": "acme/widget",
-                   "closed_loops": [{"text": "done: ship the fix"}]}
-        with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
-            n = co.auto_close(cur, payload, 2)
-        self.assertEqual(n, 1)
-
-    def test_a_different_project_never_closes_across_scopes(self):
-        cur = _CommitmentsCursor()
-        cur._seed("ship the fix", project="acme/widget")
-        payload = {"project": "acme/other",
-                   "closed_loops": [{"text": "done: ship the fix"}]}
-        with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
-            n = co.auto_close(cur, payload, 2)
-        self.assertEqual(n, 0)
-
-    def test_a_parent_session_id_does_not_close_unrelated_projectless_work(self):
-        from tests.test_audit1010_rsna import _RegistryCursor
-
-        cur = _RegistryCursor()
-        self.addCleanup(cur.conn.close)
-        cur.episode(1, "other-session")
-        cid = cur.commitment("ship the fix", project=None)
-        payload = {"parent_session_id": "claude_code:host-1",
-                   "closed_loops": [{"text": "done: ship the fix"}]}
-        with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
-            n = co.auto_close(cur, payload, 2)
-        self.assertEqual(n, 0)
-        self.assertEqual(cur.value("commitments", cid, "status"), "open")
 
     def test_list_owed_accepts_parent_session_id_as_the_scope_key(self):
         from tests.test_audit1010_rsna import _RegistryCursor
@@ -477,177 +364,15 @@ class ScopeCoalescingTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["text"], "a")
 
-    def test_null_scope_dedup_falls_back_to_the_in_code_check(self):
-        from tests.test_audit1010_rsna import _RegistryCursor
-
-        cur = _RegistryCursor()
-        self.addCleanup(cur.conn.close)
-        payload = {"open_loops": ["truly unscoped follow up"]}
-        n1 = co.open_from_episode(cur, payload, 1)
-        n2 = co.open_from_episode(cur, payload, 2)
-        self.assertEqual(n1, 1)
-        self.assertEqual(n2, 1, "episodes without lineage must remain independent")
-        self.assertEqual(co.open_from_episode(cur, payload, 2), 0)
-        self.assertEqual(cur.conn.execute("SELECT count(*) FROM commitments").fetchone()[0], 2)
 
 
 class AutoCloseTest(unittest.TestCase):
     def _open(self, cur, text, project="acme/widget", episode=1):
         cur._seed(text, project=project, episode=episode)
 
-    def test_explicit_done_prefix_closes_unconditionally(self):
-        cur = _CommitmentsCursor()
-        self._open(cur, "totally unrelated wording")
-        payload = {"project": "acme/widget", "closed_loops": [{"text": "done: totally unrelated wording"}]}
-        with mock.patch.object(co, "_cosine_scores", _no_cosine):
-            n = co.auto_close(cur, payload, 99)
-        self.assertEqual(n, 1)
-        row = list(cur.rows.values())[0]
-        self.assertEqual(row["status"], "closed")
-        self.assertEqual(row["closed_episode"], 99)
-        self.assertIn("explicit done", row["close_reason"])
-
-    def test_jaccard_fallback_closes_a_similar_closed_loop(self):
-        cur = _CommitmentsCursor()
-        self._open(cur, "follow up with Matt about the deploy plan")
-        payload = {"project": "acme/widget",
-                   "closed_loops": [{"text": "follow up with Matt about the deploy plan"}]}
-        with mock.patch.object(co, "_cosine_scores", _no_cosine):
-            n = co.auto_close(cur, payload, 5)
-        self.assertEqual(n, 1)
-
-    def test_dissimilar_text_does_not_close(self):
-        cur = _CommitmentsCursor()
-        self._open(cur, "follow up with Matt about the deploy plan")
-        payload = {"project": "acme/widget", "closed_loops": [{"text": "completely different subject"}]}
-        with mock.patch.object(co, "_cosine_scores", _no_cosine):
-            n = co.auto_close(cur, payload, 5)
-        self.assertEqual(n, 0)
-        self.assertEqual(list(cur.rows.values())[0]["status"], "open")
-
-    def test_short_closed_loop_phrase_keeps_longer_commitment_open(self):
-        cur = _CommitmentsCursor()
-        self._open(cur, "run the crimson lantern audit after the widget-42 release ships")
-        payload = {"project": "acme/widget", "closed_loops": [{"text": "crimson lantern audit"}]}
-        with mock.patch.object(co, "_cosine_scores", _no_cosine):
-            n = co.auto_close(cur, payload, 12)
-        self.assertEqual(n, 0)
-        self.assertEqual(list(cur.rows.values())[0]["status"], "open")
-
-    def test_decision_with_done_prefix_also_closes(self):
-        cur = _CommitmentsCursor()
-        self._open(cur, "ship the fix")
-        payload = {"project": "acme/widget", "decisions": ["done: ship the fix"]}
-        with mock.patch.object(co, "_cosine_scores", _no_cosine):
-            n = co.auto_close(cur, payload, 7)
-        self.assertEqual(n, 1)
-
-    def test_no_candidates_or_no_open_commitments_is_a_noop(self):
-        cur = _CommitmentsCursor()
-        self.assertEqual(co.auto_close(cur, {"project": "p"}, 1), 0)
-        self._open(cur, "something")
-        self.assertEqual(co.auto_close(cur, {"project": "p"}, 1), 0)
-
-    def test_different_project_never_closes(self):
-        cur = _CommitmentsCursor()
-        self._open(cur, "follow up", project="acme/widget")
-        payload = {"project": "other/repo", "closed_loops": [{"text": "follow up"}]}
-        with mock.patch.object(co, "_cosine_scores", _no_cosine):
-            n = co.auto_close(cur, payload, 1)
-        self.assertEqual(n, 0)
-
-    def test_each_open_commitment_closes_at_most_once(self):
-        cur = _CommitmentsCursor()
-        self._open(cur, "ship the fix")
-        payload = {"project": "acme/widget", "closed_loops": [
-            {"text": "done: ship the fix"}, {"text": "done: ship the fix"},
-        ]}
-        with mock.patch.object(co, "_cosine_scores", _no_cosine):
-            n = co.auto_close(cur, payload, 1)
-        self.assertEqual(n, 1)
-
-    def test_explicit_done_closes_the_best_match_not_the_first_row(self):
-        """fix 4: multiple open commitments — an explicit 'done:' close must
-        pick the one whose text actually matches, not whatever the DB
-        happened to return first."""
-        cur = _CommitmentsCursor()
-        self._open(cur, "unrelated topic entirely", episode=1)
-        self._open(cur, "ship the mobile release fix", episode=1)
-        self._open(cur, "another unrelated item", episode=1)
-        payload = {"project": "acme/widget",
-                   "closed_loops": [{"text": "done: ship the mobile release fix"}]}
-        with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
-            n = co.auto_close(cur, payload, 99)
-        self.assertEqual(n, 1)
-        closed = [r for r in cur.rows.values() if r["status"] == "closed"]
-        self.assertEqual(len(closed), 1)
-        self.assertEqual(closed[0]["text"], "ship the mobile release fix")
-
-    def test_explicit_done_closes_nothing_when_no_candidate_clears_the_bar(self):
-        """fix 4: if the done-phrase doesn't resemble ANY open commitment,
-        nothing closes — an explicit done: prefix is not a license to close
-        an arbitrary row."""
-        cur = _CommitmentsCursor()
-        self._open(cur, "totally different subject matter here")
-        payload = {"project": "acme/widget",
-                   "closed_loops": [{"text": "done: zzz qqq xyz nonsense words"}]}
-        with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
-            n = co.auto_close(cur, payload, 1)
-        self.assertEqual(n, 0)
-        self.assertEqual(list(cur.rows.values())[0]["status"], "open")
-
-    def test_explicit_done_never_calls_the_embed_api(self):
-        """fix 5a: an explicit done: close is text-matched only — no cosine/
-        embed API call, ever."""
-        cur = _CommitmentsCursor()
-        self._open(cur, "ship the fix")
-        payload = {"project": "acme/widget", "closed_loops": [{"text": "done: ship the fix"}]}
-        with mock.patch.object(co, "_cosine_scores") as m_cosine, \
-                mock.patch.object(co, "_has_commitment_embeddings") as m_has_emb:
-            n = co.auto_close(cur, payload, 1)
-        self.assertEqual(n, 1)
-        m_cosine.assert_not_called()
-        m_has_emb.assert_not_called()
-
-    def test_non_explicit_close_skips_cosine_when_no_embeddings_exist(self):
-        """fix 5b: for a non-explicit closed_loop, cosine is only attempted
-        when commitment embeddings actually exist for the scope; otherwise
-        it falls straight to Jaccard with no API call."""
-        cur = _CommitmentsCursor()
-        self._open(cur, "follow up with Matt about the deploy plan")
-        payload = {"project": "acme/widget",
-                   "closed_loops": [{"text": "follow up with Matt about the deploy plan"}]}
-        with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings), \
-                mock.patch.object(co, "_cosine_scores") as m_cosine:
-            n = co.auto_close(cur, payload, 5)
-        self.assertEqual(n, 1)
-        m_cosine.assert_not_called()
-
-    def test_non_explicit_close_attempts_cosine_when_embeddings_exist(self):
-        """fix 5b, positive case: a closed_loop whose wording does NOT overlap
-        the commitment text (so the text/containment bar fails) still closes
-        via cosine when the scope's commitments are embedded — here the cosine
-        score is forced strong. This is the semantic-paraphrase path."""
-        cur = _CommitmentsCursor()
-        self._open(cur, "follow up with Matt about the deploy plan")
-        cid = list(cur.rows.keys())[0]
-        payload = {"project": "acme/widget", "closed_loops": [{"text": "completely different wording"}]}
-        with mock.patch.object(co, "_has_commitment_embeddings", _has_embeddings), \
-                mock.patch.object(co, "_cosine_scores", return_value={cid: 0.95}):
-            n = co.auto_close(cur, payload, 5)
-        self.assertEqual(n, 1)
-        self.assertEqual(cur.rows[cid]["status"], "closed")
-
 
 class MarkStaleTest(unittest.TestCase):
-    def test_open_commitments_flip_to_stale(self):
-        cur = _CommitmentsCursor()
-        cur._seed("a", project="p")
-        cur._seed("b", project="p")
-        n = co.mark_stale(cur)
-        self.assertEqual(n, 2)
-        self.assertTrue(all(r["status"] == "stale" for r in cur.rows.values()))
-
+    pass
 
 class ListOwedAndSetStatusTest(unittest.TestCase):
     def test_list_owed_filters_by_project_and_status(self):
@@ -756,15 +481,6 @@ class PrecisionFilterTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(co.rejection_reason(text), text)
 
-    def test_open_from_episode_drops_the_rejects_before_insert(self):
-        cur = _CommitmentsCursor()
-        payload = {"project": "acme/widget", "open_loops": [
-            "Drive 46 is still running",
-            "Send 'screen free' message to Khipu session",
-            "Matt to decide whether 0.3.17 ships with the seal fix",
-        ]}
-        self.assertEqual(co.open_from_episode(cur, payload, 1), 0)
-        self.assertEqual(list(cur.rows.values()), [])
 
 
 class OpenDedupTest(unittest.TestCase):
@@ -775,79 +491,14 @@ class OpenDedupTest(unittest.TestCase):
         "Check whether the seal fix ships in 0.3.17",
     ]}
 
-    def test_paraphrase_does_not_open_a_second_row(self):
-        cur = _CommitmentsCursor(migrated=True)
-        co.open_from_episode(cur, self.payload, 1)
-        again = {"project": "acme/widget", "open_loops": [
-            "Check whether the seal fix ships in 0.3.17 or waits",
-        ]}
-        with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
-            self.assertEqual(co.open_from_episode(cur, again, 2), 0)
-        self.assertEqual(len(cur.rows), 1)
-
-    def test_a_restatement_touches_last_seen_and_seen_count(self):
-        cur = _CommitmentsCursor(migrated=True)
-        co.open_from_episode(cur, self.payload, 1)
-        with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
-            co.open_from_episode(cur, self.payload, 2)
-        row = list(cur.rows.values())[0]
-        self.assertEqual(row["seen_count"], 2)
-        self.assertIsNotNone(row["last_seen_at"])
-
-    def test_pre_migration_hub_still_dedups_without_touching(self):
-        cur = _CommitmentsCursor(migrated=False)
-        co.open_from_episode(cur, self.payload, 1)
-        with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
-            self.assertEqual(co.open_from_episode(cur, self.payload, 2), 0)
-        self.assertEqual(len(cur.rows), 1)
-        self.assertEqual(list(cur.rows.values())[0]["seen_count"], 1)
-
-    def test_cosine_catches_a_paraphrase_that_shares_no_tokens(self):
-        cur = _CommitmentsCursor(migrated=True)
-        co.open_from_episode(cur, self.payload, 1)
-        cid = list(cur.rows.keys())[0]
-        other = {"project": "acme/widget", "open_loops": [
-            "Investigate release readiness and deployment status",
-        ]}
-        with mock.patch.object(co, "_has_commitment_embeddings", _has_embeddings), \
-                mock.patch.object(co, "_cosine_scores", return_value={cid: 0.93}):
-            self.assertEqual(co.open_from_episode(cur, other, 2), 0)
-        self.assertEqual(len(cur.rows), 1)
-
-    def test_an_unrelated_item_still_opens(self):
-        cur = _CommitmentsCursor(migrated=True)
-        co.open_from_episode(cur, self.payload, 1)
-        other = {"project": "acme/widget", "open_loops": [
-            "Renew the TLS cert for the hub before December",
-        ]}
-        with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
-            self.assertEqual(co.open_from_episode(cur, other, 2), 1)
-        self.assertEqual(len(cur.rows), 2)
-
 
 class StaleRuleTest(unittest.TestCase):
     """Item 3: expiry by SILENCE, per kind, and never before a live due date."""
 
-    def test_followups_and_promises_age_out_at_14_days(self):
-        sql = " ".join(co.stale_sql(has_last_seen=True).split())
-        self.assertIn("kind IN ('followup', 'promise')", sql)
-        self.assertIn("interval '14 days'", sql)
 
-    def test_blockers_and_questions_age_out_at_30_days(self):
-        sql = " ".join(co.stale_sql(has_last_seen=True).split())
-        self.assertIn("ELSE interval '30 days'", sql)
 
-    def test_a_future_due_date_is_never_stale(self):
-        sql = " ".join(co.stale_sql(has_last_seen=True).split())
-        self.assertIn("(due_after IS NULL OR due_after <= now())", sql)
 
-    def test_silence_is_measured_from_last_seen_when_the_column_exists(self):
-        self.assertIn("COALESCE(last_seen_at, opened_at)", co.stale_sql(has_last_seen=True))
 
-    def test_pre_migration_hub_falls_back_to_opened_at(self):
-        sql = co.stale_sql(has_last_seen=False)
-        self.assertNotIn("last_seen_at", sql)
-        self.assertIn("GREATEST(opened_at, due_after) <", " ".join(sql.split()))
 
 
 class SessionPlanClosureTest(unittest.TestCase):
@@ -859,83 +510,6 @@ class SessionPlanClosureTest(unittest.TestCase):
         cur._seed("Drive 46 is still running", episode=7, session_id="claude:s1")
         cur._seed("Generate the UI mocks for the Owed screen", episode=7, session_id="claude:s1")
         return cur
-
-    def test_sessionend_closes_every_assistant_item_of_that_session(self):
-        """The session-ended rule (2026-09-04): an assistant commitment with
-        no cross-session trigger dies with its session — the in-flight status
-        line AND the plain plan step, not just the plan-shaped one."""
-        cur = self._cur()
-        payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "sessionend"}
-        self.assertEqual(co.close_session_plan(cur, payload, 9), 2)
-        closed = [r for r in cur.rows.values() if r["status"] == "closed"]
-        self.assertEqual({r["close_reason"] for r in closed}, {"session-ended"})
-
-    def test_a_future_trigger_promise_survives_its_own_sessionend(self):
-        cur = _CommitmentsCursor(migrated=True)
-        cur._seed("Send Matt the restore numbers next session", kind="promise",
-                  episode=7, session_id="claude:s1")
-        cur._seed("Run oracle.sh when Matt says the lane is re-authed",
-                  episode=7, session_id="claude:s1")
-        cur._seed("Rebuild the index and paste the timings", episode=7, session_id="claude:s1")
-        payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "sessionend"}
-        self.assertEqual(co.close_session_plan(cur, payload, 9), 1)
-        still_open = {r["text"] for r in cur.rows.values() if r["status"] == "open"}
-        self.assertEqual(still_open, {
-            "Send Matt the restore numbers next session",
-            "Run oracle.sh when Matt says the lane is re-authed",
-        })
-
-    def test_a_restated_row_survives_the_opening_sessions_sessionend(self):
-        cur = _CommitmentsCursor(migrated=True)
-        cid = cur._seed("Rebuild the index and paste the timings", episode=7,
-                        session_id="claude:s1")
-        cur.rows[cid]["seen_count"] = 2
-        cur.rows[cid]["last_seen_at"] = "now"
-        payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "sessionend"}
-        self.assertEqual(co.close_session_plan(cur, payload, 9), 0)
-        self.assertEqual(cur.rows[cid]["status"], "open")
-
-    def test_event_is_read_from_scope_when_the_payload_predates_the_field(self):
-        cur = self._cur()
-        payload = {"project": "acme/widget", "session_id": "claude:s1", "scope": "claude sessionend"}
-        self.assertEqual(co.close_session_plan(cur, payload, 9), 2)
-
-    def test_a_stop_capture_closes_nothing_on_its_own(self):
-        cur = self._cur()
-        payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "stop"}
-        self.assertEqual(co.close_session_plan(cur, payload, 9), 0)
-
-    def test_idle_sweep_keeps_stop_semantics_even_with_a_sessionend_scope(self):
-        cur = self._cur()
-        payload = {"project": "acme/widget", "session_id": "claude:s1",
-                   "event": "idle_sweep", "scope": "claude sessionend"}
-        self.assertEqual(co.close_session_plan(cur, payload, 9), 0)
-        payload["closed_loops"] = [{"text": "Drive 46 is still running"}]
-        self.assertEqual(co.close_session_plan(cur, payload, 9), 1)
-
-    def test_a_mention_in_closed_loops_closes_it_without_sessionend(self):
-        cur = self._cur()
-        payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "stop",
-                   "closed_loops": [{"text": "Drive 46 is still running"}]}
-        self.assertEqual(co.close_session_plan(cur, payload, 9), 1)
-
-    def test_another_sessions_commitments_are_untouched(self):
-        cur = self._cur()
-        cur._seed("Drive 12 is still running", episode=8, session_id="claude:s2")
-        payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "sessionend"}
-        co.close_session_plan(cur, payload, 9)
-        other = next(r for r in cur.rows.values() if r["text"] == "Drive 12 is still running")
-        self.assertEqual(other["status"], "open")
-
-    def test_user_owed_items_are_never_closed_this_way(self):
-        cur = _CommitmentsCursor(migrated=True)
-        cur._seed("Matt is waiting on the pricing sheet", kind="question",
-                  episode=7, session_id="claude:s1")
-        cur._seed("Matt is waiting on the licence decision", kind="followup",
-                  owner="user", episode=7, session_id="claude:s1")
-        payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "sessionend"}
-        self.assertEqual(co.close_session_plan(cur, payload, 9), 0)
-        self.assertTrue(all(r["status"] == "open" for r in cur.rows.values()))
 
 
 class OwedOutputTest(unittest.TestCase):
@@ -1155,56 +729,10 @@ class ReportingRuleTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(co.rejection_reason(text), text)
 
-    def test_open_from_episode_never_opens_one(self):
-        cur = _CommitmentsCursor(migrated=True)
-        payload = {"project": "acme/widget", "open_loops": [
-            "Reply with the SHA each PR now points at.",
-            "Matt to decide whether 0.3.17 ships with the seal fix",
-        ]}
-        self.assertEqual(co.open_from_episode(cur, payload, 1), 0)
-        self.assertEqual(list(cur.rows.values()), [])
 
 
 class OpenStoresOwnerAndTriggerTest(unittest.TestCase):
-    def test_owner_is_stored_normalised(self):
-        cur = _CommitmentsCursor(migrated=True)
-        payload = {"project": "acme/widget", "open_loops": [
-            {"text": "Matt must merge the stacked PRs", "owner": "Matt"},
-            {"text": "Rebuild the search index", "owner": "Peer 1"},
-        ]}
-        self.assertEqual(co.open_from_episode(cur, payload, 1), 1)
-        owners = {r["text"]: r["owner"] for r in cur.rows.values()}
-        self.assertNotIn("Matt must merge the stacked PRs", owners)
-        self.assertEqual(owners["Rebuild the search index"], "assistant")
-
-    def test_future_trigger_is_stored_when_the_column_exists(self):
-        cur = _CommitmentsCursor(migrated=True, trigger=True)
-        payload = {"project": "acme/widget", "open_loops": [
-            "Send Matt the restore-drill numbers next session",
-            "Rebuild the search index",
-        ]}
-        self.assertEqual(co.open_from_episode(cur, payload, 1), 2)
-        flags = {r["text"]: r["future_trigger"] for r in cur.rows.values()}
-        self.assertTrue(flags["Send Matt the restore-drill numbers next session"])
-        self.assertFalse(flags["Rebuild the search index"])
-
-    def test_the_model_cannot_override_the_deterministic_trigger(self):
-        cur = _CommitmentsCursor(migrated=True, trigger=True)
-        payload = {"project": "acme/widget", "open_loops": [
-            {"text": "Rebuild the search index", "future_trigger": True},
-        ]}
-        co.open_from_episode(cur, payload, 1)
-        self.assertFalse(list(cur.rows.values())[0]["future_trigger"])
-
-    def test_a_pre_migration_hub_opens_without_the_column(self):
-        cur = _CommitmentsCursor(migrated=True, trigger=False)
-        payload = {"project": "acme/widget", "open_loops": [
-            "Send Matt the restore-drill numbers next session",
-        ]}
-        self.assertEqual(co.open_from_episode(cur, payload, 1), 1)
-        stmt = next(s for s in cur.statements if s.startswith("INSERT INTO commitments"))
-        self.assertNotIn("future_trigger", stmt)
-
+    pass
 
 class DroppedStatusTest(unittest.TestCase):
     def test_set_status_accepts_dropped_and_still_rejects_junk(self):

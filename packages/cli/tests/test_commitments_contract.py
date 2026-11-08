@@ -133,53 +133,13 @@ class UntilLineTest(unittest.TestCase):
 
 
 class DeferralNeverClosesAtSessionEndTest(unittest.TestCase):
-    """close_session_plan must never close a row whose text carries a future
+    """historical session closure must never close a row whose text carries a future
     trigger — including the O1 shapes that used to slip through
     (has_future_trigger was False for them, so 'session-ended' fired)."""
 
-    def test_a_deferred_until_row_survives_sessionend(self):
-        cur = _CommitmentsCursor(migrated=True)
-        cur._seed(
-            "Run the oracle again until the ledger closes.",
-            owner="assistant", kind="followup", session_id="claude:s1",
-        )
-        payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "sessionend"}
-        closed = co.close_session_plan(cur, payload, 9)
-        self.assertEqual(closed, 0)
-        self.assertTrue(all(r["status"] == "open" for r in cur.rows.values()))
-
-    def test_a_before_clause_row_survives_sessionend(self):
-        cur = _CommitmentsCursor(migrated=True)
-        cur._seed(
-            "Ship the notes before the wave lands.",
-            owner="assistant", kind="followup", session_id="claude:s1",
-        )
-        payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "sessionend"}
-        closed = co.close_session_plan(cur, payload, 9)
-        self.assertEqual(closed, 0)
-
 
 class OpenFromEpisodeStoresTriggerTextTest(unittest.TestCase):
-    def test_trigger_text_is_stored_when_the_column_exists(self):
-        cur = _CommitmentsCursor(migrated=True, trigger=True, trigger_text=True)
-        payload = {"project": "acme/widget", "open_loops": [
-            {"text": "Run the oracle again until the ledger closes.",
-             "kind": "followup", "owner": "assistant"},
-        ]}
-        self.assertEqual(co.open_from_episode(cur, payload, 1), 1)
-        row = next(iter(cur.rows.values()))
-        self.assertTrue(row["future_trigger"])
-        self.assertIsNotNone(row["trigger_text"])
-        assert row["trigger_text"] is not None
-        self.assertTrue(row["trigger_text"].lower().startswith("until"))
-
-    def test_a_pre_migration_hub_opens_without_the_column(self):
-        cur = _CommitmentsCursor(migrated=True)  # no trigger/trigger_text columns
-        payload = {"project": "acme/widget", "open_loops": [
-            "Run the oracle again until the ledger closes.",
-        ]}
-        self.assertEqual(co.open_from_episode(cur, payload, 1), 1)
-
+    pass
 
 class ListOwedShowsUntilLineTest(unittest.TestCase):
     def test_list_owed_carries_an_until_line_for_a_deferred_row(self):
@@ -343,188 +303,29 @@ class _DecisionsCursor:
 
 
 class DecisionsInsertTest(unittest.TestCase):
-    def test_each_string_becomes_a_row(self):
-        cur = _DecisionsCursor()
-        payload = {"project": "acme/widget", "session_id": "claude:s1",
-                   "ts": "2026-09-14T10:00:00+00:00",
-                   "decisions": ["Ship 0.4.4 with the seal fix", "Use AGPL-3.0 + CLA"]}
-        n = de.insert_decisions_from_episode(cur, payload, 42)
-        self.assertEqual(n, 2)
-        self.assertEqual(len(cur.rows), 2)
-        texts = {r["text"] for r in cur.rows.values()}
-        self.assertEqual(texts, {"Ship 0.4.4 with the seal fix", "Use AGPL-3.0 + CLA"})
+    pass
 
-    def test_dedups_the_same_text_in_the_same_project_within_30_days(self):
-        cur = _DecisionsCursor()
-        payload1 = {"project": "acme/widget", "ts": "2026-09-01T10:00:00+00:00",
-                    "decisions": ["Ship 0.4.4 with the seal fix"]}
-        payload2 = {"project": "acme/widget", "ts": "2026-09-10T10:00:00+00:00",
-                    "decisions": ["Ship 0.4.4 with the seal fix"]}
-        self.assertEqual(de.insert_decisions_from_episode(cur, payload1, 1), 1)
-        self.assertEqual(de.insert_decisions_from_episode(cur, payload2, 2), 0)
-        self.assertEqual(len(cur.rows), 1)
 
-    def test_outside_the_30_day_window_is_a_new_row(self):
-        cur = _DecisionsCursor()
-        payload1 = {"project": "acme/widget", "ts": "2026-01-01T10:00:00+00:00",
-                    "decisions": ["Ship 0.4.4 with the seal fix"]}
-        payload2 = {"project": "acme/widget", "ts": "2026-09-10T10:00:00+00:00",
-                    "decisions": ["Ship 0.4.4 with the seal fix"]}
-        self.assertEqual(de.insert_decisions_from_episode(cur, payload1, 1), 1)
-        self.assertEqual(de.insert_decisions_from_episode(cur, payload2, 2), 1)
-        self.assertEqual(len(cur.rows), 2)
 
-    def test_different_projects_do_not_dedup_each_other(self):
-        cur = _DecisionsCursor()
-        payload1 = {"project": "acme/widget", "ts": "2026-09-01T10:00:00+00:00",
-                    "decisions": ["Ship 0.4.4 with the seal fix"]}
-        payload2 = {"project": "acme/other", "ts": "2026-09-02T10:00:00+00:00",
-                    "decisions": ["Ship 0.4.4 with the seal fix"]}
-        self.assertEqual(de.insert_decisions_from_episode(cur, payload1, 1), 1)
-        self.assertEqual(de.insert_decisions_from_episode(cur, payload2, 2), 1)
-        self.assertEqual(len(cur.rows), 2)
 
-    def test_pre_migration_hub_is_a_noop(self):
-        cur = _DecisionsCursor(migrated=False)
-        payload = {"project": "acme/widget", "ts": "2026-09-14T10:00:00+00:00",
-                   "decisions": ["Ship 0.4.4 with the seal fix"]}
-        self.assertEqual(de.insert_decisions_from_episode(cur, payload, 1), 0)
-        self.assertEqual(len(cur.rows), 0)
 
-    def test_no_decisions_is_a_noop(self):
-        cur = _DecisionsCursor()
-        self.assertEqual(de.insert_decisions_from_episode(cur, {"project": "acme/widget"}, 1), 0)
 
 
 class DecisionsListAndSupersedeTest(unittest.TestCase):
-    def test_list_decisions_filters_by_project_and_since(self):
-        cur = _DecisionsCursor()
-        de.insert_decisions_from_episode(
-            cur, {"project": "acme/widget", "ts": "2026-09-01T10:00:00+00:00",
-                  "decisions": ["Old decision"]}, 1,
-        )
-        de.insert_decisions_from_episode(
-            cur, {"project": "acme/widget", "ts": "2026-09-14T10:00:00+00:00",
-                  "decisions": ["New decision"]}, 2,
-        )
-        de.insert_decisions_from_episode(
-            cur, {"project": "acme/other", "ts": "2026-09-14T10:00:00+00:00",
-                  "decisions": ["Other project decision"]}, 3,
-        )
-        rows = de.list_decisions(cur, project="acme/widget", since="2026-09-05T00:00:00+00:00")
-        self.assertEqual([r["text"] for r in rows], ["New decision"])
+    pass
 
-    def test_supersede_marks_the_old_row_and_is_idempotent(self):
-        cur = _DecisionsCursor()
-        de.insert_decisions_from_episode(
-            cur, {"project": "acme/widget", "ts": "2026-09-01T10:00:00+00:00",
-                  "decisions": ["Use Apache 2.0"]}, 1,
-        )
-        de.insert_decisions_from_episode(
-            cur, {"project": "acme/widget", "ts": "2026-09-14T10:00:00+00:00",
-                  "decisions": ["Use AGPL-3.0 + CLA"]}, 2,
-        )
-        old_id = next(r["id"] for r in cur.rows.values() if r["text"] == "Use Apache 2.0")
-        new_id = next(r["id"] for r in cur.rows.values() if r["text"] == "Use AGPL-3.0 + CLA")
-        self.assertTrue(de.supersede(cur, old_id, new_id))
-        self.assertEqual(cur.rows[old_id]["superseded_by"], new_id)
-        # a second call is a no-op (already superseded), not an error
-        self.assertFalse(de.supersede(cur, old_id, new_id))
 
-    def test_supersede_across_projects_needs_force(self):
-        """Phase 2A: cross-project supersession is refused by default
-        (Evidence rule #3, "supersession requires matching scope") — `force`
-        opts back into the old, unrestricted behavior."""
-        cur = _DecisionsCursor()
-        de.insert_decisions_from_episode(
-            cur, {"project": "acme/widget", "ts": "2026-09-01T10:00:00+00:00",
-                  "decisions": ["Use Apache 2.0"]}, 1,
-        )
-        de.insert_decisions_from_episode(
-            cur, {"project": "acme/other", "ts": "2026-09-14T10:00:00+00:00",
-                  "decisions": ["Use AGPL-3.0 + CLA"]}, 2,
-        )
-        old_id = next(r["id"] for r in cur.rows.values() if r["text"] == "Use Apache 2.0")
-        new_id = next(r["id"] for r in cur.rows.values() if r["text"] == "Use AGPL-3.0 + CLA")
-        with self.assertRaises(ValueError):
-            de.supersede(cur, old_id, new_id)
-        self.assertIsNone(cur.rows[old_id]["superseded_by"])
-        self.assertTrue(de.supersede(cur, old_id, new_id, force=True))
-        self.assertEqual(cur.rows[old_id]["superseded_by"], new_id)
 
-    def test_list_decisions_can_exclude_superseded(self):
-        cur = _DecisionsCursor()
-        de.insert_decisions_from_episode(
-            cur, {"project": "acme/widget", "ts": "2026-09-01T10:00:00+00:00",
-                  "decisions": ["Use Apache 2.0"]}, 1,
-        )
-        de.insert_decisions_from_episode(
-            cur, {"project": "acme/widget", "ts": "2026-09-14T10:00:00+00:00",
-                  "decisions": ["Use MIT instead"]}, 2,
-        )
-        old_id = next(r["id"] for r in cur.rows.values() if r["text"] == "Use Apache 2.0")
-        new_id = next(r["id"] for r in cur.rows.values() if r["text"] == "Use MIT instead")
-        de.supersede(cur, old_id, new_id)
-        rows = de.list_decisions(cur, project="acme/widget", include_superseded=False)
-        self.assertEqual([r["text"] for r in rows], ["Use MIT instead"])
 
 
 class DecisionsSearchEnrichmentTest(unittest.TestCase):
-    def test_episode_rows_get_current_and_superseded_counts(self):
-        cur = _DecisionsCursor()
-        de.insert_decisions_from_episode(
-            cur, {"project": "acme/widget", "ts": "2026-09-01T10:00:00+00:00",
-                  "decisions": ["Use Apache 2.0"]}, 101,
-        )
-        de.insert_decisions_from_episode(
-            cur, {"project": "acme/widget", "ts": "2026-09-14T10:00:00+00:00",
-                  "decisions": ["Use AGPL-3.0 + CLA"]}, 101,
-        )
-        old_id = next(r["id"] for r in cur.rows.values() if r["text"] == "Use Apache 2.0")
-        new_id = next(r["id"] for r in cur.rows.values() if r["text"] == "Use AGPL-3.0 + CLA")
-        de.supersede(cur, old_id, new_id)
-        results = [{"kind": "episode", "id": "101", "label": "licence episode"},
-                   {"kind": "topic", "id": "licensing"}]
-        out = de.enrich_search_results(cur, results)
-        episode_row = next(r for r in out if r["kind"] == "episode")
-        self.assertEqual(episode_row["decisions_current"], 1)
-        self.assertEqual(episode_row["decisions_superseded"], 1)
-        topic_row = next(r for r in out if r["kind"] == "topic")
-        self.assertNotIn("decisions_current", topic_row)
+    pass
 
 
 class DecisionsBackfillTest(unittest.TestCase):
-    def test_dry_run_counts_without_writing(self):
-        cur = _DecisionsCursor()
-        cur.episodes = [
-            (1, "acme/widget", "claude:s1", ["Ship 0.4.4 with the seal fix"],
-             "2026-09-01T10:00:00+00:00"),
-            (2, "acme/widget", "claude:s2", ["Use AGPL-3.0 + CLA"],
-             "2026-09-02T10:00:00+00:00"),
-        ]
-        report = de.backfill_decisions(cur, apply=False)
-        self.assertEqual(report["episodes_scanned"], 2)
-        self.assertEqual(report["decisions_inserted"], 2)
-        self.assertTrue(report["dry_run"])
-        self.assertEqual(len(cur.rows), 0)  # dry run never writes
+    pass
 
-    def test_apply_actually_inserts_and_is_idempotent(self):
-        cur = _DecisionsCursor()
-        cur.episodes = [
-            (1, "acme/widget", "claude:s1", ["Ship 0.4.4 with the seal fix"],
-             "2026-09-01T10:00:00+00:00"),
-        ]
-        report1 = de.backfill_decisions(cur, apply=True)
-        self.assertEqual(report1["decisions_inserted"], 1)
-        self.assertEqual(len(cur.rows), 1)
-        report2 = de.backfill_decisions(cur, apply=True)
-        self.assertEqual(report2["decisions_inserted"], 0)  # already backfilled
-        self.assertEqual(len(cur.rows), 1)
 
-    def test_pre_migration_hub_refuses_cleanly(self):
-        cur = _DecisionsCursor(migrated=False)
-        report = de.backfill_decisions(cur, apply=False)
-        self.assertFalse(report.get("ok", True))
 
 
 # ---- O4: deliverables index -------------------------------------------------
@@ -674,12 +475,6 @@ class DeliverablesInsertTest(unittest.TestCase):
         ]}
         self.assertEqual(dl.insert_deliverables_from_episode(cur, payload, 1), 0)
 
-    def test_pre_migration_hub_is_a_noop(self):
-        cur = _DeliverablesCursor(migrated=False)
-        payload = {"project": "acme/widget", "deliverables": [
-            {"kind": "file", "path": "khipu/decisions.py"},
-        ]}
-        self.assertEqual(dl.insert_deliverables_from_episode(cur, payload, 1), 0)
 
 
 class DeliverablesMatcherTest(unittest.TestCase):

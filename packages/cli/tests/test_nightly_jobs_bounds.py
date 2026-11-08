@@ -288,13 +288,13 @@ def test_a_library_over_the_nightly_cap_is_not_a_failed_embed_step(monkeypatch):
     assert res["ok"] is True, res
 
 
-def test_failed_close_rules_query_cache_and_ledger_steps_turn_a_doctor_row_red(monkeypatch):
+def test_failed_query_cache_and_ledger_steps_turn_a_doctor_row_red(monkeypatch):
     now = datetime.now(timezone.utc).isoformat()
     names_ok = ["sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
-                "commitments_mark_stale", "commitments_hygiene", "snapshot_refresh"]
+                "snapshot_refresh"]
     steps = [{"name": n, "ok": True, "counts": None, "error": None, "ts": now} for n in names_ok]
     steps += [{"name": n, "ok": False, "counts": None, "error": "boom", "ts": now}
-              for n in ("commitments_close_rules", "query_cache_prune", "ledger")]
+              for n in ("query_cache_prune", "ledger")]
     jobs._nightly_last_path().write_text(json.dumps({"steps": steps}))
     monkeypatch.setattr(jobs, "_is_index_sync_host", lambda: True)
     monkeypatch.setattr(jobs, "_job_entry", lambda name: {

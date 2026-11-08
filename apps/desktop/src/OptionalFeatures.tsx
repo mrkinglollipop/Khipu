@@ -58,20 +58,6 @@ export const REJECTED_FEATURES: ReadonlyArray<FeatureRow> = [
     what: "Search also offers results reached by following links in the knowledge graph.",
     found: "A blind judge preferred the results without it 59 to 4, with 18 ties.",
   },
-  {
-    name: "decision_details",
-    label: "Record a reason and a time for each decision",
-    what: "When a session is captured, each decision also records why it was made and when it took effect.",
-    found:
-      "With it on, 1 transcript in 10 lost all its decisions. Decisions per run went from 4.6 to 4.3.",
-  },
-  {
-    name: "auto_supersede",
-    label: "Mark a decision replaced without asking",
-    what: "When a new decision reverses an earlier one, the earlier one is marked replaced automatically.",
-    found: "It relies on the switch above, so it carries the same risk: with that one on, 1 transcript in 10 lost all its decisions.",
-    needs: { name: "decision_details", label: "“Record a reason and a time for each decision”" },
-  },
 ];
 
 /* Routing truth, phase 3a (docs/plans/2026-10-14-routing-truth.md). Off by

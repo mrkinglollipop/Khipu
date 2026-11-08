@@ -41,7 +41,7 @@ def _closed_by_decision(pg, *, forget_first=False):
     _, did = _ids(pg, victim)
     if forget_first:
         assert forget.forget_everywhere(victim, memory_root=pg.memory, gateway=False).get("soft_deleted")
-    # What close_by_rule writes for a strict decision close (close_rules._decision_rule).
+    # Historical metadata for a strict decision close.
     with pg.connect() as conn:
         conn.execute("UPDATE commitments SET status='closed', closed_at=now(), closed_episode=%s, close_reason=%s, "
                      "closed_by='rule', close_rule_key=%s, close_evidence=%s::jsonb WHERE id=%s",

@@ -471,7 +471,6 @@ def _run_nightly_locked() -> int:
     changes_result = _fact_changes_prune()
     _record_nightly_step(steps, "fact_changes_prune", **_step_result(changes_result),
                          deferred=changes_result.get("deferred") if isinstance(changes_result, dict) else None)
-    _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
     _record_nightly_step(steps, "ledger", **_step_result(_ledger_nightly()))
     receipt_result = _receipt_prune()
     _record_nightly_step(steps, "receipt_prune", **_step_result(receipt_result),
@@ -920,30 +919,6 @@ def _receipt_prune() -> dict[str, Any]:
     return out
 
 
-def _mark_stale_commitments() -> dict[str, Any]:
-    """W3: age open commitments past STALE_AFTER_DAYS into 'stale'.
-
-    ``commitments.mark_stale`` shipped with no caller at all (audit
-    2026-09-04), so nothing ever aged: `khipu owed --status stale` was
-    permanently empty and the open list grew without bound. Same posture as
-    ``_reconcile_notes_if_due`` — additive, fail-open, and it must never turn
-    a good nightly into a bad one (the external driver's exit code is what
-    gates job_status/doctor)."""
-    try:
-        from khipu import commitments
-        from khipu.db import connect
-
-        with connect() as conn:
-            with conn.cursor() as cur:
-                n = commitments.mark_stale(cur)
-            conn.commit()
-        out = {"ok": True, "stale": int(n)}
-    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
-        out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
-    _nightly_log(f"commitments-mark-stale: {json.dumps(out, default=str)[:300]}")
-    return out
-
-
 def _transient_provenance_error(exc: BaseException) -> bool:
     """Retryable DB outages/contention, never a provenance or schema refusal."""
     from khipu.provenance import retryable_db_error
@@ -1043,64 +1018,6 @@ def _provenance_nightly() -> dict[str, Any]:
         fatal = [r for r in failures if not r.get("transient", False)]
         out["reason"] = (fatal or failures)[0].get("reason") or "provenance backfill failed"
     _nightly_log(f"provenance-backfill: {json.dumps(out, default=str)[:600]}")
-    return out
-
-
-def _commitment_close_rules() -> dict[str, Any]:
-    """Legacy direct wrapper, still exercised by close-rule/provenance tests.
-
-    Not called by the nightly. Retained with those tests, whose removal is
-    outside this slice. Owed slice 2: fact-provenance witness backfill while projects
-    are pending, fill ``prs`` on rows from before migration 0034, then
-    run the PR and decision close rules over every open item
-    (``close_rules.run_nightly``). Before mark_stale, so an item whose PR merged
-    closes as done rather than aging out. Its returned outcome is consumed
-    only by direct callers; the nightly has its own provenance-only step."""
-    witness: dict[str, Any] | None = None
-    preparation: dict[str, Any] | None = None
-    try:
-        from khipu import close_rules
-        from khipu.db import connect
-
-        filled = 0
-        try:
-            with connect() as conn:
-                # Fact provenance's witness backfill first (section 4 of the
-                # 2026-10-23 design): a legacy restater proven tonight counts
-                # for tonight's rules (its PR refs clear needs_owner).
-                witness = _provenance_outcome(_provenance_backfill(conn))
-                reconnect = witness.get("connection_unusable", False)
-                if reconnect:
-                    # A dropped connection cannot run preparation or commit on
-                    # context exit. Retire it; the next phase gets one fresh try.
-                    conn.close()
-                else:
-                    with conn.cursor() as cur:
-                        filled = close_rules.backfill_prs(cur)
-                    conn.commit()
-            if reconnect:
-                with connect() as conn:
-                    with conn.cursor() as cur:
-                        filled = close_rules.backfill_prs(cur)
-                    conn.commit()
-        except Exception as exc:  # noqa: BLE001 — rolled-back preparation may wait until next night
-            if not _transient_provenance_error(exc):
-                raise
-            filled = 0
-            preparation = {"ok": False, "transient": True, "reason": f"{type(exc).__name__}: {exc}"}
-        report = close_rules.run_nightly()
-        out = {**report, "backfilled": int(filled), "provenance": witness}
-        if preparation is not None:
-            out["preparation"] = preparation
-            out["deferred_transient"] = out.get("deferred_transient", 0) + 1
-    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
-        out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
-        if witness is not None:
-            out["provenance"] = witness
-    if witness is not None and not witness.get("ok", True) and not witness.get("transient", False):
-        out["ok"] = False
-        out.setdefault("reason", witness.get("reason") or witness.get("error") or "provenance backfill failed")
-    _nightly_log(f"commitments-close-rules: {json.dumps(out, default=str)[:300]}")
     return out
 
 
@@ -1205,10 +1122,6 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
     ),
     "receipt_prune_ok": (
         "receipt_prune",
-        "run `khipu jobs install nightly` or wait for the next nightly",
-    ),
-    "mark_stale_ok": (
-        "commitments_mark_stale",
         "run `khipu jobs install nightly` or wait for the next nightly",
     ),
     "ledger_ok": (

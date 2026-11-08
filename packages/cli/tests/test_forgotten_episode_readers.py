@@ -223,34 +223,12 @@ class HubGraphEpisodeTopicsTest(_CacheCase):
 
 
 class DecisionBackfillTest(_CacheCase):
-    def test_backfill_never_rederives_decisions_from_a_forgotten_episode(self):
-        from khipu import decisions
+    pass
 
-        cur = _EpisodeTableCur()
-        seen: list[int] = []
-
-        def _insert(_cur, payload, eid):
-            seen.append(eid)
-            return len(payload["decisions"])
-
-        with mock.patch.object(decisions, "_decisions_ready", return_value=True), \
-                mock.patch.object(decisions, "insert_decisions_from_episode", side_effect=_insert):
-            report = decisions.backfill_decisions(cur, apply=True)
-        self.assertEqual(seen, [1])
-        self.assertEqual(report["episodes_scanned"], 1)
-
-    def test_the_dry_run_counts_only_live_episodes(self):
-        from khipu import decisions
-
-        cur = _EpisodeTableCur()
-        with mock.patch.object(decisions, "_decisions_ready", return_value=True), \
-                mock.patch.object(decisions, "_find_recent_duplicate", return_value=None):
-            report = decisions.backfill_decisions(cur, apply=False)
-        self.assertEqual(report["episodes_scanned"], 1)
-        self.assertEqual(report["decisions_inserted"], 1)
 
 
 class EpisodeEditReembedTest(_CacheCase):
+    pass
     def _reembed(self, eid):
         from khipu import cli
 

@@ -330,7 +330,7 @@ def _owners(conn, ids):
 
 def test_bulk_reassignment_keeps_its_reason_and_prior_owner(owed, monkeypatch):
     """A successful owner-approved bulk move must leave a durable undo/audit record."""
-    from khipu import owed_tidy
+    from khipu import owed_changes
 
     reason = "Owner-approved move after a specific review"
     ids = _seed(owed, 1, text="ship widget {i} to staging", owner="user") + _seed(
@@ -346,7 +346,7 @@ def test_bulk_reassignment_keeps_its_reason_and_prior_owner(owed, monkeypatch):
         state = {int(c): {"reason": r, "prior": p} for c, r, p in cur.fetchall()}
     assert reason in json.dumps(state), "Successful bulk reassignment discarded its required reason and prior owners"
     assert (state[ids[0]]["prior"]["owner"], state[ids[1]]["prior"]["owner_label"]) == ("user", "reviewer")
-    undone = owed_tidy.undo(result["batches"][0], project=PROJECT)
+    undone = owed_changes.undo(result["batches"][0], project=PROJECT)
     assert undone["ok"] and undone["restored"] == 2
     assert _owners(owed, ids) == before
 
@@ -406,9 +406,9 @@ def test_the_two_caps_are_count_settings():
 
 
 def _state(conn, ids):
-    from khipu import owed_tidy
+    from khipu import owed_changes
 
-    cols = ", ".join(owed_tidy.BULK_PRIOR_FIELDS)
+    cols = ", ".join(owed_changes.BULK_PRIOR_FIELDS)
     with conn.cursor() as cur:
         cur.execute(f"SELECT id, {cols} FROM commitments WHERE id = ANY(%s) ORDER BY id", (list(ids),))
         return {int(r[0]): r[1:] for r in cur.fetchall()}
@@ -424,7 +424,7 @@ def _audit(conn, batches):
 def test_bulk_snooze_preserves_reason_and_prior_due_after(owed):
     """The review's probe on the hermetic hub: a successful bulk snooze keeps
     its reason and each item's previous due date, and undo restores both."""
-    from khipu import owed_tidy
+    from khipu import owed_changes
 
     reason = "Matt asked to defer these until the vendor replies"
     original_due_after = "2026-10-18"
@@ -440,16 +440,16 @@ def test_bulk_snooze_preserves_reason_and_prior_due_after(owed):
     assert reason in json.dumps(state)
     assert original_due_after in json.dumps(state)
     assert state[ids[1]]["prior"]["due_after"] is None
-    undone = owed_tidy.undo(result["batches"][0], project=PROJECT)
+    undone = owed_changes.undo(result["batches"][0], project=PROJECT)
     assert undone["ok"] and undone["restored"] == 2
     assert _state(owed, ids) == before
 
 
 @pytest.mark.parametrize("action", ["close", "reopen", "snooze", "reassign"])
 def test_every_bulk_action_keeps_the_same_audit_record_and_undoes_exactly(owed, action):
-    from khipu import owed_tidy
+    from khipu import owed_changes
 
-    assert set(owed_tidy.BULK_ACTIONS) == {"close", "reopen", "snooze", "reassign"}
+    assert set(owed_changes.BULK_ACTIONS) == {"close", "reopen", "snooze", "reassign"}
     ids = _seed(owed, 2, text=f"{action} widget {{i}} in the staging area", owner="assistant")
     if action == "reopen":
         with owed.cursor() as cur:
@@ -465,9 +465,9 @@ def test_every_bulk_action_keeps_the_same_audit_record_and_undoes_exactly(owed, 
     assert sorted(audit) == ids
     for cid in ids:
         assert audit[cid]["action"] == action and audit[cid]["reason"] == reason
-        assert set(audit[cid]["prior"]) == set(owed_tidy.BULK_PRIOR_FIELDS)
+        assert set(audit[cid]["prior"]) == set(owed_changes.BULK_PRIOR_FIELDS)
     assert _state(owed, ids) != before
-    undone = owed_tidy.undo(result["batches"][0], project=PROJECT)
+    undone = owed_changes.undo(result["batches"][0], project=PROJECT)
     assert undone["ok"] and undone["restored"] == 2, undone
     assert _state(owed, ids) == before
 
@@ -536,13 +536,12 @@ def test_plain_cli_listing_obeys_page_cap(monkeypatch, capsys):
 # batches key; its assertions are the reviewer's.
 
 import copy  # noqa: E402
-from tests.fact_seed import announce  # noqa: E402
 from tests.owner_jobs import finish_owner_job
 
 
 
 def test_bulk_snooze_keeps_audit_with_new_batch_response(monkeypatch):
-    from khipu import commitments, config, db, mcp_server, offline, owed_tidy
+    from khipu import commitments, config, db, mcp_server, offline, owed_changes
 
     reason = "Matt asked to defer these until the vendor replies"
     original_due_after = "2026-10-18"
@@ -613,8 +612,8 @@ def test_bulk_snooze_keeps_audit_with_new_batch_response(monkeypatch):
 
     conn = Connection()
     monkeypatch.setattr(db, "connect", lambda **kwargs: conn)
-    monkeypatch.setattr(owed_tidy, "_ready", lambda cur: True)
-    monkeypatch.setattr(owed_tidy, "_select", lambda cur, project, ids=None, **kwargs: {
+    monkeypatch.setattr(owed_changes, "_ready", lambda cur: True)
+    monkeypatch.setattr(owed_changes, "_select", lambda cur, project, ids=None, **kwargs: {
         cid: copy.deepcopy(row) for cid, row in state["commitments"].items()
         if ids is None or cid in ids
     })
@@ -702,35 +701,6 @@ def test_a_reassign_keeps_who_why_and_the_prior_owner(owed):
     assert by
     row = next(r for r in srv._tool_owed({"project": PROJECT})["results"] if r["id"] == ids[0])
     assert (row["owner_prior"], row["owner_reassign_reason"]) == ("user", "the reviewer owns rebases")
-
-
-def test_similar_items_of_two_owners_both_stay_linked_on_the_hub(owed):
-    from unittest import mock
-
-    # One transaction, as capture runs these writers in (the fact gate checks at COMMIT).
-    with owed.transaction(), owed.cursor() as cur:
-        announce(cur)
-        cur.execute("INSERT INTO episodes (ts, summary, raw) VALUES (now(), 's', '{}'::jsonb) RETURNING id")
-        ep = int(cur.fetchone()[0])
-        base = {"project": PROJECT, "session_id": "claude_code:host-1"}
-        with mock.patch.object(co, "_has_commitment_embeddings", lambda cur, ids: False):
-            assert co.open_from_episode(cur, dict(base, open_loops=[
-                {"text": "Review the deployment checklist before release", "kind": "followup",
-                 "owner": "assistant"}]), ep) == 1
-            from tests.fact_seed import owner_commitment
-            cur.execute("SELECT id FROM commitments WHERE opened_episode = %s", (ep,))
-            assistant = cur.fetchone()[0]
-            owner_commitment(cur, "I will review the deployment checklist before release", project=PROJECT,
-                             episode_id=ep, kind="promise", linked_ids=[assistant])
-            assert co.open_from_episode(cur, dict(base, open_loops=[
-                {"text": "Review the deployment checklist before the release", "kind": "followup",
-                 "owner": "assistant"}]), ep) == 0
-        cur.execute("SELECT id, owner, linked_ids, latest_text FROM commitments WHERE project = %s "
-                    "AND status = 'open' ORDER BY id", (PROJECT,))
-        (a, a_owner, a_links, a_latest), (u, u_owner, u_links, _u_latest) = cur.fetchall()
-    assert (a_owner, u_owner) == ("assistant", "user")
-    assert (a_links, u_links) == ([u], [a])
-    assert a_latest == "Review the deployment checklist before the release"
 
 
 # ---- "close those": a bulk change to the owner's items on his direction ---------------------

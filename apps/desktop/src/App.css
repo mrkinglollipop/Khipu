@@ -2217,10 +2217,6 @@ button.row.on {
 .owed-reason {
   font-size: var(--t-xs);
 }
-.owed-tidy .card .row .mono {
-  min-width: 64px;
-  text-align: right;
-}
 
 /* Under ~1040px the six fixed columns leave the text under 150px, so the row
    stacks: text on its own line, the columns beneath it. */

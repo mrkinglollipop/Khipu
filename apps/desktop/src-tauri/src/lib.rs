@@ -499,7 +499,6 @@ fn cli_has_no_time_limit(args: &[String]) -> bool {
         "db" => matches!(args.get(1).map(String::as_str), Some("move" | "preflight" | "connect")),
         // The Owed clean-up: a plan may make its capped model calls, and an
         // apply or undo changes thousands of rows in one transaction.
-        "owed" => args.get(1).map(String::as_str) == Some("tidy"),
         _ => false,
     }
 }
@@ -729,8 +728,6 @@ const FEATURE_NAMES: &[&str] = &[
     "relevance_floor",
     "rerank",
     "graph_candidates",
-    "decision_details",
-    "auto_supersede",
     "routing_push",
 ];
 
@@ -746,7 +743,7 @@ const JOB_NAMES: &[&str] = &[
 
 const CAPTURE_MODES: &[&str] = &["legacy", "dual", "hub"];
 /// `config --set KEY N` with N in [0, 1] (`FLOAT_SETTINGS`).
-const UNIT_FLOAT_KEYS: &[&str] = &["dedup_similarity", "commitment_close_similarity"];
+const UNIT_FLOAT_KEYS: &[&str] = &["dedup_similarity"];
 /// `config --set KEY PATH` / `config --unset KEY` (`PATH_SETTINGS`).
 const PATH_KEYS: &[&str] = &[
     "memory_root",
@@ -815,9 +812,7 @@ const SYNTH_FALLBACKS: &[&str] = &["gemini", "none"];
 const USAGE_ACCOUNTS_KEY: &str = "usage_accounts";
 /// Owed's limits (`khipu.config.COUNT_SETTINGS`): whole numbers of 0 or
 /// more, 0 for no limit, each `config --set KEY N` or `config --unset=KEY`.
-const OWED_COUNT_KEYS: &[&str] = &["owed_orchestrator_slice_max", "owed_page_max", "owed_bulk_max", "owed_tidy_calls"];
-/// Whether Owed's close rules ask GitHub, read-only, if a pull request merged.
-const OWED_GITHUB_KEY: &str = "owed_pr_check_github";
+const OWED_COUNT_KEYS: &[&str] = &["owed_page_max", "owed_bulk_max"];
 
 /// Settings -> Data, "This Mac's copy": how old the copy may get before the
 /// background job updates it, how often the job looks, and how long a failed
@@ -1476,13 +1471,6 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
             Ok(set("synth_fallback", v.to_string()))
         }
         k if OWED_COUNT_KEYS.contains(&k) => Ok(set(k, parse_daily_calls(k, value)?)),
-        OWED_GITHUB_KEY => {
-            let v = value.trim();
-            if v != "on" && v != "off" {
-                return Err(format!("{OWED_GITHUB_KEY} must be on or off, got {value:?}"));
-            }
-            Ok(set(OWED_GITHUB_KEY, v.to_string()))
-        }
         k if PATH_KEYS.contains(&k) => Ok(set(k, checked_path(key, value)?)),
         k if cli_setting_key(k) => Ok(set(k, checked_cli_setting_path(k, value)?)),
         k if routing_key(k) => Ok(set(k, routing_setting_value(k, value)?)),
@@ -1515,7 +1503,6 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
         && key != COSINE_FLOOR_KEY
         && key != USAGE_ACCOUNTS_KEY
         && !OWED_COUNT_KEYS.contains(&key)
-        && key != OWED_GITHUB_KEY
         && minute_key(key).is_none()
         && key != GATE_IGNORE_KEY
         && !cli_setting_key(key)
@@ -3095,69 +3082,6 @@ fn owed_change_argv(
     Ok(argv)
 }
 
-/// Where the app keeps a project's clean-up plan between Make a plan and
-/// Apply, inside Khipu's own data folder: the webview never names a path,
-/// and Apply applies exactly the plan it showed. The file name is the
-/// project's safe characters plus a hash of the whole key, so two projects
-/// never share one.
-fn owed_tidy_plan_path(data_dir: &Path, project: &str) -> PathBuf {
-    let safe: String = project
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
-        .take(60)
-        .collect();
-    // FNV-1a, 64 bit: stable across builds, unlike the std hasher.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in project.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    data_dir.join("state").join("owed-tidy").join(format!("plan-{safe}-{h:016x}.json"))
-}
-
-fn owed_tidy_base(project: &str) -> Result<Vec<String>, String> {
-    Ok(vec!["owed".to_string(), "tidy".to_string(), format!("--project={}", checked_ledger_project(project)?)])
-}
-
-fn owed_tidy_plan_argv(project: &str, plan: &Path) -> Result<Vec<String>, String> {
-    let mut argv = owed_tidy_base(project)?;
-    argv.push(format!("--plan-out={}", plan.to_string_lossy()));
-    Ok(argv)
-}
-
-fn owed_tidy_apply_argv(project: &str, plan: &Path) -> Result<Vec<String>, String> {
-    let mut argv = owed_tidy_base(project)?;
-    argv.push(format!("--apply={}", plan.to_string_lossy()));
-    Ok(argv)
-}
-
-/// A clean-up batch id as `owed_tidy.apply` makes it (`tidy-<time>-<hex>`).
-fn owed_tidy_undo_argv(project: &str, batch: &str) -> Result<Vec<String>, String> {
-    let ok = batch.starts_with("tidy-")
-        && batch.len() <= 64
-        && batch.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-    if !ok {
-        return Err("that is not a clean-up Khipu knows".to_string());
-    }
-    let mut argv = owed_tidy_base(project)?;
-    argv.push(format!("--undo={batch}"));
-    Ok(argv)
-}
-
-/// The plan document for the preview: totals, samples, notes and the model
-/// line, without the per-item list (thousands of rows the app never shows;
-/// Apply reads them from the file). `items_count` says how many there were.
-fn owed_tidy_plan_for_app(raw: &str) -> Result<String, String> {
-    let mut doc: Value = serde_json::from_str(raw).map_err(|_| "the clean-up plan could not be read".to_string())?;
-    if doc.get("format").and_then(Value::as_str) != Some("khipu-owed-tidy-plan") {
-        return Err("the clean-up plan is not in a form this app reads".to_string());
-    }
-    let obj = doc.as_object_mut().ok_or_else(|| "the clean-up plan could not be read".to_string())?;
-    let count = obj.remove("items").and_then(|i| i.as_array().map(Vec::len)).unwrap_or(0);
-    obj.insert("items_count".to_string(), Value::from(count));
-    serde_json::to_string(&doc).map_err(|e| e.to_string())
-}
-
 /// Khipu's data folder, as `app_cli_timeout_secs` finds it.
 fn khipu_data_dir() -> Result<PathBuf, String> {
     data_dir_from_pointer()
@@ -3174,57 +3098,6 @@ async fn khipu_owed_change(
     label: Option<String>,
 ) -> Result<String, String> {
     run_khipu_cli_async(owed_change_argv(&action, &ids, &reason, to.as_deref(), label.as_deref())?).await
-}
-
-#[tauri::command]
-async fn khipu_owed_tidy_plan(project: String) -> Result<String, String> {
-    let path = owed_tidy_plan_path(&khipu_data_dir()?, &project);
-    let argv = owed_tidy_plan_argv(&project, &path)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("could not make the folder for the plan: {e}"))?;
-    }
-    let _ = std::fs::remove_file(&path);
-    let out = run_khipu_cli_async(argv).await?;
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        // No file: the CLI said why on stdout (a refusal is JSON with ok false).
-        Err(_) => return Ok(out),
-    };
-    owed_tidy_plan_for_app(&raw)
-}
-
-#[tauri::command]
-async fn khipu_owed_tidy_apply(project: String) -> Result<String, String> {
-    let path = owed_tidy_plan_path(&khipu_data_dir()?, &project);
-    if !path.is_file() {
-        return Err("make a plan first; there is no plan for this project to apply".to_string());
-    }
-    run_khipu_cli_async(owed_tidy_apply_argv(&project, &path)?).await
-}
-
-#[tauri::command]
-async fn khipu_owed_tidy_undo(project: String, batch: String) -> Result<String, String> {
-    run_khipu_cli_async(owed_tidy_undo_argv(&project, &batch)?).await
-}
-
-#[tauri::command]
-async fn khipu_owed_origin_preview() -> Result<String, String> {
-    run_khipu_cli_async(fixed_argv(&["owed", "correct-job-origin"])).await
-}
-
-#[tauri::command]
-async fn khipu_owed_origin_requests() -> Result<String, String> {
-    run_khipu_cli_async(fixed_argv(&["owed", "correct-job-origin", "--requests"])).await
-}
-
-#[tauri::command]
-async fn khipu_owed_origin_confirm(request: String) -> Result<String, String> {
-    let suffix = request.strip_prefix("origin-").unwrap_or("");
-    if suffix.len() != 24 || !suffix.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err("that is not a job-origin request Khipu knows".to_string());
-    }
-    run_khipu_cli_async(vec!["owed".into(), "correct-job-origin".into(),
-                            format!("--confirm={request}"), "--from-app".into()]).await
 }
 
 fn ledger_projects_argv() -> Vec<String> {
@@ -5491,12 +5364,6 @@ pub fn run() {
             khipu_work_hide,
             khipu_work_same,
             khipu_owed_change,
-            khipu_owed_tidy_plan,
-            khipu_owed_tidy_apply,
-            khipu_owed_tidy_undo,
-            khipu_owed_origin_preview,
-            khipu_owed_origin_requests,
-            khipu_owed_origin_confirm,
             khipu_ledger_projects,
             khipu_ledger_project_set,
             khipu_work_hidden,
@@ -6676,7 +6543,7 @@ mod settings_command_tests {
 
     #[test]
     fn every_switch_builds_an_on_and_an_off_argv() {
-        assert_eq!(FEATURE_NAMES.len(), 8);
+        assert_eq!(FEATURE_NAMES.len(), 6);
         for n in FEATURE_NAMES {
             assert_eq!(feature_set_argv(n, true).unwrap(), v(&["features", "--set", n, "on"]));
             assert_eq!(feature_set_argv(n, false).unwrap(), v(&["features", "--set", n, "off"]));
@@ -6767,7 +6634,7 @@ mod settings_command_tests {
 
     #[test]
     fn a_number_can_never_reach_argv_as_a_flag_or_junk() {
-        for key in ["dedup_similarity", "commitment_close_similarity", "relevance.cosine_floor"] {
+        for key in ["dedup_similarity", "relevance.cosine_floor"] {
             for bad in ["-0.1", "-1", "--set", "-", "1.01", "2", "nan", "NaN", "inf", "-inf", "", "abc", "0.5 0.6", "0,5"] {
                 assert!(config_set_argv(key, bad).is_err(), "{key} accepted {bad:?}");
             }
@@ -8466,55 +8333,9 @@ mod work_command_tests {
     }
 
     #[test]
-    fn the_clean_up_runs_on_fixed_argv_with_the_plan_kept_where_khipu_chose() {
-        let dir = PathBuf::from("/data/khipu");
-        let path = owed_tidy_plan_path(&dir, "owner/atlas");
-        assert!(path.starts_with("/data/khipu/state/owed-tidy"));
-        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("json"));
-        assert_ne!(path, owed_tidy_plan_path(&dir, "owner_atlas"), "two projects never share a plan file");
-        assert_eq!(path, owed_tidy_plan_path(&dir, "owner/atlas"));
-        let shown = path.to_string_lossy().to_string();
-        assert_eq!(
-            owed_tidy_plan_argv("owner/atlas", &path).unwrap(),
-            vec!["owed".to_string(), "tidy".into(), "--project=owner/atlas".into(), format!("--plan-out={shown}")]
-        );
-        assert_eq!(
-            owed_tidy_apply_argv("owner/atlas", &path).unwrap(),
-            vec!["owed".to_string(), "tidy".into(), "--project=owner/atlas".into(), format!("--apply={shown}")]
-        );
-        assert_eq!(
-            owed_tidy_undo_argv("owner/atlas", "tidy-20261016T120000Z-a1b2c3").unwrap(),
-            vec!["owed", "tidy", "--project=owner/atlas", "--undo=tidy-20261016T120000Z-a1b2c3"]
-        );
-        for bad in ["", "--apply=x", "tidy 1", "../x", "tidy-1\n"] {
-            assert!(owed_tidy_undo_argv("atlas", bad).is_err(), "{bad:?}");
-        }
-        assert!(owed_tidy_plan_argv("a#b", &path).is_err());
-    }
-
-    #[test]
-    fn the_app_reads_the_plan_without_its_item_list() {
-        let raw = r#"{"format":"khipu-owed-tidy-plan","version":1,"project":"atlas",
-            "totals":{"open":3},"samples":{"move":[]},"items":[{"id":1},{"id":2}]}"#;
-        let shown: Value = serde_json::from_str(&owed_tidy_plan_for_app(raw).unwrap()).unwrap();
-        assert!(shown.get("items").is_none());
-        assert_eq!(shown["totals"]["open"], 3);
-        assert_eq!(shown["items_count"], 2);
-        assert!(owed_tidy_plan_for_app(r#"{"format":"something-else","version":1}"#).is_err());
-        assert!(owed_tidy_plan_for_app("not json").is_err());
-    }
-
-    #[test]
-    fn the_clean_up_is_not_cut_short_but_other_owed_calls_are() {
-        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(cli_has_no_time_limit(&v(&["owed", "tidy", "--project=atlas", "--plan-out=/x.json"])));
-        assert!(!cli_has_no_time_limit(&v(&["owed", "--close=1,2", "--reason=x"])));
-    }
-
-    #[test]
     fn the_owed_limits_and_the_github_switch_are_settable_and_resettable() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        for key in ["owed_orchestrator_slice_max", "owed_page_max", "owed_bulk_max", "owed_tidy_calls"] {
+        for key in ["owed_page_max", "owed_bulk_max"] {
             assert_eq!(config_set_argv(key, " 0 ").unwrap(), v(&["config", "--set", key, "0"]));
             assert_eq!(config_set_argv(key, "750").unwrap(), v(&["config", "--set", key, "750"]));
             assert_eq!(config_unset_argv(key).unwrap(), v(&["config", &format!("--unset={key}")]));
@@ -8522,15 +8343,11 @@ mod work_command_tests {
                 assert!(config_set_argv(key, bad).is_err(), "{key}={bad:?}");
             }
         }
-        assert_eq!(config_set_argv("owed_pr_check_github", "off").unwrap(), v(&["config", "--set", "owed_pr_check_github", "off"]));
         assert_eq!(
             config_set_argv("routing_usage_login_cursor", "on").unwrap(),
             v(&["config", "--from-app", "--set", "routing_usage_login_cursor", "on"])
         );
         assert!(config_set_argv("routing_usage_login_grok", "yes").is_err());
-        assert_eq!(config_set_argv("owed_pr_check_github", " on ").unwrap(), v(&["config", "--set", "owed_pr_check_github", "on"]));
-        assert!(config_set_argv("owed_pr_check_github", "maybe").is_err());
-        assert_eq!(config_unset_argv("owed_pr_check_github").unwrap(), v(&["config", "--unset=owed_pr_check_github"]));
     }
 
     fn v(a: &[&str]) -> Vec<String> {

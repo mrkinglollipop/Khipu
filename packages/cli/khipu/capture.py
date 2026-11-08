@@ -21,6 +21,8 @@ failed (dual/hub) · capture_v2's own code if the file leg fails.
 """
 from __future__ import annotations
 
+from contextvars import ContextVar
+
 import hashlib
 import json
 import os
@@ -162,11 +164,13 @@ def _record_fact_gap(cur, episode_id: int | None, step: str, exc: BaseException,
     gap in the same transaction, so doctor reports it and the nightly
     re-runs it (invariant I4). Only on a hub with migration 0047; a gap that
     cannot be recorded defers the whole capture instead of losing the items."""
-    # The capture's caller is told which step lost its items, whether or not
-    # this hub can record the gap (a hub without 0047 has no table for it).
-    from khipu import commitments as _commitments
+    report = _FACT_GAPS.get()
+    if report is not None:
+        from khipu.redact import redact_secrets
 
-    _commitments.report_step_failed(exc, step)
+        reason = redact_secrets(f"{type(exc).__name__}: {str(exc)[:300]}")[0]
+        report.append({"step": step, "reason": reason})
+    # A hub without 0047 cannot persist the gap, but the caller still sees it.
     if episode_id is None:
         return
     from khipu import provenance
@@ -841,86 +845,7 @@ def _merge_into_episode(
 
     # The merged capture's own open/closed loops belong to the target episode
     # — same call the insert path makes in write_pg, same SAVEPOINT fail-open.
-    try:
-        cur.execute("SAVEPOINT capture_merge_commitments")
-    except Exception:  # noqa: BLE001 — no savepoint support (fake cur / autocommit)
-        pass
-    try:
-        from khipu import commitments
-
-        commitments.open_from_episode(cur, payload, target_id)
-        commitments.auto_close(cur, payload, target_id)
-        commitments.close_session_plan(cur, payload, target_id)
-    except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
-        _defer_if_transient(exc, "commitments")
-        try:
-            cur.execute("ROLLBACK TO SAVEPOINT capture_merge_commitments")
-        except Exception:  # noqa: BLE001
-            pass
-        else:
-            _record_fact_gap(cur, target_id, "merge commitments", exc, source_id=source_id)
-        _log(f"merge commitments step failed ({type(exc).__name__}: {exc})")
-
-    # O2: the merged capture's own decision strings belong to the target
-    # episode too, same SAVEPOINT fail-open posture as commitments above.
-    try:
-        cur.execute("SAVEPOINT capture_merge_decisions")
-    except Exception:  # noqa: BLE001 — no savepoint support (fake cur / autocommit)
-        pass
-    try:
-        from khipu import decisions as _decisions
-
-        _decisions.insert_decisions_from_episode(cur, payload, target_id)
-    except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
-        _defer_if_transient(exc, "decisions")
-        try:
-            cur.execute("ROLLBACK TO SAVEPOINT capture_merge_decisions")
-        except Exception:  # noqa: BLE001
-            pass
-        else:
-            _record_fact_gap(cur, target_id, "merge decisions", exc, source_id=source_id)
-        _log(f"merge decisions step failed ({type(exc).__name__}: {exc})")
-
-    # Phase 2, session C: conservative reversal detection reads the row
-    # insert_decisions_from_episode just wrote — its own SAVEPOINT so a
-    # detection failure can never take the merged decision row down with it.
-    try:
-        cur.execute("SAVEPOINT capture_merge_decision_detection")
-    except Exception:  # noqa: BLE001 — no savepoint support (fake cur / autocommit)
-        pass
-    try:
-        from khipu import decisions as _decisions
-
-        _decisions.detect_reversals_from_episode(cur, payload, target_id)
-    except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
-        _defer_if_transient(exc, "decision detection")
-        try:
-            cur.execute("ROLLBACK TO SAVEPOINT capture_merge_decision_detection")
-        except Exception:  # noqa: BLE001
-            pass
-        else:
-            _record_fact_gap(cur, target_id, "merge decision detection", exc, source_id=source_id)
-        _log(f"merge decision detection step failed ({type(exc).__name__}: {exc})")
-
-    # Owed close rules (slice 2): this capture's project, with this capture
-    # as the later evidence. After the decisions step, which they read.
-    try:
-        cur.execute("SAVEPOINT capture_merge_close_rules")
-    except Exception:  # noqa: BLE001 — no savepoint support (fake cur / autocommit)
-        pass
-    try:
-        from khipu import close_rules
-
-        close_rules.run(cur, payload=payload, episode_id=target_id)
-    except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
-        _defer_if_transient(exc, "close rules")
-        try:
-            cur.execute("ROLLBACK TO SAVEPOINT capture_merge_close_rules")
-        except Exception:  # noqa: BLE001
-            pass
-        else:
-            _record_fact_gap(cur, target_id, "merge close rules", exc, source_id=source_id)
-        _log(f"merge close rules step failed ({type(exc).__name__}: {exc})")
+    _declare_history_writer(cur, payload)
 
     # O4: same posture for the merged capture's own deliverables.
     try:
@@ -1187,67 +1112,14 @@ def _forgotten_result(cur, payload: dict[str, Any], source: dict[str, Any], *,
 
 def run_fact_steps(cur, payload: dict[str, Any], episode_id: int) -> None:
     """The fact steps of a newly inserted capture, each in its own
-    savepoint: commitments, decisions, reversal detection, close rules and
-    deliverables. A transient or old-writer error raises
+    savepoint for deliverables. A transient or old-writer error raises
     :class:`FactStepDeferred` (the whole transaction must roll back and be
     retried); any other error rolls its step back and records a
     ``fact_gaps`` row (invariant I4). ``write_pg`` runs them for a capture,
     and the file recovery writers (``mirror.sync_recent_episodes``,
     ``mirror.reconcile_memory_root``) for a file line they import, so the
     episode commits with its claims (0047's writer gate)."""
-    cur.execute("SAVEPOINT capture_commitments")
-    try:
-        from khipu import commitments
-
-        commitments.open_from_episode(cur, payload, episode_id)
-        commitments.auto_close(cur, payload, episode_id)
-        commitments.close_session_plan(cur, payload, episode_id)
-    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-        _defer_if_transient(exc, "commitments")
-        cur.execute("ROLLBACK TO SAVEPOINT capture_commitments")
-        _record_fact_gap(cur, episode_id, "commitments", exc)
-        _log(f"commitments step failed ({type(exc).__name__}: {exc})")
-
-    # O2: each string in payload['decisions'] becomes a row.
-    cur.execute("SAVEPOINT capture_decisions")
-    try:
-        from khipu import decisions as _decisions
-
-        _decisions.insert_decisions_from_episode(cur, payload, episode_id)
-    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-        _defer_if_transient(exc, "decisions")
-        cur.execute("ROLLBACK TO SAVEPOINT capture_decisions")
-        _record_fact_gap(cur, episode_id, "decisions", exc)
-        _log(f"decisions step failed ({type(exc).__name__}: {exc})")
-
-    # Phase 2, session C: conservative reversal detection over
-    # the rows the step above just inserted — its own
-    # SAVEPOINT, same fail-open posture as every neighbour
-    # here, so a detection failure can never take the
-    # episode (or the decisions just written) down with it.
-    cur.execute("SAVEPOINT capture_decision_detection")
-    try:
-        from khipu import decisions as _decisions
-
-        _decisions.detect_reversals_from_episode(cur, payload, episode_id)
-    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-        _defer_if_transient(exc, "decision detection")
-        cur.execute("ROLLBACK TO SAVEPOINT capture_decision_detection")
-        _record_fact_gap(cur, episode_id, "decision detection", exc)
-        _log(f"decision detection step failed ({type(exc).__name__}: {exc})")
-
-    # Owed close rules (slice 2): PR and decision closes for
-    # this capture's project, after the decisions they read.
-    cur.execute("SAVEPOINT capture_close_rules")
-    try:
-        from khipu import close_rules
-
-        close_rules.run(cur, payload=payload, episode_id=episode_id)
-    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-        _defer_if_transient(exc, "close rules")
-        cur.execute("ROLLBACK TO SAVEPOINT capture_close_rules")
-        _record_fact_gap(cur, episode_id, "close rules", exc)
-        _log(f"close rules step failed ({type(exc).__name__}: {exc})")
+    _declare_history_writer(cur, payload)
 
     # O4: files/PR-issue-URLs/release tags from payload['deliverables'].
     cur.execute("SAVEPOINT capture_deliverables")
@@ -2369,17 +2241,14 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
     # write must still carry it into the outbox, so the retry gets a copy.
     checkout = payload.get("checkout")
     try:
-        # What the commitment steps did with the loops this capture carried
-        # rides back as ``commitments`` (opened, restated, closed, rejected and
-        # not_closed with a reason each, or step_failed / fact_gaps), so the
-        # caller can say which were not kept. Absent when no loop was involved.
-        from khipu import commitments as _commitments
-
-        report: dict[str, Any] = {}
-        with _commitments.collecting(report):
+        gaps: list[dict] = []
+        token = _FACT_GAPS.set(gaps)
+        try:
             stats = write_pg(payload)
-        if report and isinstance(stats, dict):
-            stats["commitments"] = _commitments.finish_report(report)
+        finally:
+            _FACT_GAPS.reset(token)
+        if gaps:
+            stats["fact_gaps"] = gaps
         if result is not None:
             # The proof holds the row's raw, for the drain's archive only.
             result.update({k: v for k, v in stats.items() if k != "legacy_projection_duplicate"})
@@ -2477,6 +2346,21 @@ def main(argv: list[str] | None = None) -> int:
     raw = Path(args.payload_file).read_text(encoding="utf-8") if args.payload_file else sys.stdin.read()
     payload = load_payload(raw)
     return capture(payload, mode=args.mode)
+
+
+
+
+def _declare_history_writer(cur, payload: dict[str, Any]) -> None:
+    # Migration 0047's episode gate also covers the legacy loop/decision
+    # fields. They are now stored only in the episode; the surviving
+    # deliverable step continues to declare its own claim-bearing writes.
+    from khipu import provenance
+
+    if not payload.get("deliverables") and provenance.ready(cur):
+        provenance.declare_writer(cur)
+
+
+_FACT_GAPS: ContextVar[list[dict] | None] = ContextVar("capture_fact_gaps", default=None)
 
 
 if __name__ == "__main__":

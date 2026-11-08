@@ -17,7 +17,7 @@ from unittest import mock
 import pytest
 from psycopg import errors as pg_errors
 
-from khipu import capture, capture_stores, commitments, db, outbox, provenance, tombstones
+from khipu import capture, capture_stores, db, outbox, provenance, tombstones
 from khipu.capture_identity import source_identity
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 
@@ -59,7 +59,6 @@ def pg(hub, monkeypatch, tmp_path):  # noqa: F811
     monkeypatch.setattr(embed, "embed_one", mock.Mock(side_effect=RuntimeError("no provider")))
     monkeypatch.setattr(topic_graph, "persist_capture_graph", lambda *a, **kw: {})
     monkeypatch.setattr(outbox, "_queued_origin", lambda: {"origin": None})
-    monkeypatch.setattr(commitments, "_has_commitment_embeddings", lambda cur, ids: False)
     return hub
 
 

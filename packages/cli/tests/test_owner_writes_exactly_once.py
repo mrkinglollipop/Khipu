@@ -193,27 +193,6 @@ def test_legacy_landed_snooze_is_not_applied_twice(tx_hub, state):
     assert refused["error"] == "queued by an older build; check it and redo it"
 
 
-@pytest.mark.parametrize("action", ["retract", "supersede"])
-def test_refused_decision_lost_reply_is_not_acknowledged_as_applied(tx_hub, monkeypatch, action):
-    # Review probe: the hub refuses the edit, commits, and the reply is lost.
-    from khipu import decisions
-
-    real_apply = ow._apply
-
-    def lost_reply(tool, args):
-        result = real_apply(tool, args)
-        assert result["ok"] is False
-        raise psycopg.OperationalError("server closed the connection after COMMIT")
-
-    monkeypatch.setattr(ow, "_apply", lost_reply)
-    monkeypatch.setattr(decisions, "_fetch_decision_row", lambda cur, id: {"id": id, "superseded_by": 2})
-    args = {"id": 999, "action": action}
-    if action == "supersede":
-        args["new_text"] = "owner requested replacement decision"
-    assert ow.run("decisions_update", args)["waiting_to_sync"]
-    result = ow.drain()
-    assert result["refused"] == 1, f"unapplied action acknowledged as success: {result}"
-    assert [o for o, _e in tx_hub.answered.values()] == ["refused"]
 
 
 # ---- against a real PostgreSQL ------------------------------------------------
@@ -318,20 +297,6 @@ def test_a_write_lost_before_sending_is_sent_though_an_older_snooze_is_live(real
     assert len(_applied(real_hub)) == 2
 
 
-def test_a_decision_update_records_its_id_with_the_write(real_hub):
-    with real_hub.connect() as conn, conn.cursor() as cur:
-        cur.execute("INSERT INTO decisions (text) VALUES ('scratch decision') RETURNING id")
-        did = cur.fetchone()[0]
-        fact_seed.adopt(cur, "decision", did)
-        conn.commit()
-    args = {"id": did, "action": "retract", "reason": "scratch", "write_id": "scratch-decision"}
-    assert srv._decisions_update_on_hub(args)["ok"]
-    assert srv._decisions_update_on_hub(args)["already_applied"]
-    assert _applied(real_hub) == [("scratch-decision", "decisions_update")]
-    missing = {"id": did + 1000, "action": "retract", "write_id": "scratch-missing-decision"}
-    assert srv._decisions_update_on_hub(missing)["ok"] is False
-    assert srv._decisions_update_on_hub(missing)["already_refused"]
-    assert [w for w, _e in _refused(real_hub)] == ["scratch-missing-decision"]
 
 
 def test_a_hub_without_the_record_keeps_writes_waiting(hub, home, monkeypatch):  # noqa: F811

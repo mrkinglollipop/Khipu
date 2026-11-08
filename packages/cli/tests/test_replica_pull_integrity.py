@@ -114,7 +114,8 @@ def replica(tmp_path, monkeypatch):
     now = datetime.now(timezone.utc)
     dump = now - timedelta(hours=7)
     hub = PullHub()
-    hub.episodes = [{"id": 1, "summary": "old summary", "ingested_at": dump - timedelta(hours=1),
+    hub.episodes = [{"id": 1, "summary": "old summary", "decisions": ["old decision"],
+                     "ingested_at": dump - timedelta(hours=1),
                      "deleted_at": None, "raw": {"t3_thread_id": "probe-thread"},
                      "session_id": "codex:probe", "harness": "codex"}]
     hub.topics = [{"slug": "probe", "body": "corrected", "updated_at": now}]
@@ -123,8 +124,11 @@ def replica(tmp_path, monkeypatch):
     con = sqlite3.connect(hs.snapshot_path())
     hs._create_schema(con)
     certify(con)
-    con.execute("INSERT INTO episodes(id,summary,ingested_at,raw,session_id,harness) VALUES (1,?,?,?,?,?)",
-                ("old summary", hub.episodes[0]["ingested_at"].isoformat(),
+    # Thread memory reads decisions from the episode's own strings (capture
+    # writes them); the registry row below is archive state only.
+    con.execute("INSERT INTO episodes(id,summary,decisions,ingested_at,raw,session_id,harness) "
+                "VALUES (1,?,?,?,?,?,?)",
+                ("old summary", json.dumps(["old decision"]), hub.episodes[0]["ingested_at"].isoformat(),
                  json.dumps({"t3_thread_id": "probe-thread"}), "codex:probe", "codex"))
     con.execute("INSERT INTO topics(slug,body) VALUES ('probe','original')")
     con.execute("INSERT INTO commitments(id,text,status,opened_episode) VALUES (1,'probe owed','open',1)")
@@ -217,7 +221,7 @@ def test_foreign_episode_and_forget_stay_clean(replica):
     assert rows("SELECT deleted_at IS NOT NULL FROM episodes WHERE id=2") == [(1,)]
 
 
-@pytest.mark.parametrize("surface", ["owed", "decisions"])
+@pytest.mark.parametrize("surface", ["owed"])
 def test_pending_forget_never_reappears_through_offline_reads(replica, surface):
     lock = hs._acquire_refresh_lock()
     try:
@@ -228,8 +232,7 @@ def test_pending_forget_never_reappears_through_offline_reads(replica, surface):
             assert con.execute("SELECT id FROM episodes WHERE id=1").fetchall() == []
         finally:
             con.close()
-        out = (offline_reads.owed(None, "open", 10) if surface == "owed"
-               else offline_reads.decisions(None, None, "all", 10))
+        out = offline_reads.owed(None, "open", 10)
         assert out["results"] == [], out
     finally:
         hs._release_refresh_lock(lock)

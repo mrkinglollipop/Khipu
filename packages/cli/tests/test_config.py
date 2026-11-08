@@ -145,9 +145,6 @@ class FloatSettingTest(unittest.TestCase):
         os.environ.clear()
         os.environ.update(self._env)
 
-    def test_defaults(self):
-        self.assertEqual(config.float_setting("dedup_similarity"), 0.92)
-        self.assertEqual(config.float_setting("commitment_close_similarity"), 0.85)
 
     def test_set_persists_and_reads_back(self):
         config.set_float_setting("dedup_similarity", 0.8)

@@ -44,4 +44,4 @@ def test_only_declared_keys_pass_and_tool_callers_cannot_assign_or_close():
         assert key not in payload, sorted(payload)
     assert payload["open_loops"] == ["plain", {"text": "Review the report"}]
     assert payload["closed_loops"] == [{"text": "Completed the audit"}]
-    assert payload["decision_details"] == [{"text": "Keep it"}]
+    assert "decision_details" not in payload

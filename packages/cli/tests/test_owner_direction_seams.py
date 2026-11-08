@@ -5,7 +5,7 @@ from contextlib import nullcontext
 
 import pytest
 
-from khipu import owed_tidy, owner_direction
+from khipu import owed_changes, owner_direction
 
 
 @pytest.fixture(autouse=True)
@@ -47,10 +47,10 @@ class _BatchCursor:
 
 
 def _bulk(monkeypatch, action="close", projects=("p",)):
-    monkeypatch.setattr(owed_tidy, "_batch_id", lambda prefix: f"{prefix}-batch-{len(cur.inserted) + 1}")
-    monkeypatch.setattr(owed_tidy, "_select", lambda *_a, ids, **_kw: {cid: {} for cid in ids})
+    monkeypatch.setattr(owed_changes, "_batch_id", lambda prefix: f"{prefix}-batch-{len(cur.inserted) + 1}")
+    monkeypatch.setattr(owed_changes, "_select", lambda *_a, ids, **_kw: {cid: {} for cid in ids})
     cur = _BatchCursor(projects)
-    return cur, lambda change: owed_tidy.bulk_batch(
+    return cur, lambda change: owed_changes.bulk_batch(
         cur, list(range(1, len(projects) + 1)), action, change, reason="owner request", gate="direction")
 
 
@@ -65,12 +65,12 @@ def test_bulk_owner_change_undo_survives_lost_finish(monkeypatch):
     result = owner_direction.finish({"ok": True, "batches": batches})
     assert result["record_incomplete"]
     seen = []
-    monkeypatch.setattr(owed_tidy, "undo", lambda batch, **_kw: seen.append(batch) or {"ok": True, "restored": 2})
+    monkeypatch.setattr(owed_changes, "undo", lambda batch, **_kw: seen.append(batch) or {"ok": True, "restored": 2})
     assert owner_direction.undo(action_id, "direction")["restored"] == 2
     assert seen == cur.inserted == ["close-batch-1"]
 
 
-@pytest.mark.parametrize("action", owed_tidy.BULK_ACTIONS)
+@pytest.mark.parametrize("action", owed_changes.BULK_ACTIONS)
 @pytest.mark.parametrize("projects", [("p",), ("p", "q"), (None, "q")])
 def test_each_bulk_batch_is_durable_before_its_first_mutation(monkeypatch, action, projects):
     monkeypatch.setattr(owner_direction, "_before", lambda _want: {"owners_items": [1, 2]})
@@ -85,7 +85,7 @@ def test_each_bulk_batch_is_durable_before_its_first_mutation(monkeypatch, actio
     assert owner_direction.actions()[0]["before"]["batches"] == batches
 
 
-@pytest.mark.parametrize("action", owed_tidy.BULK_ACTIONS)
+@pytest.mark.parametrize("action", owed_changes.BULK_ACTIONS)
 def test_a_batch_is_not_written_if_its_recovery_record_cannot_be_written(monkeypatch, action):
     monkeypatch.setattr(owner_direction, "_before", lambda _want: {"owners_items": [1, 2]})
     owner_direction.gate(owner_direction.intent("owed.change", "1,2", facts={"change": action}))
@@ -97,7 +97,7 @@ def test_a_batch_is_not_written_if_its_recovery_record_cannot_be_written(monkeyp
     assert changed == cur.inserted == cur.updated == []
 
 
-@pytest.mark.parametrize("action", owed_tidy.BULK_ACTIONS)
+@pytest.mark.parametrize("action", owed_changes.BULK_ACTIONS)
 def test_directed_bulk_changes_refuse_a_pre_migration_hub(monkeypatch, action):
     from khipu import commitments, db, mcp_server, owner_writes
 
@@ -107,7 +107,7 @@ def test_directed_bulk_changes_refuse_a_pre_migration_hub(monkeypatch, action):
     monkeypatch.setattr(commitments, "owners_of", lambda *_a, **_kw: {
         cid: {"owner": "user"} for cid in (1, 2)})
     monkeypatch.setattr(owner_writes, "apply_on_hub", lambda conn, cur, verb, args, write, echo: write())
-    monkeypatch.setattr(owed_tidy, "_ready", lambda _cur: False)
+    monkeypatch.setattr(owed_changes, "_ready", lambda _cur: False)
     changed = []
     monkeypatch.setattr(commitments, "set_status", lambda cur, cid, *a, **kw: changed.append(cid) or True)
     monkeypatch.setattr(commitments, "reassign", lambda cur, cid, *a, **kw: changed.append(cid) or True)
@@ -116,36 +116,7 @@ def test_directed_bulk_changes_refuse_a_pre_migration_hub(monkeypatch, action):
     result = mcp_server._owed_change_on_hub(args)
     assert result["ok"] is False
     assert result["changed"] == 0
-    assert result["error"] == owed_tidy.NOT_READY
+    assert result["error"] == owed_changes.NOT_READY
     assert changed == cur.inserted == cur.updated == []
 
 
-@pytest.mark.parametrize("change", ["apply", "undo"])
-def test_tidy_undo_survives_lost_finish(monkeypatch, change):
-    batch = "tidy-batch-1"
-    facts = {"change": change, **({"batch": batch} if change == "undo" else {})}
-    owner_direction.gate(owner_direction.intent("owed.tidy", "p", facts=facts))
-    action_id = owner_direction._PENDING.get()["line"]["id"]
-    if change == "apply":
-        from khipu import db
-
-        cur = _BatchCursor([])
-        monkeypatch.setattr(db, "connect", lambda **_kw: nullcontext(type("Conn", (), {
-            "cursor": lambda self: nullcontext(cur)})()))
-        monkeypatch.setattr(owed_tidy, "_ready", lambda _cur: True)
-        monkeypatch.setattr(owed_tidy, "_select", lambda *_a, **_kw: {})
-        monkeypatch.setattr(owed_tidy, "_batch_id", lambda _prefix: batch)
-        result = owed_tidy.apply({"format": owed_tidy.PLAN_FORMAT, "version": owed_tidy.PLAN_VERSION,
-                                  "project": "p", "items": []}, owner_gate="direction")
-    else:
-        owner_direction.record_owed_undo_scope(batch, [1, 2])
-        result = {"ok": True, "batch": batch}
-    _lose_finish(monkeypatch)
-    assert owner_direction.finish(result)["record_incomplete"]
-    seen = []
-    inverse = "redo" if change == "undo" else "undo"
-    monkeypatch.setattr(owed_tidy, inverse, lambda bid, **_kw: seen.append(bid) or {
-        "ok": True, "restored": 2, "reapplied": 2})
-    out = owner_direction.undo(action_id, "direction")
-    assert out["reapplied" if change == "undo" else "restored"] == 2
-    assert seen == [batch]

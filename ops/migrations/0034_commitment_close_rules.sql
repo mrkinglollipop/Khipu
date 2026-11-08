@@ -9,7 +9,7 @@
 --   prs                 the pull request numbers the item names (PR #N,
 --                       pull request N, #N next to "PR", a GitHub pull link),
 --                       parsed at insert. NULL means not parsed yet: the
---                       nightly backfill (khipu.close_rules.backfill_prs)
+--                       nightly backfill (historical closure rules.backfill_prs)
 --                       fills those; an empty array means none named.
 --   closed_by           who closed it: 'Khipu, by rule', 'you, in the app' or
 --                       'a conversation'. NULL for closes from before this.
@@ -46,7 +46,7 @@ ALTER TABLE commitments ADD COLUMN IF NOT EXISTS settle_suggestion JSONB;
 ALTER TABLE commitments ADD COLUMN IF NOT EXISTS pr_check JSONB;
 
 COMMENT ON COLUMN commitments.prs IS
-    'Pull request numbers the item names, parsed at insert (khipu.close_rules.parse_prs). NULL: not parsed yet (the nightly backfills); empty: none named.';
+    'Pull request numbers the item names, parsed at insert (historical closure rules.parse_prs). NULL: not parsed yet (the nightly backfills); empty: none named.';
 COMMENT ON COLUMN commitments.closed_by IS
     'Who closed it: ''Khipu, by rule'', ''you, in the app'' or ''a conversation''. NULL for closes from before migration 0034.';
 COMMENT ON COLUMN commitments.close_rule_key IS

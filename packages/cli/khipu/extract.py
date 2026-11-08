@@ -40,50 +40,6 @@ Output ONLY a single JSON object (no prose, no markdown fences) with these keys:
 - decisions: list of strings
 - preferences: list of strings
 - scope: short string
-- open_loops: list of objects {{text, kind, due_after, owner, owner_label, future_trigger}}. BE STRICT —
-  an empty list is the right answer for most sessions. Include an item ONLY if
-  it is (a) something the USER must decide, provide, approve, or do, or (b)
-  something you explicitly promised to do in a FUTURE session and cannot
-  finish in this one.
-  NEVER include:
-    * in-progress status of any kind — "is running", "still building",
-      "pending", "in flight", "waiting on/for", "awaiting";
-    * anything about agents, subagents, drives, notifications, reports
-      arriving, verdicts, or polling;
-    * inter-session or inter-agent coordination — "send/receive ... message",
-      "screen free/busy", "ping the session";
-    * steps of your OWN plan for this session (you will finish them here);
-    * anything this window already reports as completed;
-    * vague items with no concrete action or actor.
-  GOOD: "Matt to decide whether 0.3.17 ships with the seal fix or waits";
-  "Send Matt the Linode restore-drill numbers next session";
-  "Matt must supply the second Mac's hostname before soak can start";
-  "Approve the AGPL CLA wording".
-  BAD: "Drive 46 is still running"; "Generate the UI mocks" (a step of this
-  session's own plan); "Send 'screen free' message to the Khipu session";
-  "Receive the report from the phase 1-2 agent"; "Visual check agent's
-  verdict is pending".
-  kind is one of "followup", "blocker", "question", "promise".
-  owner is "user" (the USER must decide/provide/approve/do it, or it is a
-  question for them), "assistant", or "other" (someone else named as the
-  one who must act: the orchestrator, a pull request's author, a reviewer, a
-  builder, another job) — always answer it. owner_label is a short name for
-  that someone ("orchestrator", "PR author", "reviewer"), or null when owner
-  is not "other".
-  future_trigger is true ONLY when the text names an explicit cross-session
-  condition ("when Matt says the lane is re-authed, ...", "next session",
-  "after the wave merges", "if attempt six dies"); false otherwise.
-  NEVER record a within-session reporting duty — "reply with the SHAs",
-  "tell the user when it relaunches", "notify Matt", "report back",
-  "provide the evidence paths" — unless the USER is the one who owes it.
-  A scope, plan, or design that was APPROVED this session but whose BUILD was
-  explicitly deferred is an open loop of kind "followup", future_trigger
-  true, with the deferral condition itself as the text (e.g. "Build the
-  export screen once the migration ships" — not just "Build the export
-  screen", which loses the condition).
-  due_after is optional; omit or use null when unknown.
-- closed_loops: list of objects {{text}} for anything explicitly finished,
-  merged, shipped, or no longer needed this turn.
 Capture concrete decisions, user preferences/corrections, project state, file paths in play, and ruled-out dead ends.
 Return a summary of empty string if nothing durable.
 
@@ -91,40 +47,6 @@ Session project (cwd): {cwd}
 
 Transcript:
 {transcript}
-"""
-
-# Spliced in before the "Session project (cwd):" block for a dispatched
-# job's transcript only (owed scope 2026-10-16, design (a) rule 4). The
-# person typing in a job is the orchestrator that dispatched it, so the
-# model must not record the orchestrator's asks as the user's. Khipu's own
-# deterministic owner rule still wins on conflict (khipu.commitments).
-JOB_SECTION = """
-This transcript is a dispatched job's: the "user" turns were written by the
-orchestrator that dispatched it, not by the person who owns the project.
-Something the orchestrator (or the person, through it) must decide, answer or
-do is owner "other" with owner_label "orchestrator", even when the text names
-the person ("Matt to decide X" in a job is the orchestrator's to raise).
-"""
-
-# Appended after PROMPT, before the ``.format()`` call, ONLY when the
-# `decision_details` switch is on (khipu.features) — with the switch off the
-# formatted prompt is byte-identical to PROMPT.format(...) alone, the
-# invariant docs/plans/2026-09-27-memory-reasoning-scope.md calls "the heart
-# of capture". `decisions`'s own key/instructions above are unchanged.
-DECISION_DETAILS_SECTION = """
-When `decisions` is non-empty, ALSO include:
-- decision_details: list of objects {{text, by, rationale, reverses}}. One
-  entry per item in `decisions` you are confident enough to detail — an
-  empty list is fine, and skipping an item you are unsure about is fine.
-  text: the SAME decision, copied WORD FOR WORD from `decisions` — never a
-  paraphrase or summary.
-  by: "user" or "assistant" — whoever actually decided it, from the
-  transcript's own turns.
-  rationale: the stated reason, ONLY when the session gives one explicitly;
-  omit or use null rather than inventing one.
-  reverses: the EARLIER decision this one replaces, in the session's own
-  words, or null. A refinement or elaboration of an earlier decision is NOT
-  a reversal — only a decision that undoes or contradicts an earlier one is.
 """
 
 
@@ -836,163 +758,18 @@ def parse_model_json(text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-_TOP_LEVEL_KEYS = ("summary", "topics", "people", "decisions", "preferences", "scope",
-                   "open_loops", "closed_loops")
+_TOP_LEVEL_KEYS = ("summary", "topics", "people", "decisions", "preferences", "scope")
 
 
-def _detail_block_ends(text: str, start: int):
-    """Offsets where the ``decision_details`` value that begins at ``start``
-    could end, best guess first: the first top-level comma or closing brace
-    (string- and nesting-aware), then the comma before each known sibling key,
-    then the object's last brace. Every guess is checked by re-parsing."""
-    depth, in_str, escaped = 0, False, False
-    for j in range(start, len(text)):
-        ch = text[j]
-        if in_str:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_str = False
-        elif ch == '"':
-            in_str = True
-        elif ch in "[{":
-            depth += 1
-        elif ch in "]}":
-            if depth == 0:
-                yield j
-                break
-            depth -= 1
-        elif ch == "," and depth == 0:
-            yield j
-            break
-    sibling = re.compile(r',\s*"(?:%s)"\s*:' % "|".join(_TOP_LEVEL_KEYS))
-    for m in sibling.finditer(text, start):
-        yield m.start()
-    last = text.rstrip().rfind("}")
-    if last > start:
-        yield last
 
 
-def _parse_without_decision_details(text: str) -> dict[str, Any] | None:
-    """An answer that fails to parse only because its optional
-    ``decision_details`` block is malformed is still a good answer: cut the
-    block out and parse what is left. None when no cut gives a JSON object,
-    so an answer broken anywhere else still fails as before."""
-    for m in re.finditer(r'"decision_details"\s*:\s*', text):
-        for end in _detail_block_ends(text, m.end()):
-            before = text[: m.start()].rstrip()
-            after = text[end:].lstrip()
-            if after.startswith(","):
-                after = after[1:].lstrip()
-            elif before.endswith(","):
-                before = before[:-1].rstrip()
-            parsed = parse_model_json(f"{before} {after}")
-            if parsed is not None:
-                return parsed
-    return None
-
-
-def _as_open_loops(v: Any) -> list[dict[str, Any]]:
-    if not isinstance(v, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for item in v:
-        if isinstance(item, str):
-            text = item.strip()
-            if text:
-                out.append({"text": text, "kind": "followup", "due_after": None,
-                            "owner": None, "future_trigger": None})
-            continue
-        if not isinstance(item, dict):
-            continue
-        text = str(item.get("text") or "").strip()
-        if not text:
-            continue
-        kind = str(item.get("kind") or "followup").strip().lower()
-        if kind not in ("followup", "blocker", "question", "promise"):
-            kind = "followup"
-        loop = {
-            "text": text,
-            "kind": kind,
-            "due_after": item.get("due_after") or None,
-            "owner": item.get("owner") or None,
-            # Carried through for the record; khipu.commitments decides the
-            # stored value deterministically (has_future_trigger wins).
-            "future_trigger": item.get("future_trigger"),
-        }
-        label = item.get("owner_label")
-        if isinstance(label, str) and label.strip():
-            # Only for an "other" owner; khipu.commitments keeps it when no
-            # rule names the owner.
-            loop["owner_label"] = label.strip()[:40]
-        out.append(loop)
-    return out
-
-
-def _as_closed_loops(v: Any) -> list[dict[str, Any]]:
-    if not isinstance(v, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for item in v:
-        text = item.get("text") if isinstance(item, dict) else item
-        text = str(text or "").strip()
-        if text:
-            out.append({"text": text})
-    return out
 
 
 _VALID_SOURCE_KINDS = ("user", "assistant")
 
 
-def _as_decision_details(v: Any, decisions: list[str]) -> list[dict[str, Any]]:
-    """Tolerant per "BUILD" item 1: the key's absence, a wrong type, extra
-    keys, and an item whose ``text`` matches none of the already-parsed
-    ``decisions`` (dropped, not repaired — a detail must repeat a decision
-    word for word) are all accepted rather than raised. Nothing here can
-    make an extraction fail that would have succeeded without it."""
-    if not isinstance(v, list) or not decisions:
-        return []
-    valid_texts = set(decisions)
-    out: list[dict[str, Any]] = []
-    for item in v:
-        if not isinstance(item, dict):
-            continue
-        text = str(item.get("text") or "").strip()
-        if not text or text not in valid_texts:
-            continue
-        by = str(item.get("by") or "").strip().lower()
-        if by not in _VALID_SOURCE_KINDS:
-            by = None
-        rationale = item.get("rationale")
-        rationale = rationale.strip() if isinstance(rationale, str) and rationale.strip() else None
-        reverses = item.get("reverses")
-        reverses = reverses.strip() if isinstance(reverses, str) and reverses.strip() else None
-        out.append({"text": text, "by": by, "rationale": rationale, "reverses": reverses})
-    return out
 
 
-def _build_prompt(*, cwd: str, transcript: str, job: bool = False) -> str:
-    """PROMPT, plus DECISION_DETAILS_SECTION spliced in right before the
-    trailing "Session project (cwd):" block, ONLY when the `decision_details`
-    switch is on, and JOB_SECTION the same way for a dispatched job's
-    transcript. With the switch off, for a conversation, this returns exactly
-    ``PROMPT.format(...)`` — the invariant every extraction test pins."""
-    marker = "\nSession project (cwd):"
-    template = PROMPT
-    try:
-        from khipu import features
-
-        if features.enabled("decision_details"):
-            idx = template.index(marker)
-            template = template[:idx] + DECISION_DETAILS_SECTION + template[idx:]
-    except Exception:  # noqa: BLE001 — the switch registry must never block extraction
-        template = PROMPT
-    if job:
-        idx = template.index(marker)
-        template = template[:idx] + JOB_SECTION + template[idx:]
-    return template.format(cwd=cwd or "(unknown)", transcript=transcript)
 
 
 def _parse_capture(raw: str) -> dict[str, Any] | None:
@@ -1005,8 +782,6 @@ def _parse_capture(raw: str) -> dict[str, Any] | None:
     except ValueError:
         pass
     parsed = parse_model_json(raw)
-    if parsed is None:
-        parsed = _parse_without_decision_details(raw)
     if parsed is not None:
         summary = parsed.get("summary")
         if not (isinstance(summary, str) or
@@ -1061,7 +836,7 @@ def _merge_items(first: dict[str, Any], retried: dict[str, Any]) -> dict[str, An
     """``first`` with any list items only ``retried`` found appended; a blank
     retry never drops what the first reply extracted."""
     merged = dict(first)
-    for key in (*_ITEM_KEYS, "preferences", "decision_details", "topics", "people"):
+    for key in (*_ITEM_KEYS, "preferences", "topics", "people"):
         a, b = first.get(key), retried.get(key)
         if isinstance(a, list) and isinstance(b, list):
             merged[key] = a + [x for x in b if x not in a]
@@ -1202,7 +977,7 @@ def extract_memory(transcript: str, *, cwd: str = "", job: bool = False) -> dict
     if not summary:
         if not (extract_verbatim(transcript) or extract_deliverables(transcript)
                 or any(parsed.get(k) for k in ("decisions", "preferences", "open_loops",
-                                               "closed_loops", "decision_details"))):
+                                               "closed_loops"))):
             return None
         # Kept, not summarised: the evidence is stored whole under an empty
         # summary and the marker, never under a sentence that embeds alike.
@@ -1219,15 +994,6 @@ def extract_memory(transcript: str, *, cwd: str = "", job: bool = False) -> dict
     # 378). The project identity now belongs in the capture payload's own
     # `project` field (khipu.identity, set by the hook), not in topics.
     decisions = _as_str_list(parsed.get("decisions"))
-    # Asked for the detail block, the model often writes a decision there and
-    # nowhere else (measured on real sessions: 7 decisions captured without
-    # the block, 0 with it). A detail's text is a decision: it joins the list.
-    raw_details = parsed.get("decision_details")
-    if isinstance(raw_details, list):
-        for item in raw_details:
-            text = str(item.get("text") or "").strip() if isinstance(item, dict) else ""
-            if text and text not in decisions:
-                decisions.append(text)
     return {
         "summary": summary,
         **({"summary_kind": VERBATIM_ONLY} if verbatim_only else {}),
@@ -1236,9 +1002,12 @@ def extract_memory(transcript: str, *, cwd: str = "", job: bool = False) -> dict
         "decisions": decisions,
         "preferences": _as_str_list(parsed.get("preferences")),
         "scope": str(parsed.get("scope", "")).strip(),
-        "open_loops": _as_open_loops(parsed.get("open_loops")),
-        "closed_loops": _as_closed_loops(parsed.get("closed_loops")),
-        "decision_details": _as_decision_details(parsed.get("decision_details"), decisions),
+        "open_loops": [],
+        "closed_loops": [],
         "edges": [],
         "topic_pages": [],
     }
+
+
+def _build_prompt(*, cwd: str, transcript: str, job: bool = False) -> str:
+    return PROMPT.format(cwd=cwd or "(unknown)", transcript=transcript)

@@ -1,6 +1,6 @@
 # MCP tools
 
-Khipu exposes 19 tools locally and 17 through the HTTPS gateway, which omits `khipu_owner_act` and `khipu_needs_you`, through one MCP server (server id `khipu`). Agents call them to read memory, write to it, manage commitments and decisions, and read the routing record, and take an owner action the owner asked for.
+Khipu exposes 17 tools locally and 15 through the HTTPS gateway, which omits `khipu_owner_act` and `khipu_needs_you`, through one MCP server (server id `khipu`). Agents call them to read memory, write to it, file and manage explicit asks, and read the routing record, and take an owner action the owner asked for.
 
 The tool list is returned verbatim by the server's `tools/list`. This page groups the tools by job. For the exact schema of any tool, ask the server.
 
@@ -104,7 +104,7 @@ Behaviour depends on where it runs:
 
 An immediate capture returns `ok`, `mode` and `ts`, plus `episode_id` when the writer identifies the row it actually landed on. This may be an existing episode that the capture merged into. A hook-owned call instead returns `queued`, `captured_by`, `harness`, `session_id` and `resolved_by`.
 
-An immediate capture also says what became of the loops it carried. `ok: true` means the episode is stored; it does not mean every loop took effect. `dropped` lists each loop that did not, as `{kind, text, reason}` (`kind` is `open_loop` or `closed_loop`): an open loop the precision filter rejected (too short, no action, status chatter), or a closed loop that matched no open commitment, matched several equally, or matched one its rules keep open. `partial: true` is present when `dropped` is not empty. `commitments` gives the counts (`opened`, `restated` for words already open, `closed`), or `step_failed` with the error when the commitment step was rolled back, in which case every loop sent is in `dropped`. `fact_gaps` (`{step, error}`) names any other fact step (decisions, close rules, deliverables) that failed and was rolled back. An exact replay of a capture already recorded has `commitments: {not_processed}` and no `dropped` (the first write handled its loops). A capture matched to an existing episode by resemblance stores no loops: they come back in `dropped` with the reason `capture matched episode N; loops not stored`. A `done:` decision that closes nothing is reported with `kind: "decision"`. Error text in `step_failed` and `fact_gaps` is the exception class and one short line; a database error shows only its class and SQLSTATE.
+An immediate capture can also return `fact_gaps` (`{step, error}`), which names a fact step that failed and was rolled back, together with `partial: true`. Loops, decisions and the rest of the capture are kept as episode memory and never change Owed; only an explicit ask does. Error text in `fact_gaps` is the exception class and one short line; a database error shows only its class and SQLSTATE.
 
 A hook-owned call stores the summary as the note only. Any `open_loops`, `closed_loops`, `decisions`, `decision_details`, `preferences`, `topics`, `people`, `deliverables` or `verbatim` sent with it are not kept and come back in `dropped` as `{field, count, reason}`. The note is capped at 14,000 characters (the newest are kept, across repeated requests); when text was cut the answer has `truncated: true`, `stored_chars`, `sent_chars` and `dropped_chars`. `khipu capture now` prints the same four fields when it cuts.
 
@@ -114,11 +114,11 @@ Tombstone one episode. Parameter: `id` (required). The row is not erased: its su
 
 `khipu_forget` also accepts `ledger:<project>#<row id>` to remove a ledger row, with optional `note` and `children` (`remove` or `move-up`). The owner can restore the removed row during the configured retention period.
 
-## Commitments and decisions
+## Explicit asks and archived commitments
 
 ### khipu_owed
 
-List commitments (followups, blockers, questions, promises). Read-only.
+List deliberately filed asks and archived commitments. Read-only.
 
 | Parameter | Meaning |
 | --- | --- |
@@ -135,49 +135,23 @@ Follow `next_cursor` for subsequent pages; `total` and `counts` cover all matchi
 
 ### khipu_owed_update
 
-Close, reopen, snooze or reassign commitments.
+File an explicit ask, or manually close, reopen, snooze or reassign a stored item.
+
+To file an ask, use `action="ask"` with `requester`, `question`, `yes` and `no`. No existing id is needed. The question appears in `khipu_needs_you`.
 
 | Parameter | Meaning |
 | --- | --- |
-| `id`, `ids` | Supply a commitment id or a list of ids from `khipu_owed`. |
-| `action` | Required. `close`, `reopen`, `snooze` or `reassign`. |
+| `id`, `ids` | For an existing item, supply a commitment id or a list of ids from `khipu_owed`. |
+| `action` | Required. `ask`, `close`, `reopen`, `snooze` or `reassign`. |
 | `until` | For snooze: a date, or `7d`, `2w`, `1m`. |
 | `owner`, `owner_label` | Reassignment requires `owner` (`user`, `assistant` or `agent`), with an optional label. |
 | `reason` | Required when changing multiple ids. |
 
 Multiple ids are changed in one transaction with a result per id, bounded by `owed_bulk_max` (500 by default, 0 for no cap). The answer's `ok` is false, with `changed: 0`, `failed` and an `error`, when no id changed (every id missing, or a reopen of items already open); the per-id `results` still say why, and the tool call is an error. When some ids changed and others did not, `ok` stays true so the ids that landed are kept, with `partial: true` and `failed` listing the ids that did not; check `results` per id. `khipu owed --close/--reopen/--reassign ID,ID` prints the same answer and exits 1 unless `ok`. Bulk changes including user-owned items require owner confirmation or owner-directed `owed.change`.
 
-### khipu_decisions
+When the hub is unavailable, owed reads use this Mac's replica and mark stale results and pending updates (`pending_sync`). Local explicit updates queue for replay with hub outcome receipts. Gateway updates and episode forget do not queue.
 
-List decisions with their validity. Read-only.
-
-| Parameter | Meaning |
-| --- | --- |
-| `project` | Filter to one project. |
-| `status` | `standing` (default), `superseded`, `retracted`, `all` or `conflicts`. |
-| `since` | ISO date or relative, such as `7d`. |
-| `limit` | Default 20, capped at 100. |
-
-`conflicts` returns unresolved candidate links, with the text of both sides, that nobody has confirmed or rejected yet.
-
-When the hub is unavailable, owed and decision reads use this Mac’s replica and mark stale results and pending updates (`pending_sync`). Decision conflicts still require the hub. Local owed and decision updates queue for replay with hub outcome receipts. Gateway updates and episode forget do not queue.
-
-### khipu_decisions_update
-
-Change one decision.
-
-| Parameter | Meaning |
-| --- | --- |
-| `action` | Required. `supersede`, `restore`, `retract`, `confirm` or `reject`. |
-| `id` | The decision, for supersede, restore and retract. |
-| `link_id` | The candidate link, for confirm and reject. |
-| `by` | For supersede: an existing decision id that replaces this one. |
-| `new_text` | For supersede: the replacement wording. Creates a new decision. |
-| `source_kind` | With `new_text`: `user`, `assistant` or `tool`. Default `assistant`. |
-| `reason` | For supersede and retract, in the user's own words. |
-| `project`, `session_id` | For the new row created by `new_text`. |
-
-Supersede requires `id` and exactly one of `by` or `new_text`. Restore and retract require `id`; confirm and reject require `link_id`. Supersede only when the user reverses or replaces a decision, not for a refinement. Retract marks a decision wrong outright.
+Episode decision strings remain searchable memory. Archived registry validity is attached to search and episode detail; there is no separate decision-list or decision-update tool.
 
 ## Routing
 
@@ -283,6 +257,6 @@ Rows carry titles and short plain-words lines about the work, never code, diffs,
 
 ## Related
 
-- [CLI reference](cli.md): the same operations from a terminal (`khipu search`, `khipu owed`, `khipu decisions`, `khipu route`, `khipu usage`).
+- [CLI reference](cli.md): the same operations from a terminal (`khipu search`, `khipu owed`, `khipu route`, `khipu usage`).
 - [Integrations](integrations.md): which harnesses get the server and which hooks push recall.
 - [How it works](how-it-works.md): capture, storage and recall.

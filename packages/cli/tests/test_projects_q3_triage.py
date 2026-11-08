@@ -7,7 +7,7 @@ from unittest import mock
 import pytest
 
 from khipu import identity
-from tests.fact_seed import adopt, announce
+from tests.fact_seed import announce
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 
 ALPHA, BETA = "owner/alpha", "owner/beta"
@@ -86,27 +86,8 @@ def test_undo_leaves_a_forgotten_capture_where_forget_left_it(cur):
     assert cur.fetchall() == [(BETA, "unique zebrafish note three")]
 
 
-def test_close_rules_see_open_items_stored_under_an_alias_of_the_captured_project(cur):
-    from khipu import close_rules
-
-    _alias(cur)
-    cur.execute("INSERT INTO commitments (text, project, owner, content_hash) VALUES "
-                "('ship the zebrafish thing', %s, 'agent', 'h1') RETURNING id", (ALPHA,))
-    adopt(cur, "commitment", cur.fetchone()[0])
-    cur.connection.commit()
-    items = close_rules._open_items(cur, BETA)
-    assert [i["project"] for i in items] == [ALPHA], "alias-stored open item is invisible to a capture under the canonical name"
 
 
-def test_decision_dedup_sees_a_standing_decision_stored_under_an_alias(cur):
-    from khipu import decisions
-
-    _alias(cur)
-    cur.execute("INSERT INTO decisions (project, text) VALUES (%s, 'use zebrafish') RETURNING id", (ALPHA,))
-    adopt(cur, "decision", cur.fetchone()[0])
-    cur.connection.commit()
-    assert decisions._find_recent_duplicate(cur, BETA, "use zebrafish", None) is not None, \
-        "same decision restated under the canonical name becomes a second standing row"
 
 
 def test_project_search_filter_does_not_match_a_substring_of_the_old_name(cur):

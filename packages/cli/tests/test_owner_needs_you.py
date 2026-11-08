@@ -207,8 +207,7 @@ def _all_confirmations(world, monkeypatch) -> dict[str, dict]:
     monkeypatch.setattr(owner_act, "_forget_list", lambda: {
         "strings": ["forgotten-a"], "ids": [{"id": 41, "summary": "a talk about the roof"}], "at": "2026-11-01T00:00:00Z"})
     monkeypatch.setattr(routing, "_hub_configured", lambda: True)
-    monkeypatch.setattr(needs_you, "_hub_items", lambda: [needs_you.job_origin_item("origin-1", 3, "2026-11-01T00:00:00Z"),
-                                                          needs_you.project_pair_item("acme/old", "acme/new", None)])
+    monkeypatch.setattr(needs_you, "_hub_items", lambda: [needs_you.project_pair_item("acme/old", "acme/new", None)])
     return {i["kind"]: i for i in _items()}
 
 
@@ -630,7 +629,7 @@ def test_a_held_answer_whose_target_moved_can_only_be_refused(world):
 @pytest.mark.parametrize("kind,side,action", [
     ("forget_send", "confirm", "forget.send"), ("forget_id", "confirm", "forget.here"),
     ("forget_id", "undo", "forget.not_same"),
-    ("job_origin", "confirm", "owed.correct_job_origin.confirm"), ("project_pair", "confirm", "project.merge"),
+    ("project_pair", "confirm", "project.merge"),
     ("project_pair", "undo", "project.keep_separate"),
 ])
 def test_what_waits_off_the_record_goes_through_the_same_hold_and_yes(world, monkeypatch, kind, side, action):

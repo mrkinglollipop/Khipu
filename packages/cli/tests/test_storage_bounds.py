@@ -338,24 +338,7 @@ def test_doctor_gets_a_row_for_every_new_nightly_step():
             "receipt_prune_ok", "routing_ledger_prune_ok"} <= keys
 
 
-def test_the_nightly_records_each_new_step(homes, monkeypatch):
-    names = []
-    monkeypatch.setattr(jobs, "_record_nightly_step", lambda steps, name, **kw: names.append(name))
-    for fn in ("_drain_sessions", "_reconcile_notes_if_due", "_embed_backfill", "_summary_kind_backfill",
-               "_prune_query_cache", "_prune_routing_ledgers", "_storage_sweep",
-               "_commitment_close_rules", "_fact_changes_prune", "_mark_stale_commitments",
-               "_provenance_nightly", "_ledger_nightly", "_receipt_prune", "_project_renames_sweep",
-               "_recall_eval_step", "_refresh_snapshot"):
-        monkeypatch.setattr(jobs, fn, lambda *a, **k: {"ok": True})
-    monkeypatch.setattr(jobs, "_run_script", lambda *a, **k: 0)
-    monkeypatch.setattr(jobs, "_write_job_state", lambda *a, **k: None)
-    jobs._run_nightly_locked()
-    for step in ("storage_sweep", "fact_changes_prune", "receipt_prune"):
-        assert step in names
-    assert names.index("fact_changes_prune") > names.index("provenance_backfill")
-
-
-def test_fact_changes_prune_is_its_own_step_and_survives_a_close_rules_failure(homes, monkeypatch):
+def test_fact_changes_prune_reports_its_own_success_and_failure(homes, monkeypatch):
     from khipu import db, provenance
 
     class Conn:

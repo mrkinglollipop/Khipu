@@ -123,11 +123,11 @@ STORES: tuple[Store, ...] = (
           "hold job summaries, ids and hashes only",
           "the Work view's read model, which lists open commitments' text", "work view",
           _w("work._replace_json")),
-    Store("Owed reset export", "the file named with khipu owed reset --export FILE and FILE.sha256",
+    Store("Owed reset export", "legacy owner-selected export FILE and FILE.sha256",
           "archived commitment rows, including capture-derived text and lineage",
           "kept: an owner-chosen archive outside managed stores; forget cannot find or erase it; "
           "the export output and command help disclose this boundary",
-          _w("owed_reset.export")),
+          ()),
     Store("recall eval record", "a file the owner names with khipu recall eval --record",
           "the golden queries, quoted text included, and the ids each one returned",
           "kept: an owner-chosen file outside the data folder that forget cannot find; a known "
@@ -210,12 +210,11 @@ STORES: tuple[Store, ...] = (
           "a binary copy of the commitments table, whose text a capture opened",
           "kept: closed commitments remain by design (forget's kept text)",
           _w("hygiene.backup_commitments")),
-    Store("owed tidy plan", "the file named with khipu owed tidy --plan-out; the app keeps it at "
+    Store("archived clean-up plan", "legacy clean-up plans at "
           "data folder state/owed-tidy/plan-<project>-<hash>.json",
           "a clean-up plan: open commitments' text, owners and the evidence for each change",
-          "kept: commitments' text remains by design (forget's kept text); each plan is rewritten "
-          "on the next Tidy this list",
-          _w("cli.cmd_owed_tidy")),
+          "kept: historical plans remain as archive files; no current writer",
+          ()),
     Store("local backup", "a backup folder or archive the owner chose",
           "a copy of the data folder", "kept: backups are kept for recovery (forget's kept text); "
           "an import restores only what a store here says it may, each file through that "
@@ -243,7 +242,7 @@ OTHER_DATA: tuple[DataFiles, ...] = (
               Restore(("forgotten_sources.json",), "registry merge")),
     DataFiles("ledger outbox", "ledger writes waiting for the hub, the owner's work rows",
               Restore(("ledger-outbox/*.json",), "no capture text")),
-    DataFiles("owner writes", "owner writes waiting for the hub: closing an owed item, superseding a decision",
+    DataFiles("owner writes", "owner writes waiting for the hub: updating an explicit ask",
               Restore(("owner-writes/*.json",), "no capture text")),
 )
 

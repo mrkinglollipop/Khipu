@@ -96,14 +96,6 @@ def test_owed_from_a_replica_without_the_table_keeps_the_hub_error(home, hub_dow
         srv._tool_owed({})
 
 
-def test_decisions_with_the_hub_down_filter_and_skip_forgotten(replica, hub_down):
-    standing = srv._tool_decisions({"project": "p"})
-    assert [r["id"] for r in standing["results"]] == [1]
-    assert standing["stale"] is True and standing["results"][0]["state"] == "current"
-    everything = srv._tool_decisions({"status": "all"})
-    assert {r["id"]: r["state"] for r in everything["results"]} == {1: "current", 2: "superseded", 4: "retracted"}
-    conflicts = srv._tool_decisions({"status": "conflicts"})
-    assert conflicts["results"] == [] and "hub" in conflicts["note"]
 
 
 def test_a_close_made_with_the_hub_away_waits_then_replays_once(home):
@@ -164,13 +156,6 @@ def test_the_gateway_never_queues(home):
     assert _queued(home) == []
 
 
-def test_a_decision_write_with_the_hub_away_waits(home):
-    with mock.patch.object(srv, "_decisions_update_on_hub", side_effect=DOWN):
-        out = srv._tool_decisions_update({"id": 7, "action": "retract", "reason": "wrong"})
-        with pytest.raises(ValueError):
-            srv._tool_decisions_update({"action": "retract"})  # still validated before anything waits
-    assert out["waiting_to_sync"] and out["action"] == "retract"
-    assert owner_writes.pending_marks("decisions_update") == {7: "retract"}
 
 
 def test_rows_with_a_waiting_write_say_so(replica, hub_down):
@@ -331,15 +316,6 @@ def test_a_landed_check_that_cannot_reach_the_hub_keeps_the_write_waiting(home, 
     assert out["stopped_early"] and out["waiting"] == 1 and sent == []
 
 
-def test_a_result_the_hub_refused_is_kept_as_refused_not_counted_as_done(home, monkeypatch):
-    owner_writes._enqueue("decisions_update", {"id": 9, "action": "restore"}, "connection refused")
-    monkeypatch.setattr(owner_writes, "_apply", lambda *_: {"ok": False, "id": 9, "action": "restore"})
-    result = owner_writes.drain()
-    assert result["refused"] == 1, result
-    assert result["replayed"] == 0 and _queued(home) == []
-    kept = json.loads(next((home / "owner-writes" / "refused").glob("*.json")).read_text())
-    assert kept["args"]["id"] == 9 and "refused" in kept["error"]
-    assert owner_writes.status()["refused"] == 1
 
 
 def test_a_write_made_during_a_replay_cannot_be_overtaken_by_a_later_one(home, monkeypatch):
@@ -380,41 +356,12 @@ def test_a_write_made_during_a_replay_cannot_be_overtaken_by_a_later_one(home, m
     assert calls == [1, 2, 3], calls
 
 
-def test_only_the_ledger_sends_an_owner_write_to_the_hub():
-    """Every queued-or-direct owner write goes through owner_writes.run, so
-    the order and exactly-once rules above hold for all of them."""
-    import ast
-    from pathlib import Path
-
-    package = Path(owner_writes.__file__).resolve().parent
-    hub_halves = {"_owed_update_on_hub", "_decisions_update_on_hub"}
-    found = []
-    for path in sorted(package.rglob("*.py")):
-        if path.name == "owner_writes.py":
-            continue
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            word = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
-            if word in hub_halves:
-                found.append(f"{path.name}:{node.lineno} {word}")
-    assert not found, "send owner writes through owner_writes.run: " + ", ".join(found)
-    callers = []
-    for path in sorted(package.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                    and node.func.attr == "run" and getattr(node.func.value, "id", "") == "owner_writes":
-                callers.append(path.name)
-    assert sorted(set(callers)) == ["cli.py", "mcp_server.py"]
 
 
 # Every action of every owner write tool, each made to be refused by the hub.
 _REFUSED_WRITES = {
     "owed_update": [{"id": 1, "action": "close"}, {"id": 1, "action": "reopen"},
                     {"id": 1, "action": "snooze", "until": "7d"}],
-    "decisions_update": [{"id": 1, "action": "supersede", "by": 2},
-                         {"id": 1, "action": "supersede", "new_text": "scratch replacement"},
-                         {"id": 1, "action": "restore"}, {"id": 1, "action": "retract"},
-                         {"link_id": 1, "action": "confirm"}, {"link_id": 1, "action": "reject"}],
 }
 
 
@@ -442,23 +389,13 @@ def test_every_owner_writer_records_its_outcome_with_the_write():
 def test_a_refused_owner_write_replays_as_refused_after_a_lost_reply(tx_hub, monkeypatch, tool, args):  # noqa: F811
     import psycopg
 
-    from khipu import commitments, decisions
+    from khipu import commitments
 
     monkeypatch.setattr(owner_writes, "_landed", _REAL_LANDED)
     tx_hub.missing = True
     monkeypatch.setattr(commitments, "set_status", lambda cur, cid, status, **kw: False)
-    monkeypatch.setattr(decisions, "restore", lambda cur, did: False)
-    monkeypatch.setattr(decisions, "retract", lambda cur, did, reason: False)
-    monkeypatch.setattr(decisions, "supersede", lambda cur, old, new, **kw: False)
-    monkeypatch.setattr(decisions, "_fetch_decision_row", lambda cur, did: {"id": did, "superseded_by": None})
-    monkeypatch.setattr(decisions, "create_decision", lambda cur, **kw: 5)
 
-    def resolve_link(cur, link_id, action, **kw):
-        if action == "confirm":
-            raise ValueError(f"no such link: {link_id}")
-        return {"ok": False, "error": "decision_links table not migrated"}
 
-    monkeypatch.setattr(decisions, "resolve_link", resolve_link)
     real_apply = owner_writes._apply
 
     def lost_reply(tool, args):
@@ -475,3 +412,18 @@ def test_a_refused_owner_write_replays_as_refused_after_a_lost_reply(tx_hub, mon
     assert out["refused"] == 1 and out["replayed"] == 0, out
     assert [o for o, _e in tx_hub.answered.values()] == ["refused"]
     assert tx_hub.commitment_writes == 0
+
+
+def test_retired_tools_archive_the_original_write_without_applying_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
+    original = {"tool": "retired_fixture", "args": {"id": 42, "new_text": "Keep the original wording",
+                                                   "write_id": "fixture-retired"}}
+    path = owner_writes.queue_dir() / "legacy.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(original))
+    monkeypatch.setattr(owner_writes, "_apply", lambda *a: pytest.fail("retired writes must never run"))
+    monkeypatch.setattr(owner_writes, "_landed", lambda *a: pytest.fail("retired writes must not reach the hub"))
+    assert owner_writes._replay(path) == "refused"
+    archived = json.loads((owner_writes._refused_dir() / path.name).read_text())
+    assert archived["tool"] == original["tool"] and archived["args"] == original["args"]
+    assert "archived, not applied" in archived["error"]

@@ -10,8 +10,8 @@
 -- Three schema changes back the fix:
 --   * last_seen_at / seen_count — a paraphrase of an already-open commitment
 --     no longer inserts a second row; it touches the first one instead
---     (khipu.commitments.open_from_episode). last_seen_at is also the clock
---     mark_stale ages against, so a commitment that keeps being restated
+--     (khipu.commitments.historical commitment capture). last_seen_at is also the clock
+--     historical aging ages against, so a commitment that keeps being restated
 --     stays open and a genuinely silent one expires.
 --   * status 'dropped' — the hygiene re-judge never DELETEs. A rejected
 --     commitment is parked in 'dropped' with a close_reason, so a bad verdict
@@ -31,7 +31,7 @@ CREATE INDEX IF NOT EXISTS idx_commitments_last_seen
     ON commitments (last_seen_at DESC) WHERE status = 'open';
 
 COMMENT ON COLUMN commitments.last_seen_at IS
-    'Last capture that restated this commitment (open_from_episode near-duplicate hit). NULL = never restated since opened_at; mark_stale ages against COALESCE(last_seen_at, opened_at).';
+    'Last capture that restated this commitment (historical commitment capture near-duplicate hit). NULL = never restated since opened_at; historical aging ages against COALESCE(last_seen_at, opened_at).';
 COMMENT ON COLUMN commitments.seen_count IS
     'How many captures have stated this commitment, including the one that opened it.';
 

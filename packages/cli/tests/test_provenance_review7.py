@@ -16,19 +16,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-import threading
 import uuid
 
 import pytest
 
-from khipu import capture, forget, provenance, tombstones
+from khipu import forget, provenance, tombstones
 from khipu import hub_snapshot as hs
 from khipu.capture_identity import episode_key, source_key
 from tests.hermetic_pg import Hub, chain_dir, hub, pg_cluster  # noqa: F401
 from tests.test_provenance_forget import ALT, CANON, _capture, _payload, _rows, env, pg  # noqa: F401
 from tests.replica_copy import mark_ready
 from tests.test_provenance_replica import _replica, _replica_readers, replica  # noqa: F401
-from tests.fact_seed import announce
 
 
 def _import(method):
@@ -68,7 +66,7 @@ def _send_and_recover(pg, a, b):  # noqa: F811
 def test_legacy_hash_only_receipt_refusal_waits_until_sent(pg, replica, method):  # noqa: F811
     replica(pg)
     a = _capture(loop=CANON)
-    b = capture.write_pg(dict(_payload(loop=ALT, session_id=None, transcript_range=None)))["episode_id"]
+    b = _capture(loop=ALT, session_id=None, transcript_range=None)
     with pg.connect() as c:
         # 0027's backfilled origin: an episode key and no payload hash. History
         # from before 0047, which now refuses moving a receipt's identity.
@@ -93,7 +91,7 @@ def test_column_only_identity_refusal_waits_until_sent(pg, replica, method):  # 
     replica(pg)
     a = _capture(loop=CANON)
     payload = _payload(loop=ALT, part="2")
-    b = capture.write_pg(dict(payload))["episode_id"]
+    b = _capture(loop=ALT, part="2")
     assert hs.refresh()["ok"]
     column = {k: payload.get(k) for k in ("harness", "session_id", "transcript_range", "window_id")}
     tombstones.publish_identities({source_key(column)}, set())
@@ -114,52 +112,11 @@ def test_legacy_merged_payload_refusal_waits_until_sent(env, replica, method):  
                   (json.dumps([{"payload": merged}]), b))
     env.to_0047()
     mark_ready(env)
-    pg = env
+    pg = env  # noqa: F811
     assert hs.refresh()["ok"]
     tombstones.publish_payloads([merged])
     _assert_listed_without_alt(_import(method))
     _send_and_recover(pg, a, b)
-
-
-def test_real_legacy_upgrade_refusal_waits_until_sent(env, replica, pg_cluster, tmp_path, monkeypatch):  # noqa: F811
-    from khipu import commitments, db
-
-    name = "legacyfacts_" + uuid.uuid4().hex[:12]
-    with pg_cluster.admin() as admin:
-        admin.execute("CREATE DATABASE " + name + " TEMPLATE template0")
-    h = Hub(pg_cluster, name)
-    try:
-        h.migrate(directory=chain_dir(tmp_path / "oldchain", "0026"))
-        db._TABLE_COLUMNS_CACHE.clear()
-        provenance._reset_ready_cache()
-        monkeypatch.setattr(db, "connect", lambda *a, **kw: h.connect())
-        replica(h, ready=False)
-        a = _capture(loop=CANON)
-        b = capture.write_pg(_payload(loop=ALT, session_id=None, transcript_range=None))["episode_id"]
-        h.migrate(directory=chain_dir(tmp_path / "middlechain", "0044"))
-        db._TABLE_COLUMNS_CACHE.clear()
-        provenance._reset_ready_cache()
-        with h.connect() as c:
-            raw = c.execute("SELECT raw FROM episodes WHERE id = %s", (b,)).fetchone()[0]
-            commitments.open_from_episode(c.cursor(), raw, b)
-        h.migrate()
-        db._TABLE_COLUMNS_CACHE.clear()
-        provenance._reset_ready_cache()
-        with h.connect() as c:
-            provenance.backfill(c)
-            assert c.execute("SELECT source_key, payload_sha256 FROM episode_sources WHERE episode_id = %s",
-                             (b,)).fetchall() == [(episode_key(b), None)]
-            assert c.execute("SELECT opened_episode, text, latest_text FROM commitments").fetchall() \
-                == [(a, CANON, ALT)]
-        mark_ready(h)
-        assert hs.refresh()["ok"]
-        tombstones.publish_payloads([raw])
-        result = hs.copy_facts()
-        _assert_listed_without_alt(result)
-        assert not result["ok"] and result.get("unsent"), result
-        _send_and_recover(h, a, b)
-    finally:
-        pg_cluster.drop(h)
 
 
 def test_real_0027_surrogate_receipt_refusal_is_matched_on_the_hub(pg_cluster, tmp_path):  # noqa: F811
@@ -296,64 +253,6 @@ def test_the_owner_actions_on_the_list_are_owner_only(pg, replica, capsys):  # n
 # ---- P2: a restatement never takes an episode lock after the fact lock --------------
 
 
-def test_pr_restatements_do_not_deadlock_a_production_forget(pg, monkeypatch):  # noqa: F811
-    from khipu import commitments as co
-
-    _capture(loop=CANON)
-    words = CANON + " for PR #41"
-    victim = _capture(loop=words)
-    with pg.connect() as conn:
-        provenance.backfill(conn)
-    assert _rows(pg, "SELECT latest_text FROM commitments") == [(words,)]
-    original_claim, original_forget = co._claim_restatement, forget._forget_claims
-    current = {}
-    threads, results, errors = [], [], []
-
-    def pause_after_fact_lock(cur, cid, eid, *args, **kw):
-        if threading.current_thread().name == "scheduled-capture":
-            cur.execute("SET LOCAL deadlock_timeout = '5s'")
-            current["fact_locked"].set()
-            current["episode_locked"].wait(5)
-        return original_claim(cur, cid, eid, *args, **kw)
-
-    def signal_after_episode_lock(cur, eid):
-        # The forget runs on provenance.hub_call's worker (design 6.4).
-        if threading.current_thread().name != "scheduled-capture":
-            current["episode_locked"].set()
-        return original_forget(cur, eid)
-
-    monkeypatch.setattr(co, "_claim_restatement", pause_after_fact_lock)
-    monkeypatch.setattr(forget, "_forget_claims", signal_after_episode_lock)
-
-    def next_forget_connection(**kw):
-        for t in threads:
-            t.join(10)
-        current.update(fact_locked=threading.Event(), episode_locked=threading.Event())
-
-        def take_fact():
-            try:
-                results.append(capture.write_pg(_payload(loop=words)))
-            except Exception as exc:  # noqa: BLE001
-                errors.append(repr(exc))
-                current["fact_locked"].set()
-
-        t = threading.Thread(target=take_fact, name="scheduled-capture")
-        threads.append(t)
-        t.start()
-        assert current["fact_locked"].wait(10)
-        conn = pg.connect()
-        conn.execute("SET deadlock_timeout = '50ms'")
-        conn.execute("SET statement_timeout = '10s'")
-        return conn
-
-    out = forget._forget_on_hub(next_forget_connection, victim, memory_root=pg.memory)
-    for t in threads:
-        t.join(10)
-        assert not t.is_alive()
-    assert out["soft_deleted"] and not out.get("deadlock_retries"), out
-    assert len(results) == 1 and not errors, (results, errors)
-    assert _rows(pg, "SELECT deleted_at IS NOT NULL FROM episodes WHERE id = %s", (victim,)) == [(True,)]
-    assert _rows(pg, "SELECT count(*) FROM fact_gaps") == [(0,)]
 
 
 def test_forget_retry_is_time_bounded(pg, monkeypatch):  # noqa: F811

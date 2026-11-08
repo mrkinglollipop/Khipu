@@ -133,7 +133,6 @@ const UNMAPPED_DOCTOR_FAILURES = [
   "launchers_ok",
   "notes_reconcile_ok",
   "embed_provider_ok",
-  "mark_stale_ok",
   "topics_embed_lag_ok",
   "degraded_rate_ok",
 ] as const;

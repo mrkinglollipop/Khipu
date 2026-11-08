@@ -81,7 +81,6 @@ class IngressTest(unittest.TestCase):
             "closed_loops": [{"text": "Completed the audit", "commitment_id": 42}],
             "deliverables": [{"kind": "file", "path": "report.md", "title": "Audit"}],
             "verbatim": {"note": "Preserve this note"},
-            "decision_details": [{"text": "Keep local verification", "source_kind": "user"}],
         }
         with mock.patch.object(srv, "_stdio_hook_owns_capture", return_value=False), \
                 mock.patch.object(srv, "_capture_mode", return_value="hub"), \
@@ -98,21 +97,6 @@ class IngressTest(unittest.TestCase):
         schema = next(t["inputSchema"] for t in srv.TOOLS if t["name"] == "khipu_capture")
         self.assertTrue(schema.get("additionalProperties", True))
 
-    def test_malformed_mutation_ids_never_open_database(self):
-        cases = [
-            ("khipu_forget", srv._tool_forget, {"id": 1}, "id"),
-            ("khipu_owed_update", srv._tool_owed_update, {"id": 1, "action": "close"}, "id"),
-            ("khipu_decisions_update", srv._tool_decisions_update, {"id": 1, "action": "retract"}, "id"),
-            ("khipu_decisions_update", srv._tool_decisions_update, {"link_id": 1, "action": "confirm"}, "link_id"),
-            ("khipu_decisions_update", srv._tool_decisions_update, {"id": 1, "by": 2, "action": "supersede"}, "by"),
-        ]
-        for name, func, args, key in cases:
-            for bad in (True, False, 42.9, 1.0, 0, -1, "-1", "1.2", "+2", " 2", "2x"):
-                with self.subTest(tool=name, key=key, bad=bad), \
-                        mock.patch("khipu.db.connect", side_effect=AssertionError("database touched")) as connect:
-                    with self.assertRaises(ValueError):
-                        func({**args, key: bad})
-                    connect.assert_not_called()
 
 
 class ProtocolTest(unittest.TestCase):
@@ -298,45 +282,8 @@ class MutationTest(unittest.TestCase):
         self.assertEqual(body.get("partial_errors"), failed["partial_errors"])
         self.assertEqual(body.get("id"), 7)
 
-    def test_replacement_inherits_project_and_no_orphan_on_retry(self):
-        conn = _Connection((1, "acme/repo", None))
-        with mock.patch("khipu.db.connect", return_value=conn), \
-                mock.patch("khipu.decisions._evidence_ready", return_value=True), \
-                mock.patch("khipu.decisions.create_decision", return_value=8) as create, \
-                mock.patch("khipu.decisions.supersede", return_value=True):
-            out = srv._tool_decisions_update({"id": 1, "action": "supersede", "new_text": "replacement"})
-            self.assertTrue(out["ok"])
-            self.assertEqual(create.call_args.kwargs["project"], "acme/repo")
-            conn.row = (1, "acme/repo", 8)
-            create.reset_mock()
-            out = srv._tool_decisions_update({"id": 1, "action": "supersede", "new_text": "unused"})
-            self.assertFalse(out["ok"])
-            create.assert_not_called()
 
-    def test_replacement_rolls_back_if_application_loses_race(self):
-        conn = _Connection((1, "acme/repo", None))
-        with mock.patch("khipu.db.connect", return_value=conn), \
-                mock.patch("khipu.decisions._evidence_ready", return_value=True), \
-                mock.patch("khipu.decisions.create_decision", return_value=8), \
-                mock.patch("khipu.decisions.supersede", return_value=False):
-            out = srv._tool_decisions_update({"id": 1, "action": "supersede", "new_text": "replacement"})
-        self.assertFalse(out["ok"])
-        self.assertEqual(conn.committed, 0)
-        self.assertEqual(conn.rolled_back, 1)
 
-    def test_decision_text_and_reasons_are_redacted_at_mcp_boundary(self):
-        secret = "sk-ant-" + "A" * 30
-        conn = _Connection((1, "acme/repo", None))
-        with mock.patch("khipu.db.connect", return_value=conn), \
-                mock.patch("khipu.decisions._evidence_ready", return_value=True), \
-                mock.patch("khipu.decisions.create_decision", return_value=8) as create, \
-                mock.patch("khipu.decisions.supersede", return_value=True) as supersede, \
-                mock.patch("khipu.decisions.retract", return_value=True) as retract:
-            srv._tool_decisions_update({"id": 1, "action": "supersede", "new_text": secret, "reason": secret})
-            srv._tool_decisions_update({"id": 1, "action": "retract", "reason": secret})
-        self.assertNotIn(secret, str(create.call_args))
-        self.assertNotIn(secret, str(supersede.call_args))
-        self.assertNotIn(secret, str(retract.call_args))
 
 
 class RecallBoundaryTest(unittest.TestCase):

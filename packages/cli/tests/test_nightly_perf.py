@@ -1,17 +1,13 @@
 """Nightly regressions with bounded work, synthetic archives and recording SQL."""
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import timedelta
-import json
 import os
 from unittest.mock import Mock
 
-import psycopg
 import pytest
 
-from khipu import close_rules, db, jobs, mirror, notes, outbox, provenance
+from khipu import db, jobs, mirror, notes, outbox, provenance
 from khipu.capture_identity import payload_sha256
-from tests.test_completion_transactions import NOW, harness, item  # noqa: F401
 from tests.test_notes import _FakeConn, _FakeTopicsCursor
 from tests.test_outbox_legacy_projection import ORIGINAL, REASON, projection, world  # noqa: F401
 
@@ -31,7 +27,7 @@ def archive(number=0):
     return path, record
 
 
-def test_recovery_builds_one_index_for_n_lines_without_scanning_under_lock(world, monkeypatch):
+def test_recovery_builds_one_index_for_n_lines_without_scanning_under_lock(world, monkeypatch):  # noqa: F811
     records = [archive(n) for n in range(50)]
     monkeypatch.setattr(outbox, "_RECOVERY_INDEX", None)
     locked = False
@@ -65,7 +61,7 @@ def test_recovery_builds_one_index_for_n_lines_without_scanning_under_lock(world
 
 
 @pytest.mark.parametrize("change", ["add", "remove", "replace", "corrupt"])
-def test_warm_archive_index_rechecks_changes_and_damage(world, monkeypatch, change):
+def test_warm_archive_index_rechecks_changes_and_damage(world, monkeypatch, change):  # noqa: F811
     path, record = archive()
     queued = record["queued_evidence"]["payload"]
     assert outbox.is_resolved_payload(queued)
@@ -84,7 +80,7 @@ def test_warm_archive_index_rechecks_changes_and_damage(world, monkeypatch, chan
     assert outbox.is_resolved_payload(queued) is (change == "add")
 
 
-def test_archive_membership_change_between_scan_and_lock_rebuilds(world, monkeypatch):
+def test_archive_membership_change_between_scan_and_lock_rebuilds(world, monkeypatch):  # noqa: F811
     path, record = archive()
     index = outbox._RecoveryIndex
     calls = []
@@ -103,7 +99,7 @@ def test_archive_membership_change_between_scan_and_lock_rebuilds(world, monkeyp
     assert result.parent == outbox.outbox_dir()
 
 
-def test_warm_archive_index_does_not_suppress_direct_capture_or_different_origin(world):
+def test_warm_archive_index_does_not_suppress_direct_capture_or_different_origin(world):  # noqa: F811
     _path, record = archive()
     queued = record["queued_evidence"]["payload"]
     assert outbox.is_resolved_payload(queued)
@@ -113,7 +109,7 @@ def test_warm_archive_index_does_not_suppress_direct_capture_or_different_origin
     assert outbox.enqueue(queued, origin="local:synthetic", recovery=True).parent == outbox.outbox_dir()
 
 
-def test_mirror_skips_both_archived_payloads_but_queues_distinct_evidence(world, monkeypatch):
+def test_mirror_skips_both_archived_payloads_but_queues_distinct_evidence(world, monkeypatch):  # noqa: F811
     _path, record = archive()
     monkeypatch.setattr(provenance, "ready", lambda cur: True)
     conflicts = Mock(side_effect=lambda cur, lines: [obj for obj, _key in lines])
@@ -128,82 +124,6 @@ def test_mirror_skips_both_archived_payloads_but_queues_distinct_evidence(world,
     assert conflicts.call_args.args[1] == [lines[-1]]
 
 
-def questions(harness, count=20):
-    harness.rows = {n: {**item(), "id": n, "text": f"Decide release option {n}",
-                        "kind": "question", "prs": []} for n in range(1, count + 1)}
-
-
-def test_apply_reuses_one_connection_and_fetches_decisions_once_per_project(harness, monkeypatch):
-    questions(harness)
-    for n in range(11, 21):
-        harness.rows[n]["project"] = "acme/other"
-    reads = Mock(wraps=close_rules._read_decisions)
-    monkeypatch.setattr(close_rules, "_read_decisions", reads)
-    monkeypatch.setattr(close_rules.GitHub, "state", Mock(side_effect=AssertionError("no PRs")))
-    result = close_rules.run_nightly()
-    assert result["ok"], result
-    assert harness.events.count("connect") == 2  # gather + one apply connection
-    assert reads.call_count == 2
-    locks = [i for i, event in enumerate(harness.events) if isinstance(event, tuple) and event[0] == "lock"]
-    assert len(locks) == 20
-    for before, after in zip(locks, locks[1:]):
-        assert "commit" in harness.events[before + 1:after]
-    assert harness.active == 0
-
-
-def test_decision_cache_is_built_after_github_and_preserves_item_date_filter(harness, monkeypatch):
-    questions(harness, 3)
-    harness.rows[1].update(kind="followup", text="Finish PR #41", prs=[41])
-    harness.rows[3]["opened_at"] = NOW + timedelta(seconds=1)
-    harness.decisions = []
-
-    def state(*args):
-        assert harness.active == 0 and harness.events[-1] == "close"
-        harness.decisions = [(5, "Resolved item #2 and item #3", 10, NOW)]
-        return "merged", None
-
-    monkeypatch.setattr(close_rules.GitHub, "state", state)
-    result = close_rules.run_nightly()
-    assert result["ok"], result
-    assert harness.rows[2]["status"] == "closed"
-    assert harness.rows[3]["status"] == "open"
-
-
-def test_withdrawn_cached_decision_never_closes_an_item(harness, monkeypatch):
-    questions(harness, 2)
-    harness.decisions = [(5, "Resolved item #2", 10, NOW)]
-    original = close_rules._open_items
-
-    def open_items(cur, project, **kwargs):
-        if kwargs.get("commitment_id") == 2:
-            harness.decisions = []
-        return original(cur, project, **kwargs)
-
-    monkeypatch.setattr(close_rules, "_open_items", open_items)
-    result = close_rules.run_nightly()
-    assert result["ok"] and result["closed_decision"] == 0, result
-    assert harness.rows[2]["status"] == "open"
-
-
-@pytest.mark.parametrize("broken", [False, True])
-def test_apply_failure_rolls_back_and_only_reconnects_when_unusable(harness, monkeypatch, broken):
-    harness.rows[2] = {**item(), "id": 2}
-    original = close_rules._open_items
-
-    def open_items(cur, project, **kwargs):
-        if kwargs.get("commitment_id") == 1:
-            if broken:
-                cur.conn.close()
-            raise psycopg.errors.SerializationFailure("synthetic candidate interruption")
-        return original(cur, project, **kwargs)
-
-    monkeypatch.setattr(close_rules, "_open_items", open_items)
-    monkeypatch.setattr(close_rules.GitHub, "state", lambda *a: ("merged", None))
-    result = close_rules.run_nightly()
-    assert result["ok"] and result["deferred_transient"] == 1, result
-    assert result["closed_pr"] == 1
-    assert harness.rows[1]["status"] == "open" and harness.rows[2]["status"] == "closed"
-    assert harness.events.count("connect") == (3 if broken else 2)
 
 
 @pytest.mark.parametrize("errors,expected", [
@@ -265,7 +185,7 @@ def test_killed_driver_keeps_unbuffered_progress(tmp_path, monkeypatch):
     assert os.environ["PYTHONUNBUFFERED"] == "0"
 
 
-def test_steady_archive_churn_cannot_starve_recovery(world, monkeypatch):
+def test_steady_archive_churn_cannot_starve_recovery(world, monkeypatch):  # noqa: F811
     # Every lock-free build races one archive (a concurrent drain): the stale
     # index is rebuilt once under the lock instead of retried without bound.
     path, record = archive(0)
@@ -303,7 +223,7 @@ def test_steady_archive_churn_cannot_starve_recovery(world, monkeypatch):
     assert len(builds) == 2
 
 
-def test_concurrent_archiver_does_not_starve_recovery_enqueue(world, monkeypatch):
+def test_concurrent_archiver_does_not_starve_recovery_enqueue(world, monkeypatch):  # noqa: F811
     import threading
     import time
 

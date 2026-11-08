@@ -206,6 +206,8 @@ def _merge(pg, eid, private, *, before_commit=lambda: None):
     (the merge's own registry check passed before the source was forgotten)."""
     with pg.connect() as conn, conn.cursor() as cur:
         assert capture._merge_into_episode(cur, eid, private, matched_via="review", score=1.0)
+        from tests.fact_seed import archived_facts
+        archived_facts(cur, private, eid)
         before_commit()
         conn.commit()
 
@@ -399,6 +401,9 @@ def test_every_import_path_keeps_and_fences_every_contributor(pg, replica, gate_
     b = capture.write_pg(dict(bpayload))["episode_id"]
     assert a != b
     with pg.connect() as conn:
+        from tests.fact_seed import archived_facts
+        cid = conn.execute("SELECT id FROM commitments WHERE opened_episode = %s", (a,)).fetchone()[0]
+        archived_facts(conn.cursor(), bpayload, b, restates=cid)
         assert conn.execute("SELECT opened_episode, latest_text FROM commitments").fetchall() == [(a, B_WORDS)]
         claimants = {(k, e) for k, e in conn.execute(
             "SELECT kind, episode_id FROM fact_claims WHERE claimant = 'episode'").fetchall()}

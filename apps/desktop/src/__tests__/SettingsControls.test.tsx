@@ -41,7 +41,6 @@ beforeEach(() => {
     user_aliases: ["matt"],
     float_settings: {
       dedup_similarity: { value: 0.92, source: "default", default: 0.92 },
-      commitment_close_similarity: { value: 0.9, source: "env", default: 0.85 },
     },
     config: { gateway_url: "https://khipu.example.org", user_aliases: ["matt"] },
   };
@@ -97,31 +96,31 @@ describe("CaptureTuningCard", () => {
   });
 
   it("locks a threshold the environment decides and names the variable", async () => {
+    config.float_settings = { dedup_similarity: { value: 0.9, source: "env", default: 0.92 } };
     render(<CaptureTuningCard active />);
-    const close = (await screen.findByLabelText("Close a commitment when a later capture matches it at")) as HTMLInputElement;
+    const close = (await screen.findByLabelText("Merge near-duplicate captures at")) as HTMLInputElement;
     await waitFor(() => expect(close.value).toBe("0.9"));
     expect(close).toBeDisabled();
     expect(screen.getAllByText("Locked").length).toBeGreaterThan(0);
-    expect(screen.getByText("KHIPU_COMMITMENT_CLOSE_SIMILARITY")).toBeInTheDocument();
+    expect(screen.getByText("KHIPU_DEDUP_SIMILARITY")).toBeInTheDocument();
   });
 
-  it("describes the independent matching rules beside both thresholds", async () => {
+  it("describes capture matching and has no automatic commitment threshold", async () => {
     render(<CaptureTuningCard active />);
     await screen.findByLabelText("Merge near-duplicate captures at");
     expect(
       screen.getByText("From 0 to 1; higher merges only closer matches. A word matching rule can also merge close captures. Default 0.92."),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("From 0 to 1. A word and completion rule can also close a commitment. Default 0.85."),
-    ).toBeInTheDocument();
+      screen.queryByLabelText("Close a commitment when a later capture matches it at"),
+    ).not.toBeInTheDocument();
   });
 
-  it("keeps both newest threshold values when reversed reloads finish", async () => {
+  it("keeps the newest capture settings when reversed reloads finish", async () => {
     config = {
       ...config,
       float_settings: {
         dedup_similarity: { value: 0.92, source: "default", default: 0.92 },
-        commitment_close_similarity: { value: 0.85, source: "default", default: 0.85 },
       },
     };
     const pending: Array<(raw: string) => void> = [];
@@ -136,35 +135,34 @@ describe("CaptureTuningCard", () => {
 
     render(<CaptureTuningCard active />);
     const dedup = (await screen.findByLabelText("Merge near-duplicate captures at")) as HTMLInputElement;
-    const close = screen.getByLabelText("Close a commitment when a later capture matches it at") as HTMLInputElement;
-    await waitFor(() => expect(close.value).toBe("0.85"));
+    const close = screen.getByLabelText("Your names") as HTMLInputElement;
+    await waitFor(() => expect(close.value).toBe(""));
 
     fireEvent.change(dedup, { target: { value: "0.8" } });
     fireEvent.submit(dedup.closest("form")!);
-    fireEvent.change(close, { target: { value: "0.7" } });
+    fireEvent.change(close, { target: { value: "matt" } });
     fireEvent.submit(close.closest("form")!);
     await waitFor(() => expect(pending).toHaveLength(2));
 
     const newest = {
       ...config,
+      user_aliases: ["matt"],
       float_settings: {
         dedup_similarity: { value: 0.8, source: "file", default: 0.92 },
-        commitment_close_similarity: { value: 0.7, source: "file", default: 0.85 },
       },
     };
     const stale = {
       ...config,
       float_settings: {
         dedup_similarity: { value: 0.8, source: "file", default: 0.92 },
-        commitment_close_similarity: { value: 0.85, source: "default", default: 0.85 },
       },
     };
     await act(async () => pending[1](JSON.stringify(newest)));
-    await waitFor(() => expect(close.value).toBe("0.7"));
+    await waitFor(() => expect(close.value).toBe("matt"));
     await act(async () => pending[0](JSON.stringify(stale)));
 
     expect(dedup.value).toBe("0.8");
-    expect(close.value).toBe("0.7");
+    expect(close.value).toBe("matt");
   });
 
   it("is two cards: when a conversation is saved, and commitments", async () => {
@@ -181,26 +179,21 @@ describe("CaptureTuningCard", () => {
     const [first, second] = Array.from(container.querySelectorAll(".section-card"));
     expect(first.querySelector("select")).not.toBeNull();
     expect(first.textContent).toContain("Merge near-duplicate captures at");
-    expect(second.textContent).toContain("A commitment is something a conversation said is still owed");
+    expect(second.textContent).toContain("Owed keeps explicitly filed asks and archived commitments");
     expect(second.textContent).toContain("Your names");
-    expect(second.textContent).toContain("Close a commitment when a later capture matches it at");
+    expect(second.textContent).not.toContain("Close a commitment when a later capture matches it at");
     expect(second.textContent).toContain("Default: none.");
   });
 
-  it("offers every Owed limit with No limit, and the GitHub check as a switch", async () => {
+  it("offers page and explicit bulk limits with No limit", async () => {
     config.count_settings = {
-      owed_orchestrator_slice_max: { value: 3, source: "default", default: 3, no_limit: 0 },
       owed_page_max: { value: 200, source: "default", default: 200, no_limit: 0 },
       owed_bulk_max: { value: 900, source: "file", default: 500, no_limit: 0 },
-      owed_tidy_calls: { value: 25, source: "default", default: 25, no_limit: 0 },
     };
-    config.config = { ...(config.config as Record<string, unknown>), owed_pr_check_github: "on" };
     render(<CaptureTuningCard active />);
     const labels = [
-      "Items for the orchestrator at the start of a conversation",
       "Most items on one page of Owed",
       "Most items changed at once",
-      "Most model calls for one clean-up plan",
     ];
     for (const label of labels) expect(await screen.findByLabelText(label)).toBeInTheDocument();
     const page = screen.getByLabelText("Most items on one page of Owed") as HTMLInputElement;
@@ -211,10 +204,6 @@ describe("CaptureTuningCard", () => {
     const bulk = screen.getByLabelText("Most items changed at once").closest("form") as HTMLElement;
     fireEvent.click(within(bulk).getByRole("button", { name: "Reset" }));
     await waitFor(() => expect(calls).toContainEqual(["khipu_config_unset", { key: "owed_bulk_max" }]));
-    const gh = screen.getByLabelText("Ask GitHub whether a pull request merged") as HTMLSelectElement;
-    expect(gh.value).toBe("on");
-    fireEvent.change(gh, { target: { value: "off" } });
-    await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "owed_pr_check_github", value: "off" }]));
   });
 
   it("reads the settings once for both cards", async () => {
@@ -272,23 +261,7 @@ describe("CaptureTuningCard", () => {
     expect(calls).toContainEqual(["khipu_config_set", { key: "user_aliases", value: "matt, matthew" }]);
   });
 
-  it("saves the commitment closing threshold as commitment_close_similarity", async () => {
-    config = {
-      ...config,
-      float_settings: {
-        dedup_similarity: { value: 0.92, source: "default", default: 0.92 },
-        commitment_close_similarity: { value: 0.85, source: "default", default: 0.85 },
-      },
-    };
-    render(<CaptureTuningCard active />);
-    const close = (await screen.findByLabelText("Close a commitment when a later capture matches it at")) as HTMLInputElement;
-    await waitFor(() => expect(close.value).toBe("0.85"));
-    fireEvent.change(close, { target: { value: "0.8" } });
-    fireEvent.submit(close.closest("form")!);
-    await waitFor(() =>
-      expect(calls).toContainEqual(["khipu_config_set", { key: "commitment_close_similarity", value: "0.8" }]),
-    );
-  });
+
 });
 
 describe("Save button", () => {

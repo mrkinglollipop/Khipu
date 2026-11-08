@@ -295,7 +295,7 @@ def _annotate_episode_validity(cur, episodes: list[dict]) -> list[dict]:
     return _validity.annotate(episodes, counts, None)
 
 
-_SLICE_TABLES = ("episodes", "decisions", "decision_links", "topics", "project_aliases",
+_SLICE_TABLES = ("episodes", "topics", "decisions", "project_aliases",
                  "project_pairs")
 
 
@@ -313,8 +313,7 @@ def project_slice(
     # forget-fence source: session start fences the slice (recall_rule._fenced_slice)
     """Session-start reads for a resolved repo: recent episodes for the project, the topic pages those episodes actually link
     to (their already-hygiene-resolved ``topics`` array — real graph edges,
-    not guessed slugs), and (O2) decisions still standing in the last 14
-    days. The slice contains decisions, episodes and topics; ``recall_rule`` renders them and owns the
+    not guessed slugs). ``recall_rule`` renders them and owns the
     cwd-token fallback and the token budget.
 
     ``host_session_id`` (this session's own lineage id, ``harness:hostid``)
@@ -328,15 +327,13 @@ def project_slice(
     a plain read with no fail-open of its own, same posture as every other
     function in this module.
 
-    Commitments are no longer fetched for session start. The empty
-    ``commitments`` key and unused limits remain for older callers.
+    The empty ``commitments`` and ``decisions`` keys and unused limits
+    remain for older callers. Archived validity still annotates episodes.
     """
-    from khipu import decisions as _decisions
     from khipu.embed import _episode_schema_flags
 
     episodes: list[dict[str, Any]] = []
     topics: list[dict[str, Any]] = []
-    decisions: list[dict[str, Any]] = []
     from khipu.db import prime_table_columns
     from khipu.identity import group_memo
 
@@ -345,15 +342,6 @@ def project_slice(
         # time; one query answers them all (a round trip each to the hub).
         prime_table_columns(conn, *_SLICE_TABLES)
         with conn.cursor() as cur:
-            if project:
-                from datetime import timedelta
-
-                decisions = _decisions.standing_decisions(
-                    cur, project=project,
-                    since=datetime.now(timezone.utc) - timedelta(days=14),
-                    limit=decision_limit,
-                )
-
             flags = _episode_schema_flags(cur)
             project_expr = "COALESCE(project, scope)" if flags["project"] else "scope"
             clauses: list[str] = []
@@ -464,4 +452,4 @@ def project_slice(
                 from khipu.project_group import asked_pairs
 
                 pairs = asked_pairs(cur, project)
-    return {"commitments": [], "episodes": episodes, "topics": topics, "decisions": decisions, "pairs": pairs}
+    return {"commitments": [], "episodes": episodes, "topics": topics, "decisions": [], "pairs": pairs}

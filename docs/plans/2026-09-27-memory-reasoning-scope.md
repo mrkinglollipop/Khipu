@@ -1,5 +1,7 @@
 **Khipu memory evidence and retrieval — scope, 27 September 2026, amended 28 September**
 
+> Historical plan or research. Registry extraction and standalone registry tools were retired; see [current memory behavior](../explicit-memory-lists.md).
+
 Status: approved with amendments on 28 September 2026. The user delegated approval to the [review](../research/hindsight-plan-review-2026-09-28.md) and authorized implementation. Local implementation and testing are authorized. Each outward action — pushing a branch, applying a migration to the hub, redeploying the gateway, releasing the desktop app, installing hooks — still needs its own authorization. This document is the design source of truth for the [thin plan](2026-09-27-memory-reasoning-plan.md).
 
 Read the [verification record](../research/hindsight-parity-verification-2026-09-27.md) first, then the [review](../research/hindsight-plan-review-2026-09-28.md). The record contains pinned revisions, corrected parity claims, the three recall paths, the harness matrix, exact Aegis dependencies, and the executed offline checks. The review contains the findings behind every amendment below. Those contracts are not duplicated here.
@@ -16,7 +18,7 @@ An optional isolated Hindsight comparison is useful experimental work. Replacing
 - Restore the per-prompt recall lane to its budget before adding anything to it. In production it misses its deadline on 85% of prompts and returns nothing. The fix changes speed and failure behavior only: identical hits whenever both legs finish, keyword-only results marked as degraded when the embedding is late, and a doctor check on the lane's real outcome rate so the failure can never again be silent.
 - Add a capability signal: a real server version and a `capabilities` list on MCP initialize and in the status payload, so a client can test for a feature instead of inferring it.
 - Make forgetting complete: a forgotten episode is not returned by any reader, and forgetting cascades to the decisions and deliverables that episode produced.
-- Give supersession a write path every harness can reach: the existing CLI, an MCP pair (`khipu_decisions` to read, `khipu_decisions_update` to supersede, restore or retract), and conservative detection at capture. Each records its source and reason.
+- Give supersession a write path every harness can reach: the existing CLI, an MCP pair (the retired registry to read, the retired registry writer to supersede, restore or retract), and conservative detection at capture. Each records its source and reason.
 - Extend the existing evaluator to score evidence relevance, current-truth errors, abstention, source grounding, latency, and per-operation model/token usage. Cover all three retrieval paths and their user-facing consumers.
 - Extend source and decision records with traceable evidence, actual rationale when available, source type, event/recorded/effective time, revisions, and explicit supersession/conflict state. Preserve the manual CLI.
 - Make retrieval and rendering honor that state. A mixed episode containing valid and superseded decisions must not be discarded wholesale. Historical questions must still retrieve historical evidence.

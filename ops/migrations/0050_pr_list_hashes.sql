@@ -1,4 +1,4 @@
--- Keep khipu_text_prs aligned with close_rules.parse_prs: a number after the
+-- Keep khipu_text_prs aligned with pr_refs.parse_prs: a number after the
 -- word PR counts only when it is in a bare/#N list joined by ",", "&", "and",
 -- "/", or "plus" immediately after that word (optional leading "("; not a
 -- later "issue #44" in the same clause).
@@ -39,5 +39,5 @@ END
 $fn$;
 
 INSERT INTO schema_migrations (version, note)
-VALUES ('0050_pr_list_hashes', 'khipu_text_prs follows close_rules.parse_prs: PR lists after the word PR, not a later issue number')
+VALUES ('0050_pr_list_hashes', 'khipu_text_prs follows pr_refs.parse_prs: PR lists after the word PR, not a later issue number')
 ON CONFLICT (version) DO NOTHING;

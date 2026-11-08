@@ -2,9 +2,9 @@
 --
 -- B2 in docs/research/hindsight-plan-review-2026-09-28.md: production holds
 -- 40,409 decision rows, 0 superseded, 0 with a rationale, because the only
--- writer was `khipu decisions supersede OLD NEW` — a CLI no cloud harness can
+-- writer was a local supersession CLI that cloud harnesses could not
 -- reach. This migration gives `decisions` the columns an agent-callable
--- write path (khipu_decisions_update) and conservative capture-time
+-- write path (the historical decision writer) and conservative capture-time
 -- detection need: who/what said it, the evidence behind it, and a full
 -- supersede/retract lifecycle instead of the single `superseded_by` pointer.
 -- `decision_links` holds candidates a detector proposes but nothing has

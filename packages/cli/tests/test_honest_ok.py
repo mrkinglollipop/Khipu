@@ -66,42 +66,10 @@ def _open_texts(conn) -> list[str]:
 
 # ---- 1. capture names the commitments it did not keep ---------------------------
 
-def test_capture_says_which_open_loops_were_dropped_and_why(pg):
-    out = _capture(open_loops=["fix it", "Review the widget parser migration plan before the release"])
-    assert out["ok"] is True and out["episode_id"]
-    assert _open_texts(pg) == ["Review the widget parser migration plan before the release"]
-    assert out["commitments"]["opened"] == 1
-    dropped = out["dropped"]
-    assert [d["text"] for d in dropped] == ["fix it"]
-    assert dropped[0]["kind"] == "open_loop" and dropped[0]["reason"]
-    assert out["partial"] is True
 
 
-def test_capture_with_every_loop_kept_has_no_dropped_list(pg):
-    out = _capture(open_loops=["Review the widget parser migration plan before the release"])
-    assert out["ok"] is True and out["dropped"] == []
-    assert "partial" not in out or out["partial"] is False
-    assert out["commitments"]["opened"] == 1
 
 
-def test_capture_says_when_a_closed_loop_matched_nothing(pg):
-    out = _capture(closed_loops=["Finished the quarterly tax filing for the llama ranch"])
-    assert out["ok"] is True
-    assert [(d["kind"], d["text"]) for d in out["dropped"]] == [
-        ("closed_loop", "Finished the quarterly tax filing for the llama ranch")]
-    assert out["dropped"][0]["reason"]
-
-
-def test_capture_whose_commitment_step_failed_says_so(pg, monkeypatch):
-    def boom(*a, **k):
-        raise RuntimeError("commitments table on fire")
-
-    monkeypatch.setattr(co, "open_from_episode", boom)
-    out = _capture(open_loops=["Review the widget parser migration plan before the release"])
-    assert out["ok"] is True and out["episode_id"]
-    assert [d["kind"] for d in out["dropped"]] == ["open_loop"]
-    assert "commitments table on fire" in out["dropped"][0]["reason"]
-    assert out["commitments"]["step_failed"]
 
 
 def _with_dedup(monkeypatch, dedup):
@@ -110,80 +78,12 @@ def _with_dedup(monkeypatch, dedup):
     monkeypatch.setattr(cap, "dedup_before_insert", lambda *a, **k: dict(dedup))
 
 
-def test_an_exact_replay_says_its_loops_were_handled_then(pg, monkeypatch):
-    first = _capture()
-    _with_dedup(monkeypatch, {"action": "skip", "matched_episode": first["episode_id"],
-                              "matched_via": "exact_window", "match": "identity"})
-    out = _capture(open_loops=["Review the widget parser migration plan before the release"])
-    assert out["dropped"] == [] and "partial" not in out
-    assert "handled then" in out["commitments"]["not_processed"]
 
 
-@pytest.mark.parametrize("dedup", [
-    {"action": "skip", "matched_via": "receipt", "match": "similarity"},
-    {"action": "merge", "matched_via": "cosine", "score": 0.97, "match": "similarity"},
-])
-def test_loops_on_a_capture_matched_by_resemblance_are_listed_as_dropped(pg, monkeypatch, dedup):
-    first = _capture()
-    _with_dedup(monkeypatch, {**dedup, "matched_episode": first["episode_id"]})
-    out = _capture(open_loops=["Review the widget parser migration plan before the release"],
-                   closed_loops=["Finished the parser rewrite"])
-    assert out["ok"] is True and out["partial"] is True
-    assert {d["kind"] for d in out["dropped"]} == {"open_loop", "closed_loop"}
-    assert all(d["reason"] == f"capture matched episode {first['episode_id']}; loops not stored"
-               for d in out["dropped"])
-    assert _open_texts(pg) == []
 
 
-def test_a_done_decision_that_closes_nothing_is_not_called_a_closed_loop(pg):
-    out = _capture(decisions=["done: sign the llama ranch agreement before the audit"])
-    assert [d["kind"] for d in out["dropped"]] == ["decision"]
 
 
-def test_an_unclosed_loop_that_the_session_plan_step_closed_is_not_reported(pg):
-    report = {"closed": 1, "_closed_rows": [7],
-              "not_closed": [{"kind": "closed_loop", "text": "a", "reason": "r", "_row": 7},
-                             {"kind": "closed_loop", "text": "b", "reason": "r", "_row": 8},
-                             {"kind": "closed_loop", "text": "c", "reason": "r"}]}
-    done = co.finish_report(report)
-    assert [i["text"] for i in done["not_closed"]] == ["b", "c"]
-    assert all("_row" not in i for i in done["not_closed"]) and "_closed_rows" not in done
-
-
-def test_step_errors_carry_the_class_and_a_short_message_never_sql(pg, monkeypatch):
-    import psycopg
-
-    def sql_boom(*a, **k):
-        raise psycopg.errors.UndefinedTable('relation "commitments" does not exist\nLINE 1: SELECT secret_col')
-
-    monkeypatch.setattr(co, "open_from_episode", sql_boom)
-    out = _capture(open_loops=["Review the widget parser migration plan before the release"])
-    text = json.dumps(out)
-    assert "UndefinedTable" in out["commitments"]["step_failed"]
-    assert "relation" not in text and "secret_col" not in text
-    assert "(sqlstate 42P01)" in out["commitments"]["step_failed"]
-
-    def multi(*a, **k):
-        raise RuntimeError("short reason\n  File secrets/trace " + "x" * 400)
-
-    monkeypatch.setattr(co, "open_from_episode", multi)
-    step = _capture(summary="Another widget parser capture entirely.",
-                    open_loops=["Review the widget parser migration plan before the release"]
-                    )["commitments"]["step_failed"]
-    assert step == "RuntimeError: short reason"
-
-
-def test_capture_names_a_fact_step_that_failed_and_was_rolled_back(pg, monkeypatch):
-    from khipu import decisions
-
-    def boom(*a, **k):
-        raise RuntimeError("decisions table on fire")
-
-    monkeypatch.setattr(decisions, "insert_decisions_from_episode", boom)
-    out = _capture(decisions=["Use rolling deploys for the widget service"])
-    assert out["ok"] is True and out["episode_id"] and out["partial"] is True
-    assert [g["step"] for g in out["fact_gaps"]] == ["decisions"]
-    assert "decisions table on fire" in out["fact_gaps"][0]["error"]
 
 
 def test_a_capture_the_stop_hook_queues_names_the_fields_it_cannot_carry(monkeypatch):

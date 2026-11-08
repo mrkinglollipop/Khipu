@@ -55,12 +55,12 @@ def test_offline_reads_follow_the_snapshot_contract(pg, replica, reader):
 
     def read():
         return (offline_reads.owed(None, "open", 100) if reader == "owed"
-                else offline_reads.decisions(None, None, "standing", 100))
+                else hs.episode_detail_snapshot(eid) or {"decision_states": []})
 
     with mock.patch.object(target, attr, interleave):
         read()  # in flight: may reflect pre-forget state
     assert fired
-    assert not read()["results"]
+    assert not read()["results" if reader == "owed" else "decision_states"]
     assert CANON not in _raw_fact_text() and "private decision before forget" not in _raw_fact_text()
 
 

@@ -638,15 +638,13 @@ def replica(tmp_path):
 
 
 @pytest.mark.parametrize("key", [A, B])
-def test_replica_owed_and_decisions_group_by_either_key(replica, key):
+def test_replica_owed_groups_by_either_key(replica, key):
     from khipu import offline_reads
 
     owed = offline_reads.owed(key, "open", 50)
     assert sorted(r["text"] for r in owed["results"]) == [f"ship zebrafish {A}", f"ship zebrafish {B}"]
     assert {r["project"] for r in owed["results"]} == {B}
-    dec = offline_reads.decisions(key, None, "all", 50)
-    assert sorted(r["text"] for r in dec["results"]) == [f"use zebrafish for {A}", f"use zebrafish for {B}"]
-    assert {r["project"] for r in dec["results"]} == {B}
+
 
 
 @pytest.mark.parametrize("key", [A, B])

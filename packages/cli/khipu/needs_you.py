@@ -22,7 +22,7 @@ from datetime import datetime
 from khipu import owner_direction, routing
 
 CONFIRM_KINDS = ("priority", "rule", "setting", "accounts", "tier_table", "cap_proposal", "held",
-                 "job_origin", "project_pair", "forget_send", "forget_id", "override_review")
+                 "project_pair", "forget_send", "forget_id", "override_review")
 LOOK_KINDS = ("remind", "signin", "interrupted", "ask")
 KINDS = CONFIRM_KINDS + LOOK_KINDS
 
@@ -32,12 +32,10 @@ SETTLE_ACTIONS = owner_direction.SETTLE_ACTIONS
 _ANSWERS = frozenset({
     "route.priority.confirm", "route.priority.undo", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
     "config.answer_request.confirm", "config.answer_request.undo", "accounts.request.confirm",
-    "accounts.request.undo", "route.tier_table.confirm", "owed.correct_job_origin.confirm",
+    "accounts.request.undo", "route.tier_table.confirm",
 })
 # A held request's action in words, for every action one can hold.
 ACTION_WORDS = {
-    "owed.correct_job_origin": "ask Khipu to work out which Owed items a background job opened",
-    "owed.correct_job_origin.confirm": "mark Owed items as opened by a background job, as previewed",
     "route.definition.set": "change a provider, account or lane definition",
     "route.pause": "pause an account so no work goes to it", "route.lift": "lift the pause on an account",
     "route.clear": "treat an account as open again", "route.note.set": "set your routing note",
@@ -72,7 +70,7 @@ ACTION_WORDS = {
     "ledger.remove": "remove a ledger row", "work.hide": "hide a work item", "work.unhide": "show a hidden work item",
     "work.same": "mark a ledger row and an Owed item as the same work",
     "work.not_same": "mark a ledger row and an Owed item as different work",
-    "owed.change": "close, reopen or reassign Owed items", "owed.tidy": "apply or undo an Owed list clean-up",
+    "owed.change": "close, reopen or reassign Owed items",
     "direction.off": "turn off changes by conversation", "direction.on": "turn on changes by conversation",
     "direction.set": "change who may make owner changes by conversation", "direction.undo": "undo an earlier change",
     "project.alias_add": "add another name for a project", "project.alias_remove": "remove a project's other name",
@@ -615,33 +613,15 @@ def _interrupted() -> list[dict]:
 def _hub_items() -> list[dict]:
     """What waits on the hub: job-origin corrections and same-project pairs.
     Raises when the hub can't be read, so the answer says so."""
-    from khipu import owed_origin, project_group, explicit_asks
-    from khipu.config import read_only_config
-    from khipu.db import has_table
+    from khipu import project_group, explicit_asks
     from khipu.hub_snapshot import try_hub_connect
 
     out = []
     with try_hub_connect(connect_timeout=3, statement_timeout_s=3) as conn, conn.cursor() as cur:
         cur.execute("SET TRANSACTION READ ONLY")
-        if has_table(cur, "commitment_origin_requests"):
-            cur.execute("SELECT id, preview, requested_at FROM commitment_origin_requests WHERE state = 'pending' "
-                        "ORDER BY requested_at")
-            for rid, doc, at in cur.fetchall():
-                with read_only_config():
-                    preview = owed_origin._pending_preview(cur, doc)
-                n = (preview.get("counts") or {}).get("total") or 0
-                out.append(job_origin_item(rid, n, routing._iso(at) if at else None))
         out += explicit_asks.needs_you(cur)
         out += [project_pair_item(p["a"], p["b"], p.get("created_at")) for p in project_group.all_asked_pairs(cur)]
     return out
-
-
-def job_origin_item(request: str, n: int, at: str | None) -> dict:
-    return _item("job_origin", f"job_origin:{request}", f"Khipu found {n} item{'' if n == 1 else 's'} on your Owed "
-                 "list that a background job opened, though they read as your own. A correction is waiting for your "
-                 "answer.", at=at, confirm_does="Marks them as opened by a job, not as yours.",
-                 undo_does="No undo to choose: if you leave it, nothing changes.",
-                 confirm=_act("owed.correct_job_origin.confirm", request=request))
 
 
 def project_pair_item(a: str, b: str, at: str | None) -> dict:
