@@ -353,12 +353,18 @@ def page(view: dict, now: datetime, conversation: dict | None = None, readings: 
     To fit, the roles and exceptions are shortened in steps, then whole rule
     lines are dropped from the bottom with a count; accounts, status words
     and caps are never dropped."""
-    from khipu import routing as r
+    from khipu import agent_view, routing as r
 
     now = now.astimezone(timezone.utc)
     if not view.get("record"):
         return "ROUTING: no routing record on this Mac."
-    conversation, readings = conversation or {}, readings or {}
+    # Every scrub below is of this one view: one table for the whole render.
+    with agent_view.pinned(a.get("key") for a in view.get("accounts") or [] if isinstance(a, dict)):
+        return _fitted(view, now, conversation or {}, readings or {}, r)
+
+
+def _fitted(view: dict, now: datetime, conversation: dict, readings: dict, r) -> str:
+    """``page``'s fitting loop (see there)."""
     rules = _rules(view)
     text = ""
     # Roles and exceptions shorten first (all rules kept), then whole rule
