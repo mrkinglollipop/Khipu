@@ -55,7 +55,7 @@ DeepSeek provider facts and an account; existing provider restrictions are kept.
 `label`, `family`, `login` (`folder` or `none`), `probe` (`claude`, `codex`,
 `grok`, `muse`, `glm`, `http-quota`, or `none`), optional hostname `host`,
 `lane_names`, optional exact model ids in `models_allowed` and `models_never`,
-and `use` (`normal` or `on_request`). With `probe: http-quota` and a `host`,
+and `use` (`normal`, `on_request` or `second_opinion`). With `probe: http-quota` and a `host`,
 the periodic usage refresh reads `https://<host>/` for each account of the
 provider: HTTPS only to that confirmed host, redirects refused, and the key
 stored as `<provider>_api_key` read from the Keychain only at request time
@@ -83,6 +83,8 @@ as owner facts and appear in launch advice; rule 13 remains an independent
 standing rule.
 An undeclared model causes no model-violation warning. `use: on_request` is a
 neutral reminder: the dispatch hook does not establish whether the owner asked.
+`use: second_opinion` means second opinions and reviews only: launch advice leaves
+such an account off build and fix lists and offers it first for a check or review.
 
 Put `task: <task-class>` in a dispatch brief for an explicit tier-table check.
 Otherwise Khipu may infer the work class and label it as a guess. Mismatches

@@ -85,20 +85,30 @@ def _tier_of(model) -> str | None:
     return model_tier(model)
 
 
+def asks_for_second_opinion(purpose, kind) -> bool:
+    """Whether a question is a check or review: the work a ``second_opinion``
+    account is for. A build or fix question is not."""
+    return purpose == "check" or kind == "check"
+
+
 def eligibility(view: dict, entry: dict, *, tier=None, kind=None, privacy=False,
-                explicit: bool = False) -> tuple[bool, str]:
+                explicit: bool = False, second_opinion: bool = False) -> tuple[bool, str]:
     """Whether this account may take work of this tier/kind, from facts.
 
     Only structured facts decide: a provider's ``models_allowed`` /
     ``models_never`` and its ``use``. Privacy is never read from prose —
     no provider fact carries a privacy flag, so ``privacy`` excludes only
-    ``on_request`` providers the owner has not explicitly named.
+    ``on_request`` providers the owner has not explicitly named. A
+    ``second_opinion`` provider takes checks and reviews only (or the account
+    the caller names), never builds or fixes.
     """
     provider = _provider_for(view, entry)
     if provider is None:
         return True, "no provider fact restricts this account"
     if provider.get("use") == "on_request" and not explicit:
         return False, "provider is on request only"
+    if provider.get("use") == "second_opinion" and not (explicit or second_opinion):
+        return False, "provider is for second opinions and reviews only"
     if tier is not None:
         allowed = provider.get("models_allowed")
         if allowed is not None and not any(_tier_of(m) == tier for m in allowed):
@@ -107,6 +117,34 @@ def eligibility(view: dict, entry: dict, *, tier=None, kind=None, privacy=False,
                for m in provider.get("models_never") or []):
             return False, f"{tier} models are never used for this provider"
     return True, "provider facts allow this work"
+
+
+def plan_ended(entry: dict, now) -> str | None:
+    """The owner's ``ends`` term on this account once it has passed, else None."""
+    from khipu import routing_entries
+
+    ends = (entry.get("terms") or {}).get("ends")
+    when = routing_entries.term_time(ends) if ends else None
+    return ends if when is not None and when <= now else None
+
+
+def nearly_out(entry: dict) -> float | None:
+    """The percent left on the account's longest window with a placeable
+    reading, when that is under ``routing_pace.NEARLY_OUT_LEFT_PCT``, else None.
+    The page prints NEARLY OUT on the same test, whatever the rate."""
+    from khipu import routing_pace
+
+    best = None
+    for pace in entry.get("pace") or []:
+        if _pace_reading_unknown(pace):
+            continue
+        params = routing_pace.window_params(pace.get("window"))
+        length = params["window_s"] if params else 0
+        if best is None or length > best[0]:
+            best = (length, pace["used_pct"])
+    if best is None or not routing_pace.nearly_out(best[1]):
+        return None
+    return round(100 - best[1], 1)
 
 
 def _login_here_is_another_account(view: dict, entry: dict) -> bool:
@@ -241,7 +279,8 @@ def _applies(status: dict, purpose: str, statuses: list[dict], *, tier=None, sen
 
 def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
                    tier=None, kind=None, privacy: bool = False, sensitive: bool = False,
-                   explicit: bool = False, declared_tier=_DECLARED_TIER, override: dict | None = None) -> dict:
+                   explicit: bool = False, declared_tier=_DECLARED_TIER, override: dict | None = None,
+                   second_opinion: bool = False) -> dict:
     """One account's advice at ``now``. Never a permission decision.
 
     ``override`` (a live conversation override that applies to the caller, see
@@ -285,8 +324,9 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
         elif status["kind"] == "concurrency":
             numbers.update(active_jobs=status.get("jobs"), concurrency_cap=status.get("cap_n"))
     numbers = {k: v for k, v in numbers.items() if v is not None}
-    eligible, why_eligible = eligibility(view, entry, tier=tier, kind=kind,
-                                         privacy=privacy, explicit=explicit)
+    eligible, why_eligible = eligibility(view, entry, tier=tier, kind=kind, privacy=privacy,
+                                         explicit=explicit, second_opinion=second_opinion)
+    ended = plan_ended(entry, now)
     held = [h for h in view.get("holds") or []
             if (h.get("scope") or {}).get("kind") in ("account", "all", "machine")
             and ((h.get("scope") or {}).get("account") in (None, entry["key"])
@@ -300,6 +340,8 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
     verdict, reason = "go", why_eligible
     if held:
         verdict, reason = "closed", "held"
+    elif ended:
+        verdict, reason = "closed", f"plan ended {ended}"
     elif entry.get("state") == routing.PAUSED:
         verdict, reason = "closed", "paused by the owner"
     elif entry.get("state") == routing.LIMITED:
@@ -364,6 +406,9 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
             "caps": [{**s, "applies": _applies(s, purpose, statuses, tier=check_tier, sensitive=sensitive)}
                      for s in statuses],
             "eligible": eligible, "why_eligible": why_eligible, "advisory": True}
+    left = nearly_out(entry)
+    if left is not None and verdict == "go":
+        out["nearly_out"] = left
     if applied is not None:
         out["override"] = applied
     return out
@@ -403,7 +448,8 @@ def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
          overrides: dict | None = None) -> list[dict]:
     """Every account's advice, ranked for work of this kind.
 
-    Eligible ``go`` accounts come first in the owner's priority order
+    Eligible ``go`` accounts come first, those with room before those nearly
+    out (under 10% left), each group in the owner's priority order
     (accounts he did not rank follow, soonest pace first is not invented:
     they keep the record's order), then ``hold_back``, then ``closed``,
     then accounts the facts do not allow for this tier or kind. Each row
@@ -418,15 +464,17 @@ def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
     priority = view.get("priority") or {}
     order = {e.get("account"): i for i, e in enumerate(priority.get("entries") or [])}
     rows = []
+    # An account whose plan has ended is absent from advice, unless asked for by name.
     entries = [e for e in view.get("accounts") or []
-               if target_key is None or e["key"] == target_key]
+               if (e["key"] == target_key if target_key is not None else plan_ended(e, now) is None)]
+    second_opinion = asks_for_second_opinion(purpose, kind)
     if overrides:
         from khipu import routing
     for entry in entries:
         # An override is kept under the account's one id, whichever login-folder key it was asked by.
         advice = account_advice(view, entry, now, purpose=purpose, tier=tier, kind=kind,
                                 privacy=privacy, sensitive=sensitive, explicit=target_key is not None,
-                                declared_tier=declared_tier,
+                                declared_tier=declared_tier, second_opinion=second_opinion,
                                 override=overrides.get(routing.account_id(entry["key"])) if overrides else None)
         if not advice["eligible"]:
             group = 3
@@ -435,6 +483,8 @@ def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
             group = 0
             why = (f"priority {order[entry['key']] + 1}" if entry["key"] in order
                    else "open; not in the owner's priority")
+            if advice.get("nearly_out") is not None:
+                why = f"nearly out ({advice['nearly_out']:g}% left); " + why
         elif advice["verdict"] == "hold_back":
             group = 1
             why = advice["reason"]
@@ -445,8 +495,13 @@ def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
         # rank, one that may go with no fresh reading ranks below one whose
         # evidence is known.
         unknown = 1 if group == 0 and advice["evidence"] == "unknown" and entry["key"] not in order else 0
+        # Among accounts that may go: room before nearly out, then (for a check
+        # or review) the account that exists for second opinions, then the
+        # owner's order.
+        nearly = 1 if advice.get("nearly_out") is not None else 0
+        specialist = 0 if second_opinion and (_provider_for(view, entry) or {}).get("use") == "second_opinion" else 1
         rows.append({**advice, "why_ranked": why,
-                     "_rank": (group, order.get(entry["key"], len(order) + 1000), unknown)})
+                     "_rank": (group, nearly, specialist, order.get(entry["key"], len(order) + 1000), unknown)})
     rows.sort(key=lambda r: r["_rank"])
     for i, row in enumerate(rows, 1):
         row["rank"] = i
