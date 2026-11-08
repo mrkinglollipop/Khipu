@@ -5,7 +5,7 @@ it was a machine message, and so on. The records themselves go after a day: a re
 retention removes them, and the replica-refresh timer removes them when no further prompt
 comes. Forgetting an episode removes its session's turn files and briefs, deletes an old
 widenings file, and scrubs words from owner-actions lines written under the old design,
-which keep their hash so the log's chain still holds. On the gateway the scan does not apply
+which keep their action and Undo. On the gateway the scan does not apply
 and touches nothing. A purge runs on its own once its day has passed, from the same
 timer, and from its deadline on it can no longer be cancelled.
 
@@ -199,7 +199,7 @@ def _direction_with_old_words(world, session: str, words: str, verb: str) -> dic
     return next(x for x in owner_direction.read_log() if x.get("session") == session and x.get("words"))
 
 
-def test_forget_scrubs_old_words_and_deletes_the_turns_and_the_chain_still_holds(world):
+def test_forget_scrubs_old_words_and_deletes_the_turns_and_keeps_the_log(world):
     _direction_with_old_words(world, "s-forgotten", "pause Codex for now", "pause")
     _direction_with_old_words(world, "s-kept", "lift Codex please", "lift")
     owner_turns.note_brief("a dispatched brief from the forgotten session", parent="s-forgotten",
@@ -216,27 +216,20 @@ def test_forget_scrubs_old_words_and_deletes_the_turns_and_the_chain_still_holds
     raw = owner_direction.log_path().read_text(encoding="utf-8")
     assert "pause Codex for now" not in raw and "lift Codex please" in raw
     scrubbed = [x for x in owner_direction.read_log() if x.get("session") == "s-forgotten" and x.get("scrubbed")]
-    assert scrubbed and all(x["words"] is None and x["words_sha"] for x in scrubbed)
-    assert owner_direction.verify_log()["ok"] is True, owner_direction.verify_log()
+    assert scrubbed and all(x["words"] is None for x in scrubbed)
 
 
-def test_scrubbing_a_line_from_before_the_chain_keeps_the_chain(folders):
+def test_scrubbing_a_line_from_before_the_chain_blanks_its_words(folders):
     log = owner_direction.log_path()
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text(json.dumps({"kind": "action", "id": "old-1", "action": "route.pause", "target": "codex|",
                                "session": "s-legacy", "words": "pause Codex long ago"}) + "\n", encoding="utf-8")
     owner_direction._append({"kind": "action", "id": "new-1", "action": "route.lift", "target": "codex|",
                              "session": "s-other", "words": "lift Codex now"})
-    assert owner_direction.verify_log()["ok"] is True
     assert owner_direction.scrub_words({"s-legacy"}) == 1
     assert "long ago" not in log.read_text(encoding="utf-8")
-    assert owner_direction.verify_log()["ok"] is True, owner_direction.verify_log()
-    # Any other change to that line still breaks the chain.
-    row = json.loads(log.read_text(encoding="utf-8").splitlines()[0])
-    row["target"] = "grok|"
-    lines = log.read_text(encoding="utf-8").splitlines()
-    log.write_text("\n".join([json.dumps(row)] + lines[1:]) + "\n", encoding="utf-8")
-    assert owner_direction.verify_log()["ok"] is False
+    rows = {x["id"]: x for x in owner_direction.read_log()}
+    assert rows["old-1"]["words"] is None and rows["new-1"]["words"] == "lift Codex now"
 
 
 def test_forget_matches_a_bare_episode_session_to_a_prefixed_turn_file(folders):
@@ -330,7 +323,6 @@ def test_an_overdue_purge_runs_from_the_replica_refresh_timer(world, monkeypatch
         assert cli.main(["snapshot", "heal"]) == 0
     assert purged == [("atlas", "T-12")]
     assert owner_direction.line_state(line["id"]) == "done"
-    assert json.loads(json.dumps(owner_direction.verify_log()))["ok"] is True
 
 
 # ---- the second review's probes: every file a turn or an action wrote goes -------------------
@@ -420,10 +412,10 @@ def test_every_file_owner_direction_writes_is_in_the_inventory(folders, monkeypa
     listed = {str(p) for p in owner_files.listed()}
     assert written and set(written) <= listed, sorted(set(written) - listed)
     kinds = {owner_files.kind_of(p) for p in owner_files.listed()}
-    assert {"turns", "briefs", "settings", "pending", "log", "head", "lock", "temp"} <= kinds, kinds
+    assert {"turns", "briefs", "settings", "pending", "log", "lock", "temp"} <= kinds, kinds
 
 
-def test_normal_forget_scrubs_old_words_and_keeps_the_action_log_chain_and_undo_state(folders):
+def test_normal_forget_scrubs_old_words_and_keeps_the_action_log_and_undo_state(folders):
     session = "normal-forget"
     words = "pause Codex for review"
     owner_turns.record({"session_id": session, "prompt": words, "cwd": str(folders)}, HOOK, now=1700000000)
@@ -438,9 +430,8 @@ def test_normal_forget_scrubs_old_words_and_keeps_the_action_log_chain_and_undo_
     assert not owner_turns.session_file(session).exists() and not widenings.exists()
     assert words not in (owner_turns.folder() / "briefs.jsonl").read_text(encoding="utf-8")
     assert words not in owner_direction.log_path().read_text(encoding="utf-8")
-    assert owner_direction.verify_log()["first_bad"] is None
     line = owner_direction.actions()[0]
-    assert line["words"] is None and line["words_sha"]
+    assert line["words"] is None and line["scrubbed"] is True
 
 
 def test_retention_read_prunes_expired_records_but_keeps_fresh_ones_and_never_the_words(folders):

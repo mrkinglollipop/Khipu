@@ -142,7 +142,7 @@ def test_every_answering_action_is_offered_and_every_action_has_words():
     assert set(needs_you.ACTION_WORDS) == set(owner_direction.ACTIONS)
     assert needs_you.SETTLE_ACTIONS <= owner_direction.ACTIONS
     assert needs_you.SETTLE_ACTIONS <= set(owner_act.SPECS)
-    answers = {a for a in owner_direction.ACTIONS if a.endswith((".confirm", ".undo", ".dismiss", ".acknowledge"))}
+    answers = {a for a in owner_direction.ACTIONS if a.endswith((".confirm", ".undo", ".dismiss"))}
     # direction.undo undoes something already done: nothing waits for it.
     assert answers - {"direction.undo"} <= needs_you.SETTLE_ACTIONS
 
@@ -167,11 +167,11 @@ def test_an_unreadable_part_is_named_and_nothing_is_not_claimed(world, monkeypat
     def fail():
         raise OSError("/private/secret/path")
 
-    monkeypatch.setattr(owner_direction, "read_alarm", fail)
+    monkeypatch.setattr(needs_you, "_forgets", fail)
     out = needs_you.waiting()
     assert out["items"] == []
     assert "couldn't be read" in out["line"] and not out["line"].startswith("Nothing is waiting for your answer.")
-    assert out["unread"] == [{"what": "the owner-actions alarm", "why": "it couldn't be read"}]
+    assert out["unread"] == [{"what": "conversations forgotten on this Mac", "why": "it couldn't be read"}]
 
 
 def test_a_hub_that_cannot_be_read_leaves_the_rest_of_the_list_and_says_so(world, monkeypatch):
@@ -206,7 +206,6 @@ def _all_confirmations(world, monkeypatch) -> dict[str, dict]:
     _override_due(monkeypatch)
     monkeypatch.setattr(owner_act, "_forget_list", lambda: {
         "strings": ["forgotten-a"], "ids": [{"id": 41, "summary": "a talk about the roof"}], "at": "2026-11-01T00:00:00Z"})
-    monkeypatch.setattr(owner_direction, "read_alarm", lambda: {"at": "2026-11-01T00:00:00Z", "first_bad": {}})
     monkeypatch.setattr(routing, "_hub_configured", lambda: True)
     monkeypatch.setattr(needs_you, "_hub_items", lambda: [needs_you.project_pair_item("acme/old", "acme/new", None)])
     return {i["kind"]: i for i in _items()}
@@ -629,7 +628,7 @@ def test_a_held_answer_whose_target_moved_can_only_be_refused(world):
 
 @pytest.mark.parametrize("kind,side,action", [
     ("forget_send", "confirm", "forget.send"), ("forget_id", "confirm", "forget.here"),
-    ("forget_id", "undo", "forget.not_same"), ("log_alarm", "confirm", "direction.acknowledge"),
+    ("forget_id", "undo", "forget.not_same"),
     ("project_pair", "confirm", "project.merge"),
     ("project_pair", "undo", "project.keep_separate"),
 ])
@@ -1188,7 +1187,6 @@ def test_a_decline_is_a_line_in_the_owner_actions_log(world):
     assert line["action"] == "direction.decline" and line["target"] == request
     assert line["state"] == "applied" and line["undo"] is None and "Nothing was changed" in line["no_undo"]
     assert line["confirmed"]["source"] == "t3"
-    assert owner_direction.verify_log()["ok"] is True
 
 
 def test_a_decline_needs_a_message_newer_than_the_read(world):

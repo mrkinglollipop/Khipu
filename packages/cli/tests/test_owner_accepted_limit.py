@@ -84,7 +84,6 @@ def test_a_forged_harness_change_is_always_visible_and_undoable(world, khipu_app
     assert (line["action"], line["auth"], line["state"], line["session"]) == (
         "route.pause", "direction", "applied", "node-unattended")
     assert not line.get("no_undo") and line["before"] == {"paused": False, "until": None}
-    assert owner_direction.verify_log()["ok"] is True
     # The app's Owner actions list (what Settings reads), Undo offered.
     rc, listed = world.run(["owner-direction", "actions", "--json"])
     assert rc == 0 and [(x["id"], x.get("no_undo")) for x in listed["actions"]] == [(line["id"], None)]

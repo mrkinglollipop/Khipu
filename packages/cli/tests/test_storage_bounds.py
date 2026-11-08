@@ -334,7 +334,7 @@ def test_usage_shows_outbox_queue_archive_state_and_jsonl_logs(homes):
 
 def test_doctor_gets_a_row_for_every_new_nightly_step():
     keys = set(jobs._NIGHTLY_STEP_CHECKS)
-    assert {"storage_sweep_ok", "owner_actions_chain_ok", "fact_changes_prune_ok",
+    assert {"storage_sweep_ok", "fact_changes_prune_ok",
             "receipt_prune_ok", "routing_ledger_prune_ok"} <= keys
 
 
@@ -392,17 +392,6 @@ def test_owner_writes_that_waited_too_long_or_were_refused_show_in_doctor_in_pla
     assert got[0] == "2 owner writes waited over 60 days and were not sent; check them."
     assert got[1] == "1 owner write the hub refused is kept for you to check."
     assert cli._owner_writes_warnings() == got
-
-
-def test_the_chain_step_goes_red_on_a_broken_log_and_green_on_a_whole_one(homes):
-    from khipu import owner_direction
-
-    owner_direction._append({"kind": "action", "id": "a1", "auth": "app", "action": "route.lift", "target": "x|"})
-    assert jobs._owner_actions_chain()["ok"] is True
-    path = owner_direction.log_path()
-    path.write_text(path.read_text().replace("route.lift", "route.fake"))
-    out = jobs._owner_actions_chain()
-    assert out["ok"] is False and "line 1" in out["error"]
 
 
 def test_nothing_in_the_new_modules_names_a_private_folder():

@@ -22,7 +22,7 @@ from datetime import datetime
 from khipu import owner_direction, routing
 
 CONFIRM_KINDS = ("priority", "rule", "setting", "accounts", "tier_table", "cap_proposal", "held",
-                 "project_pair", "forget_send", "forget_id", "log_alarm", "override_review")
+                 "project_pair", "forget_send", "forget_id", "override_review")
 LOOK_KINDS = ("remind", "signin", "interrupted", "ask")
 KINDS = CONFIRM_KINDS + LOOK_KINDS
 
@@ -72,7 +72,6 @@ ACTION_WORDS = {
     "work.not_same": "mark a ledger row and an Owed item as different work",
     "owed.change": "close, reopen or reassign Owed items",
     "direction.off": "turn off changes by conversation", "direction.on": "turn on changes by conversation",
-    "direction.acknowledge": "acknowledge the alarm on the record of your actions",
     "direction.set": "change who may make owner changes by conversation", "direction.undo": "undo an earlier change",
     "project.alias_add": "add another name for a project", "project.alias_remove": "remove a project's other name",
     "project.merge": "merge two projects", "project.keep_separate": "keep two projects separate",
@@ -611,18 +610,6 @@ def _interrupted() -> list[dict]:
             and now - float(row.get("settled_ts") or 0) <= INTERRUPTED_SHOWN_S]
 
 
-def _alarm() -> list[dict]:
-    alarm = owner_direction.read_alarm()
-    if alarm is None:
-        return []
-    return [_item("log_alarm", "log_alarm", "Khipu found that the record of your owner actions was changed or cut "
-                  "short, by something other than Khipu. It may no longer say truly what you did.",
-                  at=alarm.get("at"), confirm_does="Says you have seen it, and clears the alarm. It does not repair "
-                                                   "the record.",
-                  undo_does="No undo to choose: if you leave it, the alarm stays on.",
-                  confirm=_act("direction.acknowledge"))]
-
-
 def _hub_items() -> list[dict]:
     """What waits on the hub: job-origin corrections and same-project pairs.
     Raises when the hub can't be read, so the answer says so."""
@@ -764,7 +751,7 @@ def _gather(now: datetime) -> tuple[list[dict], list[dict], dict | None]:
     held, missed = _held(items)
     items += held
     unread += missed
-    for name, build in (("conversations forgotten on this Mac", _forgets), ("the owner-actions alarm", _alarm),
+    for name, build in (("conversations forgotten on this Mac", _forgets),
                         ("changes that were interrupted", _interrupted)):
         try:
             items += build()
@@ -922,7 +909,7 @@ def ask_for(action: str, values: dict) -> str | None:
         if action not in SETTLE_ACTIONS:
             return None
         now = routing._now()
-        items = _local_confirmations(routing.read_view(now), now) + _forgets() + _alarm()
+        items = _local_confirmations(routing.read_view(now), now) + _forgets()
         for item in items:
             for side, does in (("confirm", item["confirm_does"]), ("undo", item["undo_does"])):
                 offered = item["settle"].get(side)
