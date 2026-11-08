@@ -23,7 +23,6 @@ _WIDTHS = ((220, 140), (140, 100), (90, 60), (0, 0))
 # under that heading; every other rule goes under RULES.
 SECTIONS = ("WHICH MODEL", "NEVER", "CHECKS", "MACS")
 _HEAD = re.compile(r"^\s*(WHICH MODEL|NEVER|CHECKS|MACS)\s*:\s*", re.IGNORECASE)
-_SECOND_OPINIONS = re.compile(r"\bsecond[- ]opinions?\b", re.IGNORECASE)
 _DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}")
 _WINDOW_WORDS = {"five_hour": "of its 5 h window", "monthly": "of the month", "daily": "of the day"}
 _WINDOW_NAMES = {"five_hour": "5 h window", "weekly": "week", "monthly": "month", "daily": "day"}
@@ -177,7 +176,7 @@ def _hold_words(hold: dict, width: int, now: datetime, r) -> str:
     return text
 
 
-def _status(entry: dict, item: dict | None, windows: list[dict], holds: list[dict], last: bool, widths,
+def _status(entry: dict, provider: dict, windows: list[dict], holds: list[dict], last: bool, widths,
             now: datetime, r) -> str:
     state = entry.get("state")
     until = r._parse(entry.get("until"))
@@ -197,7 +196,7 @@ def _status(entry: dict, item: dict | None, windows: list[dict], holds: list[dic
         return "UNKNOWN"
     if window is not None and window["left"] < NEARLY_OUT_PCT:
         return "NEARLY OUT"
-    if _SECOND_OPINIONS.search(_cut((item or {}).get("role") or "", 90)):
+    if provider.get("use") == "second_opinion":  # the provider fact advice reads too
         return "SECOND OPINIONS ONLY"
     if last and any(c.get("kind") == "spend" for c in caps):
         return "LAST RESORT"
@@ -210,7 +209,8 @@ def _account_text(label: str, entry: dict, item: dict | None, *, number, holds: 
                   providers: dict, override: dict | None, readings: dict, widths, now: datetime, r) -> str:
     windows = _windows(entry, now, r)
     window = windows[0] if windows else None
-    status = _status(entry, item, windows, holds, last, widths, now, r)
+    provider = providers.get(entry.get("harness")) or providers.get(entry["key"].partition(":")[0]) or {}
+    status = _status(entry, provider, windows, holds, last, widths, now, r)
     parts = []
     if window is not None:
         text = f"{_pct(window['left'])}% {_WINDOW_WORDS.get(window['name'], '')} left".replace("%  left", "% left")
@@ -239,8 +239,7 @@ def _account_text(label: str, entry: dict, item: dict | None, *, number, holds: 
         parts.append(f"With the owner's okay, up to {_pct(terms['ceiling_with_ok'])}%")
     if override is not None:
         parts.append("Override for this conversation: " + _override_words(override, now, r))
-    allowed = (providers.get(entry.get("harness")) or providers.get(entry["key"].partition(":")[0]) or {}
-               ).get("models_allowed")
+    allowed = provider.get("models_allowed")
     if allowed:
         parts.append(", ".join(str(m) for m in allowed) + " only")
     change = terms.get("plan_change")

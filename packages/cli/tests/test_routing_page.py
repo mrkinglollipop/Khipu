@@ -114,6 +114,7 @@ def _view(*, hold=True, rules=None, roles=None):
                       for i, t in enumerate(rules, 1)],
             "priority": {"entries": entries, "until": None, "pending": False, "confirmed": True},
             "definitions": {"providers": {
+                "muse": {"id": "muse", "use": "second_opinion"},
                 "kimi": {"id": "kimi", "models_allowed": ["k3.1-pro"]},
                 "glm": {"id": "glm", "models_allowed": ["glm-5.3", "glm-5.3-flash"]},
                 "deepseek": {"id": "deepseek", "models_allowed": ["deepseek-flash"]}}}}
@@ -391,3 +392,15 @@ def test_khipu_route_page_prints_the_page_from_the_record(replay, capsys):
     for other in (["--summary"], ["--brief"], ["--since", "1"], ["--view", "rules"]):
         assert cli.main(["route", "--page", *other]) != 0
         capsys.readouterr()
+
+
+def test_second_opinions_only_comes_from_the_provider_fact_not_the_role_words():
+    """The page and advice read the same fact: ``use: second_opinion`` on the
+    provider. A role that merely mentions second opinions changes nothing."""
+    view = _view()
+    now = NOW
+    del view["definitions"]["providers"]["muse"]
+    text = routing_page.page(view, now)
+    assert "SECOND OPINIONS ONLY" not in _line(text, "Muse")
+    view["definitions"]["providers"]["muse"] = {"id": "muse", "use": "second_opinion"}
+    assert "SECOND OPINIONS ONLY" in _line(routing_page.page(view, now), "Muse")
