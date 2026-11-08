@@ -197,11 +197,11 @@ STORES: tuple[Store, ...] = (
           "boundary in the scope doc",
           _w(),
           Restore(("media/conversation_memory/*",), "content addressed")),
-    Store("extraction scratch", "data folder state/synth-cli/work-*/ and its output temp",
-          "a model call's working folder and output, removed when the call returns",
+    Store("extraction scratch", "data folder state/synth-cli/work/ (always empty) and an output temp file",
+          "a Codex call's output file, removed when the call returns; the fixed working folder holds nothing",
           "kept: removed by the call that made it; one a killed call left behind is a known "
           "boundary in the scope doc",
-          _w("extract._generate_claude_cli", "extract._generate_codex_cli")),
+          _w("extract._generate_codex_cli")),
     Store("Antigravity trajectory copy", "a private temp folder khipu-ag-*/ holding t.db and its WAL",
           "a copy of a T3 Antigravity session database, read and removed by the call that made it",
           "kept: removed by the call that made it; one a killed call left behind is a known "

@@ -21,6 +21,44 @@ def root() -> Path:
     return data_dir() / "state" / "synth-cli"
 
 
+def work_dir() -> Path:
+    """The one working directory every summariser CLI call runs in.
+
+    It must stay empty: no CLAUDE.md, settings or hooks for the CLI to load.
+    Calls never write into it (the Claude call has --no-session-persistence and
+    every file tool disallowed; Codex is ephemeral and read-only), so
+    concurrent calls can share it. A fresh random directory per call made
+    Claude Code create one ``~/.claude/projects/<encoded path>/`` folder per
+    call: 23,736 of them by 2026-11-07. A fixed path is one folder, ever."""
+    path = root() / "work"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+_FLAG_SUPPORT: dict[str, bool] = {}
+
+
+def supports_flag(cli: str, flag: str, env: dict[str, str] | None = None) -> bool:
+    """Whether ``cli --help`` lists ``flag``. Cached per CLI and flag for the
+    process. When the help text cannot be read (CLI missing, hung, odd exit),
+    answer True: the flag is passed as it always was and the call's own
+    retry and error path report any real problem."""
+    key = f"{cli}\0{flag}"
+    if key in _FLAG_SUPPORT:
+        return _FLAG_SUPPORT[key]
+    import subprocess
+
+    try:
+        res = subprocess.run([cli, "--help"], capture_output=True, text=True, timeout=20, check=False,
+                             stdin=subprocess.DEVNULL, cwd=str(work_dir()), env=env)
+        text = (res.stdout or "") + (res.stderr or "")
+        answer = flag in text if res.returncode == 0 and text.strip() else True
+    except Exception:  # noqa: BLE001 — unreadable help never blocks the call
+        return True
+    _FLAG_SUPPORT[key] = answer
+    return answer
+
+
 def session_ids() -> set[str]:
     """Malformed or unavailable markers never suppress an ordinary capture."""
     try:
