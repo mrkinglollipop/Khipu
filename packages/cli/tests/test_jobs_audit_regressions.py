@@ -19,7 +19,7 @@ from khipu import graph_backup, jobs
 MAINTENANCE = ('_reconcile_notes_if_due', '_embed_backfill', '_prune_query_cache',
                '_mark_stale_commitments',
                '_provenance_nightly', '_ledger_nightly', '_project_renames_sweep',
-               '_refresh_snapshot', '_briefs_build_if_on', '_storage_sweep', '_owner_actions_chain',
+               '_refresh_snapshot', '_briefs_build_if_on', '_storage_sweep',
                '_fact_changes_prune', '_receipt_prune')
 
 

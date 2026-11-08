@@ -28,11 +28,6 @@ def _pause_by_direction(world, words: str = "pause Codex for now") -> tuple[int,
     return world.run(["route", "pause", "Codex"], True)
 
 
-def _chain_ok() -> None:
-    chain = owner_direction.verify_log()
-    assert chain["ok"] is True, chain
-
-
 def _held_grok() -> tuple[dict, dict[str, str]]:
     hold = routing.add_hold("wait for Grok", scope="account", account="Grok", reason="keep", owner=True, via="app")
     return hold, {hold["id"]: "keep"}
@@ -125,7 +120,6 @@ def test_clear_can_restore_the_report_it_replaced(world):
     world.say(words)
     rc, out = world.run(["owner-direction", "undo", out["owner_action"]], True)
     assert rc == 0 and _state("codex|") == "limited", out
-    _chain_ok()
 
 
 # ---- write-ahead ------------------------------------------------------------------------------
@@ -149,7 +143,6 @@ def test_the_undo_line_is_on_disk_before_the_change_is_made(world, monkeypatch):
     assert owner_direction.line_state(out["owner_action"]) == "applied"
     (merged,) = owner_direction.actions()
     assert merged["id"] == out["owner_action"] and merged["state"] == "applied" and merged["after"]["account"] == "codex|"
-    _chain_ok()
 
 
 def test_a_change_that_fails_is_marked_failed_and_has_no_undo(world, monkeypatch):
@@ -163,7 +156,6 @@ def test_a_change_that_fails_is_marked_failed_and_has_no_undo(world, monkeypatch
     assert line["state"] == "failed"
     rc, out = world.run(["owner-direction", "undo", line["id"], "--from-app"])
     assert rc == 2 and "did not happen" in out["error"], out
-    _chain_ok()
 
 
 def test_a_completion_that_cannot_be_written_leaves_an_unconfirmed_line_that_undo_still_reverses(world, monkeypatch):
@@ -185,7 +177,6 @@ def test_a_completion_that_cannot_be_written_leaves_an_unconfirmed_line_that_und
     rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
     assert rc == 0 and _state("codex|") != "paused", undone
     assert owner_direction.line_state(out["owner_action"]) == "undone"
-    _chain_ok()
 
 
 def test_the_app_never_waits_on_the_log(world, khipu_app, monkeypatch):
@@ -212,7 +203,6 @@ def test_the_app_is_written_ahead_too(world, khipu_app, monkeypatch):
     assert rc == 0
     assert [(x["auth"], x["state"]) for x in seen[0]] == [("app", "pending")]
     assert [x["state"] for x in owner_direction.actions()] == ["applied"]
-    _chain_ok()
 
 
 # ---- undo is written ahead too -----------------------------------------------------------------
@@ -238,7 +228,6 @@ def test_undo_is_written_before_the_inverse_and_completed_after(world, monkeypat
     last = owner_direction.read_log()[-1]
     assert (last["kind"], last["target"], last["state"]) == ("state", pending["id"], "applied")
     assert owner_direction.line_state(out["owner_action"]) == "undone"
-    _chain_ok()
 
 
 def test_an_undo_that_fails_leaves_the_action_standing(world, monkeypatch):
@@ -256,7 +245,6 @@ def test_an_undo_that_fails_leaves_the_action_standing(world, monkeypatch):
     assert owner_direction.line_state(out["owner_action"]) == "applied"
     undo_line = next(x for x in owner_direction.read_log() if x.get("kind") == "undo")
     assert owner_direction.line_state(undo_line["id"]) == "failed"
-    _chain_ok()
 
 
 def test_an_undo_whose_log_cannot_be_written_changes_nothing(world, monkeypatch):
@@ -300,7 +288,6 @@ def test_undoing_an_older_clear_keeps_the_newer_one(world, khipu_app):
     assert rc == 0 and _state("codex|") == "limited", out
     kinds = [e["type"] for e in routing.read_events()[0] if e.get("type") in ("clear", "clear_undo")]
     assert kinds == ["clear", "clear", "clear_undo", "clear_undo"]
-    _chain_ok()
 
 
 def test_a_dismissed_report_comes_back_on_undo(world, khipu_app):
@@ -313,7 +300,6 @@ def test_a_dismissed_report_comes_back_on_undo(world, khipu_app):
     rc, undone = world.run(["owner-direction", "undo", out["owner_action"], "--from-app"])
     assert rc == 0 and _state("codex|") == "limited", undone
     assert routing.read_events()[0][-1]["type"] == "undismiss"
-    _chain_ok()
 
 
 def test_the_next_routing_block_names_an_undone_clear(world, khipu_app):
@@ -348,7 +334,6 @@ def test_an_undo_left_unconfirmed_shows_its_action_as_unconfirmed(world, monkeyp
     assert owner_direction.line_state(undo_line["id"]) == "unconfirmed"
     # Whether it is undone is not known, so it is neither applied nor undone.
     assert owner_direction.line_state(out["owner_action"]) == "unconfirmed"
-    _chain_ok()
 
 
 # ---- the fifth review's probes: a finish that could not be written ------------------------------

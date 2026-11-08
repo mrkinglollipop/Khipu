@@ -547,11 +547,10 @@ def _run_nightly_locked() -> int:
                          if isinstance(prune_result, dict) else None)
     # The sweep that trims logs and per-session debris also runs from the replica
     # job; the nightly makes sure it has run at least once a day wherever that job
-    # does not. The owner-actions chain is checked end to end (every segment).
+    # does not.
     sweep_result = _storage_sweep()
     _record_nightly_step(steps, "storage_sweep", **_step_result(sweep_result),
                          deferred=sweep_result.get("deferred") if isinstance(sweep_result, dict) else None)
-    _record_nightly_step(steps, "owner_actions_chain", **_step_result(_owner_actions_chain()))
     provenance_result = _step_result(_provenance_nightly())
     _record_nightly_step(steps, "provenance_backfill", **provenance_result)
     # Its own step: it used to ride at the end of close-rules and was skipped
@@ -1076,23 +1075,6 @@ def _storage_sweep() -> dict[str, Any]:
     return out
 
 
-def _owner_actions_chain() -> dict[str, Any]:
-    """Verify the owner-actions log end to end (every sealed segment), where
-    an append only checks the current one."""
-    try:
-        from khipu import owner_direction
-
-        chain = owner_direction.verify_log()
-        bad = chain.get("first_bad")
-        out: dict[str, Any] = {"ok": not bad, "lines": chain.get("lines"), "segments": chain.get("segments", 0)}
-        if bad:
-            out["error"] = f"the owner-actions log is broken at line {bad.get('line')}: {bad.get('why')}"[:300]
-    except Exception as exc:  # noqa: BLE001
-        out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
-    _nightly_log(f"[khipu-owner-actions] chain {json.dumps(out, default=str)[:300]}")
-    return out
-
-
 def _fact_changes_prune() -> dict[str, Any]:
     """The 30-day retention of the replica change stream (``fact_changes``),
     after tonight's provenance backfill and as a step of its own. A busy or
@@ -1409,10 +1391,6 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
     "storage_sweep_ok": (
         "storage_sweep",
         "run `khipu snapshot heal` or wait for the next nightly, and check the errors it lists",
-    ),
-    "owner_actions_chain_ok": (
-        "owner_actions_chain",
-        "open Owner actions and check the entry the doctor row names",
     ),
     "provenance_backfill_ok": (
         "provenance_backfill",

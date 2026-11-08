@@ -1696,7 +1696,7 @@ def _owner_words_scan(session_id: str | None, *, gateway: bool,
                       ownership_error: str | None = None) -> dict[str, Any]:
     """The owner's typed words recorded for the episode's session: its turn
     files and briefs (``owner_turns.forget_sessions``), the old widenings
-    file, the words in its owner-actions lines (scrubbed, the chain and Undo
+    file, the words in its owner-actions lines (scrubbed, Undo
     kept), the requests it held for the owner to confirm (a pending one
     withdrawn, every one's words removed: ``owner_direction.forget_requests``),
     and every rewrite temp a crash left that could hold them

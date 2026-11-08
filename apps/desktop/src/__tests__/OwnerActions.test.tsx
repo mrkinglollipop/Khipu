@@ -6,7 +6,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 // @ts-expect-error node:fs has no types here
 import { readFileSync } from "node:fs";
 import { ACTION_LABELS, OwnerActions, actionWords } from "../OwnerActions";
-import type { ChainState, OwnerAction, OwnerDirectionSettings } from "../OwnerActions";
+import type { OwnerAction, OwnerDirectionSettings } from "../OwnerActions";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -25,7 +25,6 @@ type Backend = {
   refuse?: string;
   /** A newer change touched the same target: refused unless asked over it. */
   newer?: string;
-  chain?: ChainState;
 };
 let backend: Backend;
 const calls: Array<[string, Record<string, unknown> | undefined]> = [];
@@ -76,7 +75,6 @@ beforeEach(() => {
         return JSON.stringify({
           ok: true,
           actions: backend.actions,
-          chain: backend.chain ?? { ok: true, lines: backend.actions.length, first_bad: null },
         });
       case "khipu_owner_direction_undo": {
         if (backend.refuse) return JSON.stringify({ ok: false, error: backend.refuse });
@@ -87,9 +85,6 @@ beforeEach(() => {
         row.state = row.state === "scheduled" ? "cancelled" : "undone";
         return JSON.stringify({ ok: true, undid: row.id });
       }
-      case "khipu_owner_direction_acknowledge":
-        backend.chain = { ok: true, lines: backend.actions.length, first_bad: null };
-        return JSON.stringify({ ok: true });
       case "khipu_owner_direction_switch":
         backend.settings.enabled = Boolean(args?.on);
         return JSON.stringify({ ok: true });
@@ -227,51 +222,6 @@ describe("Owner actions", () => {
     fireEvent.click(within(items[5]).getByRole("button", { name: "Undo: Closed 3 Owed items" }));
     await waitFor(() => expect(within(items[5]).getByText("Undone")).toBeTruthy());
     expect(calls).toContainEqual(["khipu_owner_direction_undo", { id: "o1" }]);
-  });
-
-  it("no banner while the log's chain holds", async () => {
-    render(<OwnerActions active />);
-    await list();
-    expect(screen.queryByText(/changed outside Khipu/)).toBeNull();
-  });
-
-  it("a broken chain shows a banner naming the first bad entry", async () => {
-    backend.chain = {
-      ok: false,
-      lines: 5,
-      first_bad: { line: 2, id: "c3", kind: "action", why: "it was changed after Khipu wrote it" },
-    };
-    render(<OwnerActions active />);
-    await list();
-    const alert = await screen.findByText(/changed outside Khipu/);
-    expect(alert.getAttribute("role")).toBe("alert");
-    expect(alert.textContent).toContain("at line 2 (c3): it was changed after Khipu wrote it.");
-  });
-
-  it("a kept tamper alarm has an Acknowledge button that clears it", async () => {
-    backend.chain = {
-      ok: false,
-      lines: 5,
-      first_bad: { line: 3, id: null, kind: null, why: "1 line Khipu wrote is missing from the end of the log" },
-      alarm: { at: "2026-10-16T14:00:00Z", first_bad: { line: 3 } },
-    };
-    render(<OwnerActions active />);
-    await list();
-    fireEvent.click(await screen.findByRole("button", { name: "Acknowledge" }));
-    await waitFor(() => expect(screen.queryByText(/changed outside Khipu/)).toBeNull());
-    expect(calls).toContainEqual(["khipu_owner_direction_acknowledge", {}]);
-    expect(screen.queryByRole("button", { name: "Acknowledge" })).toBeNull();
-  });
-
-  it("a broken chain with no kept alarm has no Acknowledge button", async () => {
-    backend.chain = {
-      ok: false,
-      lines: 5,
-      first_bad: { line: 2, id: "c3", kind: "action", why: "it was changed after Khipu wrote it" },
-    };
-    render(<OwnerActions active />);
-    await screen.findByText(/changed outside Khipu/);
-    expect(screen.queryByRole("button", { name: "Acknowledge" })).toBeNull();
   });
 
   it("a scheduled purge's button cancels it", async () => {

@@ -127,7 +127,7 @@ class JobsRunTest(unittest.TestCase):
             names,
             ["sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
              "summary_kind_backfill", "query_cache_prune", "routing_ledger_prune", "storage_sweep",
-             "owner_actions_chain", "provenance_backfill", "fact_changes_prune",
+             "provenance_backfill", "fact_changes_prune",
              "commitments_mark_stale",
              "ledger", "receipt_prune", "project_renames",
              "recall_eval", "snapshot_refresh"],

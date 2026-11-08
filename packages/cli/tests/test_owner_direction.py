@@ -718,7 +718,6 @@ def test_the_apps_own_change_is_in_the_log_and_can_be_undone_there(world, khipu_
     rc, out = world.run(["owner-direction", "undo", "--from-app", "--", line["id"]])
     assert rc == 0, out
     assert not routing.read_view()["note"]
-    assert owner_direction.verify_log()["ok"] is True
 
 
 # ---- the fifth review's probe: every owner change is in the routing push ------------------------

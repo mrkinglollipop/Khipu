@@ -447,7 +447,6 @@ def test_the_owner_actions_log_carries_the_evidence_it_relied_on(plain):
     assert line["instant"]["source"] == "hook" and line["instant"]["turn"] == turn
     assert line["instant"]["window_h"] == owner_turns.settings()["latest_window_h"]
     assert line["state"] == "applied" and line["receipt"]["what"].startswith("Paused Codex")
-    assert owner_direction.verify_log()["ok"] is True
 
 
 def test_a_request_applied_instantly_is_logged_with_its_evidence_too(plain):

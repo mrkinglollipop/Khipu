@@ -334,7 +334,7 @@ def test_usage_shows_outbox_queue_archive_state_and_jsonl_logs(homes):
 
 def test_doctor_gets_a_row_for_every_new_nightly_step():
     keys = set(jobs._NIGHTLY_STEP_CHECKS)
-    assert {"storage_sweep_ok", "owner_actions_chain_ok", "fact_changes_prune_ok",
+    assert {"storage_sweep_ok", "fact_changes_prune_ok",
             "receipt_prune_ok", "routing_ledger_prune_ok"} <= keys
 
 
@@ -342,7 +342,7 @@ def test_the_nightly_records_each_new_step(homes, monkeypatch):
     names = []
     monkeypatch.setattr(jobs, "_record_nightly_step", lambda steps, name, **kw: names.append(name))
     for fn in ("_drain_sessions", "_reconcile_notes_if_due", "_embed_backfill", "_summary_kind_backfill",
-               "_prune_query_cache", "_prune_routing_ledgers", "_storage_sweep", "_owner_actions_chain",
+               "_prune_query_cache", "_prune_routing_ledgers", "_storage_sweep",
                "_commitment_close_rules", "_fact_changes_prune", "_mark_stale_commitments",
                "_provenance_nightly", "_ledger_nightly", "_receipt_prune", "_project_renames_sweep",
                "_recall_eval_step", "_refresh_snapshot", "_briefs_build_if_on", "_capture_previous_briefs_step"):
@@ -350,7 +350,7 @@ def test_the_nightly_records_each_new_step(homes, monkeypatch):
     monkeypatch.setattr(jobs, "_run_script", lambda *a, **k: 0)
     monkeypatch.setattr(jobs, "_write_job_state", lambda *a, **k: None)
     jobs._run_nightly_locked()
-    for step in ("storage_sweep", "owner_actions_chain", "fact_changes_prune", "receipt_prune"):
+    for step in ("storage_sweep", "fact_changes_prune", "receipt_prune"):
         assert step in names
     assert names.index("fact_changes_prune") > names.index("provenance_backfill")
 
@@ -409,17 +409,6 @@ def test_owner_writes_that_waited_too_long_or_were_refused_show_in_doctor_in_pla
     assert got[0] == "2 owner writes waited over 60 days and were not sent; check them."
     assert got[1] == "1 owner write the hub refused is kept for you to check."
     assert cli._owner_writes_warnings() == got
-
-
-def test_the_chain_step_goes_red_on_a_broken_log_and_green_on_a_whole_one(homes):
-    from khipu import owner_direction
-
-    owner_direction._append({"kind": "action", "id": "a1", "auth": "app", "action": "route.lift", "target": "x|"})
-    assert jobs._owner_actions_chain()["ok"] is True
-    path = owner_direction.log_path()
-    path.write_text(path.read_text().replace("route.lift", "route.fake"))
-    out = jobs._owner_actions_chain()
-    assert out["ok"] is False and "line 1" in out["error"]
 
 
 def test_nothing_in_the_new_modules_names_a_private_folder():

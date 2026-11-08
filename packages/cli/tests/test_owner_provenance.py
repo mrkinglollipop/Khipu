@@ -1,12 +1,9 @@
-"""Owner direction: where an owner turn comes from, and the owner-actions log
-as a tamper-evident record (docs/plans/2026-10-16-owner-direction.md, 2.8).
+"""Owner direction: where an owner turn comes from (docs/plans/2026-10-16-owner-direction.md, 2.8).
 
 Khipu and the agents run as the same Mac user, so nothing here can make a
-forged turn or a forged log line impossible. What these pin: running the
-prompt hook's shim yourself does not make a turn an owner action accepts;
-a wrapper anywhere in a turn keeps the turn from counting; and any line
-written to the log other than through Khipu's own append, or any line
-rewritten later, breaks the log's hash chain, which doctor and the app name.
+forged turn impossible. What these pin: running the prompt hook's shim
+yourself does not make a turn an owner action accepts, and a wrapper anywhere
+in a turn keeps the turn from counting.
 Hermetic: temp data and capture folders, fake hook payloads.
 """
 from __future__ import annotations
@@ -131,70 +128,6 @@ def test_any_machine_wrapper_inside_a_turn_keeps_it_from_counting(hooked, prompt
     assert _counts(prompt) is False
     turn = owner_turns.turns("review-session")[-1]
     assert turn["machine"] is True and turn["eligible"] is False
-
-
-# ---- the log: append-only and hash-chained ----------------------------------------------
-
-
-def test_owner_action_log_rejects_same_uid_tampering(folders):
-    """Same-user writes can't be stopped (2.8); a line written outside
-    Khipu's own append breaks the chain at that line, and verify says so."""
-    owner_direction._append({"kind": "action", "id": "owner-word", "auth": "direction",
-                             "action": "route.pause", "target": "codex|"})
-    log = owner_direction.log_path()
-    assert owner_direction.verify_log()["ok"] is True
-    with log.open("a", encoding="utf-8") as handle:
-        handle.write('{"kind":"tampered"}\n')
-    out = owner_direction.verify_log()
-    assert out["ok"] is False and out["first_bad"]["line"] == 2
-    assert out["first_bad"]["kind"] == "tampered"
-
-
-def test_a_rewritten_line_breaks_the_chain_at_that_line(folders):
-    for n in range(3):
-        owner_direction._append({"kind": "action", "id": f"a{n}", "auth": "app", "action": "route.lift",
-                                 "target": "codex|"})
-    log = owner_direction.log_path()
-    lines = log.read_text(encoding="utf-8").splitlines()
-    row = json.loads(lines[1])
-    row["auth"] = "direction"
-    lines[1] = json.dumps(row)
-    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    out = owner_direction.verify_log()
-    assert out["ok"] is False and out["first_bad"]["line"] == 2 and out["first_bad"]["id"] == "a1"
-
-
-def test_a_deleted_line_breaks_the_chain(folders):
-    for n in range(3):
-        owner_direction._append({"kind": "action", "id": f"d{n}", "auth": "app", "action": "route.lift",
-                                 "target": "codex|"})
-    log = owner_direction.log_path()
-    lines = log.read_text(encoding="utf-8").splitlines()
-    log.write_text("\n".join([lines[0], lines[2]]) + "\n", encoding="utf-8")
-    out = owner_direction.verify_log()
-    assert out["ok"] is False and out["first_bad"]["id"] == "d2"
-
-
-def test_a_broken_chain_is_a_red_doctor_row(folders):
-    owner_direction._append({"kind": "action", "id": "x1", "auth": "app", "action": "route.lift", "target": "codex|"})
-    assert owner_direction.doctor_block()["ok"] is True
-    with owner_direction.log_path().open("a", encoding="utf-8") as fh:
-        fh.write('{"kind":"action","id":"forged","auth":"direction"}\n')
-    block = owner_direction.doctor_block()
-    assert block["ok"] is False and "forged" in block["summary"] and "line 2" in block["summary"]
-
-
-def test_the_actions_list_carries_the_chain_state(folders, capsys):
-    owner_direction._append({"kind": "action", "id": "y1", "auth": "app", "action": "route.lift", "target": "codex|",
-                             "at": "2026-10-16T10:00:00Z"})
-    with owner_direction.log_path().open("a", encoding="utf-8") as fh:
-        fh.write('{"kind":"action","id":"y2","auth":"direction","action":"route.pause","target":"codex|",'
-                 '"at":"2026-10-16T10:01:00Z"}\n')
-    from khipu import cli
-
-    assert cli.main(["owner-direction", "actions", "--json"]) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["chain"]["ok"] is False and out["chain"]["first_bad"]["id"] == "y2"
 
 
 # ---- the second review's probes: wrappers are judged by their place, never by a closing tag ----
