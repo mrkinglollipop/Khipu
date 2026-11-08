@@ -582,7 +582,8 @@ def test_supports_flag_reads_help_caches_and_fails_open(tmp_path, monkeypatch):
 
     def fake(name, help_text, code=0):
         path = tmp_path / name
-        path.write_text(f'#!/bin/sh\necho x >> {counter}\ncat <<'"'"'EOF'"'"'\n{help_text}\nEOF\nexit {code}\n')
+        path.write_text('\n'.join(['#!/bin/sh', f'echo x >> {counter}', "cat <<'EOF'", help_text, 'EOF',
+                                   f'exit {code}', '']))
         path.chmod(0o755)
         return str(path)
 
