@@ -2414,7 +2414,10 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
                                                    event.get("value"))
             if value is not None and not any(
                     isinstance(v, str) and _dangerous(v)
-                    for v in (value.values() if isinstance(value, dict) else ())):
+                    for v in (value.values() if isinstance(value, dict) else ())) and not any(
+                    isinstance(v, str) and _dangerous(v)
+                    for term in (value.values() if isinstance(value, dict) else ()) if isinstance(term, dict)
+                    for v in term.values()):
                 if isinstance(value, dict) and "account" in value:
                     account = mapped(value["account"])
                     if account is None:
@@ -4169,12 +4172,15 @@ def _priority_mark(event: dict) -> str:
 
 
 def _priority_now(held: dict, now: datetime, labels: dict, in_settings: dict,
-                  known_keys: set, *, none: bool = False) -> tuple[list[dict], list[str]]:
+                  known_keys: set, *, none: bool = False,
+                  ends: dict | None = None) -> tuple[list[dict], list[str]]:
     """(the entries of a priority still in effect at ``now``, in the order
     the owner gave them; the labels of those whose end has passed). Khipu
     never reorders, ranks or fills in the list: an ended entry drops out and
-    the rest keep their places. An account the record no longer lists keeps
-    the label it was set with and is marked as not in Settings -> Models."""
+    the rest keep their places. An account whose definition's ``ends`` has
+    passed (``ends``: account key to that instant) drops out the same way.
+    An account the record no longer lists keeps the label it was set with
+    and is marked as not in Settings -> Models."""
     active: list[dict] = []
     ended: list[str] = []
     whole = held.get("until")
@@ -4184,7 +4190,9 @@ def _priority_now(held: dict, now: datetime, labels: dict, in_settings: dict,
             continue
         label = labels.get(key) or item.get("label") or _label_for_key(key)
         until = _parse(item.get("until"))
-        if (until is not None and until <= now) or (whole is not None and whole <= now):
+        plan_end = (ends or {}).get(key)
+        if (until is not None and until <= now) or (whole is not None and whole <= now) \
+                or (plan_end is not None and plan_end <= now):
             ended.append(label)
             continue
         if any(a["account"] == key for a in active):
@@ -4210,18 +4218,19 @@ def _priority_now(held: dict, now: datetime, labels: dict, in_settings: dict,
 
 
 def _fold_priority(priority: dict | None, now: datetime, labels: dict, in_settings: dict,
-                   known_keys: set, *, none: bool = False) -> tuple[dict | None, list[str]]:
+                   known_keys: set, *, none: bool = False,
+                   ends: dict | None = None) -> tuple[dict | None, list[str]]:
     """The owner's priority as the view shows it, and the labels of entries
     whose end has passed (a change line names them). None once every entry
     has ended: conversations then hear "No priority set"."""
     if priority is None:
         return None, []
-    active, ended = _priority_now(priority, now, labels, in_settings, known_keys, none=none)
+    active, ended = _priority_now(priority, now, labels, in_settings, known_keys, none=none, ends=ends)
     if not active:
         return None, ended
     replaced = None
     if priority["pending"] and priority.get("prior"):
-        held, _gone = _priority_now(priority["prior"], now, labels, in_settings, known_keys, none=none)
+        held, _gone = _priority_now(priority["prior"], now, labels, in_settings, known_keys, none=none, ends=ends)
         if held:
             replaced = {"entries": held, "until": _iso(priority["prior"]["until"])}
     by = priority["written_by"]
@@ -5064,7 +5073,20 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     in_settings.update({key: False for key, gone in removed.items() if gone})
     if cfg.get("_accounts_version"):
         priority_version = f"{priority_version}.{cfg['_accounts_version']}"
-    priority_out, priority_ended = _fold_priority(priority, now, labels, in_settings, known_keys, none=none)
+    # Each account definition's plan terms, by the key this view gives the
+    # account. They read through; a passed ``ends`` takes it out of the order.
+    terms: dict[str, dict] = {}
+    for ident, value in definitions["accounts"].items():
+        found = entry_model.account_terms(value)
+        if found:
+            terms[stable_keys.get(account_identity.forwarded(ident, stable_forwards), ident)] = found
+    account_ends = {key: at for key, found in terms.items()
+                    if (at := entry_model.term_time(found.get("ends"))) is not None}
+    for entry in entries:
+        if entry["key"] in terms:
+            entry["terms"] = dict(terms[entry["key"]])
+    priority_out, priority_ended = _fold_priority(priority, now, labels, in_settings, known_keys, none=none,
+                                                  ends=account_ends)
     if priority_out:
         for item in priority_out["entries"]:
             level = item.get("level")
@@ -5162,6 +5184,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             times.append(due)
     for runner in (sources or {}).get("runners") or []:
         times.append(_parse(runner.get("silent_deadline")))  # when it counts as stopped reporting
+    times += account_ends.values()  # an account leaves the order when its plan ends
     future = [t for t in times if t is not None and t > now]
 
     effective: dict[str, Any] = {f"account:{e['key']}": _effective_account(e) for e in entries}
@@ -10866,6 +10889,8 @@ def _public_account(entry: dict, now: datetime, view: dict | None = None) -> dic
     out["last_seen"] = _pick(entry.get("last_seen"), _LAST_SEEN_FIELDS)
     out["underlying"] = _pick(entry.get("underlying"), ("state", "until", "basis"))
     out["pace"] = [dict(p) for p in entry.get("pace") or []]
+    if entry.get("terms"):
+        out["terms"] = {k: dict(v) if isinstance(v, dict) else v for k, v in entry["terms"].items()}
     if view is not None:
         from khipu import routing_advice
 

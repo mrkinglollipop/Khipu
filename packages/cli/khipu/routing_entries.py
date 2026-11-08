@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
+from datetime import datetime, timedelta, timezone
 
 from khipu import routing_events as identity
 
@@ -201,6 +203,72 @@ DEFINITION_REQUIRED_KEYS = {"provider": ("id", "label"),
                             "lane_map": ("runner", "lane", "account")}
 
 
+# An account's plan terms, read through to every reader as the owner wrote
+# them. Only ``ends`` acts: once it passes the account leaves the order.
+ACCOUNT_TERMS = ("ends", "plan_change", "resets_held", "ceiling_with_ok")
+_DAY = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+_TERMS_WORDS_MOST = 120
+
+
+def term_time(value) -> datetime | None:
+    """The instant a date or time term stands for. A bare date is the whole
+    of that day in UTC, so ``ends: 2026-11-13`` means the account is still
+    in use on the 13th and leaves the order at 00:00Z on the 14th."""
+    from khipu import routing as r
+
+    if not isinstance(value, str):
+        return None
+    if _DAY.fullmatch(value):
+        try:
+            day = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        return day + timedelta(days=1)
+    return r._parse(value)
+
+
+def _term_text(value) -> str | None:
+    """Short owner words with the same limits as a label."""
+    if not isinstance(value, str) or not value.strip() or len(value) > _TERMS_WORDS_MOST:
+        return None
+    from khipu.routing_sources import _key_like, _redacted
+
+    if any(c in value for c in "/\\|") or _key_like(value) or _redacted(value, len(value) + 1) != value:
+        return None
+    return value
+
+
+def _checked_terms(value: dict) -> dict | None:
+    out = {}
+    if "ends" in value:
+        if term_time(value["ends"]) is None:
+            return None
+        out["ends"] = value["ends"]
+    if "plan_change" in value:
+        change = value["plan_change"]
+        if not isinstance(change, dict) or set(change) - {"to", "on"} or _term_text(change.get("to")) is None:
+            return None
+        if "on" in change and term_time(change["on"]) is None:
+            return None
+        out["plan_change"] = dict(change)
+    if "resets_held" in value:
+        held = value["resets_held"]
+        if type(held) is not int or not 0 <= held <= 99:
+            return None
+        out["resets_held"] = held
+    if "ceiling_with_ok" in value:
+        pct = value["ceiling_with_ok"]
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not 0 < pct <= 100:
+            return None
+        out["ceiling_with_ok"] = pct
+    return out
+
+
+def account_terms(value: dict) -> dict:
+    """The terms an account definition carries, as written."""
+    return {k: value[k] for k in ACCOUNT_TERMS if k in value}
+
+
 def checked_definition(name, value):
     """Closed facts carry no local binding or runner folder."""
     if name == "provider":
@@ -210,10 +278,16 @@ def checked_definition(name, value):
     if not isinstance(value, dict):
         return None
     fields = {"provider": {"id", "label", "family"},
-              "account": {"id", "label", "provider", "family"},
+              "account": {"id", "label", "provider", "family", *ACCOUNT_TERMS},
               "lane_map": {"runner", "lane", "account"}}
     if name not in fields or set(value) - fields[name] or not set(DEFINITION_REQUIRED_KEYS[name]) <= set(value):
         return None
+    terms = None
+    if name == "account":
+        terms = _checked_terms(value)
+        if terms is None:
+            return None
+        value = {k: v for k, v in value.items() if k not in ACCOUNT_TERMS}
     if any(not isinstance(v, str) or not v.strip() or "/" in v or "\\" in v or "|" in v
            for k, v in value.items() if k != "label"):
         return None
@@ -224,7 +298,7 @@ def checked_definition(name, value):
 
         if not STABLE.fullmatch(value["id"]) or value["id"].partition(":")[0] != value["provider"]:
             return None
-    return dict(value)
+    return {**value, **(terms or {})}
 
 
 # Account prefixes a provider-set fact may never hand to another provider:
