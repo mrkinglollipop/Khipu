@@ -10146,6 +10146,40 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
             "covered_entities": covered, "rules_left_out": left_out, "lean_text": lean}
 
 
+def page(view: dict, now: datetime, conversation: dict | None = None, readings: dict | None = None) -> str:
+    """The routing page (``khipu route --page``): pure, from the folded view.
+    See ``routing_page.page``."""
+    from khipu import routing_page
+
+    return routing_page.page(view, now, conversation, readings)
+
+
+def _page_inputs(view: dict, now: datetime) -> tuple[dict, dict]:
+    """What ``page`` is handed because it reads nothing itself: the live
+    overrides that apply to the asking conversation, and the measured spend
+    and running jobs of accounts that have such a cap. Either may be empty."""
+    from khipu import conversation_overrides
+
+    conversation: dict = {}
+    try:
+        who = conversation_overrides.resolve()
+        matched = conversation_overrides.matches(who, now) if who.get("subject") else {}
+        for entry in view.get("accounts") or []:
+            row = matched.get(account_id(entry["key"])) or matched.get(entry["key"])
+            if row is not None:
+                conversation[entry["key"]] = row
+    except Exception:  # noqa: BLE001 - a conversation that can't be identified just has no override line
+        conversation = {}
+    readings: dict = {}
+    for entry in view.get("accounts") or []:
+        if any(c.get("kind") in ("spend", "concurrency") for c in entry.get("caps") or []):
+            try:
+                readings[entry["key"]] = {s["kind"]: s for s in cap_statuses(view, entry, now)}
+            except Exception:  # noqa: BLE001 - an unreadable measure leaves the cap printed as set
+                continue
+    return conversation, readings
+
+
 def since(version: int, view: dict | None = None, *, now: datetime | None = None,
           epoch: str | None = None) -> dict:
     """The current state of everything that changed after ``version``. The
@@ -13555,8 +13589,18 @@ def run_cli(args) -> int:
             view = read_view(now)
             account = _resolve_account_key(args.view_account) if getattr(args, "view_account", None) else None
             mode = getattr(args, "view", None)
-            if mode and (args.since is not None or args.summary or args.brief):
-                raise RouteError("--view cannot be combined with --summary, --brief, or --since")
+            if mode and (args.since is not None or args.summary or args.brief or getattr(args, "page", False)):
+                raise RouteError("--view cannot be combined with --summary, --brief, --page, or --since")
+            if getattr(args, "page", False):
+                if args.since is not None or args.summary or args.brief:
+                    raise RouteError("--page cannot be combined with --summary, --brief, or --since")
+                conversation, readings = _page_inputs(view, now)
+                text = page(view, now, conversation, readings)
+                if args.json:
+                    _print_json({"text": text, "chars": len(text)})
+                else:
+                    print(text)
+                return 0
             if args.since is not None:
                 version, epoch = _parse_since(args.since)
                 out = since(version, view, now=now, epoch=epoch)

@@ -5893,6 +5893,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="The current state of everything that changed after version V (or EPOCH:V)")
     rt.add_argument("--summary", action="store_true", help="The summary a conversation gets at its start")
     rt.add_argument("--brief", action="store_true", help="The text a job runner puts into a brief")
+    rt.add_argument("--page", action="store_true",
+                    help="The routing page: the accounts in the owner's order, then the owner's rules (at most 4,500 characters)")
     rt.add_argument("--account", dest="view_account", default=None, metavar="A", help="One account only")
     rt.add_argument(
         "--view", default=None, metavar="NAME",
