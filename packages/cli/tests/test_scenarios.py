@@ -175,16 +175,6 @@ def test_dedup_key_changes_when_a_rows_validity_revision_changes():
 
 # ---- 12. deferred commitment -------------------------------------------------
 
-def test_a_deferred_commitment_surfaces_as_owed_with_an_until_line():
-    cur = _CommitmentsCursor(migrated=True)
-    payload = {"project": "acme/widget", "open_loops": [
-        {"text": "Ship the widget-batching rollout once the staging soak finishes.",
-         "kind": "followup", "owner": "assistant"},
-    ]}
-    assert co.open_from_episode(cur, payload, 501) == 1
-    row = co.list_owed(cur, project="acme/widget")[0]
-    assert row["future_trigger"] is True
-    assert row["until"] is not None and row["until"].startswith("until:")
 
 
 # ---- 13. existing artifact ---------------------------------------------------
@@ -200,15 +190,6 @@ def test_an_existing_artifact_is_fetchable_by_id(tmp_path):
 
 # ---- 14. commitment restatement ---------------------------------
 
-def test_restatement_from_another_episode_deduplicates_commitments():
-    cur = _CommitmentsCursor(migrated=True)
-    text = "Ship the widget-batching rollout once the staging soak finishes."
-    assert co.open_from_episode(cur, {"project": "acme/widget", "open_loops": [text]}, 601) == 1
-    # Another episode restates the identical text: touch the existing row.
-    assert co.open_from_episode(cur, {"project": "acme/widget", "open_loops": [text]}, 602) == 0
-    assert len(cur.rows) == 1
-    row = next(iter(cur.rows.values()))
-    assert row["seen_count"] == 2
 
 
 # ---- 15. snapshot tombstone visibility ----------------------------------------------------

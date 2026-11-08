@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from khipu import accounts, needs_you, owed_tidy, owner_act, owner_direction, routing
+from khipu import accounts, needs_you, owed_changes, owner_act, owner_direction, routing
 from tests.test_owner_needs_you import (
     _accounts_request, _cap_request, _earlier_ask, _owner_types, _priority_request,
     _rule_added, _rule_changed, _setting_request, _tier_request,
@@ -64,7 +64,7 @@ def test_legacy_hold_never_applies_after_a_full_read_and_later_yes(world, monkey
     row = _legacy(world, monkeypatch, kind)
     seen = []
     if kind == 'owed_plan':
-        monkeypatch.setattr(owed_tidy, 'apply', lambda doc, **kw: seen.append(doc) or {'ok': True})
+        monkeypatch.setattr(owed_changes, 'apply', lambda doc, **kw: seen.append(doc) or {'ok': True})
     before_events = routing.read_events()[0]
     from khipu.config import load_config
     before_config = load_config()

@@ -124,20 +124,3 @@ def test_identical_setting_resubmissions_have_distinct_pins(world):
     assert pin != routing.setting_request_pin(key, routing._setting_requests(after)[key], after[key])
 
 
-def test_owed_tidy_hold_replays_the_full_reviewed_plan(world, monkeypatch):
-    from khipu import owed_tidy
-    path = world['tmp'] / 'plan.json'
-    original = {'project': 'p', 'items': [{'id': 4, 'owner': 'assistant'}]}
-    path.write_text(json.dumps(original))
-    ok, held = _ask_in_t3(world, 'direction.request', {'action': 'owed.tidy',
-                                                      'args': {'project': 'p', 'plan': str(path)}})
-    assert ok and held['pending'] and 'assistant' in held['ask'], held
-    path.write_text(json.dumps({'project': 'p', 'items': [{'id': 99, 'owner': 'user'}]}))
-    seen = []
-    def apply(doc, **kw):
-        seen.append(doc)
-        return {'ok': True}
-    monkeypatch.setattr(owed_tidy, 'apply', apply)
-    _owner_says_yes(world)
-    ok, out = _confirm_id(held['request'])
-    assert ok and seen == [original], out

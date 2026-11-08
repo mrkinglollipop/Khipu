@@ -249,15 +249,4 @@ class RelevanceCosineFloorConfigTest(unittest.TestCase):
 
 
 class ConfigShowFloatSettingsTest(unittest.TestCase):
-    def test_show_names_value_source_and_default_for_each_knob(self):
-        with tempfile.TemporaryDirectory() as td, \
-                mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": td, "KHIPU_DEDUP_SIMILARITY": ""}):
-            config.set_float_setting("commitment_close_similarity", 0.9)
-            base = dict(set_capture_mode=None, set_gateway_url=None, set=None, unset=None)
-            with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
-                cli.cmd_config(mock.Mock(**base))
-            shown = json.loads(out.getvalue())["float_settings"]
-        self.assertEqual(shown["dedup_similarity"],
-                         {"value": 0.92, "source": "default", "default": 0.92})
-        self.assertEqual(shown["commitment_close_similarity"]["source"], "file")
-        self.assertEqual(shown["commitment_close_similarity"]["value"], 0.9)
+    pass

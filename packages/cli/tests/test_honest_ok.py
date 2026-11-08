@@ -92,18 +92,6 @@ def test_capture_says_when_a_closed_loop_matched_nothing(pg):
     assert out["dropped"][0]["reason"]
 
 
-def test_capture_whose_commitment_step_failed_says_so(pg, monkeypatch):
-    def boom(*a, **k):
-        raise RuntimeError("commitments table on fire")
-
-    monkeypatch.setattr(co, "open_from_episode", boom)
-    out = _capture(open_loops=["Review the widget parser migration plan before the release"])
-    assert out["ok"] is True and out["episode_id"]
-    assert [d["kind"] for d in out["dropped"]] == ["open_loop"]
-    assert "commitments table on fire" in out["dropped"][0]["reason"]
-    assert out["commitments"]["step_failed"]
-
-
 def _with_dedup(monkeypatch, dedup):
     from khipu import capture as cap
 
@@ -138,39 +126,6 @@ def test_loops_on_a_capture_matched_by_resemblance_are_listed_as_dropped(pg, mon
 def test_a_done_decision_that_closes_nothing_is_not_called_a_closed_loop(pg):
     out = _capture(decisions=["done: sign the llama ranch agreement before the audit"])
     assert [d["kind"] for d in out["dropped"]] == ["decision"]
-
-
-def test_an_unclosed_loop_that_the_session_plan_step_closed_is_not_reported(pg):
-    report = {"closed": 1, "_closed_rows": [7],
-              "not_closed": [{"kind": "closed_loop", "text": "a", "reason": "r", "_row": 7},
-                             {"kind": "closed_loop", "text": "b", "reason": "r", "_row": 8},
-                             {"kind": "closed_loop", "text": "c", "reason": "r"}]}
-    done = co.finish_report(report)
-    assert [i["text"] for i in done["not_closed"]] == ["b", "c"]
-    assert all("_row" not in i for i in done["not_closed"]) and "_closed_rows" not in done
-
-
-def test_step_errors_carry_the_class_and_a_short_message_never_sql(pg, monkeypatch):
-    import psycopg
-
-    def sql_boom(*a, **k):
-        raise psycopg.errors.UndefinedTable('relation "commitments" does not exist\nLINE 1: SELECT secret_col')
-
-    monkeypatch.setattr(co, "open_from_episode", sql_boom)
-    out = _capture(open_loops=["Review the widget parser migration plan before the release"])
-    text = json.dumps(out)
-    assert "UndefinedTable" in out["commitments"]["step_failed"]
-    assert "relation" not in text and "secret_col" not in text
-    assert "(sqlstate 42P01)" in out["commitments"]["step_failed"]
-
-    def multi(*a, **k):
-        raise RuntimeError("short reason\n  File secrets/trace " + "x" * 400)
-
-    monkeypatch.setattr(co, "open_from_episode", multi)
-    step = _capture(summary="Another widget parser capture entirely.",
-                    open_loops=["Review the widget parser migration plan before the release"]
-                    )["commitments"]["step_failed"]
-    assert step == "RuntimeError: short reason"
 
 
 def test_capture_names_a_fact_step_that_failed_and_was_rolled_back(pg, monkeypatch):

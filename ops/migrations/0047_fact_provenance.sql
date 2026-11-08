@@ -182,7 +182,7 @@ COMMENT ON COLUMN provenance_projects.project IS
 
 -- ---- PR numbers and refs a text names (legacy classification only) --------
 --
--- A stricter reading of khipu.close_rules.parse_prs / pr_requirement_labels:
+-- A stricter reading of historical closure rules.parse_prs / pr_requirement_labels:
 -- every number it returns is one parse_prs returns for the same text, never
 -- more (word boundaries and spaces count as ASCII only, so a non-ASCII
 -- neighbour makes it miss a number rather than invent one). A missed number

@@ -8,48 +8,10 @@ from unittest.mock import patch
 
 import pytest
 
-from khipu import close_rules as cr, commitments as co, db, hub_snapshot as hs
+from khipu import commitments as co, db, hub_snapshot as hs
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.fact_seed import announce
 from tests.replica_copy import certify
-
-
-def test_close_restatement_preserves_each_repository_pr(hub):
-    conn = hub.connect()
-    hub.migrate(conn=conn)
-    db._TABLE_COLUMNS_CACHE.clear()
-    base = 'Prepare the deployment release checklist for the next version'
-    words = [base, base + ' once PR #41 merges',
-             base + ' once https://github.com/other/repo/pull/41 merges']
-    with conn.cursor() as cur:
-        for idx, text in enumerate(words):
-            announce(cur)
-            cur.execute("INSERT INTO episodes (ts, summary, raw, project, session_id) "
-                        "VALUES (now(), %s, '{}'::jsonb, 'acme/widget', 'owed-fake') RETURNING id", (f'fake {idx}',))
-            eid = cur.fetchone()[0]
-            with patch.object(co, '_has_commitment_embeddings', lambda *a: False):
-                n = co.open_from_episode(cur, {'project': 'acme/widget', 'session_id': 'owed-fake',
-                     'open_loops': [{'text': text, 'owner': 'assistant'}]}, eid)
-                assert n == (1 if idx == 0 else 0)
-        cur.execute('SELECT id, text, latest_text, prs, pr_check, status FROM commitments')
-        cid, original, latest, prs, check, before = cur.fetchone()
-        item = {'text': original, 'latest_text': latest, 'prs': prs, 'pr_check': check}
-        refs = cr.item_refs(item, 'acme/widget')
-        asked = []
-        def state(self, repo, number):
-            asked.append((repo, number))
-            return ('open' if repo == 'acme/widget' else 'merged', None)
-        with patch.object(cr, '_runner_states', lambda *_: {}), \
-             patch.object(cr, '_ledger_states', lambda *_: {}), \
-             patch.object(cr, '_episode_states', lambda *_: {}), \
-             patch.object(cr.GitHub, 'state', state):
-            report = cr.run(cur)
-        cur.execute('SELECT status, close_rule_key, close_evidence FROM commitments WHERE id = %s', (cid,))
-        status, key, evidence = cur.fetchone()
-        assert status == 'open', (refs, asked, key, report)
-        assert report['closed_pr'] == 0
-        assert set(refs) == {('acme/widget', 41), ('other/repo', 41)}
-        assert ('acme/widget', 41) in asked
 
 
 def test_capture_resume_prefers_current_home_with_old_file_present(tmp_path):
@@ -250,20 +212,3 @@ def test_recall_graph_neighbors_recheck_each_metadata_filter(monkeypatch, semant
     con.close()
 
 
-def test_close_foreign_only_requirement_does_not_invent_own_repository_pr(hub):
-    conn = hub.connect()
-    hub.migrate(conn=conn)
-    db._TABLE_COLUMNS_CACHE.clear()
-    base = 'Prepare the deployment release checklist for the next version'
-    with conn.cursor() as cur:
-        for idx, text in enumerate((base, base + ' once https://github.com/other/repo/pull/41 merges', base)):
-            announce(cur)
-            cur.execute("INSERT INTO episodes (ts, summary, raw, project, session_id) "
-                        "VALUES (now(), %s, '{}'::jsonb, 'acme/widget', 'owed-fake') RETURNING id", (str(idx),))
-            eid = cur.fetchone()[0]
-            with patch.object(co, '_has_commitment_embeddings', lambda *a: False):
-                co.open_from_episode(cur, {'project': 'acme/widget', 'session_id': 'owed-fake',
-                                          'open_loops': [{'text': text, 'owner': 'assistant'}]}, eid)
-        cur.execute('SELECT text, latest_text, prs, pr_check FROM commitments')
-        item = dict(zip(('text', 'latest_text', 'prs', 'pr_check'), cur.fetchone()))
-        assert cr.item_refs(item, 'acme/widget') == [('other/repo', 41)]

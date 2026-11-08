@@ -480,10 +480,6 @@ class ConfigFloatSettingsTest(unittest.TestCase):
         m_path.assert_not_called()
         self.assertTrue(payload["ok"])
 
-    def test_the_close_similarity_knob_takes_the_same_route(self):
-        rc, _payload, m_set, _m_path = self._run("commitment_close_similarity", "0.9")
-        self.assertEqual(rc, 0)
-        m_set.assert_called_once_with("commitment_close_similarity", 0.9)
 
     def test_out_of_range_is_rejected(self):
         rc, payload, m_set, _ = self._run("dedup_similarity", "1.5")

@@ -96,10 +96,7 @@ const SETTING_WORDS: Record<string, string> = {
  *  target where it helps; an id missing here still reads as words, never as the
  *  raw dotted id. A test keeps this table equal to the back end's list. */
 export const ACTION_LABELS: Record<string, string> = {
-  "owed.correct_job_origin": "Checked which Owed items came from background jobs",
-  "owed.correct_job_origin.confirm": "Moved Owed items that came from background jobs",
   "owed.change": "Changed Owed items",
-  "owed.tidy": "Tidied the Owed list",
   "route.definition.set": "Changed an account or provider definition",
   "route.pause": "Paused an account",
   "route.lift": "Lifted a pause",

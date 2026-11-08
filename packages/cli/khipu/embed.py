@@ -1150,7 +1150,7 @@ def _iter_sources(
     if kind in (None, "topic"):
         yield from _topic_sources(cur, refs)
     # Commitments are OPT-IN only (`--kind commitment`), never part of the
-    # default sweep: their vectors exist for commitments.auto_close, not for
+    # default sweep: their vectors exist for historical commitment matching, not for
     # generic search (_cosine_candidates excludes kind='commitment'), and the
     # hook's bounded catch-up normally keeps them current. This is the manual
     # heal for a hub whose catch-up fell behind (audit 2026-09-04).
@@ -3493,7 +3493,7 @@ def coverage(
                 cur.execute("SELECT COUNT(*) FROM media_assets")
                 medias = cur.fetchone()[0]
             # Commitments carry vectors too (migration 0009 widened the kind
-            # constraint) and auto_close depends on them, but coverage reported
+            # constraint) and archived commitment matching depends on them, but coverage reported
             # nothing at all — a hub whose commitment catch-up had fallen behind
             # looked perfectly green (audit 2026-09-04). Pre-0009 hubs have no
             # table; report zeroes rather than raising.
@@ -3573,7 +3573,7 @@ def coverage(
         # not fail activate() or doctor embed_coverage_ok (episode+topic only).
         "media": {"total": medias, "embedded": m["refs"], "missing": max(0, medias - m["refs"]),
                   "chunks": m["chunks"], "pct": _pct(m["refs"], medias)},
-        # Denominator = OPEN commitments (the only ones auto_close scores
+        # Denominator = OPEN commitments (the only ones archived commitment matching scores
         # against). Informational, like media: it does not gate activate().
         "commitments": {"total": commitments_total, "embedded": commitments_refs,
                         "missing": max(0, commitments_total - commitments_refs),
@@ -3726,7 +3726,7 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
 
             # fix 5c: populate commitment embeddings HERE (the hook's bounded
             # catch-up step), not inline on the capture decision path —
-            # commitments.auto_close would otherwise pay for an embed API
+            # historical commitment matching would otherwise pay for an embed API
             # call on the hot capture path just to find out no embeddings
             # exist yet. Small and bounded (COMMITMENT_CATCHUP_LIMIT), same
             # shape as the episode pass above.

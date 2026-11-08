@@ -80,31 +80,6 @@ def test_old_owner_supersede_reusing_existing_decision_loses_owner_endorsement(p
     assert row == (None, None), row
 
 
-def test_nightly_does_not_replay_fact_gap_after_outbox_ack(pg, monkeypatch):
-    _finish_witness_backfill(pg)
-    real = provenance.record_claim
-
-    def broken(cur, kind, *args, **kwargs):
-        if kind == "decision":
-            raise RuntimeError("one-off decision derivation bug")
-        return real(cur, kind, *args, **kwargs)
-
-    monkeypatch.setattr(provenance, "record_claim", broken)
-    outbox.enqueue(_payload(loop=None, decision="Keep the release train weekly"), reason="synthetic")
-    drained = outbox.drain()
-    assert drained["replayed"] == 1 and not outbox.jobs(), drained
-    with pg.connect() as conn:
-        assert conn.execute("SELECT step FROM fact_gaps WHERE resolved_at IS NULL").fetchall() == [("decisions",)]
-        assert conn.execute("SELECT count(*) FROM decisions").fetchone()[0] == 0
-    monkeypatch.setattr(provenance, "record_claim", real)
-    nightly = jobs._commitment_close_rules()
-    assert nightly.get("ok"), nightly
-    with pg.connect() as conn:
-        n_facts = conn.execute("SELECT count(*) FROM decisions").fetchone()[0]
-        open_gaps = conn.execute("SELECT count(*) FROM fact_gaps WHERE resolved_at IS NULL").fetchone()[0]
-    assert (n_facts, open_gaps) == (1, 0), (n_facts, open_gaps, nightly)
-
-
 def test_conflict_winner_closing_before_recheck_drops_new_capture_claim(pg, monkeypatch):
     """Two captures race; the winning row is closed after DO NOTHING.
 

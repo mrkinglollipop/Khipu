@@ -210,7 +210,7 @@ rule", and the evidence kept. An item naming one merged PR and one open PR stays
 "before PR #N merges" closes on the merge too, since the window it guarded is gone.
 
 **Settled by a decision.** A question or a "decide" item closes when a later decision in the same project
-answers it: the decision's text matches the item at or above `commitment_close_similarity` by the existing
+answers it: the decision's text matches the item at or above `archived commitment matching threshold` by the existing
 completion match, or the decision names the item's id. The reason records the decision's id. Anything
 looser is shown as "Looks settled by decision 79627" with Close and Not settled in the app, and never closed
 on its own.
@@ -242,14 +242,14 @@ conversation", "Khipu, by rule"), so no close is silent again.
 
 ### (d) The one-time clean-up of the existing flood
 
-A planner, `khipu owed tidy --project P`, applies (a) and (b) to every open item and writes a plan without
+A planner, `the archived Owed clean-up --project P`, applies (a) and (b) to every open item and writes a plan without
 changing anything:
 
 - per item: keep as is; **reassign** (to the orchestrator, a job, the assistant) with the rule that fired;
   **close** because every named PR merged, because a decision settled it, or as a duplicate of a kept item;
   each with its evidence.
 - totals: how many stay Matt's, how many move, how many close and why, and 20 sample items per group.
-- deterministic first; an optional model pass for the items no rule decides, capped by `owed_tidy_calls`
+- deterministic first; an optional model pass for the items no rule decides, capped by `archived_owed_cleanup_calls`
   (a setting, 0 for no limit), never on items that name Matt.
 
 The app shows the plan (slice 5) with Apply and Not now. Apply writes every change in one batch with a
@@ -346,7 +346,7 @@ Inspect `_tool_owed`, `_tool_owed_update`, `_owed_update_on_hub`, `owner_writes`
 
 Inspect `hygiene.run_commitments_hygiene` (its order, its model cap, its never-delete rule) and reuse it.
 
-- Build: `khipu owed tidy --project P [--plan-out FILE] [--apply PLAN] [--undo BATCH]`, `tidy_batch`, the
+- Build: `the archived Owed clean-up --project P [--plan-out FILE] [--apply PLAN] [--undo BATCH]`, `tidy_batch`, the
   plan document the app reads.
 - Tests: on a synthetic flood shaped like project A's, the plan's counts add up to the open total; apply then
   undo returns every row to its prior state; an item changed after apply is left alone by undo and listed.

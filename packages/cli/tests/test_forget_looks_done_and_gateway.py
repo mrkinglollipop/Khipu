@@ -14,26 +14,6 @@ from tests.test_astra_1026_forget import PRIVATE, _ids, _rows
 from tests.test_provenance_forget import _capture, env, pg  # noqa: F401
 
 
-def test_a_confirmed_looks_done_close_does_not_keep_quoting_a_forgotten_decision(pg):
-    pg.memory.mkdir(exist_ok=True)
-    later = _capture(loop=None, decision=PRIVATE)
-    earlier = _capture(loop="Choose the launch codename", kind="question", owner="user")
-    cid, _ = _ids(pg, earlier)
-    _, did = _ids(pg, later)
-    quote = f"settled by decision {did}: '{PRIVATE}'"
-    with pg.connect() as conn, conn.cursor() as cur:
-        assert co.suggest_looks_done(cur, cid, rule="decision", reason=quote, key=f"decision:{did}",
-                                     evidence={"text": PRIVATE, "decision_id": did}, episode=later)
-        # what the app's "Looks done" button sends (App.tsx): the suggestion's reason, prefixed
-        assert co.set_status(cur, cid, "closed", reason=f"Looked done: {quote}", by=co.BY_APP)
-        conn.commit()
-    forget.forget_everywhere(later, memory_root=pg.memory, gateway=False)
-    with pg.connect() as conn, conn.cursor() as cur:
-        closed = json.dumps(co.list_owed(cur, status="closed", limit=500), default=str)
-        conn.rollback()
-    assert PRIVATE not in closed, "the closed item still quotes the forgotten decision"
-
-
 def test_a_gateway_token_can_forget_a_grok_build_prefixed_row_it_wrote(pg, monkeypatch):
     monkeypatch.setattr(srv, "_ensure_path", lambda: None)
     eid = _capture(session_id="grok_build:sess-1", harness="grok_build", summary="cloud capture by a token")

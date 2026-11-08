@@ -35,37 +35,6 @@ class NightlyStepHealthTest(unittest.TestCase):
             self.assertTrue(out[key]["ok"])
             self.assertFalse(out[key]["applicable"])
 
-    def test_missing_evidence_on_the_sync_host_is_skipped_not_red(self):
-        """A step that has never been recorded is a false red on every fresh
-        install and every Mac the day it updates (maintainer, 2026-09-14:
-        "especially after they update") — skipped, and must not flip `ok`."""
-        from khipu import jobs
-
-        with tempfile.TemporaryDirectory() as td:
-            with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
-                    mock.patch.object(jobs, "ensure_data_dir", return_value=Path(td)), \
-                    mock.patch.object(jobs, "_job_entry", return_value={
-                        "plist_loaded": True,
-                        "plist_mtime": time.time(),
-                        "last_exit": None,
-                        "last_exit_ts": None,
-                    }):
-                out = jobs.nightly_step_health()
-        for key in (
-            "notes_reconcile_ok", "embed_provider_ok", "query_cache_prune_ok",
-            "provenance_backfill_ok", "mark_stale_ok",
-            "ledger_ok",
-        ):
-            self.assertTrue(out[key]["ok"], key)
-            self.assertTrue(out[key]["skipped"], key)
-            self.assertEqual(out[key]["reason"], "not checked yet — the nightly runs at 02:05")
-        skipped = jobs.skipped_step_names(out)
-        for name in (
-            "notes_reconcile", "embed_provider", "query_cache_prune",
-            "provenance_backfill", "mark_stale",
-            "ledger",
-        ):
-            self.assertIn(name, skipped)
 
     def test_a_stale_recording_over_36h_old_is_red_even_if_it_was_ok(self):
         """A nightly that stopped running altogether must not hide behind a

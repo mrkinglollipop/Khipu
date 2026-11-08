@@ -151,13 +151,3 @@ def test_khipu_get_episode_is_a_superset_of_the_fixture(tmp_path):
 
 # ---- khipu_owed -------------------------------------------------------------
 
-def test_khipu_owed_result_is_a_superset_of_the_fixture():
-    fixture = _load("khipu_owed.result.json")
-    cur = _CommitmentsCursor(migrated=True)
-    payload = {"project": "acme/widget", "open_loops": [
-        {"text": "Ship the widget-batching rollout once the staging soak finishes.",
-         "kind": "followup", "owner": "assistant"},
-    ]}
-    assert co.open_from_episode(cur, payload, 501) == 1
-    actual = co.list_owed(cur, project="acme/widget")[0]
-    _assert_superset(actual, fixture, label="khipu_owed.result.json")

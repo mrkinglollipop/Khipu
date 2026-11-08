@@ -58,7 +58,7 @@ import { WorkingBanner } from "./WorkingBanner";
 import { FeedbackForm } from "./FeedbackForm";
 import { PostUpdateNoticeDialog } from "./PostUpdateNoticeDialog";
 import { StorageReportDialog } from "./StorageReportDialog";
-import { OwedChangeDialog, OwedSelectionBar, OwedTidyDialog, owedChange } from "./OwedBulk";
+import { OwedChangeDialog, OwedSelectionBar, owedChange } from "./OwedBulk";
 import type { OwedOwner } from "./OwedBulk";
 import { OptionalFeatures } from "./OptionalFeatures";
 import { OwnerActions } from "./OwnerActions";
@@ -1442,7 +1442,6 @@ export default function App() {
   // Close… or Move to…, and Tidy this list….
   const [owedSelected, setOwedSelected] = useState<ReadonlySet<number>>(new Set());
   const [owedChangeMode, setOwedChangeMode] = useState<"close" | "move" | null>(null);
-  const [owedTidyOpen, setOwedTidyOpen] = useState(false);
   const [owedStatus, setOwedStatus] = useState<OwedStatus>("open");
   const [owedProject, setOwedProject] = useState<string | null>(null);
   const [owedKind, setOwedKind] = useState<string | null>(null);
@@ -3564,10 +3563,6 @@ export default function App() {
   const owedProjects = Array.from(
     new Set(owedRows.map((c) => c.project).filter((p): p is string => Boolean(p))),
   ).sort();
-  // Tidy this list… offers the projects that have open items.
-  const owedOpenProjects = Array.from(
-    new Set(owedOpenRows.map((c) => c.project).filter((p): p is string => Boolean(p))),
-  ).sort();
   const owedKinds = Array.from(
     new Set(owedRows.map((c) => c.kind).filter((k): k is string => Boolean(k))),
   ).sort();
@@ -5575,11 +5570,6 @@ export default function App() {
                     <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
                     Refresh
                   </button>
-                  {owedOpenProjects.length > 0 ? (
-                    <button type="button" className="sm" onClick={() => setOwedTidyOpen(true)}>
-                      Tidy this list…
-                    </button>
-                  ) : null}
                 </div>
                 <div className="inline">
                   <Segmented
@@ -5913,7 +5903,7 @@ export default function App() {
                     <p className="set-intro cm-intro">
                       Khipu saves a short summary of each conversation (a capture) and keeps a list of what
                       conversations say is still owed (commitments). Here you choose when it saves, which model
-                      writes the summaries, and how commitments close.
+                      writes the summaries, and manages explicitly filed asks.
                     </p>
 
                     <CaptureTuningCard
@@ -6539,15 +6529,6 @@ export default function App() {
           if (why === null) setOwedChangeMode(null);
           return why;
         }}
-      />
-      <OwedTidyDialog
-        open={owedTidyOpen}
-        projects={owedOpenProjects}
-        defaultProject={owedProject}
-        onCancel={() => setOwedTidyOpen(false)}
-        onChanged={() =>
-          Promise.all([loadOwed("open", true), loadOwed("closed", true), loadOwed("stale", true), work.load(true)])
-        }
       />
 
       {/* Snooze — `khipu owed --snooze ID --until`. Presets only: the CLI

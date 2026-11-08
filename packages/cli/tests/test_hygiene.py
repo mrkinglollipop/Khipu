@@ -398,20 +398,6 @@ class UserOwedGuardTest(unittest.TestCase):
     who the user is, and dropped rows like "Matt to merge L&D PR #48" as
     "Not user or assistant action"."""
 
-    def test_user_owed_row_is_kept_even_when_the_judge_says_drop(self):
-        cur = _OpenCommitmentsCursor([
-            (1, "The user must decide whether the release ships",
-             "acme/widget", "followup", None, "t0"),
-        ])
-
-        def judge(texts):
-            return [{"keep": False, "reason": "not a commitment"} for _ in texts]
-
-        report = hygiene.run_commitments_hygiene(cur, judge=judge)
-        self.assertEqual(report["model_calls"], 0)
-        verdict = next(v for v in report["verdicts"] if v["id"] == 1)
-        self.assertEqual(verdict["verdict"], "keep")
-        self.assertEqual(verdict["reason"], "user-owed")
 
 
 class DuplicateGroupsCosineTest(unittest.TestCase):

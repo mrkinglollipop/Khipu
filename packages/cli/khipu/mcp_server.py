@@ -1053,9 +1053,6 @@ TOOLS: list[dict] = [
             "Actions: route.pause, route.lift, the note, holds, rules, route.definition.set (definition plus a "
             "structured value), route.tier_table.set (a tiers object naming every task class), tracked accounts, a "
             "routing setting, ledger rows, owed.change for several Owed items at once (\"close those\"), and "
-            "owed.tidy after showing the plan's summary (undo takes project, batch and optionally ids). "
-            "owed.correct_job_origin (optional project) only returns a preview and leaves it pending: confirm it with "
-            "owed.correct_job_origin.confirm and its request id, here or in the app, never with a terminal yes. "
             "forget.list reads the forgets this Mac holds that the hub lacks, with each hub summary, and changes "
             "nothing; forget.here and forget.not_same take {\"id\": N} from it. "
             "For one account's priority entry use route.priority.amend (account, expect, append or role, optional "
@@ -1839,7 +1836,7 @@ def _tool_capture(args: dict) -> dict:
     from khipu.commitments import _payload_event, SESSION_END_EVENTS
 
     # Only declared keys pass. A session end is the hook's to declare
-    # (close_session_plan would close the open items of a session_id the
+    # (the archived writer could close the open items of a session_id the
     # caller names), and lineage, owners, decision authors and commitment ids
     # are the hook's and the owner's to set, never a tool caller's.
     schema = next(t["inputSchema"] for t in TOOLS if t["name"] == "khipu_capture")
@@ -2137,7 +2134,7 @@ def _tool_owed_update(args: dict) -> dict:
     action = (args.get("action") or "").strip().lower()
     _ensure_path()
     from khipu import commitments, owner_writes
-    from khipu.owed_tidy import BULK_ACTIONS
+    from khipu.owed_changes import BULK_ACTIONS
 
     if action == "ask":
         from khipu import explicit_asks
@@ -2349,7 +2346,7 @@ def _owed_change_on_hub(args: dict) -> dict:
     from khipu import commitments, offline, owner_writes
     from khipu.db import connect
 
-    from khipu import owed_tidy
+    from khipu import owed_changes
 
     echo = {"ids": ids, "action": action}
     reason = str(args.get("reason") or "") or None
@@ -2384,14 +2381,14 @@ def _owed_change_on_hub(args: dict) -> dict:
 
                 batches: list[str] = []
                 live = [cid for cid in ids if cid in rows]
-                batch_ready = len(ids) > 1 and owed_tidy._ready(cur)
+                batch_ready = len(ids) > 1 and owed_changes._ready(cur)
                 if len(ids) > 1 and args.get("owner_gate") == "direction" and not batch_ready:
-                    return {"ok": False, "changed": 0, "error": owed_tidy.NOT_READY, **echo}
+                    return {"ok": False, "changed": 0, "error": owed_changes.NOT_READY, **echo}
                 if batch_ready:
                     # Every bulk action is kept with its reason and each
                     # item's state before (owner, status, due date), so
                     # `khipu owed tidy --undo BATCH` restores them exactly.
-                    done, batches = owed_tidy.bulk_batch(cur, live, action, change, reason=reason or "",
+                    done, batches = owed_changes.bulk_batch(cur, live, action, change, reason=reason or "",
                                                          gate=args.get("owner_gate"))
                 else:
                     done = {cid: change(cid) for cid in live}

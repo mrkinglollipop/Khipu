@@ -420,8 +420,6 @@ def test_the_guard_finds_a_reader_by_what_it_reads(tmp_path):
     assert found == {"leaky.owed_for_reader", "leaky.leaky_tool"}
 
 
-
-
 # ---- the provider guard: text reaches a provider only through the chokepoint --
 #
 # A function that calls a provider client (an embedding, summariser, rerank or
@@ -1026,15 +1024,15 @@ def test_the_chokepoint_refuses_the_wrong_door():
         provider_text.live_input("x", "topic")
 
 
-def test_hygiene_and_owed_tidy_judges_send_no_forgotten_or_unsourced_commitment(list_state):
-    from khipu import hygiene, owed_tidy
+def test_hygiene_and_owed_changes_judges_send_no_forgotten_or_unsourced_commitment(list_state):
+    from khipu import hygiene, owed_changes
     from khipu.provider_text import sourced
 
     sent: list = []
     texts = [sourced("FORGOTTEN-JUDGE", [902]), sourced("live judge text", [904]), "no source at all"]
     with mock.patch("khipu.extract._generate", side_effect=lambda p, **k: sent.append(p) or "{}"):
         hygiene._model_judge(texts)
-        owed_tidy._model_owner_judge(texts)
+        owed_changes._model_owner_judge(texts)
         hygiene._model_adjudicate_pairs([(texts[0], texts[1]), (texts[1], texts[2])])
     assert not any("FORGOTTEN-JUDGE" in p or "no source at all" in p for p in sent)
     if list_state == "unreadable":

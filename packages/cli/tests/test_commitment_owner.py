@@ -603,18 +603,6 @@ def test_an_assistant_duplicate_cannot_swallow_the_owners_new_promise():
         assert len(cur.rows) == 1
 
 
-def test_reviewer_work_in_a_conversation_must_not_die_with_the_session(monkeypatch):
-    monkeypatch.setenv("KHIPU_USER_ALIASES", "Matt")
-    co.reset_user_patterns()
-    text = "The reviewer must rebase the release branch"
-    cur = _OwnerCursor()
-    _open(cur, CONVERSATION, {"text": text, "kind": "followup"})
-    monkeypatch.setattr(co, "_session_open_commitments", lambda cur, sid: list(cur.rows.values()))
-    closed = co.close_session_plan(cur, dict(CONVERSATION, event="sessionend"), episode_id=2)
-    assert closed == 0, "A third party still owes this work after the conversation ends"
-    assert next(iter(cur.rows.values()))["status"] == "open"
-
-
 def test_owner_conversation_job_and_orchestrator_attribution(monkeypatch):
     monkeypatch.setenv("KHIPU_USER_ALIASES", "Matt")
     co.reset_user_patterns()

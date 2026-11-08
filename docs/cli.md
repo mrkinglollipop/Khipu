@@ -84,7 +84,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 
 `--close ID[,ID...]`, `--reopen ID[,ID...]`, and `--reassign ID[,ID...]` accept comma-separated ids. Reassignment needs `--to user|assistant|agent` and accepts `--label` for an agent. Multiple ids require `--reason` and default to a 500-item cap (`owed_bulk_max`; 0 unlimited). A multi-item change including the owner's items requires owner authorization. `--dismiss ID[,ID...]` dismisses `rd-...` routing directions. `--snooze ID --until WINDOW` takes a date or a window like `7d` or `2w`.
 
-`owed tidy --project PROJECT` plans a one-time cleanup. `--plan-out FILE` writes the plan, `--apply PLAN` applies it, and `--undo BATCH` reverses an applied batch. `--no-model` uses rules only; otherwise the model-call ceiling is `owed_tidy_calls` (25 by default). Owner-directed apply/undo uses `--owner-direction`.
+`owed tidy --project PROJECT` plans a one-time cleanup. `--plan-out FILE` writes the plan, `--apply PLAN` applies it, and `--undo BATCH` reverses an applied batch. `--no-model` uses rules only; otherwise the model-call ceiling is `archived_owed_cleanup_calls` (25 by default). Owner-directed apply/undo uses `--owner-direction`.
 
 `work [--json]` shows the Work view. `work check FILE` validates a runner summary; `hidden`, `hide ID`, and `unhide ID` manage hidden commitments. `same ROW COMMITMENT` and `not-same ROW COMMITMENT` answer a proposed match, with ROW written as `<project>#<row id>`. Hide/unhide and match answers support `--owner-direction`.
 
@@ -226,7 +226,7 @@ Configuration includes these shipped defaults. Duration values below are shown i
 | Storage | `disk_warn_free_gb=10`, `disk_warn_free_percent=5`, `disk_fail_free_gb=3`, `disk_fail_free_percent=2`, `commitments_backup_keep_days=30`, `synth_usage_keep_days=90`, `log_max_mb=5` |
 | Ledger | `ledger_id_chars=80`, `ledger_title_chars=2000`, `ledger_evidence_chars=1000`, `ledger_stale_after=7d`, `ledger_purge_after=30d`, `ledger_owner_word="NEEDS OWNER"` |
 | Work | `work_projects=[]`, `work_file_max_bytes=262144`, `work_max_jobs=50`, `work_max_prs=200`, `work_max_trains=20`, `work_max_runs=20`, `work_line_chars=200`, `work_stale_after="auto"`, `work_job_quiet_after=900s`, `work_gone_after=86400s`, `work_finished_for=1800s`, `work_merged_for=7d`, `work_clock_slack=300s`, `work_refresh=5s` |
-| Owed | `owed_orchestrator_slice_max=3`, `owed_page_max=200`, `owed_bulk_max=500`, `owed_tidy_calls=25` |
+| Owed | `archived orchestrator item limit=3`, `owed_page_max=200`, `owed_bulk_max=500`, `archived_owed_cleanup_calls=25` |
 | CLI paths | `cli_path.claude`, `cli_path.codex`, `cli_path.grok`, `cli_path.muse`, `node_folder`; no configured path by default |
 
 Zero is setting-specific: `replica_refresh_after=0` refreshes at every check; `hub_down_memo_for=0` never skips a connection attempt. Timeouts, retention, and display limits each define their own zero meaning in `khipu config`; there is no blanket unlimited rule.

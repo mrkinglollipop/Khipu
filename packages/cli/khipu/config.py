@@ -319,7 +319,6 @@ FLOAT_SETTINGS: dict[str, tuple[str, float]] = {
     "dedup_similarity": ("KHIPU_DEDUP_SIMILARITY", 0.92),
     # W3.3 commitments auto-close: cosine threshold for a closed_loop/decision
     # to close an open commitment in the same project.
-    "commitment_close_similarity": ("KHIPU_COMMITMENT_CLOSE_SIMILARITY", 0.85),
 }
 
 
@@ -507,21 +506,9 @@ def minute_settings_status() -> dict:
 # ---------------------------------------------------------------------------
 # Counts: how many of something to show or take at once, whole numbers >= 0,
 # 0 = no limit (every limit Khipu enforces is liftable on the spot).
-# `owed_orchestrator_slice_max` is how many items for the orchestrator (owner
-# `agent`, from its jobs) a conversation's session-start list shows
-# (docs/plans/2026-10-16-owed-and-ledger-ssot.md, decision 2).
-# `owed_page_max` is the most items one `khipu_owed` page returns, and
-# `owed_bulk_max` the most ids one `khipu_owed_update` call changes (the same
-# scope, design (c)). `owed_tidy_calls` is the most model calls one `khipu
-# owed tidy` plan makes for the items its rules cannot sort (design (d),
-# decision 4); past it those items are kept as they are and counted.
-# ---------------------------------------------------------------------------
-
 COUNT_SETTINGS: dict[str, int] = {
-    "owed_orchestrator_slice_max": 3,
     "owed_page_max": 200,
     "owed_bulk_max": 500,
-    "owed_tidy_calls": 25,
 }
 
 
@@ -576,14 +563,8 @@ def count_settings_status() -> dict:
 # (account limit, not logged in, transport error, a reply that is not the
 # capture JSON): `gemini` retries that window on Gemini Flash when a Gemini
 # key resolves, `none` leaves the job queued for a later retry. Unset = gemini.
-# `owed_pr_check_github`: whether the owed close rules ask GitHub, read-only
-# through `gh pr view`, whether a pull request an item names has merged
-# (docs/plans/2026-10-16-owed-and-ledger-ssot.md, decision 1). Unset = on.
-# ---------------------------------------------------------------------------
-
 CHOICE_SETTINGS: dict[str, tuple[str, ...]] = {
     "synth_fallback": ("gemini", "none"),
-    "owed_pr_check_github": ("on", "off"),
 }
 
 

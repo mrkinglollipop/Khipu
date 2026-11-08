@@ -30,7 +30,6 @@ beforeEach(() => {
           user_aliases: [],
           float_settings: {
             dedup_similarity: { value: 0.92, source: "default", default: 0.92 },
-            commitment_close_similarity: { value: 0.85, source: "default", default: 0.85 },
           },
           config: {},
         });

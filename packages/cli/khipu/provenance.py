@@ -282,7 +282,7 @@ def _json_list(value: Any) -> list:
 def _prove_prs(cur, fact_id: int, episode_id: int, words: str, project: str | None) -> int:
     """The PR numbers and refs ``words`` name that are already on the fact
     (any claimant): this episode claims each. Returns the count recorded."""
-    from khipu.close_rules import parse_prs, pr_requirement_labels
+    from khipu.pr_refs import parse_prs, pr_requirement_labels
 
     cur.execute("SELECT field, value FROM fact_claims WHERE kind = 'commitment' AND fact_id = %s "
                 "AND field IN ('pr', 'pr_ref')", (fact_id,))
@@ -557,13 +557,7 @@ def _gap_step(cur, step: str, payload: dict[str, Any], episode_id: int) -> None:
     """Re-run one capture fact step, exactly the calls capture made in it
     (``capture.write_pg`` and its merge path)."""
     name = step[len("merge "):] if step.startswith("merge ") else step
-    if name == "commitments":
-        from khipu import commitments
-
-        commitments.open_from_episode(cur, payload, episode_id)
-        commitments.auto_close(cur, payload, episode_id)
-        commitments.close_session_plan(cur, payload, episode_id)
-    elif name == "decisions":
+    if name == "decisions":
         from khipu import decisions
 
         decisions.insert_decisions_from_episode(cur, payload, episode_id)
@@ -571,12 +565,6 @@ def _gap_step(cur, step: str, payload: dict[str, Any], episode_id: int) -> None:
         from khipu import decisions
 
         decisions.detect_reversals_from_episode(cur, payload, episode_id)
-    elif name == "close rules":
-        from khipu import close_rules
-
-        # Replay owns episode/gap locks. Missing GitHub evidence is gathered
-        # by the subsequent connection-owning nightly pass, outside SQL.
-        close_rules.run(cur, payload=payload, episode_id=episode_id, github_enabled=False)
     elif name == "deliverables":
         from khipu import deliverables
 
@@ -593,8 +581,7 @@ def _gap_step(cur, step: str, payload: dict[str, Any], episode_id: int) -> None:
 # the earlier step re-runs them after it, in capture's order, in the same
 # transaction (third Astra review #4). Each is idempotent.
 DEPENDENT_STEPS: dict[str, tuple[str, ...]] = {
-    "commitments": ("close rules",),
-    "decisions": ("decision detection", "close rules"),
+    "decisions": ("decision detection",),
 }
 
 

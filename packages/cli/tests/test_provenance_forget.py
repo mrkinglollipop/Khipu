@@ -38,7 +38,7 @@ from unittest import mock
 import psycopg
 import pytest
 
-from khipu import capture, close_rules, commitments as co, decisions, deliverables, forget, outbox, provenance
+from khipu import capture, commitments as co, decisions, deliverables, forget, outbox, provenance
 from tests.hermetic_pg import chain_dir, hub, migration_sql, pg_cluster  # noqa: F401
 from tests.fact_seed import announce
 
@@ -624,7 +624,7 @@ def test_t3_a_statement_timeout_on_a_fact_lock_keeps_the_job(pg, monkeypatch):
 _RSS_PROBE = textwrap.dedent("""
     import json, resource, sys
     import psycopg
-    from khipu import (capture, close_rules, commitments, decisions, deliverables, forget, provenance,
+    from khipu import (capture, commitments, decisions, deliverables, forget, provenance,
                        tombstones)
     dsn, eid, root = sys.argv[1], int(sys.argv[2]), sys.argv[3]
     conn = psycopg.Connection.connect(dsn)
@@ -675,74 +675,6 @@ def test_t5_a_100k_episode_legacy_forget_streams(env, tmp_path):
 # ---- close rules -----------------------------------------------------------------------------
 
 
-def test_needs_owner_survives_the_pr_rule_and_blocks_auto_close(pg, monkeypatch):
-    """A legacy PR value no live claim holds: the rule keeps needs_owner on
-    pr_check and never closes the item, even when every PR it names merged."""
-    _capture(loop="Land PR #41 before release")
-    with pg.connect() as conn, conn.cursor() as cur:
-        cid = cur.execute("SELECT id FROM commitments").fetchone()[0]
-        provenance.record_claim(cur, "commitment", cid, "pr", 77, claimant="legacy_unproven")
-        provenance.project(cur, "commitment", cid)
-        conn.commit()
-    (check,), = _rows(pg, "SELECT pr_check FROM commitments")
-    assert check.get("needs_owner") is True and "refs" not in check, check
-    monkeypatch.setattr(close_rules.GitHub, "state", lambda self, repo, n: ("merged", None))
-    with pg.connect() as conn, conn.cursor() as cur:
-        report = close_rules.run(cur)
-        conn.commit()
-    assert report["closed_pr"] == 0 and report.get("needs_owner") == 1, report
-    (status, check), = _rows(pg, "SELECT status, pr_check FROM commitments")
-    assert status == "open" and check.get("needs_owner") is True, check
-    # The owner can still close it by hand.
-    with pg.connect() as conn, conn.cursor() as cur:
-        assert co.set_status(cur, cid, "closed", reason="done", by=co.BY_APP)
-        conn.commit()
-
-
-def test_a_forgotten_capture_is_no_close_rule_evidence(pg, monkeypatch):
-    """The original audit's P2: the nightly closed items on a forgotten
-    episode's git lines."""
-    _capture(loop="Land PR #41 before release")
-    with pg.connect() as conn:
-        # Not a capture (that would run the capture-time rules on itself).
-        announce(conn)
-        e = conn.execute("INSERT INTO episodes (ts, session_id, harness, summary, project, raw) "
-                         "VALUES (now(), 'codex:merge', 'codex', 'Merge pull request #41 from acme/fix', %s, "
-                         "'{}'::jsonb) RETURNING id", (PROJECT,)).fetchone()[0]
-        conn.commit()
-    with pg.connect() as conn, conn.cursor() as cur:
-        assert close_rules._episode_states(cur, PROJECT, 0), "the control: the line is evidence while live"
-    _forget(pg, e)
-    with pg.connect() as conn, conn.cursor() as cur:
-        assert close_rules._episode_states(cur, PROJECT, 0) == {}
-    monkeypatch.setattr(close_rules.GitHub, "state", lambda self, repo, n: (None, "GitHub not asked"))
-    with pg.connect() as conn, conn.cursor() as cur:
-        report = close_rules.run(cur)
-        conn.commit()
-    assert report["closed_pr"] == 0, report
-    assert _rows(pg, "SELECT status FROM commitments") == [("open",)]
-
-
-def test_backfill_prs_claims_a_never_parsed_row_after_0047(env):
-    """prs NULL (before 0034) stays "not parsed" through 0047; backfill_prs
-    then records the anchor's own numbers as its claims."""
-    _capture()
-    _capture(loop="Implement the two fixes before PR #366 can merge")
-    with env.connect() as conn:
-        conn.execute("UPDATE commitments SET prs = NULL")
-        conn.commit()
-    env.to_0047()
-    assert sorted(_rows(env, "SELECT text, prs FROM commitments")) == [
-        ("Implement the two fixes before PR #366 can merge", None), (CANON, [])]
-    with env.connect() as conn, conn.cursor() as cur:
-        assert close_rules.backfill_prs(cur) == 1
-        conn.commit()
-        assert close_rules.backfill_prs(cur) == 0
-    assert sorted(_rows(env, "SELECT text, prs FROM commitments")) == [
-        ("Implement the two fixes before PR #366 can merge", [366]), (CANON, [])]
-    assert _rows(env, "SELECT claimant, value FROM fact_claims WHERE field = 'pr'") == [("episode", "366")]
-
-
 def test_the_backfill_proves_a_plain_pr_ref_and_clears_needs_owner(env):
     """Phase 1's note 8: a plain "PR #41" ref needs the project's repository,
     which only Python knows; the witness backfill proves it."""
@@ -757,17 +689,6 @@ def test_the_backfill_proves_a_plain_pr_ref_and_clears_needs_owner(env):
         provenance.backfill(conn)
     (prs, check), = _rows(env, "SELECT prs, pr_check FROM commitments")
     assert prs == [41] and check["refs"] == ["acme/widget#41"] and "needs_owner" not in check
-
-
-def test_the_nightly_step_runs_the_backfill(pg, monkeypatch):
-    from khipu import jobs
-
-    monkeypatch.setattr(jobs, "_nightly_log", lambda msg: None)
-    monkeypatch.setattr(close_rules.GitHub, "state", lambda self, repo, n: (None, "not asked"))
-    _capture()
-    out = jobs._commitment_close_rules()
-    assert out["ok"] and out["provenance"]["ok"] and out["provenance"]["projects"] == 1, out
-    assert jobs._commitment_close_rules()["provenance"]["projects"] == 0
 
 
 def test_the_cli_runs_the_backfill(pg, capsys):

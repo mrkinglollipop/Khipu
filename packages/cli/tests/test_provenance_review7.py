@@ -121,47 +121,6 @@ def test_legacy_merged_payload_refusal_waits_until_sent(env, replica, method):  
     _send_and_recover(pg, a, b)
 
 
-def test_real_legacy_upgrade_refusal_waits_until_sent(env, replica, pg_cluster, tmp_path, monkeypatch):  # noqa: F811
-    from khipu import commitments, db
-
-    name = "legacyfacts_" + uuid.uuid4().hex[:12]
-    with pg_cluster.admin() as admin:
-        admin.execute("CREATE DATABASE " + name + " TEMPLATE template0")
-    h = Hub(pg_cluster, name)
-    try:
-        h.migrate(directory=chain_dir(tmp_path / "oldchain", "0026"))
-        db._TABLE_COLUMNS_CACHE.clear()
-        provenance._reset_ready_cache()
-        monkeypatch.setattr(db, "connect", lambda *a, **kw: h.connect())
-        replica(h, ready=False)
-        a = _capture(loop=CANON)
-        b = capture.write_pg(_payload(loop=ALT, session_id=None, transcript_range=None))["episode_id"]
-        h.migrate(directory=chain_dir(tmp_path / "middlechain", "0044"))
-        db._TABLE_COLUMNS_CACHE.clear()
-        provenance._reset_ready_cache()
-        with h.connect() as c:
-            raw = c.execute("SELECT raw FROM episodes WHERE id = %s", (b,)).fetchone()[0]
-            commitments.open_from_episode(c.cursor(), raw, b)
-        h.migrate()
-        db._TABLE_COLUMNS_CACHE.clear()
-        provenance._reset_ready_cache()
-        with h.connect() as c:
-            provenance.backfill(c)
-            assert c.execute("SELECT source_key, payload_sha256 FROM episode_sources WHERE episode_id = %s",
-                             (b,)).fetchall() == [(episode_key(b), None)]
-            assert c.execute("SELECT opened_episode, text, latest_text FROM commitments").fetchall() \
-                == [(a, CANON, ALT)]
-        mark_ready(h)
-        assert hs.refresh()["ok"]
-        tombstones.publish_payloads([raw])
-        result = hs.copy_facts()
-        _assert_listed_without_alt(result)
-        assert not result["ok"] and result.get("unsent"), result
-        _send_and_recover(h, a, b)
-    finally:
-        pg_cluster.drop(h)
-
-
 def test_real_0027_surrogate_receipt_refusal_is_matched_on_the_hub(pg_cluster, tmp_path):  # noqa: F811
     from khipu import db
 

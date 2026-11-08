@@ -40,50 +40,6 @@ Output ONLY a single JSON object (no prose, no markdown fences) with these keys:
 - decisions: list of strings
 - preferences: list of strings
 - scope: short string
-- open_loops: list of objects {{text, kind, due_after, owner, owner_label, future_trigger}}. BE STRICT —
-  an empty list is the right answer for most sessions. Include an item ONLY if
-  it is (a) something the USER must decide, provide, approve, or do, or (b)
-  something you explicitly promised to do in a FUTURE session and cannot
-  finish in this one.
-  NEVER include:
-    * in-progress status of any kind — "is running", "still building",
-      "pending", "in flight", "waiting on/for", "awaiting";
-    * anything about agents, subagents, drives, notifications, reports
-      arriving, verdicts, or polling;
-    * inter-session or inter-agent coordination — "send/receive ... message",
-      "screen free/busy", "ping the session";
-    * steps of your OWN plan for this session (you will finish them here);
-    * anything this window already reports as completed;
-    * vague items with no concrete action or actor.
-  GOOD: "Matt to decide whether 0.3.17 ships with the seal fix or waits";
-  "Send Matt the Linode restore-drill numbers next session";
-  "Matt must supply the second Mac's hostname before soak can start";
-  "Approve the AGPL CLA wording".
-  BAD: "Drive 46 is still running"; "Generate the UI mocks" (a step of this
-  session's own plan); "Send 'screen free' message to the Khipu session";
-  "Receive the report from the phase 1-2 agent"; "Visual check agent's
-  verdict is pending".
-  kind is one of "followup", "blocker", "question", "promise".
-  owner is "user" (the USER must decide/provide/approve/do it, or it is a
-  question for them), "assistant", or "other" (someone else named as the
-  one who must act: the orchestrator, a pull request's author, a reviewer, a
-  builder, another job) — always answer it. owner_label is a short name for
-  that someone ("orchestrator", "PR author", "reviewer"), or null when owner
-  is not "other".
-  future_trigger is true ONLY when the text names an explicit cross-session
-  condition ("when Matt says the lane is re-authed, ...", "next session",
-  "after the wave merges", "if attempt six dies"); false otherwise.
-  NEVER record a within-session reporting duty — "reply with the SHAs",
-  "tell the user when it relaunches", "notify Matt", "report back",
-  "provide the evidence paths" — unless the USER is the one who owes it.
-  A scope, plan, or design that was APPROVED this session but whose BUILD was
-  explicitly deferred is an open loop of kind "followup", future_trigger
-  true, with the deferral condition itself as the text (e.g. "Build the
-  export screen once the migration ships" — not just "Build the export
-  screen", which loses the condition).
-  due_after is optional; omit or use null when unknown.
-- closed_loops: list of objects {{text}} for anything explicitly finished,
-  merged, shipped, or no longer needed this turn.
 Capture concrete decisions, user preferences/corrections, project state, file paths in play, and ruled-out dead ends.
 Return a summary of empty string if nothing durable.
 
@@ -93,18 +49,6 @@ Transcript:
 {transcript}
 """
 
-# Spliced in before the "Session project (cwd):" block for a dispatched
-# job's transcript only (owed scope 2026-10-16, design (a) rule 4). The
-# person typing in a job is the orchestrator that dispatched it, so the
-# model must not record the orchestrator's asks as the user's. Khipu's own
-# deterministic owner rule still wins on conflict (khipu.commitments).
-JOB_SECTION = """
-This transcript is a dispatched job's: the "user" turns were written by the
-orchestrator that dispatched it, not by the person who owns the project.
-Something the orchestrator (or the person, through it) must decide, answer or
-do is owner "other" with owner_label "orchestrator", even when the text names
-the person ("Matt to decide X" in a job is the orchestrator's to raise).
-"""
 
 # Appended after PROMPT, before the ``.format()`` call, ONLY when the
 # `decision_details` switch is on (khipu.features) — with the switch off the
@@ -894,55 +838,6 @@ def _parse_without_decision_details(text: str) -> dict[str, Any] | None:
     return None
 
 
-def _as_open_loops(v: Any) -> list[dict[str, Any]]:
-    if not isinstance(v, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for item in v:
-        if isinstance(item, str):
-            text = item.strip()
-            if text:
-                out.append({"text": text, "kind": "followup", "due_after": None,
-                            "owner": None, "future_trigger": None})
-            continue
-        if not isinstance(item, dict):
-            continue
-        text = str(item.get("text") or "").strip()
-        if not text:
-            continue
-        kind = str(item.get("kind") or "followup").strip().lower()
-        if kind not in ("followup", "blocker", "question", "promise"):
-            kind = "followup"
-        loop = {
-            "text": text,
-            "kind": kind,
-            "due_after": item.get("due_after") or None,
-            "owner": item.get("owner") or None,
-            # Carried through for the record; khipu.commitments decides the
-            # stored value deterministically (has_future_trigger wins).
-            "future_trigger": item.get("future_trigger"),
-        }
-        label = item.get("owner_label")
-        if isinstance(label, str) and label.strip():
-            # Only for an "other" owner; khipu.commitments keeps it when no
-            # rule names the owner.
-            loop["owner_label"] = label.strip()[:40]
-        out.append(loop)
-    return out
-
-
-def _as_closed_loops(v: Any) -> list[dict[str, Any]]:
-    if not isinstance(v, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for item in v:
-        text = item.get("text") if isinstance(item, dict) else item
-        text = str(text or "").strip()
-        if text:
-            out.append({"text": text})
-    return out
-
-
 _VALID_SOURCE_KINDS = ("user", "assistant")
 
 
@@ -989,9 +884,6 @@ def _build_prompt(*, cwd: str, transcript: str, job: bool = False) -> str:
             template = template[:idx] + DECISION_DETAILS_SECTION + template[idx:]
     except Exception:  # noqa: BLE001 — the switch registry must never block extraction
         template = PROMPT
-    if job:
-        idx = template.index(marker)
-        template = template[:idx] + JOB_SECTION + template[idx:]
     return template.format(cwd=cwd or "(unknown)", transcript=transcript)
 
 
@@ -1236,8 +1128,8 @@ def extract_memory(transcript: str, *, cwd: str = "", job: bool = False) -> dict
         "decisions": decisions,
         "preferences": _as_str_list(parsed.get("preferences")),
         "scope": str(parsed.get("scope", "")).strip(),
-        "open_loops": _as_open_loops(parsed.get("open_loops")),
-        "closed_loops": _as_closed_loops(parsed.get("closed_loops")),
+        "open_loops": [],
+        "closed_loops": [],
         "decision_details": _as_decision_details(parsed.get("decision_details"), decisions),
         "edges": [],
         "topic_pages": [],

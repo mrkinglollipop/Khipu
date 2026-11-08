@@ -127,7 +127,7 @@ STORES: tuple[Store, ...] = (
           "archived commitment rows, including capture-derived text and lineage",
           "kept: an owner-chosen archive outside managed stores; forget cannot find or erase it; "
           "the export output and command help disclose this boundary",
-          _w("owed_reset.export")),
+          ()),
     Store("recall eval record", "a file the owner names with khipu recall eval --record",
           "the golden queries, quoted text included, and the ids each one returned",
           "kept: an owner-chosen file outside the data folder that forget cannot find; a known "
@@ -216,7 +216,7 @@ STORES: tuple[Store, ...] = (
           "a clean-up plan: open commitments' text, owners and the evidence for each change",
           "kept: commitments' text remains by design (forget's kept text); each plan is rewritten "
           "on the next Tidy this list",
-          _w("cli.cmd_owed_tidy")),
+          ()),
     Store("local backup", "a backup folder or archive the owner chose",
           "a copy of the data folder", "kept: backups are kept for recovery (forget's kept text); "
           "an import restores only what a store here says it may, each file through that "

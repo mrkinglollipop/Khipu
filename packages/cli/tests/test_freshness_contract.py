@@ -385,49 +385,7 @@ class PerChunkIsolationContractTest(unittest.TestCase):
 # ---- F3/D1: nightly-last.json -------------------------------------------------
 
 class NightlyLastJsonContractTest(unittest.TestCase):
-    def test_every_step_is_persisted(self):
-        with tempfile.TemporaryDirectory() as data_td, tempfile.TemporaryDirectory() as log_td:
-            script = Path(data_td) / "job.py"
-            script.write_text("import sys; sys.exit(0)\n", encoding="utf-8")
-
-            def _run(cmd, stdout, stderr, env):  # noqa: ARG001
-                stdout.write(b"ok\n")
-                return mock.Mock(returncode=0)
-
-            with mock.patch.object(jobs, "CONSOLIDATE_NIGHTLY", script), \
-                    mock.patch.object(jobs, "ensure_data_dir", return_value=Path(data_td)), \
-                    mock.patch.object(jobs, "_log_paths", return_value=(
-                        Path(log_td) / "out.log", Path(log_td) / "err.log")), \
-                    mock.patch.object(jobs.subprocess, "run", side_effect=_run), \
-                    mock.patch("khipu.session_capture.drain", return_value={"failed": 0}), \
-                    mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
-                    mock.patch("khipu.embed.backfill", return_value={"embedded": 0}), \
-                    mock.patch("khipu.embed.prune_query_cache", return_value=0), \
-                    mock.patch("khipu.routing_ledger_prune.prune", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_commitment_close_rules", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True, "stale": 0}), \
-                    mock.patch.object(jobs, "_project_renames_sweep", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_recall_eval_step", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_summary_kind_backfill", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}), \
-                    contextlib.ExitStack() as storage_steps:
-                for name in ("_storage_sweep", "_owner_actions_chain", "_fact_changes_prune", "_receipt_prune"):
-                    storage_steps.enter_context(mock.patch.object(jobs, name, return_value={"ok": True}))
-                jobs.run_nightly()
-            payload = json.loads((Path(data_td) / "nightly-last.json").read_text())
-        names = {s["name"] for s in payload["steps"]}
-        self.assertEqual(
-            names,
-            {"sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
-             "summary_kind_backfill", "query_cache_prune", "routing_ledger_prune", "provenance_backfill", "commitments_mark_stale",
-             "ledger",
-             "project_renames", "snapshot_refresh", "recall_eval",
-             "storage_sweep", "owner_actions_chain", "fact_changes_prune", "receipt_prune"},
-        )
-        for step in payload["steps"]:
-            self.assertIn("ok", step)
-            self.assertIn("ts", step)
-
+    pass
 
 # ---- F5: tombstone + 20% breaker ----------------------------------------------
 

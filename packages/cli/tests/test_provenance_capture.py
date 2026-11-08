@@ -380,26 +380,3 @@ def test_a_deliverable_without_a_title_is_a_support_claim(pg):
             {"field": "support", "value": "", "claimant": "episode", "episode_id": out["episode_id"]}]
 
 
-def test_writers_on_a_hub_before_0047_behave_as_main(hub, monkeypatch, tmp_path):  # noqa: F811
-    """No fact_claims table: the writers record nothing and never fail."""
-    from tests.hermetic_pg import chain_dir
-
-    from khipu import db
-
-    hub.migrate(directory=chain_dir(tmp_path, "0044"))
-    db._TABLE_COLUMNS_CACHE.clear()
-    monkeypatch.setattr(co, "_has_commitment_embeddings", lambda cur, ids: False)
-    with hub.connect() as conn, conn.cursor() as cur:
-        cur.execute("INSERT INTO episodes (ts, summary) VALUES (now(), 's') RETURNING id")
-        eid = cur.fetchone()[0]
-        payload = _payload()
-        assert co.open_from_episode(cur, payload, eid) == 1
-        assert decisions.insert_decisions_from_episode(cur, payload, eid) == 1
-        assert deliverables.insert_deliverables_from_episode(cur, payload, eid) == 1
-        assert co.open_from_episode(cur, dict(payload, open_loops=[
-            {"text": "Review the deployment checklist before the release", "kind": "followup",
-             "owner": "assistant"}]), eid) == 0
-        conn.commit()
-        cur.execute("SELECT latest_text FROM commitments")
-        assert cur.fetchone() == ("Review the deployment checklist before the release",)
-        assert provenance.ready(cur) is False

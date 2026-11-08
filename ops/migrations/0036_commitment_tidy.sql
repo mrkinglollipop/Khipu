@@ -68,7 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_commitment_tidy_items_commitment
 COMMENT ON COLUMN commitments.tidy_batch IS
     'The `khipu owed tidy` batch that last changed this item (commitment_tidy_batches.id), or NULL.';
 COMMENT ON TABLE commitment_tidy_batches IS
-    'One applied clean-up plan (khipu.owed_tidy): counts, skipped items, owner gate, undo.';
+    'One applied clean-up plan (historical Owed clean-up): counts, skipped items, owner gate, undo.';
 COMMENT ON TABLE commitment_tidy_items IS
     'One item a clean-up changed: action, reason, its state before (for undo) and a fingerprint of its state after.';
 

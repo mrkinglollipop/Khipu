@@ -156,38 +156,6 @@ def test_a_direct_wording_write_is_refused_at_commit(migrated, sql):
     assert getattr(exc, "sqlstate", None) == "08K01", exc
 
 
-def test_an_old_dedup_is_refused_whole_savepoints_included(migrated):
-    """main's dedup (commitments.py open_from_episode): touch seen, overwrite
-    latest_text, union prs, keep refs, inside the capture's fail-open
-    savepoint, after the episode insert. COMMIT refuses all of it, so no
-    episode lands without its claims."""
-    conn = migrated.conn
-    c = migrated.ids["c"]
-    with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM episodes")
-        before = cur.fetchone()[0]
-        _episode(cur, "the restater")
-        cur.execute("SAVEPOINT commitments_step")
-        cur.execute("UPDATE commitments SET last_seen_at = now(), seen_count = seen_count + 1 WHERE id = %s", (c,))
-        cur.execute("UPDATE commitments SET latest_text = %s WHERE id = %s", ("ship the gate today", c))
-        cur.execute("UPDATE commitments SET prs = ARRAY(SELECT DISTINCT n FROM "
-                    "unnest(COALESCE(prs, '{}'::int[]) || %s::int[]) AS n ORDER BY n) WHERE id = %s", ([41], c))
-        cur.execute("UPDATE commitments SET pr_check = %s::jsonb WHERE id = %s",
-                    (json.dumps({"refs": ["acme/app#41"]}), c))
-        cur.execute("RELEASE SAVEPOINT commitments_step")
-    import psycopg
-
-    with pytest.raises(psycopg.OperationalError) as caught:
-        conn.commit()
-    assert caught.value.sqlstate == "08K01"
-    conn.rollback()
-    with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM episodes")
-        assert cur.fetchone()[0] == before
-        cur.execute("SELECT latest_text, prs, pr_check, seen_count FROM commitments WHERE id = %s", (c,))
-        assert cur.fetchone() == (None, [], None, 1)
-
-
 def test_an_old_forget_of_a_claimed_episode_is_refused(migrated):
     """main's forget_episode: tombstone, then close/retract/delete by anchor.
     The forget gate refuses it at COMMIT while claims still name the episode."""
@@ -491,38 +459,6 @@ PR_TEXTS = [
     "PR #13.\nPR list: #14", "nothing here", "", "PR #15, #16; #17", "a PR: #18",
     "Merge pull request #19 from x/y", "PR #20 & #21", "PRs —#22", "PR\n#23",
 ]
-
-
-def test_sql_pr_parse_is_never_more_than_parse_prs(migrated):
-    from khipu.close_rules import parse_prs
-
-    conn = migrated.conn
-    disagree = []
-    with conn.cursor() as cur:
-        for t in PR_TEXTS:
-            cur.execute("SELECT khipu_text_prs(%s)", (t,))
-            sql = set(cur.fetchone()[0])
-            py = set(parse_prs(t))
-            assert sql <= py, (t, sql, py)
-            if sql != py:
-                disagree.append(t)
-    conn.rollback()
-    # Only texts with a non-ASCII neighbour or space may read stricter.
-    assert all(re.search(r"[^\x00-\x7f]", t) for t in disagree), disagree
-
-
-def test_sql_pull_refs_are_the_qualified_labels_of_pull_links(migrated):
-    from khipu.close_rules import pr_requirement_labels
-
-    conn = migrated.conn
-    with conn.cursor() as cur:
-        for t in PR_TEXTS:
-            cur.execute("SELECT khipu_text_pull_refs(%s)", (t,))
-            sql = set(cur.fetchone()[0])
-            py = set(pr_requirement_labels(t, None))
-            assert sql <= py, (t, sql, py)
-            assert sql == py or re.search(r"[^\x00-\x7f]", t), (t, sql, py)
-    conn.rollback()
 
 
 # ---- The single-writer inventory section 4's proof rests on ---------------------

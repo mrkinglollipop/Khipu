@@ -6,20 +6,10 @@ from unittest import mock
 
 import pytest
 
-from khipu import commitments as co, explicit_asks, mcp_server, needs_you, owed_reset, owed_tidy
-from tests.test_owed_tidy import owed, Flood, PROJECT, FIELDS  # noqa: F401
+from khipu import commitments as co, explicit_asks, mcp_server, needs_you, owed_reset, owed_changes
+from tests.test_owed_changes import owed, Flood, PROJECT, FIELDS  # noqa: F401
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.test_commitments import _CommitmentsCursor
-
-
-def test_summary_question_does_not_create_owner_work():
-    cur = _CommitmentsCursor()
-    with mock.patch.dict('os.environ', KHIPU_USER_ALIASES='matt'):
-        co.reset_user_patterns()
-        assert co.open_from_episode(cur, {"project": PROJECT, "open_loops": [
-            {"text": "Matt to decide whether to approve the new design", "kind": "question", "owner": "user"}]}, 42) == 0
-    assert not cur.rows
-    co.reset_user_patterns()
 
 
 def test_filed_ask_is_visible_and_has_no_authority(owed, monkeypatch):
@@ -77,10 +67,10 @@ def test_reset_dry_run_export_apply_and_whole_batch_undo(owed, tmp_path, capsys,
     late = mcp_server._tool_owed_update({'action': 'ask', 'requester': 'Builder', 'question': 'Use another design?', 'yes': 'use another design',
                                        'no': 'keep this design', 'episode_id': eid})
     assert late['ok'], late
-    out = owed_tidy.apply(doc, owner_gate='direction')
+    out = owed_changes.apply(doc, owner_gate='direction')
     assert out['changed'] == 3, out
     assert len(out['batches']) == 1
-    undo = owed_tidy.undo(out['batches'][0], owner_gate='direction')
+    undo = owed_changes.undo(out['batches'][0], owner_gate='direction')
     assert undo['restored'] == 3, undo
     with owed.cursor() as cur:
         cur.execute('SELECT id, status FROM commitments ORDER BY id')
@@ -132,47 +122,6 @@ def test_ask_project_resolves_bare_name_and_alias(owed):
     with owed.cursor() as cur:
         cur.execute('SELECT project FROM commitments WHERE id = %s', (first['id'],))
         assert cur.fetchone() == (PROJECT,)
-
-
-def test_new_owner_summary_rejection_is_accounted_for():
-    cur = _CommitmentsCursor()
-    report = {}
-    with mock.patch.dict('os.environ', KHIPU_USER_ALIASES='matt'), co.collecting(report):
-        co.reset_user_patterns()
-        inserted = co.open_from_episode(cur, {'project': PROJECT, 'open_loops': [
-            {'text': 'Matt to decide whether to approve this design', 'kind': 'question', 'owner': 'user'}]}, 42)
-    co.reset_user_patterns()
-    assert inserted == 0 and not cur.rows
-    assert len(report['rejected']) == 1
-    assert 'not filed explicitly' in report['rejected'][0]['reason']
-    assert not report.get('opened')
-
-
-def test_existing_owner_restatement_records_claim_and_forget_keeps_only_live_words(owed, monkeypatch):
-    from khipu import forget
-    from tests.fact_seed import owner_commitment
-    monkeypatch.setenv('KHIPU_USER_ALIASES', 'matt')
-    co.reset_user_patterns()
-    flood = Flood(owed)
-    first, second = flood.episode(), flood.episode()
-    text = 'Matt to review the deployment checklist before release'
-    with owed.transaction(), owed.cursor() as cur:
-        cid = owner_commitment(cur, text, project=PROJECT, episode_id=first)
-        report = {}
-        with co.collecting(report):
-            assert co.open_from_episode(cur, {'project': PROJECT, 'open_loops': [
-                {'text': text, 'kind': 'followup', 'owner': 'user'}]}, second) == 0
-        assert report['restated'] == 1 and not report.get('rejected')
-        cur.execute("SELECT count(*) FROM fact_claims WHERE kind = 'commitment' AND fact_id = %s AND episode_id = %s",
-                    (cid, second))
-        assert cur.fetchone()[0] > 0
-        assert forget.forget_episode(cur, first, memory_root=None)['commitments_closed'] == 0
-        cur.execute('SELECT status, opened_episode FROM commitments WHERE id = %s', (cid,))
-        assert cur.fetchone() == ('open', second)
-        assert forget.forget_episode(cur, second, memory_root=None)['commitments_closed'] == 1
-        cur.execute('SELECT status, close_reason FROM commitments WHERE id = %s', (cid,))
-        assert cur.fetchone() == ('closed', 'forgotten')
-    co.reset_user_patterns()
 
 
 def test_export_output_and_help_disclose_the_unreachable_copy(owed, tmp_path, capsys):

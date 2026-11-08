@@ -182,26 +182,15 @@ const CAPTURE_MODE_OPTIONS: ReadonlyArray<readonly [string, string, string]> = [
 
 const SIMILARITY_ENV = {
   dedup_similarity: "KHIPU_DEDUP_SIMILARITY",
-  commitment_close_similarity: "KHIPU_COMMITMENT_CLOSE_SIMILARITY",
 } as const;
 
 /** Owed's limits (`khipu.config.COUNT_SETTINGS`), each liftable with 0. */
 const OWED_LIMIT_ROWS: ReadonlyArray<readonly [string, string, string]> = [
-  [
-    "owed_orchestrator_slice_max",
-    "Items for the orchestrator at the start of a conversation",
-    "How many items a job left for its orchestrator a conversation is shown when it starts.",
-  ],
   ["owed_page_max", "Most items on one page of Owed", "How many items one read of Owed returns. Show more reads the next page."],
   ["owed_bulk_max", "Most items changed at once", "How many items one Close… or Move to… changes together."],
-  [
-    "owed_tidy_calls",
-    "Most model calls for one clean-up plan",
-    "For the items no rule can sort. Past it they are kept as they are.",
-  ],
 ];
 
-const OWED_GITHUB_KEY = "owed_pr_check_github";
+
 
 /** Two cards that share one read of the config: when and where a
  *  conversation is saved, and how commitments are owned and closed. */
@@ -228,18 +217,6 @@ export function CaptureTuningCard({
   const aliasesFromEnv = aliases.length > 0 && aliases.join(",") !== fileAliases.join(",");
 
   const owedLimits = c?.count_settings ?? {};
-  const githubId = useId();
-  const [githubBusy, setGithubBusy] = useState(false);
-  const [githubError, setGithubError] = useState<string | null>(null);
-  const githubStored = c?.config?.[OWED_GITHUB_KEY];
-  const github = githubStored === "off" ? "off" : "on";
-
-  async function changeGithub(next: string) {
-    setGithubBusy(true);
-    setGithubError(await writeConfig(OWED_GITHUB_KEY, next, cfg.reload));
-    setGithubBusy(false);
-  }
-
   async function changeMode(next: string) {
     setModeBusy(true);
     setModeError(await writeConfig("capture_mode", next, cfg.reload));
@@ -247,7 +224,7 @@ export function CaptureTuningCard({
   }
 
   function similarity(
-    key: "dedup_similarity" | "commitment_close_similarity",
+    key: "dedup_similarity",
     label: string,
     help: string,
   ) {
@@ -339,8 +316,7 @@ export function CaptureTuningCard({
         <div className="section-head">Commitments</div>
         <div className="section-body">
           <p className="set-help">
-            A commitment is something a conversation said is still owed: a follow-up, a blocker, a question or a
-            promise. They are listed on Owed.
+            Owed keeps explicitly filed asks and archived commitments. Only a deliberate update changes them.
           </p>
           <SettingField
             label="Your names"
@@ -348,7 +324,7 @@ export function CaptureTuningCard({
             placeholder="matt, matthew"
             help={
               <>
-                Names that mean you when Khipu decides who owns a commitment. Separate them with commas. Default:
+                Names used to interpret ownership of archived commitments. Separate them with commas. Default:
                 none.
                 {aliasesFromEnv ? (
                   <>
@@ -360,11 +336,6 @@ export function CaptureTuningCard({
             }
             onSave={(v) => writeConfig("user_aliases", v, cfg.reload)}
           />
-          {similarity(
-            "commitment_close_similarity",
-            "Close a commitment when a later capture matches it at",
-            "From 0 to 1. A word and completion rule can also close a commitment.",
-          )}
           {OWED_LIMIT_ROWS.map(([key, label, help]) => {
             const row = owedLimits[key];
             return (
@@ -386,41 +357,6 @@ export function CaptureTuningCard({
               />
             );
           })}
-          <div className="set-field">
-            <div className="set-labelrow">
-              <label className="set-label" htmlFor={githubId}>
-                Ask GitHub whether a pull request merged
-              </label>
-            </div>
-            <div className="toolbar">
-              <select
-                id={githubId}
-                value={c ? github : ""}
-                disabled={!c || githubBusy}
-                aria-describedby={`${githubId}-help`}
-                onChange={(e) => void changeGithub(e.target.value)}
-              >
-                {c ? (
-                  <>
-                    <option value="on">On</option>
-                    <option value="off">Off</option>
-                  </>
-                ) : (
-                  <option value="">{readFailed ? "Could not read" : "Reading…"}</option>
-                )}
-              </select>
-              {githubBusy ? <Loader2 size={14} className="spin" aria-hidden /> : null}
-            </div>
-            <p id={`${githubId}-help`} className="set-help">
-              An item that names pull requests closes when every one of them has merged or closed. Khipu reads
-              their state with <code>gh</code>, and only reads. Default: on.
-            </p>
-            {githubError ? (
-              <p className="set-error" role="alert">
-                {githubError}
-              </p>
-            ) : null}
-          </div>
         </div>
       </div>
     </>
@@ -445,7 +381,7 @@ export function OfflineWaitsCard({ active }: { active: boolean }) {
       <div className="section-head">Waiting on the hub</div>
       <div className="section-body">
         <p className="set-help">
-          How long Khipu waits before it uses this Mac's copy of Owed and Decisions. 0 means no limit.
+          How long Khipu waits before it uses this Mac's copy of Owed. 0 means no limit.
         </p>
         {cfg.error && !cfg.data ? (
           <p className="set-error" role="alert">

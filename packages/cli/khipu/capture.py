@@ -164,9 +164,6 @@ def _record_fact_gap(cur, episode_id: int | None, step: str, exc: BaseException,
     cannot be recorded defers the whole capture instead of losing the items."""
     # The capture's caller is told which step lost its items, whether or not
     # this hub can record the gap (a hub without 0047 has no table for it).
-    from khipu import commitments as _commitments
-
-    _commitments.report_step_failed(exc, step)
     if episode_id is None:
         return
     from khipu import provenance
@@ -841,26 +838,6 @@ def _merge_into_episode(
 
     # The merged capture's own open/closed loops belong to the target episode
     # — same call the insert path makes in write_pg, same SAVEPOINT fail-open.
-    try:
-        cur.execute("SAVEPOINT capture_merge_commitments")
-    except Exception:  # noqa: BLE001 — no savepoint support (fake cur / autocommit)
-        pass
-    try:
-        from khipu import commitments
-
-        commitments.open_from_episode(cur, payload, target_id)
-        commitments.auto_close(cur, payload, target_id)
-        commitments.close_session_plan(cur, payload, target_id)
-    except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
-        _defer_if_transient(exc, "commitments")
-        try:
-            cur.execute("ROLLBACK TO SAVEPOINT capture_merge_commitments")
-        except Exception:  # noqa: BLE001
-            pass
-        else:
-            _record_fact_gap(cur, target_id, "merge commitments", exc, source_id=source_id)
-        _log(f"merge commitments step failed ({type(exc).__name__}: {exc})")
-
     # O2: the merged capture's own decision strings belong to the target
     # episode too, same SAVEPOINT fail-open posture as commitments above.
     try:
@@ -901,26 +878,6 @@ def _merge_into_episode(
         else:
             _record_fact_gap(cur, target_id, "merge decision detection", exc, source_id=source_id)
         _log(f"merge decision detection step failed ({type(exc).__name__}: {exc})")
-
-    # Owed close rules (slice 2): this capture's project, with this capture
-    # as the later evidence. After the decisions step, which they read.
-    try:
-        cur.execute("SAVEPOINT capture_merge_close_rules")
-    except Exception:  # noqa: BLE001 — no savepoint support (fake cur / autocommit)
-        pass
-    try:
-        from khipu import close_rules
-
-        close_rules.run(cur, payload=payload, episode_id=target_id)
-    except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
-        _defer_if_transient(exc, "close rules")
-        try:
-            cur.execute("ROLLBACK TO SAVEPOINT capture_merge_close_rules")
-        except Exception:  # noqa: BLE001
-            pass
-        else:
-            _record_fact_gap(cur, target_id, "merge close rules", exc, source_id=source_id)
-        _log(f"merge close rules step failed ({type(exc).__name__}: {exc})")
 
     # O4: same posture for the merged capture's own deliverables.
     try:
@@ -1195,19 +1152,6 @@ def run_fact_steps(cur, payload: dict[str, Any], episode_id: int) -> None:
     and the file recovery writers (``mirror.sync_recent_episodes``,
     ``mirror.reconcile_memory_root``) for a file line they import, so the
     episode commits with its claims (0047's writer gate)."""
-    cur.execute("SAVEPOINT capture_commitments")
-    try:
-        from khipu import commitments
-
-        commitments.open_from_episode(cur, payload, episode_id)
-        commitments.auto_close(cur, payload, episode_id)
-        commitments.close_session_plan(cur, payload, episode_id)
-    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-        _defer_if_transient(exc, "commitments")
-        cur.execute("ROLLBACK TO SAVEPOINT capture_commitments")
-        _record_fact_gap(cur, episode_id, "commitments", exc)
-        _log(f"commitments step failed ({type(exc).__name__}: {exc})")
-
     # O2: each string in payload['decisions'] becomes a row.
     cur.execute("SAVEPOINT capture_decisions")
     try:
@@ -1235,19 +1179,6 @@ def run_fact_steps(cur, payload: dict[str, Any], episode_id: int) -> None:
         cur.execute("ROLLBACK TO SAVEPOINT capture_decision_detection")
         _record_fact_gap(cur, episode_id, "decision detection", exc)
         _log(f"decision detection step failed ({type(exc).__name__}: {exc})")
-
-    # Owed close rules (slice 2): PR and decision closes for
-    # this capture's project, after the decisions they read.
-    cur.execute("SAVEPOINT capture_close_rules")
-    try:
-        from khipu import close_rules
-
-        close_rules.run(cur, payload=payload, episode_id=episode_id)
-    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-        _defer_if_transient(exc, "close rules")
-        cur.execute("ROLLBACK TO SAVEPOINT capture_close_rules")
-        _record_fact_gap(cur, episode_id, "close rules", exc)
-        _log(f"close rules step failed ({type(exc).__name__}: {exc})")
 
     # O4: files/PR-issue-URLs/release tags from payload['deliverables'].
     cur.execute("SAVEPOINT capture_deliverables")
@@ -2369,17 +2300,7 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
     # write must still carry it into the outbox, so the retry gets a copy.
     checkout = payload.get("checkout")
     try:
-        # What the commitment steps did with the loops this capture carried
-        # rides back as ``commitments`` (opened, restated, closed, rejected and
-        # not_closed with a reason each, or step_failed / fact_gaps), so the
-        # caller can say which were not kept. Absent when no loop was involved.
-        from khipu import commitments as _commitments
-
-        report: dict[str, Any] = {}
-        with _commitments.collecting(report):
-            stats = write_pg(payload)
-        if report and isinstance(stats, dict):
-            stats["commitments"] = _commitments.finish_report(report)
+        stats = write_pg(payload)
         if result is not None:
             # The proof holds the row's raw, for the drain's archive only.
             result.update({k: v for k, v in stats.items() if k != "legacy_projection_duplicate"})

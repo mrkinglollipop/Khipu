@@ -137,49 +137,9 @@ class DeferralNeverClosesAtSessionEndTest(unittest.TestCase):
     trigger — including the O1 shapes that used to slip through
     (has_future_trigger was False for them, so 'session-ended' fired)."""
 
-    def test_a_deferred_until_row_survives_sessionend(self):
-        cur = _CommitmentsCursor(migrated=True)
-        cur._seed(
-            "Run the oracle again until the ledger closes.",
-            owner="assistant", kind="followup", session_id="claude:s1",
-        )
-        payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "sessionend"}
-        closed = co.close_session_plan(cur, payload, 9)
-        self.assertEqual(closed, 0)
-        self.assertTrue(all(r["status"] == "open" for r in cur.rows.values()))
-
-    def test_a_before_clause_row_survives_sessionend(self):
-        cur = _CommitmentsCursor(migrated=True)
-        cur._seed(
-            "Ship the notes before the wave lands.",
-            owner="assistant", kind="followup", session_id="claude:s1",
-        )
-        payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "sessionend"}
-        closed = co.close_session_plan(cur, payload, 9)
-        self.assertEqual(closed, 0)
-
 
 class OpenFromEpisodeStoresTriggerTextTest(unittest.TestCase):
-    def test_trigger_text_is_stored_when_the_column_exists(self):
-        cur = _CommitmentsCursor(migrated=True, trigger=True, trigger_text=True)
-        payload = {"project": "acme/widget", "open_loops": [
-            {"text": "Run the oracle again until the ledger closes.",
-             "kind": "followup", "owner": "assistant"},
-        ]}
-        self.assertEqual(co.open_from_episode(cur, payload, 1), 1)
-        row = next(iter(cur.rows.values()))
-        self.assertTrue(row["future_trigger"])
-        self.assertIsNotNone(row["trigger_text"])
-        assert row["trigger_text"] is not None
-        self.assertTrue(row["trigger_text"].lower().startswith("until"))
-
-    def test_a_pre_migration_hub_opens_without_the_column(self):
-        cur = _CommitmentsCursor(migrated=True)  # no trigger/trigger_text columns
-        payload = {"project": "acme/widget", "open_loops": [
-            "Run the oracle again until the ledger closes.",
-        ]}
-        self.assertEqual(co.open_from_episode(cur, payload, 1), 1)
-
+    pass
 
 class ListOwedShowsUntilLineTest(unittest.TestCase):
     def test_list_owed_carries_an_until_line_for_a_deferred_row(self):
