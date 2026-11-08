@@ -3,7 +3,7 @@
    (docs/mockups/2026-10-15-work-view/); tokens and components come from App.css. */
 
 .wk-panel .sr-only,
-.lg-page .sr-only,
+.lg-page .sr-only {
   position: absolute;
   width: 1px;
   height: 1px;
