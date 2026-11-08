@@ -1,38 +1,19 @@
-"""First-class commitments (W3) — open loops that outlive a single episode.
-
-``decisions`` today are immutable strings in a JSONB array: nothing can be
-opened, closed, superseded (root cause D). This module gives capture-time
-``open_loops`` / ``closed_loops`` a lifecycle in the ``commitments`` table
-(migration 0009): opened by an episode, auto-closed by a later episode's
-closed_loop / decision / explicit ``done:`` prefix in the same project, or
-aged into ``stale`` after 30 days untouched.
-
-Every function here is called from the capture write path
-(``khipu.capture.write_pg``) and must stay fail-open: an exception here must
-never take down an episode insert that already succeeded.
-"""
+"""Explicit asks, manual commitment updates and archived commitment reads."""
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import threading
-from contextlib import contextmanager
 from datetime import datetime
 from functools import lru_cache
 from typing import Any
 
-from khipu.capture import _jaccard  # shared with capture's own dedup (no byte copy)
 
 VALID_KINDS = ("followup", "blocker", "question", "promise")
 STALE_AFTER_DAYS = 30           # blockers / questions: a long-lived shape
 STALE_AFTER_DAYS_SOFT = 14      # followups / promises with no due date
-DONE_MATCH_MIN_SCORE = 0.2  # fix 4: a minimal bar even for an explicit "done:" close
-NEAR_DUP_MIN_SCORE = 0.5    # quality: token-containment bar for "already open"
 # A lost ON CONFLICT insert whose winner retired before it was locked is
 # retried this many times in all, then the capture defers (scope 3.4, I4).
-_CONFLICT_INSERT_ATTEMPTS = 3
 # Kind → sort rank for `khipu owed` (0 = most urgent). Surfaced as the row's
 # `priority` so the desktop sorts without re-deriving the rule.
 KIND_PRIORITY = {"blocker": 0, "question": 1, "promise": 2, "followup": 3}
@@ -88,24 +69,9 @@ def _log(msg: str) -> None:
 # HERE — the other two import this text so they cannot drift apart.
 # ---------------------------------------------------------------------------
 
-COMMITMENT_DEFINITION = """A commitment is ONLY one of:
-  (a) something the USER must decide, provide, approve, or do; or
-  (b) something the ASSISTANT explicitly promised to do in a FUTURE session
-      and cannot finish in this one.
-Everything else is NOT a commitment. In particular, never record:
-  - in-progress status of any kind: "is running", "still building", "pending",
-    "in flight", "waiting on/for", "awaiting";
-  - anything about agents, subagents, drives, notifications, reports arriving,
-    verdicts, or polling;
-  - inter-session or inter-agent coordination: "send/receive ... message",
-    "screen free/busy", "ping the session";
-  - steps of the assistant's own plan for THIS session (it will finish them
-    before the session ends);
-  - anything this same window reports as already completed;
-  - vague items with no concrete action or actor."""
 
 # Each rule is (reason, pattern). The reason is reported verbatim by
-# `khipu hygiene commitments` so a human reviewing a dry run can see WHY.
+# `historical commitment cleanup` so a human reviewing a dry run can see WHY.
 _IN_PROGRESS_RE = re.compile(
     r"\b(?:is|are|was|were|remains?|stays?)\s+"
     r"(?:still\s+|currently\s+|now\s+|already\s+)?"
@@ -911,7 +877,6 @@ def _parse_due_after(raw: Any) -> tuple[str, Any]:
     return "NULL", None
 
 
-_REPORT = threading.local()
 
 REJECTION_WORDS = {
     "empty": "the text is empty",
@@ -1044,36 +1009,7 @@ _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 # ---- the owner's own items --------------------------------------------------
 #
-# The invariant (Matt, 2026-10-17: "Suggest, don't close"): an item the owner
-# owes (``row_owner`` gives ``user``) is never closed, merged, hidden or
-# reassigned by anything automatic, by any rule. Every automatic rule is named
-# here with what it becomes for his item, and every automatic change goes
-# through the one write each kind of change has: :func:`close_by_rule` for a
-# close, a drop or a merge, :func:`auto_reassign` for an owner change and
-# :func:`mark_stale` for staleness. Each reads the owner under the row lock at
-# the moment of the write (never the caller's earlier read) and the write
-# itself repeats the check. A close refused for his item becomes a "Looks
-# done" suggestion on it (``settle_suggestion``) for him to close; an owner
-# change stays a proposal in the clean-up's preview; staleness lists it as
-# quiet. The owner's own changes are :func:`set_status` and :func:`reassign`;
-# a forgotten episode's items are closed by ``khipu.forget``.
-PROPOSE_LOOKS_DONE = "looks-done"
-PROPOSE_TIDY = "tidy"
-PROPOSE_QUIET = "quiet"
-AUTOMATIC_RULES: dict[str, str] = {
-    "pr": PROPOSE_LOOKS_DONE,        # every PR the item names is merged or closed
-    "loop": PROPOSE_LOOKS_DONE,      # a closed loop or "done:" line of a later capture
-    "decision": PROPOSE_LOOKS_DONE,  # a later decision settles it
-    "relay": PROPOSE_LOOKS_DONE,     # a conversation item restates a job's item
-    "duplicate": PROPOSE_LOOKS_DONE,  # dedup, in the hygiene pass or the clean-up
-    "session-ended": PROPOSE_TIDY,   # its session ended
-    "session-plan": PROPOSE_TIDY,    # a plan-shaped row the session mentioned as finished
-    "drop": PROPOSE_TIDY,            # the hygiene re-judge: not a commitment
-    "owner-rules": PROPOSE_TIDY,     # the owner rules re-run (clean-up, hygiene)
-    "model": PROPOSE_TIDY,           # the clean-up's model pass
-    "stale": PROPOSE_QUIET,          # weeks of silence: his items show as quiet instead
-}
-OWNER_GUARD_WORDS = "the owner's own item: an automatic {rule} may suggest a change to it, never make it"
+# Historical owner guards still protect explicit bulk Undo.
 LOOKS_DONE = "Looks done"
 
 
@@ -1104,7 +1040,7 @@ def _owner_cols(cur) -> list[str]:
     if _reassigned_column_ready(cur):
         cols.append("owner_reassigned_at")
     if _close_columns_ready(cur):
-        # What close_by_rule's pull request check reads (migration 0034).
+        # What historical close rule's pull request check reads (migration 0034).
         cols += ["project", "prs", "pr_check"]
         if _lineage_columns_ready(cur):
             cols.append("latest_text")
@@ -1210,37 +1146,8 @@ def close_reason_sql(cur, table: str = "commitments") -> str:
     return f"CASE WHEN EXISTS ({forgotten}) THEN 'forgotten' ELSE {col} END"
 
 
-def stale_sql(*, has_last_seen: bool) -> str:
-    """The expiry-by-SILENCE UPDATE, as text so it can be unit-tested without
-    a database.
-
-    Three rules, all in one statement:
-      * a ``due_after`` still in the FUTURE is never stale — the commitment is
-        parked on purpose (that is what ``khipu owed --snooze`` writes);
-      * followups and promises with no live due date expire after
-        ``STALE_AFTER_DAYS_SOFT`` (14) days of silence;
-      * blockers and questions get ``STALE_AFTER_DAYS`` (30) — they outlive a
-        fortnight of quiet far more often than a followup does.
-    "Silence" is measured from ``last_seen_at`` when migration 0012 is in
-    (each restatement pushes it forward), else from ``opened_at``.
-    """
-    return f"""
-        UPDATE commitments
-        SET status = 'stale'
-        WHERE {_stale_where(has_last_seen)}
-        """
 
 
-def _stale_where(has_last_seen: bool) -> str:
-    seen = "COALESCE(last_seen_at, opened_at)" if has_last_seen else "opened_at"
-    seen = f"GREATEST({seen}, due_after)"
-    return f"""status = 'open'
-          AND (due_after IS NULL OR due_after <= now())
-          AND {seen} < now() - (
-              CASE WHEN kind IN ('followup', 'promise')
-                   THEN interval '{STALE_AFTER_DAYS_SOFT} days'
-                   ELSE interval '{STALE_AFTER_DAYS} days'
-              END)"""
 
 
 def _as_utc(value: Any) -> datetime | None:
@@ -1259,7 +1166,7 @@ def _as_utc(value: Any) -> datetime | None:
 def quiet_weeks(row: dict[str, Any], now: datetime | None = None) -> int | None:
     """Whole weeks an open item of the owner's has gone unmentioned, once
     that is past the window that would make anyone else's item stale; None
-    otherwise. His items never go stale (:func:`mark_stale`); this is how a
+    otherwise. His items never go stale (:func:`historical aging`); this is how a
     list shows the quiet ones, after the active ones, instead of hiding them."""
     from datetime import timezone
 
@@ -1782,3 +1689,41 @@ def bulk_owner_gate(count: int) -> str | None:
                          "Type yes to confirm: "):
         return "terminal"
     return None
+
+def _normalize_open_loop(item: Any) -> dict[str, Any] | None:
+    if isinstance(item, str):
+        text = item.strip()
+        if not text:
+            return None
+        return {"text": text, "kind": "followup", "due_after": None, "owner": None,
+                "owner_label": None, "future_trigger": None}
+    if not isinstance(item, dict):
+        return None
+    text = str(item.get("text") or "").strip()
+    if not text:
+        return None
+    kind = str(item.get("kind") or "followup").strip().lower()
+    if kind not in VALID_KINDS:
+        kind = "followup"
+    return {
+        "text": text,
+        "kind": kind,
+        "due_after": item.get("due_after") or None,
+        "owner": item.get("owner") or None,
+        "owner_label": item.get("owner_label") or None,
+        # Asked for in the prompt, kept for the record — the deterministic
+        # detector decides the stored value (see resolve_owner/has_future_trigger).
+        "future_trigger": item.get("future_trigger"),
+    }
+
+def _payload_event(payload: dict[str, Any]) -> str:
+    """Normalized capture event. Queued jobs carry it as ``event``; older
+    payloads only encoded it into ``scope`` ("claude sessionend")."""
+    ev = str(payload.get("event") or "").strip().lower()
+    if ev:
+        return ev
+    scope = str(payload.get("scope") or "").strip().lower()
+    for candidate in SESSION_END_EVENTS:
+        if scope.endswith(candidate):
+            return candidate
+    return ""

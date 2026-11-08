@@ -676,7 +676,7 @@ class EmbedRecentMissingBatchIsolationTest(unittest.TestCase):
 class EmbedRecentMissingCommitmentsTest(unittest.TestCase):
     """fix 5c: the hook's bounded embed catch-up (embed_recent_missing) also
     embeds open commitments with no vector yet — not inline on the capture
-    decision path (commitments.auto_close never calls the embed API itself
+    decision path (commitments.historical closing never calls the embed API itself
     for this)."""
 
     def _run(self, commitment_rows):
@@ -1147,7 +1147,7 @@ class SearchFilterPushdownTest(unittest.TestCase):
 
 class CommitmentCoverageTest(unittest.TestCase):
     """Audit 2026-09-04: commitments carry vectors (migration 0009) and
-    commitments.auto_close depends on them, but `khipu embed status` reported
+    commitments.historical closing depends on them, but `khipu embed status` reported
     nothing about them — a hub whose commitment catch-up had fallen behind
     looked perfectly green."""
 
@@ -1226,7 +1226,7 @@ class CommitmentCoverageTest(unittest.TestCase):
 class BackfillCommitmentKindTest(unittest.TestCase):
     """`khipu embed backfill --kind commitment` heals commitment vectors the
     Stop-hook catch-up fell behind on. Opt-in only: never part of the default
-    all-kinds sweep (their vectors serve auto_close, not generic search)."""
+    all-kinds sweep (their vectors serve historical closing, not generic search)."""
 
     class _Cur:
         def __init__(self):

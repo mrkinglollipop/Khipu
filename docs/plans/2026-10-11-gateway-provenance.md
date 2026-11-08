@@ -1,5 +1,7 @@
 # Gateway provenance: server-assigned ownership for mutations
 
+> Historical plan or research. Registry extraction and standalone registry tools were retired; see [current memory behavior](../explicit-memory-lists.md).
+
 Approved in principle, Matt 2026-10-11, second of four backlog decisions from the 2026-10-10 audit. Build
 after `2026-10-11-capture-identity.md` phase 1 has landed, so the capture path changes one thing at a time.
 This page is the scope; a build session reads it first. Audit IDs: GW-6 (P0); review RV2-04 (P1).
@@ -17,7 +19,7 @@ One PR per phase, merged alone and soaked before the next.
 ## The defect, in one paragraph
 
 Through the HTTPS gateway, every valid bearer token can call every tool, and no mutation checks who owns
-the row it changes. `khipu_owed_update` and `khipu_decisions_update` have no check at all
+the row it changes. `khipu_owed_update` and the retired registry writer have no check at all
 (`mcp_server.py:1222`, `:1321`). Capture dedup picks a merge target by project, time window and similarity
 only, so a cloud capture can fold into a local episode (`capture.py` `_dedup_candidates`). `khipu_forget`
 refuses only when the episode's `session_id` starts with one of four local harness names
@@ -41,9 +43,8 @@ caller typed; it has to be assigned by the server when the row is written.
   `session_id`; `decision_links` by `old_id`/`new_id`.
 - `_tool_capture` (`mcp_server.py:1113`) forwards every non-null argument into the payload. Nothing is
   stamped server-side; the only fallback is `CLAUDE_SESSION_ID` from the environment.
-- The 12 tools: `khipu_search`, `khipu_get`, `khipu_graph`, `khipu_status`, `khipu_owed`, `khipu_decisions`,
-  `khipu_brief`, `khipu_reflect` read; `khipu_capture`, `khipu_owed_update`, `khipu_forget`,
-  `khipu_decisions_update` write. `khipu_brief` and `khipu_reflect` write caches; inspect them in phase 2.
+- The 12 tools: `khipu_search`, `khipu_get`, `khipu_graph`, `khipu_status`, `khipu_owed`, the retired registry,
+  `khipu_brief`, `khipu_reflect` read; `khipu_capture`, `khipu_owed_update`, `khipu_forget` write. `khipu_brief` and `khipu_reflect` write caches; inspect them in phase 2.
 - Liveness bookkeeping is a JSON file in the container's data dir keyed by token label
   (`gateway.py:116-157`), lost on every container recreate. It is evidence that labels already identify
   callers, nothing more.
@@ -51,7 +52,7 @@ caller typed; it has to be assigned by the server when the row is written.
   deploy script lives in the private ops repo.
 - Tests pinning today's behaviour: `tests/test_audit1010_mcp.py::MutationTest::
   test_gateway_can_forget_accepted_cloud_captures` (None, `cursor_cloud:`, `grokbot:` ids all forgettable)
-  and `test_forget_rejects_local_gateway_provenance`. No test covers `owed_update` or `decisions_update`
+  and `test_forget_rejects_local_gateway_provenance`. No test covers the explicit ask writer
   authorization, or a dedup merge across origins.
 
 ## Decisions
@@ -108,7 +109,7 @@ Deploy order on this Mac: `khipu migrate`, then deploy the gateway, then merge.
 ## Phase 2: the check
 
 1. One function, `authorize_mutation(kind, id)`, used by `khipu_forget`, `khipu_owed_update`,
-   `khipu_decisions_update` (every action, including confirm and reject links and supersede-with-new-text)
+   the retired registry writer (every action, including confirm and reject links and supersede-with-new-text)
    and the dedup candidate query. It reads the target's origin and compares with the request context. Local
    callers short-circuit to allowed.
 2. Dedup: `_dedup_candidates` filters on `origin = <the capture's origin>` when the column exists.

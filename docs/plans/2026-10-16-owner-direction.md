@@ -1,5 +1,7 @@
 # Owner direction through the agent (scope, 2026-10-16)
 
+> Historical plan or research. Registry extraction and standalone registry tools were retired; see [current memory behavior](../explicit-memory-lists.md).
+
 Status: section 2 is the decided design (Matt, 2026-10-17); it replaces the word-matching design of 2026-10-16 and the code-reply proposal of 2026-10-17. Section 1 is the inventory it applies to. Owner requirement (Matt, 2026-10-16):
 
 > "I need to be able to do any changes in Khipu through you with my direction. I can't play games trying to manually confirm something when I'm not in front of my computer."
@@ -60,7 +62,7 @@ The `owner_request` words a conversation passes today are free text it writes it
 
 ### Not gated today (no change needed, listed so nobody adds a gate by mistake)
 
-Work-view settings (`work.set_setting`, `cli.py:3286`), ledger settings (`cli.py:3273`), `khipu budget lift` (`cli.py:3541`), owed and decision updates (`khipu_owed_update`, `khipu_decisions_update`), `khipu_forget`, and conversation holds and reports. Any conversation can make these now. The join-kit passphrase prompt (`cli.py:3730`) reads a secret from a TTY; it is not an owner gate and is out of scope.
+Work-view settings (`work.set_setting`, `cli.py:3286`), ledger settings (`cli.py:3273`), `khipu budget lift` (`cli.py:3541`), owed and decision updates (`khipu_owed_update`, the retired registry writer), `khipu_forget`, and conversation holds and reports. Any conversation can make these now. The join-kit passphrase prompt (`cli.py:3730`) reads a secret from a TTY; it is not an owner gate and is out of scope.
 
 ### Tests that pin the gates
 

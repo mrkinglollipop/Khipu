@@ -16,11 +16,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from khipu import commitments as co
 from khipu import mcp_server as ms
 from khipu import recall_prompt as rp
 from tests.fixtures import corpus
-from tests.test_commitments import _CommitmentsCursor
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONTRACTS_DIR = REPO_ROOT / "docs" / "compat" / "contracts"

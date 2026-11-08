@@ -338,7 +338,7 @@ def test_doctor_gets_a_row_for_every_new_nightly_step():
             "receipt_prune_ok", "routing_ledger_prune_ok"} <= keys
 
 
-def test_fact_changes_prune_is_its_own_step_and_survives_a_close_rules_failure(homes, monkeypatch):
+def test_fact_changes_prune_reports_its_own_success_and_failure(homes, monkeypatch):
     from khipu import db, provenance
 
     class Conn:

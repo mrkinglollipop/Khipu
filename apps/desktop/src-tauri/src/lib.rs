@@ -728,8 +728,6 @@ const FEATURE_NAMES: &[&str] = &[
     "relevance_floor",
     "rerank",
     "graph_candidates",
-    "decision_details",
-    "auto_supersede",
     "routing_push",
 ];
 
@@ -3091,11 +3089,13 @@ fn owed_change_argv(
     Ok(argv)
 }
 
-/// Where the app keeps a project's clean-up plan between Make a plan and
-/// Apply, inside Khipu's own data folder: the webview never names a path,
-/// and Apply applies exactly the plan it showed. The file name is the
-/// project's safe characters plus a hash of the whole key, so two projects
-/// never share one.
+/// Khipu's data folder, as `app_cli_timeout_secs` finds it.
+fn khipu_data_dir() -> Result<PathBuf, String> {
+    data_dir_from_pointer()
+        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config/khipu")))
+        .ok_or_else(|| "Khipu's data folder could not be found".to_string())
+}
+
 #[tauri::command]
 async fn khipu_owed_change(
     action: String,
@@ -6555,7 +6555,7 @@ mod settings_command_tests {
 
     #[test]
     fn every_switch_builds_an_on_and_an_off_argv() {
-        assert_eq!(FEATURE_NAMES.len(), 8);
+        assert_eq!(FEATURE_NAMES.len(), 6);
         for n in FEATURE_NAMES {
             assert_eq!(feature_set_argv(n, true).unwrap(), v(&["features", "--set", n, "on"]));
             assert_eq!(feature_set_argv(n, false).unwrap(), v(&["features", "--set", n, "off"]));

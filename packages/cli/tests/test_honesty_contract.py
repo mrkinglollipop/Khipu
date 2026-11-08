@@ -29,7 +29,7 @@ class NightlyStepHealthTest(unittest.TestCase):
             out = jobs.nightly_step_health()
         for key in (
             "notes_reconcile_ok", "embed_provider_ok", "query_cache_prune_ok",
-            "provenance_backfill_ok", "mark_stale_ok",
+            "provenance_backfill_ok",
             "ledger_ok",
         ):
             self.assertTrue(out[key]["ok"])
@@ -87,7 +87,6 @@ class NightlyStepHealthTest(unittest.TestCase):
             self._write_last(tmp, [
                 {"name": "notes_reconcile", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
                 {"name": "embed_backfill", "ok": False, "counts": {}, "error": "missing key", "ts": recent_ts},
-                {"name": "commitments_mark_stale", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
                 {"name": "provenance_backfill", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
             ])
             with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
@@ -97,7 +96,6 @@ class NightlyStepHealthTest(unittest.TestCase):
         self.assertFalse(out["embed_provider_ok"]["ok"])
         self.assertEqual(out["embed_provider_ok"]["error"], "missing key")
         self.assertIn("embedding provider", out["embed_provider_ok"]["fix"])
-        self.assertTrue(out["mark_stale_ok"]["ok"])
         self.assertTrue(out["provenance_backfill_ok"]["ok"])
         self.assertNotIn("commitments_hygiene_ok", out)
         self.assertNotIn("commitments_close_rules_ok", out)

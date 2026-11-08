@@ -1,9 +1,9 @@
 """Tests for khipu.commitments — W3 first-class open loops.
 
 No live database: a small fake cursor backs an in-memory commitments table
-so open_from_episode / auto_close / mark_stale / list_owed / set_status can
+so historical commitment capture / historical closing / historical aging / list_owed / set_status can
 be exercised deterministically. Cosine matching is forced to fail (no key in
-tests) so auto_close falls back to the pure-Python Jaccard path, same as the
+tests) so historical closing falls back to the pure-Python Jaccard path, same as the
 capture.py dedup tests.
 """
 from __future__ import annotations
@@ -67,8 +67,8 @@ class _CommitmentsCursor:
     def _seed(self, text, *, project="acme/widget", kind="followup", owner=_CAPTURE,
               episode=1, session_id=None, status="open", future_trigger=False,
               due_after=None, opened_at="t0"):
-        """Insert a row WITHOUT going through open_from_episode's filter — for
-        tests about auto_close / stale / listing, whose fixtures predate the
+        """Insert a row WITHOUT going through historical commitment capture's filter — for
+        tests about historical closing / stale / listing, whose fixtures predate the
         precision filter and are not what those tests are about. The stored
         owner is the one capture would have decided for the text, unless the
         test gives one (``None`` stores none, like a legacy row)."""
@@ -210,7 +210,7 @@ class _CommitmentsCursor:
                 self.rowcount = 0
             return
         if s.startswith("SELECT id FROM commitments WHERE") and "due_after <= now()" in s:
-            # mark_stale's candidates; this fake ignores the silence window.
+            # historical aging's candidates; this fake ignores the silence window.
             self._result = [(r["id"],) for r in self.rows.values() if r["status"] == "open"]
             return
         if s.startswith("UPDATE commitments") and "'stale'" in s:
@@ -347,7 +347,7 @@ class DueAfterParsingTest(unittest.TestCase):
 
 class ScopeCoalescingTest(unittest.TestCase):
     """K6 (2026-09-14): the scope key is the episode's resolved ``project``
-    ONLY — a session id is not a project, so open/dedup/auto_close/list never
+    ONLY — a session id is not a project, so open/dedup/historical closing/list never
     fall back to parent_session_id/session_id any more. A NULL project stays
     NULL (real behaviour: a capture with no resolved project groups with
     every other such capture, not with itself alone by session lineage)."""
@@ -495,26 +495,10 @@ class OpenDedupTest(unittest.TestCase):
 class StaleRuleTest(unittest.TestCase):
     """Item 3: expiry by SILENCE, per kind, and never before a live due date."""
 
-    def test_followups_and_promises_age_out_at_14_days(self):
-        sql = " ".join(co.stale_sql(has_last_seen=True).split())
-        self.assertIn("kind IN ('followup', 'promise')", sql)
-        self.assertIn("interval '14 days'", sql)
 
-    def test_blockers_and_questions_age_out_at_30_days(self):
-        sql = " ".join(co.stale_sql(has_last_seen=True).split())
-        self.assertIn("ELSE interval '30 days'", sql)
 
-    def test_a_future_due_date_is_never_stale(self):
-        sql = " ".join(co.stale_sql(has_last_seen=True).split())
-        self.assertIn("(due_after IS NULL OR due_after <= now())", sql)
 
-    def test_silence_is_measured_from_last_seen_when_the_column_exists(self):
-        self.assertIn("COALESCE(last_seen_at, opened_at)", co.stale_sql(has_last_seen=True))
 
-    def test_pre_migration_hub_falls_back_to_opened_at(self):
-        sql = co.stale_sql(has_last_seen=False)
-        self.assertNotIn("last_seen_at", sql)
-        self.assertIn("GREATEST(opened_at, due_after) <", " ".join(sql.split()))
 
 
 class SessionPlanClosureTest(unittest.TestCase):

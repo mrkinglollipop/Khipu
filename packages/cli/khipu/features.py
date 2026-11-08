@@ -27,8 +27,6 @@ from khipu import __version__
 # anything else outright; states() reports an unknown name found in config.json
 # or the environment instead of silently accepting or dropping it.
 FEATURES: dict[str, str] = {
-    "decision_details": "Surface extended decision fields — rationale, source type, event/recorded/effective time, revisions.",
-    "auto_supersede": "Apply a capture-time supersession candidate automatically instead of leaving it for confirmation.",
     "validity_ranking": "Have recall honor validity/supersession state instead of ranking every row as equally current.",
     "graph_candidates": "Let bounded graph traversal contribute candidate results to recall.",
     "time_interpretation": "Parse natural-language time in a query and use it to filter/rank results.",
@@ -54,8 +52,6 @@ _CAPABILITIES = (
     "owed",
     "forget",
     "forget.cascade",
-    "decisions.tools",
-    "decisions.evidence",
     "tools.annotations",
     "launchers.read_only",
     # Phase 2, session B.
@@ -64,8 +60,6 @@ _CAPABILITIES = (
     "prior_work.project",
     "replica.schema_version",
     # Phase 2, session C.
-    "decisions.details",
-    "decisions.detection",
     # Phase 3, session A.
     "search.time_interpretation",
     "search.graph_candidates",

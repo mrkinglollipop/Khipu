@@ -25,7 +25,7 @@ import psycopg
 import pytest
 from psycopg import errors as pg_errors
 
-from khipu import capture, commitments as co, decisions, deliverables, outbox, provenance
+from khipu import capture, commitments as co, outbox, provenance
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 
 PROJECT = "acme/widget"
@@ -44,7 +44,6 @@ def pg(hub, monkeypatch, tmp_path):  # noqa: F811
     monkeypatch.setattr(embed, "embed_one", mock.Mock(side_effect=RuntimeError("no provider")))
     monkeypatch.setattr(topic_graph, "persist_capture_graph", lambda *a, **kw: {})
     monkeypatch.setattr(outbox, "_queued_origin", lambda: {"origin": None})
-    monkeypatch.setattr(co, "_has_commitment_embeddings", lambda cur, ids: False)
     monkeypatch.setattr(capture, "_dedup_candidates", lambda cur, payload: [])
     return hub
 
@@ -83,7 +82,7 @@ def _counts(hub):  # noqa: F811
 
 # ---- I4: deferral, never a silent loss -------------------------------------------
 
-STEP_KIND = {"commitments": "commitment", "decisions": "decision", "deliverables": "deliverable"}
+STEP_KIND = {"deliverables": "deliverable"}
 TRANSIENT = [pg_errors.DeadlockDetected, pg_errors.SerializationFailure, pg_errors.LockNotAvailable,
              pg_errors.QueryCanceled]
 
@@ -145,7 +144,7 @@ def test_a_plain_bug_fails_open_and_leaves_a_fact_gap(pg, monkeypatch, step):
                          ids=lambda e: e.__name__)
 def test_the_merge_path_defers_and_gaps_the_same_way(pg, monkeypatch, exc_type):
     target = capture.write_pg(_payload(loop=None, decision=None, title=None))["episode_id"]
-    real = _failing_claims(monkeypatch, "commitment", exc_type)
+    real = _failing_claims(monkeypatch, "deliverable", exc_type)
     with pytest.raises(capture.FactStepDeferred):
         with pg.connect() as conn, conn.cursor() as cur:
             capture._merge_into_episode(cur, target, _payload(), matched_via="jaccard", score=0.9)
@@ -153,49 +152,20 @@ def test_the_merge_path_defers_and_gaps_the_same_way(pg, monkeypatch, exc_type):
     assert _counts(pg)[1:] == (0, 0, 0, 0)
 
     monkeypatch.setattr(provenance, "record_claim", real)
-    _failing_claims(monkeypatch, "commitment", RuntimeError)
+    _failing_claims(monkeypatch, "deliverable", RuntimeError)
     with pg.connect() as conn, conn.cursor() as cur:
         assert capture._merge_into_episode(cur, target, _payload(), matched_via="jaccard", score=0.9)
         conn.commit()
     with pg.connect() as conn:
-        assert conn.execute("SELECT episode_id, step FROM fact_gaps").fetchall() == [(target, "merge commitments")]
+        assert conn.execute("SELECT episode_id, step FROM fact_gaps").fetchall() == [(target, "merge deliverables")]
         assert conn.execute("SELECT count(*) FROM fact_claims WHERE kind = 'decision' AND episode_id = %s",
-                            (target,)).fetchone()[0] == 1
+                            (target,)).fetchone()[0] == 0
 
 
-def test_a_lock_timeout_on_a_dedup_target_is_deferred_not_lost(pg, monkeypatch):
-    """A real LockNotAvailable: another transaction holds the item a
-    restatement folds into."""
-    first = capture.write_pg(_payload(decision=None, title=None))
-    assert first["episode_inserted"]
-    with pg.connect() as holder:
-        holder.execute("SELECT id FROM commitments FOR UPDATE")
-        real_connect = pg.connect
-
-        def connect(*a, **kw):
-            conn = real_connect()
-            conn.execute("SET lock_timeout = '200ms'")
-            return conn
-
-        from khipu import db
-
-        monkeypatch.setattr(db, "connect", connect)
-        with pytest.raises(capture.FactStepDeferred) as err:
-            capture.write_pg(_payload(decision=None, title=None))
-        assert "LockNotAvailable" in str(err.value)
-        holder.rollback()
-    assert _counts(pg)[0] == 1
-    second = capture.write_pg(_payload(decision=None, title=None))
-    assert second["episode_inserted"]
-    with pg.connect() as conn:
-        cid = conn.execute("SELECT id FROM commitments").fetchone()[0]
-        got = conn.execute("SELECT field, episode_id FROM fact_claims WHERE kind = 'commitment' AND fact_id = %s "
-                           "ORDER BY id", (cid,)).fetchall()
-    assert got == [("text", first["episode_id"]), ("restatement", second["episode_id"])]
 
 
 def test_the_outbox_keeps_a_deferred_capture_past_its_attempts_then_lands_it(pg, monkeypatch):
-    real = _failing_claims(monkeypatch, "decision", pg_errors.DeadlockDetected)
+    real = _failing_claims(monkeypatch, "deliverable", pg_errors.DeadlockDetected)
     monkeypatch.setattr(outbox, "MAX_ATTEMPTS", 1)
     payload = _payload()
     outbox.enqueue(payload, reason="FactStepDeferred")
@@ -206,7 +176,7 @@ def test_the_outbox_keeps_a_deferred_capture_past_its_attempts_then_lands_it(pg,
     (job_path,) = outbox.jobs()
     job = json.loads(job_path.read_text())
     assert job["fact_deferred"] is True and job["attempts"] == 3
-    assert job["deferral_reason"].startswith("decisions: DeadlockDetected")
+    assert job["deferral_reason"].startswith("deliverables: DeadlockDetected")
     assert not outbox.dead_jobs()
     assert _counts(pg) == (0, 0, 0, 0, 0)
 
@@ -214,7 +184,7 @@ def test_the_outbox_keeps_a_deferred_capture_past_its_attempts_then_lands_it(pg,
     assert outbox.drain()["replayed"] == 1
     assert outbox.jobs() == []
     episodes, commitments, decided, delivered, claims = _counts(pg)
-    assert (episodes, commitments, decided, delivered) == (1, 1, 1, 1) and claims >= 3
+    assert (episodes, commitments, decided, delivered) == (1, 0, 0, 1) and claims >= 1
 
 
 # ---- I2: capture-only schedules ------------------------------------------------------
@@ -306,44 +276,6 @@ SCHEDULES = [
 ]
 
 
-@pytest.mark.parametrize("schedule", SCHEDULES)
-def test_capture_schedules_project_only_live_claims(pg, schedule):
-    seen: list[int] = []
-    for step in schedule:
-        if step == "!":
-            _old_writer(pg)
-        elif step == "~":
-            _reassign(pg)
-        else:
-            out = capture.write_pg(_payload(**CAPTURES[step]))
-            assert out["episode_inserted"], (schedule, step)
-            eid = out["episode_id"]
-            if CAPTURES[step].get('owner') == 'user':
-                from tests.fact_seed import owner_commitment
-                with pg.connect() as conn, conn.cursor() as cur:
-                    owner_commitment(cur, CAPTURES[step]['loop'], project=PROJECT, episode_id=eid,
-                                     kind=CAPTURES[step]['kind'])
-            seen.append(eid)
-            titled = CAPTURES[step].get("title", "default") is not None
-            want = {"commitment", "decision"} | ({"deliverable"} if titled else set())
-            assert _claimed_by(pg, eid) == want, (schedule, step)
-        _assert_projection(pg)
-    with pg.connect() as conn:
-        # One decision and one deliverable for the whole schedule: each repeat
-        # was a claim, never a second row.
-        assert conn.execute("SELECT count(*) FROM decisions").fetchone()[0] == 1
-        assert conn.execute("SELECT count(*) FROM deliverables").fetchone()[0] == 1
-        assert conn.execute("SELECT count(*) FROM fact_gaps").fetchone()[0] == 0
-        claimed = {e for (e,) in conn.execute(
-            "SELECT DISTINCT episode_id FROM fact_claims WHERE kind = 'decision' AND claimant = 'episode'")}
-        assert claimed == set(seen)
-        # The first item's text holds, and A's exact repeat B restated it.
-        if schedule.startswith("AB"):
-            cid = conn.execute("SELECT min(id) FROM commitments").fetchone()[0]
-            got = conn.execute("SELECT field, episode_id FROM fact_claims WHERE kind = 'commitment' "
-                               "AND fact_id = %s AND field IN ('text', 'restatement') ORDER BY id",
-                               (cid,)).fetchall()
-            assert got[:2] == [("text", seen[0]), ("restatement", seen[1])], got
 
 
 def test_a_replayed_capture_writes_no_new_claim(pg):
@@ -354,19 +286,6 @@ def test_a_replayed_capture_writes_no_new_claim(pg):
     assert _counts(pg) == before
 
 
-def test_create_decision_is_an_owner_claim_and_dedups_into_one(pg):
-    with pg.connect() as conn, conn.cursor() as cur:
-        did = decisions.create_decision(cur, project=PROJECT, text="Ship weekly", evidence={"by": "owner"})
-        again = decisions.create_decision(cur, project=PROJECT, text="ship  weekly")
-        conn.commit()
-        assert again == did
-        assert sorted(provenance.claims(cur, "decision", did), key=lambda c: (c["field"], c["value"])) == [
-            {"field": "evidence", "value": '{"by": "owner"}', "claimant": "owner", "episode_id": None},
-            {"field": "text", "value": "Ship weekly", "claimant": "owner", "episode_id": None},
-            {"field": "text", "value": "ship  weekly", "claimant": "owner", "episode_id": None},
-        ]
-        cur.execute("SELECT text, episode_id, evidence FROM decisions WHERE id = %s", (did,))
-        assert cur.fetchone() == ("Ship weekly", None, {"by": "owner"})
 
 
 def test_a_deliverable_without_a_title_is_a_support_claim(pg):

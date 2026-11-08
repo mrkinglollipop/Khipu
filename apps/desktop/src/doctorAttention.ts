@@ -247,7 +247,6 @@ export function buildAttention(parsed: Record<string, unknown>): {
   const NIGHTLY_STEP_TITLE: Record<string, string> = {
     notes_reconcile_ok: "The nightly's notes reconcile step did not run cleanly",
     embed_provider_ok: "The nightly's embedding backfill step did not run cleanly",
-    mark_stale_ok: "The nightly's stale-commitments step did not run cleanly",
   };
   for (const [key, title] of Object.entries(NIGHTLY_STEP_TITLE)) {
     const step = nightlySteps?.[key];

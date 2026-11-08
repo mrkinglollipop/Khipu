@@ -1149,11 +1149,9 @@ def _iter_sources(
         yield from _episode_sources(cur, refs)
     if kind in (None, "topic"):
         yield from _topic_sources(cur, refs)
-    # Commitments are OPT-IN only (`--kind commitment`), never part of the
-    # default sweep: their vectors exist for historical commitment matching, not for
-    # generic search (_cosine_candidates excludes kind='commitment'), and the
-    # hook's bounded catch-up normally keeps them current. This is the manual
-    # heal for a hub whose catch-up fell behind (audit 2026-09-04).
+    # Archived commitment vectors remain opt-in (`--kind commitment`),
+    # outside the default sweep and generic search. The bounded catch-up
+    # retains coverage of existing rows; this path can repair missing vectors.
     if kind == "commitment":
         yield from _commitment_sources(cur, commitment_wording)
 
@@ -3492,11 +3490,8 @@ def coverage(
             if has_media:
                 cur.execute("SELECT COUNT(*) FROM media_assets")
                 medias = cur.fetchone()[0]
-            # Commitments carry vectors too (migration 0009 widened the kind
-            # constraint) and archived commitment matching depends on them, but coverage reported
-            # nothing at all — a hub whose commitment catch-up had fallen behind
-            # looked perfectly green (audit 2026-09-04). Pre-0009 hubs have no
-            # table; report zeroes rather than raising.
+            # Migration 0009 permits commitment vectors. Report retained
+            # archive coverage, or zeroes on a pre-0009 hub without the table.
             cur.execute("SELECT to_regclass('public.commitments') IS NOT NULL")
             has_commitments = bool(cur.fetchone()[0])
             commitments_total = commitments_refs = commitments_chunks = 0
@@ -3573,8 +3568,8 @@ def coverage(
         # not fail activate() or doctor embed_coverage_ok (episode+topic only).
         "media": {"total": medias, "embedded": m["refs"], "missing": max(0, medias - m["refs"]),
                   "chunks": m["chunks"], "pct": _pct(m["refs"], medias)},
-        # Denominator = OPEN commitments (the only ones archived commitment matching scores
-        # against). Informational, like media: it does not gate activate().
+        # Retained commitment coverage uses open rows as its denominator.
+        # Informational, like media: it does not gate activate().
         "commitments": {"total": commitments_total, "embedded": commitments_refs,
                         "missing": max(0, commitments_total - commitments_refs),
                         "chunks": commitments_chunks,
@@ -3724,12 +3719,8 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 except Exception as exc:  # noqa: BLE001 — replica cannot roll back the hub commit
                     _log(f"episode snapshot upsert failed: {type(exc).__name__}: {exc}")
 
-            # fix 5c: populate commitment embeddings HERE (the hook's bounded
-            # catch-up step), not inline on the capture decision path —
-            # historical commitment matching would otherwise pay for an embed API
-            # call on the hot capture path just to find out no embeddings
-            # exist yet. Small and bounded (COMMITMENT_CATCHUP_LIMIT), same
-            # shape as the episode pass above.
+            # Preserve the bounded catch-up for archived commitment vectors
+            # (COMMITMENT_CATCHUP_LIMIT), with the episode pass's shape.
             out["commitments_embedded"] = 0
             out["commitments_chunks"] = 0
             try:

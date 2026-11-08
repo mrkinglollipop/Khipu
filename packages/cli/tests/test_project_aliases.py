@@ -61,21 +61,8 @@ def test_owed_rows_by_either_key(seeded, key):
     assert {r["project"] for r in rows} == {CANON}
 
 
-@pytest.mark.parametrize("key", [CANON, ALIAS])
-def test_decisions_by_either_key(seeded, key):
-    from khipu import decisions
-
-    rows = decisions.list_decisions(seeded, project=key)
-    assert sorted(r["text"] for r in rows) == [f"use zebrafish for {ALIAS}", f"use zebrafish for {CANON}"]
-    assert {r["project"] for r in rows} == {CANON}
 
 
-@pytest.mark.parametrize("key", [CANON, ALIAS])
-def test_mcp_owed_and_decisions_by_either_key(seeded, key):
-    from khipu import mcp_server as srv
-
-    assert len(srv._tool_owed({"project": key})["results"]) == 2
-    assert len(srv._tool_decisions({"project": key, "status": "all"})["results"]) == 2
 
 
 @pytest.mark.parametrize("key", [CANON, ALIAS])
@@ -84,7 +71,7 @@ def test_session_start_slice_by_either_key(seeded, key):
 
     out = activity.project_slice(project=key)
     assert out["commitments"] == []
-    assert len(out["decisions"]) == 2
+    assert out["decisions"] == []
     assert len(out["episodes"]) == 2
 
 

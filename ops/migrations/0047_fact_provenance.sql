@@ -45,7 +45,7 @@
 -- attributed. commitments.text, the PR numbers that text itself names,
 -- decisions.text/rationale/evidence and deliverables.title each have one
 -- writer, the insert by the anchor episode, so they get an episode claim for
--- a live anchor. A decision with no episode was written by create_decision
+-- a live anchor. A decision with no episode was written by historical owner decision writer
 -- (the owner's supersede), and the new_id of an owner-made supersede link
 -- holds the owner's endorsement: both get owner claims. Everything else
 -- (latest_text, PR numbers or refs the text does not name, a fact whose
@@ -367,7 +367,7 @@ BEGIN
           AND ((fc.claimant = 'episode' AND e.deleted_at IS NULL AND e.id IS NOT NULL)
                OR fc.claimant = 'owner');
         -- prs NULL means "not parsed yet" (a row from before 0034): it stays
-        -- NULL until close_rules.backfill_prs records the anchor's numbers as
+        -- NULL until the historical PR backfill records the anchor's numbers as
         -- claims and marks it parsed. Any PR claim makes it parsed.
         IF c.prs IS NULL AND NOT EXISTS (
             SELECT 1 FROM fact_claims fc WHERE fc.kind = 'commitment' AND fc.fact_id = p_id AND fc.field = 'pr') THEN
@@ -528,7 +528,7 @@ WHERE n IS NOT NULL
 ON CONFLICT DO NOTHING;
 
 -- A row whose prs was never parsed (NULL, from before 0034) keeps NULL: its
--- one writer, close_rules.backfill_prs, stores parse_prs(text) (the anchor's
+-- one writer, the historical PR backfill, stores parse_prs(text) (the anchor's
 -- own words, read by the exact Python parser rather than the stricter SQL
 -- one) as the anchor's claims after this migration. A text with no "pr" or
 -- "pull" in it names no PR under any reading, so it is settled here as
@@ -549,7 +549,7 @@ CROSS JOIN LATERAL jsonb_array_elements_text(
 ON CONFLICT DO NOTHING;
 
 -- Decisions: the anchor episode's text, rationale and evidence; a decision
--- with no episode is create_decision's (the owner's); an owner-made
+-- with no episode is historical owner decision writer's (the owner's); an owner-made
 -- supersede link's new decision carries the owner's endorsement.
 INSERT INTO fact_claims (kind, fact_id, field, value, claimant, episode_id)
 SELECT 'decision', d.id, f.field, f.value, 'episode', d.episode_id

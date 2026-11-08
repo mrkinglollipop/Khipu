@@ -8,7 +8,6 @@ fake cursors from test_embed.py.
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import plistlib
 import tempfile
@@ -19,7 +18,6 @@ from unittest import mock
 import unittest
 
 from khipu import embed as em
-from khipu import jobs
 from khipu import launchd_gen
 from khipu import notes
 from khipu import recency

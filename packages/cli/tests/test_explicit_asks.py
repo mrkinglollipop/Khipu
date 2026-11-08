@@ -1,18 +1,13 @@
 """Explicit asks and reset proofs against throwaway PostgreSQL only."""
-import hashlib
-import json
-from types import SimpleNamespace
-from unittest import mock
 
 import pytest
 
-from khipu import commitments as co, explicit_asks, mcp_server, needs_you, owed_reset, owed_changes
-from tests.test_owed_changes import owed, Flood, PROJECT, FIELDS  # noqa: F401
+from khipu import commitments as co, explicit_asks, mcp_server, needs_you
+from tests.owed_fixtures import owed, Flood, PROJECT, FIELDS  # noqa: F401
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
-from tests.test_commitments import _CommitmentsCursor
 
 
-def test_filed_ask_is_visible_and_has_no_authority(owed, monkeypatch):
+def test_filed_ask_is_visible_and_has_no_authority(owed, monkeypatch):  # noqa: F811
     eid = Flood(owed).episode()
     out = mcp_server._tool_owed_update({"action": "ask", "requester": "Builder", "question": "Use this design?", "yes": "use the new design",
                                       "no": "keep the current design", "episode_id": eid})
@@ -34,57 +29,10 @@ def test_filed_ask_is_visible_and_has_no_authority(owed, monkeypatch):
                                       "episode_id": eid, "owner_gate": "direction"})
 
 
-def test_reset_dry_run_export_apply_and_whole_batch_undo(owed, tmp_path, capsys, monkeypatch):
-    flood = Flood(owed)
-    eid = flood.episode()
-    ids = [flood.item('old', f'Matt to approve design number {n}', episode=eid) for n in range(3)]
-    # Span projects: one reset must still be one reversible batch.
-    with owed.cursor() as cur:
-        cur.execute('UPDATE commitments SET project = %s WHERE id = %s', ('other/repo', ids[-1]))
-    ask = mcp_server._tool_owed_update({'action': 'ask', 'requester': 'Reviewer', 'question': 'Change the design?', 'yes': 'change design',
-                                      'no': 'keep design', 'episode_id': eid})
-    assert ask['ok'], ask
-    recent = flood.item('recent', 'Matt to approve a real recent request', episode=eid)
-    with owed.cursor() as cur:
-        cur.execute("UPDATE commitments SET owner_reassigned_at = now(), owner_reassigned_by = 'direction' WHERE id = %s", (recent,))
-        cur.execute('SELECT to_jsonb(c) FROM commitments c ORDER BY id')
-        before = cur.fetchall()
-    path = tmp_path / 'archive.json'
-    assert owed_reset.command(SimpleNamespace(dry_run=True, export=str(path))) == 0
-    dry = json.loads(capsys.readouterr().out)
-    assert dry['groups']['explicit_asks'] == [ask['id']]
-    assert dry['groups']['recent_owner_asks'] == [recent]
-    assert not path.exists()
-    with owed.cursor() as cur:
-        cur.execute('SELECT to_jsonb(c) FROM commitments c ORDER BY id')
-        assert cur.fetchall() == before
-        doc = owed_reset.preview(cur)
-    digest = owed_reset.export(doc, path)
-    assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
-    assert digest in path.with_suffix('.json.sha256').read_text()
-    monkeypatch.setattr(co, 'bulk_owner_gate', lambda n: None)
-    assert not owed_reset.apply(doc)['ok']
-    late = mcp_server._tool_owed_update({'action': 'ask', 'requester': 'Builder', 'question': 'Use another design?', 'yes': 'use another design',
-                                       'no': 'keep this design', 'episode_id': eid})
-    assert late['ok'], late
-    out = owed_changes.apply(doc, owner_gate='direction')
-    assert out['changed'] == 3, out
-    assert len(out['batches']) == 1
-    undo = owed_changes.undo(out['batches'][0], owner_gate='direction')
-    assert undo['restored'] == 3, undo
-    with owed.cursor() as cur:
-        cur.execute('SELECT id, status FROM commitments ORDER BY id')
-        assert all(status == 'open' for _, status in cur.fetchall())
-
-    with owed.cursor() as cur:
-        cur.execute('SELECT to_jsonb(c) FROM commitments c ORDER BY id')
-        after = {r[0]['id']: r[0] for r in cur.fetchall()}
-    for prior, in before:
-        assert {f: after[prior['id']].get(f) for f in FIELDS} == {f: prior.get(f) for f in FIELDS}
 
 
 @pytest.mark.parametrize('project', [None, PROJECT])
-def test_ask_without_episode_and_duplicate_are_visible(owed, project):
+def test_ask_without_episode_and_duplicate_are_visible(owed, project):  # noqa: F811
     args = {'action': 'ask', 'requester': 'Builder', 'question': 'Use the revised layout?',
             'yes': 'use it', 'no': 'keep it', 'project': project}
     first = mcp_server._tool_owed_update(args)
@@ -101,7 +49,7 @@ def test_ask_without_episode_and_duplicate_are_visible(owed, project):
         assert cur.fetchone() == ('YES',)
 
 
-def test_ask_requires_question_and_live_supplied_episode(owed):
+def test_ask_requires_question_and_live_supplied_episode(owed):  # noqa: F811
     args = {'action': 'ask', 'requester': 'Builder', 'yes': 'use it', 'no': 'keep it'}
     with pytest.raises(ValueError, match='question'):
         mcp_server._tool_owed_update(args)
@@ -109,7 +57,7 @@ def test_ask_requires_question_and_live_supplied_episode(owed):
         mcp_server._tool_owed_update(dict(args, question='Use it?', episode_id=999999))
 
 
-def test_ask_project_resolves_bare_name_and_alias(owed):
+def test_ask_project_resolves_bare_name_and_alias(owed):  # noqa: F811
     flood = Flood(owed)
     eid = flood.episode()
     flood.item('visible', 'Assistant to rebuild the index', owner='assistant', episode=eid)
@@ -124,14 +72,3 @@ def test_ask_project_resolves_bare_name_and_alias(owed):
         assert cur.fetchone() == (PROJECT,)
 
 
-def test_export_output_and_help_disclose_the_unreachable_copy(owed, tmp_path, capsys):
-    import argparse
-    path = tmp_path / 'archive.json'
-    owed_reset.command(SimpleNamespace(dry_run=False, export=str(path)))
-    out = json.loads(capsys.readouterr().out)
-    assert out['forget_reaches_export'] is False
-    assert 'copy a forget will not reach' in out['warning']
-    parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers()
-    owed_reset.add_parser(sub)
-    assert 'copy a forget will not reach' in ' '.join(sub.choices['reset'].format_help().split())

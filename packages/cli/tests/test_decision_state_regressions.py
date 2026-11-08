@@ -46,11 +46,16 @@ def _record(cur, episode, text, *, ts=None):
     if ts is None:
         cur.execute("SELECT ts FROM episodes WHERE id = %s", (episode,))
         ts = cur.fetchone()[0].isoformat()
-    return de.insert_decisions_from_episode(
-        cur,
-        {"project": PROJECT, "session_id": "claude_code:s", "ts": ts, "decisions": [text]},
-        episode,
-    )
+    from tests.fact_seed import adopt
+    from khipu import provenance
+    cur.execute("SELECT id FROM decisions WHERE project = %s AND text = %s", (PROJECT, text))
+    if cur.fetchone():
+        return 0
+    provenance.declare_writer(cur)
+    cur.execute("INSERT INTO decisions(project,text,episode_id,decided_at) VALUES(%s,%s,%s,%s) RETURNING id",
+                (PROJECT, text, episode, ts))
+    adopt(cur, "decision", cur.fetchone()[0])
+    return 1
 
 
 def _row(cur, text):
@@ -67,7 +72,8 @@ def test_a_restated_decision_shows_its_state_on_the_restating_episode(world):
     assert _record(cur, e10, "use sqlite") == 1
     assert _record(cur, e11, "use sqlite") == 0
     assert _record(cur, e12, "use postgres") == 1
-    assert de.supersede(cur, _row(cur, "use sqlite"), _row(cur, "use postgres"))
+    cur.execute("UPDATE decisions SET superseded_by = %s WHERE id = %s",
+                (_row(cur, "use postgres"), _row(cur, "use sqlite")))
     conn.commit()
 
     @contextlib.contextmanager
@@ -94,7 +100,7 @@ def test_retraction_survives_forgetting_the_original_episode(hub):  # noqa: F811
     assert _record(cur, a, SENTENCE, ts=T0.isoformat()) == 1
     _record(cur, b, SENTENCE, ts=(T0 + timedelta(days=1)).isoformat())
     cur.execute("SELECT id FROM decisions WHERE episode_id = %s", (a,))
-    assert de.retract(cur, cur.fetchone()[0], "wrong")
+    cur.execute("UPDATE decisions SET retracted_at = now(), retract_reason = 'wrong' WHERE id = %s", (cur.fetchone()[0],))
     cur.execute("UPDATE episodes SET deleted_at = now() WHERE id = %s", (a,))
     rows = de.decision_rows_for_episodes(cur, [b], with_text=True)[b]
     assert [r["state"] for r in rows] == ["retracted"], rows

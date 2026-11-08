@@ -6,9 +6,9 @@
    once is not offered: the CLI's snooze takes one item. "Not settled" is not
    offered either: no command records it yet. */
 
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { Loader2 } from "lucide-react";
-import { Callout, Dialog } from "./ui";
+import { Dialog } from "./ui";
 import { callCli } from "./settingsCli";
 
 export type OwedOwner = "user" | "assistant" | "agent";

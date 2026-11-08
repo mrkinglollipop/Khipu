@@ -536,7 +536,6 @@ def test_plain_cli_listing_obeys_page_cap(monkeypatch, capsys):
 # batches key; its assertions are the reviewer's.
 
 import copy  # noqa: E402
-from tests.fact_seed import announce  # noqa: E402
 from tests.owner_jobs import finish_owner_job
 
 

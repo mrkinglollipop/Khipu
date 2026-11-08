@@ -409,63 +409,11 @@ class DuplicateGroupsCosineTest(unittest.TestCase):
     def _rows(*specs):
         return [{"id": i, "text": t, "project": p} for i, t, p in specs]
 
-    def test_auto_merges_a_high_cosine_pair(self):
-        rows = self._rows(
-            (1, "Renew the certificate", "acme/widget"),
-            (2, "The security cert needs a refresh", "acme/widget"),
-        )
-        dupes = hygiene._duplicate_groups(rows, pair_scores=lambda ids: {(1, 2): 0.95})
-        self.assertEqual(dupes, {2: 1})
 
-    def test_ask_band_merges_only_when_adjudicate_says_same(self):
-        rows = self._rows(
-            (1, "Renew the certificate", "acme/widget"),
-            (2, "The security cert needs a refresh", "acme/widget"),
-        )
-        dupes = hygiene._duplicate_groups(
-            rows, pair_scores=lambda ids: {(1, 2): 0.82}, adjudicate=lambda pairs: [True],
-        )
-        self.assertEqual(dupes, {2: 1})
 
-    def test_ask_band_does_not_merge_when_adjudicate_says_different(self):
-        rows = self._rows(
-            (1, "Renew the certificate", "acme/widget"),
-            (2, "The security cert needs a refresh", "acme/widget"),
-        )
-        dupes = hygiene._duplicate_groups(
-            rows, pair_scores=lambda ids: {(1, 2): 0.82}, adjudicate=lambda pairs: [False],
-        )
-        self.assertEqual(dupes, {})
 
-    def test_never_merges_across_projects(self):
-        rows = self._rows(
-            (1, "Renew the certificate", "acme/widget"),
-            (2, "Renew the certificate", "other/repo"),
-        )
-        dupes = hygiene._duplicate_groups(rows, pair_scores=lambda ids: {(1, 2): 0.99})
-        self.assertEqual(dupes, {})
 
-    def test_keeper_is_always_the_oldest_id(self):
-        rows = self._rows(
-            (5, "Renew the certificate", "acme/widget"),
-            (9, "The security cert needs a refresh", "acme/widget"),
-        )
-        dupes = hygiene._duplicate_groups(rows, pair_scores=lambda ids: {(5, 9): 0.95})
-        self.assertEqual(dupes, {9: 5})
 
-    def test_an_adjudicator_that_raises_never_merges_and_never_raises(self):
-        rows = self._rows(
-            (1, "Renew the certificate", "acme/widget"),
-            (2, "The security cert needs a refresh", "acme/widget"),
-        )
-
-        def boom(pairs):
-            raise RuntimeError("model down")
-
-        dupes = hygiene._duplicate_groups(
-            rows, pair_scores=lambda ids: {(1, 2): 0.82}, adjudicate=boom,
-        )
-        self.assertEqual(dupes, {})
 
 
 if __name__ == "__main__":

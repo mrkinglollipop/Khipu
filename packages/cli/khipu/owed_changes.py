@@ -269,7 +269,6 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                 conn.rollback()
                 return {"ok": False, "restored": 0, "batch": batch, "needs_owner": mine,
                         "error": co.bulk_owner_refusal()}
-            from khipu import owner_direction
 
             restored = 0
             restored_ids = []

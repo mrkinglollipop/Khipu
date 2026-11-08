@@ -111,8 +111,11 @@ def test_a_refused_episodes_facts_never_reach_the_replica(pg, replica, how):
 
 def _suggest(pg, cid, *, episode, decision):
     with pg.connect() as conn, conn.cursor() as cur:
-        assert co.suggest_looks_done(cur, cid, rule="decision", reason=PRIVATE, key=f"decision:{decision}",
-                                     evidence={"text": PRIVATE, "decision_id": decision}, episode=episode)
+        suggestion = {"looks_done": True, "rule": "decision", "reason": PRIVATE,
+                      "key": f"decision:{decision}", "evidence": {"text": PRIVATE, "decision_id": decision},
+                      "episode": episode}
+        cur.execute("UPDATE commitments SET settle_suggestion = %s::jsonb WHERE id = %s",
+                    (json.dumps(suggestion), cid))
 
 
 def _owed(pg) -> str:

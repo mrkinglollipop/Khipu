@@ -29,7 +29,7 @@ import threading
 import psycopg
 import pytest
 
-from khipu import db, forget, hub_snapshot as hs, offline_reads, provenance, tombstones
+from khipu import db, forget, hub_snapshot as hs, provenance, tombstones
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.fact_seed import announce
 from tests.replica_copy import mark_ready, replica  # noqa: F401
@@ -52,10 +52,8 @@ def _replica_fact_text() -> str:
 
 
 def _replica_readers() -> str:
-    with sqlite3.connect(f"file:{hs.snapshot_path()}?mode=ro", uri=True) as con:
-        deliv = hs.recent_deliverables_snapshot(con, project=PROJECT)
-    return json.dumps([offline_reads.owed_rows(None, "open"), offline_reads.owed_rows(None, "closed"),
-                       offline_reads.decisions(None, None, "all", 500), deliv], default=str)
+    from tests.replica_copy import readers
+    return readers(PROJECT)
 
 
 def _pull():

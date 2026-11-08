@@ -67,21 +67,36 @@ def stamp() -> dict | None:
     return None if digest is None or text is None else {**json.loads(text), "fingerprint": digest}
 
 
+def decision_archive_rows(con, project=None):
+    """Inspect retained archive rows through the production replica fence."""
+    sql = "SELECT * FROM decisions WHERE 1 = 1"
+    params = []
+    if project:
+        _canonical, group = hs.snapshot_project_group(con, project)
+        sql += " AND project IN (" + ", ".join("?" for _ in group) + ")"
+        params.extend(group)
+    sql += hs.forget_fence_sql(con, "decisions", "episode_id")
+    cur = con.execute(sql, params)
+    names = [col[0] for col in cur.description]
+    return [dict(zip(names, row)) for row in cur.fetchall()]
+
+
 def readers(project: str | None = None) -> str:
-    """Every replica fact reader's output, as one string."""
+    """Active readers and fenced archived fact rows, as one string."""
     with sqlite3.connect(f"file:{hs.snapshot_path()}?mode=ro", uri=True) as con:
         deliv = hs.recent_deliverables_snapshot(con, project=project)
+        archived = decision_archive_rows(con, project)
     return json.dumps([offline_reads.owed_rows(None, "open"), offline_reads.owed_rows(None, "closed"),
-                       offline_reads.decisions(None, None, "all", 500), deliv], default=str)
+                       archived, deliv], default=str)
 
 
 def shown() -> int:
-    """How many fact rows the replica's readers return."""
+    """How many retained fact rows pass the replica's production fence."""
     with sqlite3.connect(f"file:{hs.snapshot_path()}?mode=ro", uri=True) as con:
         deliv = hs.recent_deliverables_snapshot(con, project=None) or []
-    decisions = offline_reads.decisions(None, None, "all", 500) or {}
+        archived = decision_archive_rows(con)
     return (len(offline_reads.owed_rows(None, "open") or []) + len(offline_reads.owed_rows(None, "closed") or [])
-            + len(decisions.get("results") or []) + len(deliv))
+            + len(archived) + len(deliv))
 
 
 def fact_text() -> str:

@@ -1,16 +1,4 @@
-"""The owner's own items are changed only by the owner (fourth cross-family
-review of docs/plans/2026-10-16-owed-and-ledger-ssot.md).
-
-The invariant (Matt, 2026-10-17: "Suggest, don't close"): an item the user
-owns is never closed, merged, hidden or reassigned by anything automatic,
-by any rule. Every automatic rule is named in ``commitments.AUTOMATIC_RULES``
-and every automatic write reads the owner under the row lock and passes
-``commitments.owner_guard`` in ``close_by_rule``, ``auto_reassign`` or
-``mark_stale``; a refused close lands in "Looks done". These tests enumerate
-both sides: each rule against each owner, every place in the package that
-writes a commitment's status or owner, and every automatic path run against
-the owner's own item on a real hub.
-"""
+"""Pin the remaining explicit commitment writers and archival Undo paths."""
 from __future__ import annotations
 
 import ast
@@ -26,11 +14,8 @@ PACKAGE = Path(co.__file__).parent
 
 # Every function that may write a commitment's status or owner, and why.
 WRITERS = {
-    ("commitments", "close_by_rule"): "the one automatic close, behind the owner guard",
-    ("commitments", "auto_reassign"): "the one automatic owner change, behind the owner guard",
     ("commitments", "set_status"): "the owner's own close, reopen or snooze",
     ("commitments", "reassign"): "the owner's own move",
-    ("commitments", "stale_sql"): "aging after weeks of silence, only for the rows mark_stale's owner guard lets by",
     ("forget", "tombstone_on_hub"): "the owner's own forget (and the carriers it refuses)",
     ("owed_changes", "_put"): "the owner's own undo or redo of a batch, behind the owner gate",
     ("hygiene", None): "the restore recipe in a backup's RESTORE.md, text only",
@@ -80,21 +65,8 @@ def test_the_known_writers_are_all_still_there():
     assert not missing, missing
 
 
-@pytest.mark.parametrize("rule", sorted(co.AUTOMATIC_RULES))
-def test_no_automatic_rule_changes_the_owners_item(rule):
-    """Suggest, don't close (Matt, 2026-10-17): every automatic rule, a close
-    on the item's own pull requests and his "done" in a conversation
-    included, is refused for the owner's item and only suggests."""
-    assert co.AUTOMATIC_RULES[rule] in (co.PROPOSE_LOOKS_DONE, co.PROPOSE_TIDY, co.PROPOSE_QUIET)
-    why = co.owner_guard(co.OWNER_USER, rule)
-    assert why and "suggest" in why, rule
-    for owner in (co.OWNER_ASSISTANT, co.OWNER_AGENT, None):
-        assert co.owner_guard(owner, rule) is None
 
 
-def test_an_unknown_rule_is_refused():
-    with pytest.raises(ValueError):
-        co.owner_guard(co.OWNER_USER, "something-new")
 
 
 # ---- the write itself: the owner as it is at the write ------------------------
@@ -189,25 +161,5 @@ def test_the_legacy_item_reads_as_the_users_whatever_its_text_says(racing):
 # ---- every close of someone else's item waits on every pull request -----------
 
 
-@pytest.mark.parametrize("history", ["prs", "cross_repo"])
-def test_a_decision_close_waits_on_every_pull_request_the_item_ever_named(racing, history):
-    from datetime import datetime, timezone
-
-    from khipu import close_rules as cr
-
-    text = "The reviewer will decide the rollout after PR #12 merges"
-    cid = racing.commitment(text, owner=co.OWNER_AGENT, kind="question")
-    row = dict(id=cid, text=text, owner=co.OWNER_AGENT, project="acme/widget", kind="question", opened_episode=1,
-               opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc), prs=[12, 13] if history == "prs" else [12],
-               latest_text="The reviewer will decide the rollout after PR #12 and PR #13 merge"
-               if history == "prs" else None,
-               pr_check={"refs": ["other/repo#12"]} if history == "cross_repo" else {},
-               reopened=[], suggestion=None)
-    decision = f"Settles commitment {cid}: enable the rollout.\nMerge pull request #12 from acme/feature"
-    racing.inner.conn.execute("INSERT INTO decisions (project, text, episode_id, decided_at) VALUES (?, ?, ?, ?)",
-                              ("acme/widget", decision, 2, "2026-10-17 12:00:00"))
-    report = dict(closed_decision=0, kept_open_reopened=0, suggested=0)
-    cr._decision_rule(racing, [row], report, episode_id=None)
-    assert racing.value("commitments", cid, "status") == "open", report
 
 

@@ -22,7 +22,7 @@ from datetime import datetime
 from khipu import owner_direction, routing
 
 CONFIRM_KINDS = ("priority", "rule", "setting", "accounts", "tier_table", "cap_proposal", "held",
-                 "job_origin", "project_pair", "forget_send", "forget_id", "log_alarm", "override_review")
+                 "project_pair", "forget_send", "forget_id", "log_alarm", "override_review")
 LOOK_KINDS = ("remind", "signin", "interrupted", "ask")
 KINDS = CONFIRM_KINDS + LOOK_KINDS
 
@@ -627,8 +627,6 @@ def _hub_items() -> list[dict]:
     """What waits on the hub: job-origin corrections and same-project pairs.
     Raises when the hub can't be read, so the answer says so."""
     from khipu import project_group, explicit_asks
-    from khipu.config import read_only_config
-    from khipu.db import has_table
     from khipu.hub_snapshot import try_hub_connect
 
     out = []

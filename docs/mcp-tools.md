@@ -1,6 +1,6 @@
 # MCP tools
 
-Khipu exposes 19 tools locally and 17 through the HTTPS gateway, which omits `khipu_owner_act` and `khipu_needs_you`, through one MCP server (server id `khipu`). Agents call them to read memory, write to it, manage commitments and decisions, and read the routing record, and take an owner action the owner asked for.
+Khipu exposes 17 tools locally and 15 through the HTTPS gateway, which omits `khipu_owner_act` and `khipu_needs_you`, through one MCP server (server id `khipu`). Agents call them to read memory, write to it, file and manage explicit asks, and read the routing record, and take an owner action the owner asked for.
 
 The tool list is returned verbatim by the server's `tools/list`. This page groups the tools by job. For the exact schema of any tool, ask the server.
 
@@ -114,11 +114,11 @@ Tombstone one episode. Parameter: `id` (required). The row is not erased: its su
 
 `khipu_forget` also accepts `ledger:<project>#<row id>` to remove a ledger row, with optional `note` and `children` (`remove` or `move-up`). The owner can restore the removed row during the configured retention period.
 
-## Commitments and decisions
+## Explicit asks and archived commitments
 
 ### khipu_owed
 
-List commitments (followups, blockers, questions, promises). Read-only.
+List deliberately filed asks and archived commitments. Read-only.
 
 | Parameter | Meaning |
 | --- | --- |
@@ -135,49 +135,23 @@ Follow `next_cursor` for subsequent pages; `total` and `counts` cover all matchi
 
 ### khipu_owed_update
 
-Close, reopen, snooze or reassign commitments.
+File an explicit ask, or manually close, reopen, snooze or reassign a stored item.
+
+To file an ask, use `action="ask"` with `requester`, `question`, `yes` and `no`. No existing id is needed. The question appears in `khipu_needs_you`.
 
 | Parameter | Meaning |
 | --- | --- |
-| `id`, `ids` | Supply a commitment id or a list of ids from `khipu_owed`. |
-| `action` | Required. `close`, `reopen`, `snooze` or `reassign`. |
+| `id`, `ids` | For an existing item, supply a commitment id or a list of ids from `khipu_owed`. |
+| `action` | Required. `ask`, `close`, `reopen`, `snooze` or `reassign`. |
 | `until` | For snooze: a date, or `7d`, `2w`, `1m`. |
 | `owner`, `owner_label` | Reassignment requires `owner` (`user`, `assistant` or `agent`), with an optional label. |
 | `reason` | Required when changing multiple ids. |
 
 Multiple ids are changed in one transaction with a result per id, bounded by `owed_bulk_max` (500 by default, 0 for no cap). The answer's `ok` is false, with `changed: 0`, `failed` and an `error`, when no id changed (every id missing, or a reopen of items already open); the per-id `results` still say why, and the tool call is an error. When some ids changed and others did not, `ok` stays true so the ids that landed are kept, with `partial: true` and `failed` listing the ids that did not; check `results` per id. `khipu owed --close/--reopen/--reassign ID,ID` prints the same answer and exits 1 unless `ok`. Bulk changes including user-owned items require owner confirmation or owner-directed `owed.change`.
 
-### khipu_decisions
+When the hub is unavailable, owed reads use this Mac's replica and mark stale results and pending updates (`pending_sync`). Local explicit updates queue for replay with hub outcome receipts. Gateway updates and episode forget do not queue.
 
-List decisions with their validity. Read-only.
-
-| Parameter | Meaning |
-| --- | --- |
-| `project` | Filter to one project. |
-| `status` | `standing` (default), `superseded`, `retracted`, `all` or `conflicts`. |
-| `since` | ISO date or relative, such as `7d`. |
-| `limit` | Default 20, capped at 100. |
-
-`conflicts` returns unresolved candidate links, with the text of both sides, that nobody has confirmed or rejected yet.
-
-When the hub is unavailable, owed and decision reads use this Mac’s replica and mark stale results and pending updates (`pending_sync`). Decision conflicts still require the hub. Local owed and decision updates queue for replay with hub outcome receipts. Gateway updates and episode forget do not queue.
-
-### khipu_decisions_update
-
-Change one decision.
-
-| Parameter | Meaning |
-| --- | --- |
-| `action` | Required. `supersede`, `restore`, `retract`, `confirm` or `reject`. |
-| `id` | The decision, for supersede, restore and retract. |
-| `link_id` | The candidate link, for confirm and reject. |
-| `by` | For supersede: an existing decision id that replaces this one. |
-| `new_text` | For supersede: the replacement wording. Creates a new decision. |
-| `source_kind` | With `new_text`: `user`, `assistant` or `tool`. Default `assistant`. |
-| `reason` | For supersede and retract, in the user's own words. |
-| `project`, `session_id` | For the new row created by `new_text`. |
-
-Supersede requires `id` and exactly one of `by` or `new_text`. Restore and retract require `id`; confirm and reject require `link_id`. Supersede only when the user reverses or replaces a decision, not for a refinement. Retract marks a decision wrong outright.
+Episode decision strings remain searchable memory. Archived registry validity is attached to search and episode detail; there is no separate decision-list or decision-update tool.
 
 ## Routing
 
@@ -283,6 +257,6 @@ Rows carry titles and short plain-words lines about the work, never code, diffs,
 
 ## Related
 
-- [CLI reference](cli.md): the same operations from a terminal (`khipu search`, `khipu owed`, `khipu decisions`, `khipu route`, `khipu usage`).
+- [CLI reference](cli.md): the same operations from a terminal (`khipu search`, `khipu owed`, `khipu route`, `khipu usage`).
 - [Integrations](integrations.md): which harnesses get the server and which hooks push recall.
 - [How it works](how-it-works.md): capture, storage and recall.

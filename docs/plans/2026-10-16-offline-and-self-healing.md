@@ -1,5 +1,7 @@
 # Offline and self-healing (scope, 2026-10-16)
 
+> Historical plan or research. Registry extraction and standalone registry tools were retired; see [current memory behavior](../explicit-memory-lists.md).
+
 Status: scope for review. No code changed. Owner requirements (Matt, 2026-10-16):
 
 1. A network problem must never leave Khipu degraded in a way that does not resolve by itself.
@@ -38,8 +40,8 @@ Evidence read for this doc: the code at main `1bc7501`, the installed launchd pl
 | Outbox doctor check | Red while anything is pending (`cli.py:240`). | Yes, once drained. |
 | Replica patch for replayed captures | Upserted only if the replayed embed succeeds (`outbox.py:502-506`). | No, until the nightly. |
 | MCP `khipu_search`, `khipu_get`, `khipu_graph`, `khipu_status` | Fall back to the replica on a connection failure (`mcp_server.py:986-1000`, `:1029-1099`, `:1128`, `:1273-1275`). Search embeds first with 10 s and 2 retries, so an offline search can wait tens of seconds before it falls back (inferred from constants, not measured). Library search refuses offline (`:989-992`). | Yes. |
-| MCP `khipu_owed`, `khipu_decisions` | Hub only, no fallback (`mcp_server.py:1517-1535`, `:1620-1648`): error after the 5 s connect timeout. | Yes, but useless offline. |
-| `khipu_owed_update`, `khipu_decisions_update`, `khipu_forget` | Hub writes; fail offline. | Caller must retry. |
+| MCP `khipu_owed`, the retired registry | Hub only, no fallback (`mcp_server.py:1517-1535`, `:1620-1648`): error after the 5 s connect timeout. | Yes, but useless offline. |
+| `khipu_owed_update`, the retired registry writer, `khipu_forget` | Hub writes; fail offline. | Caller must retry. |
 | Routing (`khipu_route`, the push) | Local record (`routing.py:74`); works offline. Plan figures say "can't be read just now" when vendors cannot be reached. | Yes. |
 | SessionStart slice | Falls back to replica episodes with a visible "stale: hub unreachable" line after the connect timeout (`recall_rule.py:322-367`, `:379`). | Yes. |
 | Desktop app | Each tab runs the CLI with no timeout (`apps/desktop/src-tauri/src/lib.rs:357-392`, `.output()`); Owed reloads every 60 s and on focus (`apps/desktop/src/App.tsx:2306-2325`), so offline it spins for at least the connect timeout per call and shows errors. | Yes, on the next poll. |
@@ -80,7 +82,7 @@ One idea: **the replica is the read path, and the replica heals itself.** The hu
 
 ### C. Offline reads for the rest
 
-- `khipu_owed` and `khipu_decisions` read the replica on a connection failure (the replica already holds decisions; commitments would be added), marked stale.
+- `khipu_owed` and the retired registry read the replica on a connection failure (the replica already holds decisions; commitments would be added), marked stale.
 - MCP search checks the reachability memo before the 10 s embedding call, so an offline search goes to the replica at once.
 - Owner writes made offline (owed close, decision supersede) go to a local queue like the outbox and replay when the hub answers. Forget stays hub-first, because a forget that only looked done would be a privacy failure; offline it says plainly that it is waiting.
 - Hub connections get TCP keepalives and a statement timeout per caller, so a network change cannot leave a query hanging.

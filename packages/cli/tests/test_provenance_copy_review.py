@@ -6,6 +6,8 @@ case its required correction names. Every database is a hermetic one
 """
 from __future__ import annotations
 
+import json
+
 import sqlite3
 import time
 
@@ -45,7 +47,8 @@ def test_part_forget_does_not_refuse_distinct_partless_source(pg, replica):
     # and every string this Mac's registry gained is one of them.
     assert refused and refused <= carried, sorted(refused - carried)
     assert out["snapshot"]["facts"].get("copied") and forget.unsent_forgets()["count"] == 0
-    assert "PARTLESS WORDING" in readers() and "PART TWO WORDING" not in readers()
+    assert "PARTLESS WORDING" in json.dumps(hs.episode_detail_snapshot(eb))
+    assert hs.episode_detail_snapshot(ea) is None and "PART TWO WORDING" not in readers()
 
 
 # ---- R2: a backup's file holds no fact bytes ------------------------------------------

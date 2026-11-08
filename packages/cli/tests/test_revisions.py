@@ -42,7 +42,7 @@ class FakeCursor:
         "deleted_at", "window_id", "truncated_chars", "verbatim",
     )
     # Empty by default = "the decisions table (O2, migration 0019) is not
-    # migrated on this fake hub" — khipu.decisions.standing_decisions then
+    # migrated on this fake hub" — archived validity readers then
     # returns [] without issuing its own SELECT, so a test that does not care
     # about decisions sees the exact same query sequence it always has. A
     # test that DOES care sets this to a real column tuple.

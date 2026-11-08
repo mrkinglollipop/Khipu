@@ -148,7 +148,7 @@ def test_08K01_is_plain_operational_error_and_old_code_reads_it_as_hub_away(migr
     "UPDATE deliverables SET episode_id = %(b)s WHERE id = %(v)s",
     "INSERT INTO commitments (text, project, opened_episode, content_hash) VALUES ('new', 'khipu', %(b)s, 'hx')",
     "INSERT INTO decisions (project, text, episode_id) VALUES ('khipu', 'new', %(b)s)",
-    "INSERT INTO decisions (project, text) VALUES ('khipu', 'an old create_decision')",
+    "INSERT INTO decisions (project, text) VALUES ('khipu', 'an old historical owner decision writer')",
     "INSERT INTO deliverables (project, kind, path, episode_id) VALUES ('khipu', 'file', 'b.py', %(b)s)",
 ])
 def test_a_direct_wording_write_is_refused_at_commit(migrated, sql):
@@ -479,17 +479,9 @@ WORDING_WRITERS = {
     # manual) claim, then project in the same owner-write transaction.
     ("explicit_asks", "_write_ask", "INSERT INTO commitments"),
     # prs from the anchor's own text (rows from before 0034).
-    ("close_rules", "backfill_prs", "UPDATE commitments"),
     # pr_check notes; keeps refs as they were (and drops needs_owner: phase 3).
-    ("close_rules", "_pr_rule", "UPDATE commitments"),
-    ("commitments", "_keep_pr_refs", "UPDATE commitments"),
-    ("commitments", "open_from_episode", "INSERT INTO commitments"),
-    ("commitments", "open_from_episode", "UPDATE commitments"),
     # Owner columns only (owner, owner_label, lineage, reassigned_at).
-    ("commitments", "auto_reassign", "UPDATE commitments dynamic"),
     ("commitments", "reassign", "UPDATE commitments dynamic"),
-    ("decisions", "create_decision", "INSERT INTO decisions"),
-    ("decisions", "insert_decisions_from_episode", "INSERT INTO decisions"),
     ("deliverables", "insert_deliverables_from_episode", "INSERT INTO deliverables"),
 }
 

@@ -3,14 +3,13 @@
 PostgreSQL. Every row is synthetic."""
 from __future__ import annotations
 
-import json
 
 import pytest
 
 
-from khipu import commitments as co, forget, mcp_server as srv, request_context
+from khipu import mcp_server as srv, request_context
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
-from tests.test_astra_1026_forget import PRIVATE, _ids, _rows
+from tests.test_astra_1026_forget import _rows
 from tests.test_provenance_forget import _capture, env, pg  # noqa: F401
 
 

@@ -6,15 +6,11 @@ unreadable list each drops every row tied to an episode. Kimi's round-2
 probes, 2026-10-30."""
 from __future__ import annotations
 
-import argparse
-import contextlib
-import io
-import json
 from unittest import mock
 
 import pytest
 
-from khipu import activity, cli, commitments, decisions, mcp_server, tombstones
+from khipu import activity, commitments, tombstones
 
 FORGOT = 902
 LIVE = 904
@@ -72,7 +68,7 @@ class _Connection:
         return ctx
 
 
-# ---- khipu_decisions and khipu_owed (gateway and MCP) ----------------------
+# ---- archived registry reader and khipu_owed (gateway and MCP) ----------------------
 
 DECISION = {"id": 5, "episode_id": FORGOT, "text": "FORGOTTEN-DECISION"}
 LIVE_DECISION = {"id": 7, "episode_id": LIVE, "text": "LIVE-DECISION"}
@@ -80,63 +76,16 @@ COMMITMENT = {"id": 6, "opened_episode": FORGOT, "text": "FORGOTTEN-COMMITMENT"}
 LIVE_COMMITMENT = {"id": 8, "opened_episode": LIVE, "text": "LIVE-COMMITMENT"}
 
 
-def _gateway_outputs():
-    with mock.patch.object(mcp_server, "_ensure_path"), \
-         mock.patch("khipu.db.connect", return_value=_Connection()), \
-         mock.patch("khipu.offline.setting", return_value=1), \
-         mock.patch("khipu.decisions.list_decisions", return_value=[dict(DECISION), dict(LIVE_DECISION)]), \
-         mock.patch("khipu.owner_writes.annotate", return_value={}), \
-         mock.patch("khipu.commitments.fetch_owed_rows",
-                    return_value=[dict(COMMITMENT), dict(LIVE_COMMITMENT)]), \
-         mock.patch("khipu.commitments.page_owed", side_effect=lambda rows, **kw: {"results": rows}), \
-         mock.patch.object(mcp_server, "_routing_direction_items", return_value=[]), \
-         mock.patch.object(mcp_server, "_routing_direction_rows", return_value=[]), \
-         mock.patch.object(mcp_server, "owed_page_limit", return_value=(50, None)):
-        return (mcp_server._tool_decisions({})["results"],
-                mcp_server.owed_listing({})["results"])
 
 
-def test_khipu_decisions_and_owed_hide_a_forgotten_episodes_rows(forgotten):
-    found, owed = _gateway_outputs()
-    assert [d["text"] for d in found] == ["LIVE-DECISION"]
-    assert [c["text"] for c in owed] == ["LIVE-COMMITMENT"]
 
 
-def test_khipu_decisions_and_owed_show_no_episode_row_when_the_forget_list_is_unreadable():
-    _corrupt_list()
-    found, owed = _gateway_outputs()
-    assert found == [] and owed == []
 
 
-def test_list_decisions_drops_a_forgotten_episodes_decision(forgotten):
-    cols = (5, "p", "FORGOTTEN-DECISION", None, None, FORGOT, "s", None, None)
-    live = (7, "p", "LIVE-DECISION", None, None, LIVE, "s", None, None)
-    cur = _Cursor({"FROM decisions": [cols, live]})
-    with mock.patch.object(decisions, "_evidence_ready", return_value=False), \
-         mock.patch.object(decisions, "_not_forgotten_clause", return_value=""):
-        rows = decisions.list_decisions(cur)
-    assert [r["text"] for r in rows] == ["LIVE-DECISION"]
 
 
-def test_cli_decisions_list_never_prints_a_forgotten_episodes_decision(forgotten):
-    cur = _Cursor({"FROM decisions": [(5, "p", "FORGOTTEN-DECISION", None, None, FORGOT, "s", None, None)]})
-    args = argparse.Namespace(decisions_cmd="list", since=None, project=None, limit=5)
-    with mock.patch("khipu.db.connect", return_value=_Connection(cur)), \
-         mock.patch.object(decisions, "_evidence_ready", return_value=False), \
-         mock.patch.object(decisions, "_not_forgotten_clause", return_value=""), \
-         contextlib.redirect_stdout(io.StringIO()) as out:
-        cli.cmd_decisions(args)
-    assert "FORGOTTEN-DECISION" not in out.getvalue()
 
 
-def test_decision_conflict_links_hide_a_forgotten_episodes_decision(forgotten):
-    link = (1, 5, 7, "reversal", 0.9, "auto", "r", "candidate", None, None,
-            "FORGOTTEN-DECISION", "LIVE-DECISION", FORGOT, LIVE)
-    cur = _Cursor({"FROM decision_links": [link]})
-    with mock.patch.object(decisions, "_links_ready", return_value=True), \
-         mock.patch.object(decisions, "_not_forgotten_clause", return_value=""):
-        rows = decisions.list_links(cur)
-    assert rows == []
 
 
 def test_owed_rows_drop_a_forgotten_episodes_commitment_and_its_suggestion(forgotten):

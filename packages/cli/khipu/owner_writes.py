@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-TOOLS = ("owed_update", "decisions_update")
+TOOLS = ("owed_update",)
 # What a queued write's reply repeats of the request, so a caller sees the same
 # shape it would have had from the hub.
 _ECHO = ("id", "ids", "link_id", "action", "until", "by")
@@ -171,7 +171,7 @@ def _read(path: Path) -> dict[str, Any] | None:
         job = json.loads(path.read_text(encoding="utf-8"))
     except ValueError:
         return None
-    if isinstance(job, dict) and job.get("tool") in TOOLS and isinstance(job.get("args"), dict):
+    if isinstance(job, dict) and isinstance(job.get("tool"), str) and isinstance(job.get("args"), dict):
         return job
     return None
 
@@ -180,8 +180,7 @@ def _apply(tool: str, args: dict[str, Any]) -> dict[str, Any]:
     # Resolved when called: mcp_server imports this module's callers.
     from khipu import mcp_server
 
-    fn = {"owed_update": mcp_server._owed_update_on_hub,
-          "decisions_update": mcp_server._decisions_update_on_hub}[tool]
+    fn = {"owed_update": mcp_server._owed_update_on_hub}[tool]
     return fn(args)
 
 
@@ -346,6 +345,9 @@ def _replay(path: Path) -> str | None:
         return "local_error"
     if job is None:  # never left to block the line behind it
         return "refused" if _refuse(path, {}, "ValueError: this waiting write could not be read") else "local_error"
+    if job["tool"] not in TOOLS:
+        return ("refused" if _refuse(path, job, "This tool was retired; the original write is archived, not applied")
+                else "local_error")
     if not job["args"].get("write_id"):
         # It may have landed already, and no record can say: never sent.
         return "refused" if _refuse(path, job, _NO_ID) else "local_error"

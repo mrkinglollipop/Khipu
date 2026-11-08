@@ -1146,9 +1146,6 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
         "receipt_prune",
         "run `khipu jobs install nightly` or wait for the next nightly",
     ),
-    "mark_stale_ok": (
-        "run `khipu jobs install nightly` or wait for the next nightly",
-    ),
     "ledger_ok": (
         "ledger",
         "run `khipu ledger drain` and check the error",

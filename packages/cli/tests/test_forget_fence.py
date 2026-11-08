@@ -1024,46 +1024,12 @@ def test_the_chokepoint_refuses_the_wrong_door():
         provider_text.live_input("x", "topic")
 
 
-def test_hygiene_and_owed_changes_judges_send_no_forgotten_or_unsourced_commitment(list_state):
-    from khipu import hygiene, owed_changes
-    from khipu.provider_text import sourced
-
-    sent: list = []
-    texts = [sourced("FORGOTTEN-JUDGE", [902]), sourced("live judge text", [904]), "no source at all"]
-    with mock.patch("khipu.extract._generate", side_effect=lambda p, **k: sent.append(p) or "{}"):
-        hygiene._model_judge(texts)
-        owed_changes._model_owner_judge(texts)
-        hygiene._model_adjudicate_pairs([(texts[0], texts[1]), (texts[1], texts[2])])
-    assert not any("FORGOTTEN-JUDGE" in p or "no source at all" in p for p in sent)
-    if list_state == "unreadable":
-        assert sent == []
 
 
 # ---- Kimi's fifth probes: provenance, malformed ids, live door, batch race ----
 
-def test_auto_close_cosine_sends_nothing_for_a_forgotten_or_unsourced_episode(list_state):
-    from khipu import commitments
-
-    sent: list = []
-    cur = mock.MagicMock()
-    with mock.patch.object(embed, "_active_profile", return_value="p"), \
-            mock.patch.object(embed, "embed_one", side_effect=lambda t, **k: sent.append(t) or [0.0]):
-        assert commitments._cosine_scores(cur, "FORGOTTEN-EPISODE-SNIPPET", [7], 902) == {}
-        assert commitments._cosine_scores(cur, "NO-EPISODE-SNIPPET", [7], None) == {}
-    assert sent == []
 
 
-def test_auto_close_cosine_still_sends_text_from_a_live_episode():
-    from khipu import commitments
-
-    tombstones.publish_episode_ids({FORGOT})
-    sent: list = []
-    cur = mock.MagicMock()
-    cur.fetchall.return_value = []
-    with mock.patch.object(embed, "_active_profile", return_value="p"), \
-            mock.patch.object(embed, "embed_one", side_effect=lambda t, **k: sent.append(t) or [0.0]):
-        commitments._cosine_scores(cur, "live snippet", [7], 904)
-    assert sent == ["live snippet"]
 
 
 def test_live_input_refuses_text_that_carries_source_ids():

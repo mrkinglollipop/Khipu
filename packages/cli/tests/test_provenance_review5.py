@@ -16,7 +16,7 @@ from unittest import mock
 
 import pytest
 
-from khipu import capture, commitments, embed, forget, mirror, offline_reads, outbox, paths, tombstones
+from khipu import capture, embed, forget, mirror, offline_reads, outbox, paths, tombstones
 from khipu import hub_snapshot as hs
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401 - fixtures
 from tests.test_provenance_forget import ALT, CANON, _capture, _payload, env, pg  # noqa: F401
@@ -80,8 +80,10 @@ def test_retained_vector_view_rechecks_registry(pg, replica):
     of the refused generation through its TEMP view."""
     replica(pg)
     private = _payload(loop=CANON)
-    capture.write_pg(private)
+    eid = capture.write_pg(private)["episode_id"]
     with pg.connect() as c:
+        from tests.fact_seed import archived_facts
+        archived_facts(c.cursor(), private, eid)
         cid = c.execute("SELECT id FROM commitments").fetchone()[0]
         profile, dim = c.execute("SELECT id, dim FROM embedding_profiles ORDER BY id LIMIT 1").fetchone()
         c.execute("INSERT INTO memory_embeddings (profile, kind, ref, chunk_idx, chunk_text, content_hash, "
@@ -138,8 +140,7 @@ def test_an_older_copy_cannot_overwrite_a_newer_pull(pg, replica):
 @pytest.mark.parametrize("method", ["sync_recent_episodes", "reconcile_memory_root"])
 @pytest.mark.parametrize("held", [False, True])
 def test_closed_only_recovery(pg, method, held):
-    """#4 (P2): a memory-root line carrying only ``closed_loops`` is recovered
-    by both recovery entry points."""
+    """Legacy closure wording is preserved without automatically closing work."""
     pg.memory.mkdir()
     _capture(loop=CANON)
     payload = _payload(loop=None, closed_loops=[{"text": "done: " + CANON}])
@@ -151,10 +152,14 @@ def test_closed_only_recovery(pg, method, held):
     for _ in range(2):
         getattr(mirror, method)(pg.memory)
     with pg.connect() as c:
-        status = c.execute("SELECT status FROM commitments").fetchone()[0]
+        work = c.execute("SELECT text, status FROM commitments").fetchall()
+        raws = [r[0] for r in c.execute("SELECT raw FROM episodes").fetchall()]
         gaps = c.execute("SELECT step FROM fact_gaps WHERE resolved_at IS NULL").fetchall()
     jobs = [json.loads(p.read_text()) for p in outbox.jobs()]
-    assert status == "closed" or gaps or jobs, "closure evidence silently skipped by recovery"
+    assert work == [(CANON, "open")]
+    assert not gaps
+    evidence = [*raws, *(job.get("payload", {}) for job in jobs)]
+    assert any(row.get("closed_loops") == payload["closed_loops"] for row in evidence), evidence
 
 
 def test_actual_embed_catchup_stale_hub_vector(pg, replica):

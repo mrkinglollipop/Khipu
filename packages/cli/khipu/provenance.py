@@ -241,7 +241,7 @@ def _loop_values(item: Any) -> tuple[str, ...]:
 
 def _decision_value(item: Any) -> str | None:
     """The text capture's decision writer stores for one item (exactly
-    ``insert_decisions_from_episode``'s value), or None for one it skips."""
+    the historical decision extractor's value), or None for one it skips."""
     from khipu.decisions import _redacted_value, normalize_text
 
     text = _redacted_value(str(item or "").strip())
@@ -557,15 +557,7 @@ def _gap_step(cur, step: str, payload: dict[str, Any], episode_id: int) -> None:
     """Re-run one capture fact step, exactly the calls capture made in it
     (``capture.write_pg`` and its merge path)."""
     name = step[len("merge "):] if step.startswith("merge ") else step
-    if name == "decisions":
-        from khipu import decisions
-
-        decisions.insert_decisions_from_episode(cur, payload, episode_id)
-    elif name == "decision detection":
-        from khipu import decisions
-
-        decisions.detect_reversals_from_episode(cur, payload, episode_id)
-    elif name == "deliverables":
+    if name == "deliverables":
         from khipu import deliverables
 
         deliverables.insert_deliverables_from_episode(cur, payload, episode_id)
@@ -580,9 +572,7 @@ def _gap_step(cur, step: str, payload: dict[str, Any], episode_id: int) -> None:
 # incomplete state and returned normally, so no gap names them; a replay of
 # the earlier step re-runs them after it, in capture's order, in the same
 # transaction (third Astra review #4). Each is idempotent.
-DEPENDENT_STEPS: dict[str, tuple[str, ...]] = {
-    "decisions": ("decision detection",),
-}
+DEPENDENT_STEPS: dict[str, tuple[str, ...]] = {}
 
 
 def dependent_steps(step: str) -> tuple[str, ...]:
@@ -633,7 +623,7 @@ def replay_gaps(conn, *, limit: int = GAP_REPLAY_LIMIT) -> dict[str, Any]:
             return {"ok": True, "skipped": "the hub has no fact provenance yet (migration 0047)"}
         cur.execute(
             "SELECT episode_id, step, source_id, array_agg(id ORDER BY id) FROM fact_gaps "
-            "WHERE resolved_at IS NULL GROUP BY episode_id, step, source_id "
+            "WHERE resolved_at IS NULL AND step IN ('deliverables', 'merge deliverables') GROUP BY episode_id, step, source_id "
             "ORDER BY max(attempts), min(id) LIMIT %s", (int(limit),))
         groups = cur.fetchall()
     conn.commit()

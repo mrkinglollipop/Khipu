@@ -381,7 +381,7 @@ def commitments_backup_dir() -> Path:
 
 _RESTORE_MD = """# commitments backup — {ts}
 
-Written by `khipu hygiene commitments --apply` BEFORE it changed any row.
+Written by `the historical commitment cleanup` BEFORE it changed any row.
 `commitments.bin` is a psycopg binary `COPY` of the whole table at that moment.
 
 Restore (psql against the same hub, same column order):

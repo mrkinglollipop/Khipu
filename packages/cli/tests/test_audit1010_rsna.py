@@ -1,7 +1,6 @@
 """Hermetic lifecycle regressions, using SQL against an in-memory registry."""
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
 import tempfile
@@ -12,7 +11,7 @@ from unittest import mock
 
 import pytest
 
-from khipu import commitments as co, decisions as de, validity
+from khipu import commitments as co, validity
 
 
 class _RegistryCursor:
@@ -117,93 +116,20 @@ class RegistryTest(unittest.TestCase):
     def setUp(self):
         self.cur = _RegistryCursor()
         self.addCleanup(self.cur.conn.close)
-        for target, value in (("khipu.commitments._has_commitment_embeddings", False),
-                              ("khipu.decisions._trgm_available", False)):
-            patch = mock.patch(target, return_value=value)
-            patch.start()
-            self.addCleanup(patch.stop)
 
 
 class DecisionLifecycleTest(RegistryTest):
-    def test_cap23_a_b_a_capture_reversals(self):
-        ids = []
-        with mock.patch("khipu.features.enabled", return_value=True):
-            for eid, text, reverse in ((1, "choose option alpha", None),
-                                       (2, "choose option beta", "choose option alpha"),
-                                       (3, "choose option alpha", "choose option beta")):
-                self.cur.episode(eid)
-                payload = {"project": "p", "ts": f"2026-10-0{eid} 00:00:00",
-                           "decisions": [text], "decision_details": [
-                               {"text": text, "by": "user", "reverses": reverse}]}
-                self.assertEqual(de.insert_decisions_from_episode(self.cur, payload, eid), 1)
-                de.detect_reversals_from_episode(self.cur, payload, eid)
-                ids.append(self.cur.conn.execute("SELECT id FROM decisions WHERE episode_id = ?", (eid,)).fetchone()[0])
-        self.assertEqual(self.cur.value("decisions", ids[0], "superseded_by"), ids[1])
-        self.assertEqual(self.cur.value("decisions", ids[1], "superseded_by"), ids[2])
-        self.assertIsNone(self.cur.value("decisions", ids[2], "superseded_by"))
+    pass
 
-    def test_rsn15_renew_retracted_superseded_and_forgotten(self):
-        for state in ("retracted", "superseded", "forgotten"):
-            with self.subTest(state=state):
-                text = "choose " + state
-                old = de.create_decision(self.cur, project="p", text=text)
-                if state == "retracted":
-                    de.retract(self.cur, old)
-                elif state == "superseded":
-                    new = de.create_decision(self.cur, project="p", text="replacement")
-                    de.supersede(self.cur, old, new)
-                else:
-                    self.cur.episode(1, deleted="2026-10-01")
-                    self.cur.conn.execute("UPDATE decisions SET episode_id = 1 WHERE id = ?", (old,))
-                renewed = de.create_decision(self.cur, project="p", text=text)
-                self.assertNotEqual(old, renewed)
-                self.assertIsNone(self.cur.value("decisions", renewed, "superseded_by"))
-                self.assertIsNone(self.cur.value("decisions", renewed, "retracted_at"))
 
-    def test_standing_restatement_still_deduplicates(self):
-        old = de.create_decision(self.cur, project="p", text="choose alpha")
-        self.assertEqual(de.create_decision(self.cur, project="p", text="CHOOSE   ALPHA"), old)
 
-    def test_rsn17_stale_candidate_does_not_become_applied(self):
-        a, b, c = [de.create_decision(self.cur, project="p", text=text) for text in ("alpha", "beta", "gamma")]
-        link = de.add_link(self.cur, a, b)
-        self.assertTrue(de.supersede(self.cur, a, c))
-        out = de.resolve_link(self.cur, link, "confirm")
-        self.assertFalse(out["ok"])
-        self.assertEqual(self.cur.value("decision_links", link, "state"), "candidate")
-        self.assertEqual(self.cur.value("decisions", a, "superseded_by"), c)
 
-    def test_rsn17_confirm_existing_exact_edge_is_idempotent(self):
-        a, b = [de.create_decision(self.cur, project="p", text=text) for text in ("alpha", "beta")]
-        link = de.add_link(self.cur, a, b)
-        self.cur.conn.execute("UPDATE decisions SET superseded_by = ? WHERE id = ?", (b, a))
-        self.assertTrue(de.resolve_link(self.cur, link, "confirm")["ok"])
-        self.assertEqual(self.cur.value("decision_links", link, "state"), "applied")
 
-    def test_cap2_gw2_capture_details_are_redacted_at_writer(self):
-        secret = "sk-ant-" + "x" * 30
-        text = "choose " + secret
-        payload = {"project": "p", "decisions": [text], "decision_details": [
-            {"text": text, "by": "user", "rationale": secret, "reverses": secret}]}
-        self.assertEqual(de.insert_decisions_from_episode(self.cur, payload, 1), 1)
-        stored = self.cur.conn.execute("SELECT text, rationale, evidence FROM decisions").fetchone()
-        self.assertTrue(all(secret not in str(value) for value in stored))
-        self.assertEqual(stored[1], "[REDACTED]")
-        self.assertEqual(json.loads(stored[2])["reverses"], "[REDACTED]")
 
-    def test_gw3_replacement_and_lifecycle_reasons_are_redacted(self):
-        secret = "sk-ant-" + "x" * 30
-        old = de.create_decision(self.cur, project="p", text="old")
-        new = de.create_decision(self.cur, project="p", text="new " + secret)
-        de.supersede(self.cur, old, new, reason=secret)
-        de.retract(self.cur, new, reason=secret)
-        self.assertNotIn(secret, self.cur.value("decisions", new, "text"))
-        self.assertEqual(self.cur.value("decisions", old, "supersede_reason"), "[REDACTED]")
-        self.assertEqual(self.cur.value("decisions", new, "retract_reason"), "[REDACTED]")
-        self.assertEqual(self.cur.conn.execute("SELECT reason FROM decision_links").fetchone()[0], "[REDACTED]")
 
 
 class CommitmentClosureTest(RegistryTest):
+    pass
     pass
 
 class CommitmentAgingTest(RegistryTest):

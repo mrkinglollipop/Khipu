@@ -88,7 +88,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "work.not_same": (("row", "commitment"), ()),
     # ``why`` is the change's reason (``reason`` is a hold's, from a fixed list).
     "owed.change": (("ids", "change", "why"), ("to", "label")),
-    # The clean-up: ``plan`` (a file from ``khipu owed tidy --plan-out``, shown
+    # The clean-up: ``plan`` (a file from ``the archived clean-up plan``, shown
     # to the owner first) to apply, or ``batch`` to undo; one, not both.
     "project.alias_add": (("alias", "canonical"), ()),
     "project.alias_remove": (("alias",), ()),

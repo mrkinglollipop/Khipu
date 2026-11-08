@@ -16,7 +16,6 @@ import pytest
 from khipu import jobs
 
 MAINTENANCE = ('_reconcile_notes_if_due', '_embed_backfill', '_prune_query_cache',
-               '_mark_stale_commitments',
                '_provenance_nightly', '_ledger_nightly', '_project_renames_sweep',
                '_refresh_snapshot', '_storage_sweep', '_owner_actions_chain',
                '_fact_changes_prune', '_receipt_prune')

@@ -37,7 +37,7 @@ UNFENCED = {
 }
 # The readers the fence is known to guard: a scan that stops seeing them is broken.
 KNOWN = {("hub_snapshot.py", "decision_counts_snapshot"), ("hub_snapshot.py", "recent_deliverables_snapshot"),
-         ("offline_reads.py", "owed_rows"), ("offline_reads.py", "decisions"),
+         ("offline_reads.py", "owed_rows"),
          ("recall_prompt.py", "_thread_memory_hits")}
 
 
@@ -128,4 +128,9 @@ def test_fenced_readers_answer_without_forgotten_rows(replica):
     finally:
         con.close()
     assert sorted(r["id"] for r in offline_reads.owed(None, "open", 10)["results"]) == [1, 9]
-    assert sorted(r["id"] for r in offline_reads.decisions(None, None, "all", 10)["results"]) == [1, 9]
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        states = [row for eid in (1, 2, 3, 9)
+                  for row in hs._decision_states_for_episode_snapshot(con, eid)["decision_states"]]
+    assert sorted(r["id"] for r in states) == [1]
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        assert con.execute("SELECT id FROM decisions WHERE episode_id IS NULL").fetchall() == [(9,)]

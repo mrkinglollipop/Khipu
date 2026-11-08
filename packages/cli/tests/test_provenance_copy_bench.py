@@ -30,9 +30,8 @@ import time
 from contextlib import contextmanager
 
 import psycopg
-import pytest
 
-from khipu import db, hub_snapshot as hs, offline_reads, provenance
+from khipu import db, hub_snapshot as hs, provenance
 from tests.fact_seed import announce
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.replica_copy import mark_ready, replica  # noqa: F401
@@ -282,7 +281,8 @@ def test_the_copy_under_a_sustained_workload_meets_its_bounds(pg, replica, pg_cl
             # recent deliverables, through the fact fence.
             while not stop.is_set():
                 try:
-                    offline_reads.decisions(PROJECT, None, "all", 50)
+                    with sqlite3.connect(f"file:{hs.snapshot_path()}?mode=ro", uri=True) as con:
+                        hs.decision_counts_snapshot(con, [r["id"] for r in live_rows])
                     with sqlite3.connect(f"file:{hs.snapshot_path()}?mode=ro", uri=True) as con:
                         hs.recent_deliverables_snapshot(con, project=PROJECT)
                     side["reads"] += 1

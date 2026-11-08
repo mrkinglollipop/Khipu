@@ -52,8 +52,8 @@ def adopt(cur, kind: str, ids: int | Iterable[int]) -> None:
             provenance.record_claim(cur, kind, fact_id, "restatement", latest, **who)
             if prs is None:
                 # Not parsed yet: the projection has no NULL, so the numbers
-                # close_rules.backfill_prs would have stored.
-                from khipu.close_rules import parse_prs
+                # stored by the historical PR backfill.
+                from khipu.pr_refs import parse_prs
 
                 prs = parse_prs(text)
             for n in prs:
@@ -118,7 +118,7 @@ def owner_commitment(cur, text, *, project, episode_id, kind="followup", linked_
     values = dict(text=text, project=project, owner="user", kind=kind, opened_episode=episode_id,
                   content_hash=h, origin="conversation", owner_label=None, linked_ids=list(linked_ids),
                   prs=None)
-    from khipu.close_rules import parse_prs, pr_requirement_labels
+    from khipu.pr_refs import parse_prs, pr_requirement_labels
     values['prs'] = parse_prs(text)
     values['pr_check'] = json.dumps({'refs': pr_requirement_labels(text, project)})
     have = db.table_columns(cur, "commitments")
@@ -134,3 +134,63 @@ def owner_commitment(cur, text, *, project, episode_id, kind="followup", linked_
     for linked in linked_ids:
         cur.execute("UPDATE commitments SET linked_ids = array_append(linked_ids, %s) WHERE id = %s", (cid, linked))
     return cid
+
+
+def archived_facts(cur, payload, episode_id, *, restates=None):
+    """Seed legacy rows explicitly for tests of their surviving archive readers."""
+    from khipu import commitments as co
+    from khipu.pr_refs import parse_prs, pr_requirement_labels
+    project = payload.get("project")
+    gated = provenance.ready(cur)
+    if gated:
+        provenance.declare_writer(cur)
+    for loop in payload.get("open_loops") or []:
+        loop = {"text": loop} if isinstance(loop, str) else loop
+        text = loop["text"]
+        owner = loop.get("owner") or "assistant"
+        hashed = co.content_hash(project, text + ("\x00owner:user:" if owner == "user" else ""))
+        cur.execute("SELECT id FROM commitments WHERE project IS NOT DISTINCT FROM %s "
+                    "AND content_hash = %s AND status = 'open'", (project, hashed))
+        row = cur.fetchone()
+        if restates is not None:
+            row = (restates,)
+        if row:
+            cid = row[0]
+            if gated:
+                provenance.record_claim(cur, "commitment", cid, "restatement", text, episode_id=episode_id)
+                for number in parse_prs(text):
+                    provenance.record_claim(cur, "commitment", cid, "pr", number, episode_id=episode_id)
+                for ref in pr_requirement_labels(text, project):
+                    provenance.record_claim(cur, "commitment", cid, "pr_ref", ref, episode_id=episode_id)
+                provenance.project(cur, "commitment", cid)
+            else:
+                cur.execute("SELECT prs, pr_check FROM commitments WHERE id = %s", (cid,))
+                held_prs, held_check = cur.fetchone()
+                refs = list(dict.fromkeys([*((held_check or {}).get("refs") or []), *pr_requirement_labels(text, project)]))
+                prs = sorted(set(held_prs or []) | set(parse_prs(text)))
+                cur.execute("UPDATE commitments SET latest_text = %s, prs = %s, pr_check = %s::jsonb, seen_count = seen_count + 1 WHERE id = %s",
+                            (text, prs, json.dumps({"refs": refs}), cid))
+            continue
+        owner = loop.get("owner") or "assistant"
+        cur.execute("INSERT INTO commitments(text,project,owner,kind,opened_episode,content_hash,prs,pr_check) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb) RETURNING id",
+                    (text, project, owner, loop.get("kind", "followup"), episode_id, hashed,
+                     parse_prs(text), json.dumps({"refs": pr_requirement_labels(text, project)})))
+        cid = cur.fetchone()[0]
+        if gated:
+            adopt(cur, "commitment", cid)
+    for text in payload.get("decisions") or []:
+        cur.execute("SELECT id FROM decisions WHERE project IS NOT DISTINCT FROM %s AND text = %s",
+                    (project, text))
+        row = cur.fetchone()
+        if row:
+            if gated:
+                provenance.record_claim(cur, "decision", row[0], "text", text, episode_id=episode_id)
+                provenance.project(cur, "decision", row[0])
+            continue
+        cur.execute("INSERT INTO decisions(project,text,episode_id,decided_at) "
+                    "SELECT %s,%s,id,ts FROM episodes WHERE id = %s RETURNING id",
+                    (project, text, episode_id))
+        did = cur.fetchone()[0]
+        if gated:
+            adopt(cur, "decision", did)

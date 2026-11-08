@@ -118,7 +118,11 @@ def test_t3_answer_has_no_provider_allowlist_or_process_challenge(world,harness)
 
 def test_legacy_question_does_not_block_direct_note(world):
     from tests.test_owner_gate_completion import _legacy
-    request = _legacy(world,world['mp'],'tracker')['id']
+    request = _legacy(world,world['mp'],'setting')['id']
+    with owner_direction._requests_locked() as path:
+        state = owner_direction._load(path)
+        next(row for row in state['requests'] if row['id'] == request)['args'] = None
+        owner_direction._save(path, state, owner_direction._clock())
     _owner_types(world,'set the note instead')
     ok,out=owner_act.act('route.note.set',{'text':'new direction'})
     assert ok and not out.get('pending'),out

@@ -3,8 +3,8 @@
 -- with the owner's decision 4).
 --
 -- Why: one busy project held 3,687 open commitments, 97% of them shown as
--- the user's. `khipu owed tidy` plans a clean-up (keep, reassign, close),
--- and applying a plan writes every change in one batch. Nothing is deleted
+-- the user's. Historical clean-up plans kept, reassigned or closed items;
+-- applying a plan wrote every change in one batch. Nothing is deleted
 -- and every batch can be undone, so each change keeps the item's state from
 -- before it.
 --
@@ -66,7 +66,7 @@ CREATE INDEX IF NOT EXISTS idx_commitment_tidy_items_commitment
     ON commitment_tidy_items (commitment_id);
 
 COMMENT ON COLUMN commitments.tidy_batch IS
-    'The `khipu owed tidy` batch that last changed this item (commitment_tidy_batches.id), or NULL.';
+    'The historical clean-up batch that last changed this item (commitment_tidy_batches.id), or NULL.';
 COMMENT ON TABLE commitment_tidy_batches IS
     'One applied clean-up plan (historical Owed clean-up): counts, skipped items, owner gate, undo.';
 COMMENT ON TABLE commitment_tidy_items IS

@@ -16,8 +16,6 @@ const NAMES = [
   "relevance_floor",
   "rerank",
   "graph_candidates",
-  "decision_details",
-  "auto_supersede",
   "routing_push",
 ];
 
@@ -97,9 +95,9 @@ function switchFor(label: RegExp) {
 }
 
 describe("OptionalFeatures", () => {
-  it("shows the eight switches, the four recommended ones first, routing apart, then the rejected group", async () => {
+  it("shows the seven switches, the four recommended ones first, routing apart, then the rejected group", async () => {
     render(<OptionalFeatures active />);
-    await waitFor(() => expect(screen.getAllByRole("switch")).toHaveLength(9)); // eight plus the recall service
+    await waitFor(() => expect(screen.getAllByRole("switch")).toHaveLength(7));
     const order = screen.getAllByRole("switch").map((el) => el.id);
     expect(order).toEqual([
       "feat-validity_ranking",
@@ -109,13 +107,11 @@ describe("OptionalFeatures", () => {
       "feat-recall-service",
       "feat-routing_push",
       "feat-graph_candidates",
-      "feat-decision_details",
-      "feat-auto_supersede",
     ]);
     const rejected = screen.getByText("Measured, not recommended").closest(".section-card") as HTMLElement;
-    expect(within(rejected).getAllByRole("switch")).toHaveLength(3);
+    expect(within(rejected).getAllByRole("switch")).toHaveLength(1);
     expect(within(rejected).getByText(/59 to 4/)).toBeInTheDocument();
-    expect(within(rejected).getAllByText(/1 transcript in 10 lost all its decisions/)).toHaveLength(2);
+    expect(within(rejected).queryByText(/1 transcript in 10 lost all its decisions/)).not.toBeInTheDocument();
     expect(screen.getByText(/about 0\.8 s to a search/)).toBeInTheDocument();
     const routing = screen.getByText("Routing", { selector: ".section-head" }).closest(".section-card") as HTMLElement;
     expect(within(routing).getByRole("switch", { name: /Tell conversations which accounts are open/ })).not.toBeChecked();

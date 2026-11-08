@@ -432,8 +432,7 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         err = f"{type(e).__name__}: {e}"
         nightly_steps = {
             k: {"ok": False, "applicable": True, "error": err}
-            for k in ("notes_reconcile_ok", "embed_provider_ok",
-                      "mark_stale_ok")
+            for k in ("notes_reconcile_ok", "embed_provider_ok")
         }
     # A step that has never been recorded is skipped, not red — a fresh
     # install or a Mac that just updated has nothing in nightly-last.json
@@ -933,13 +932,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         features_block = {"error": f"{type(e).__name__}: {e}"}
     rerank_block, rerank_warnings = _doctor_rerank()
     # Phase 2, session C: candidate supersession links awaiting review —
-    # visibility only, same posture as features_block above; never gates `ok`.
-    try:
-        from khipu import decisions as _decisions
-
-        decision_links_block = _decisions.candidate_link_count()
-    except Exception as e:  # noqa: BLE001 — a failed check must not crash doctor
-        decision_links_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # The worker threads' answers, joined in the order their not_configured
     # names and liveness rows used to be added.
     local = local_future.result()
@@ -1083,7 +1075,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         **({"project_renames": project_renames_block} if project_renames_block is not None else {}),
         "features": features_block,
         "rerank": rerank_block,
-        "decision_links": decision_links_block,
         "plan_usage": plan_usage_block,
         "routing": routing_block,
         # The routing log's size against its bound: green, yellow (compaction
@@ -1130,7 +1121,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "forget_list_ok": bool(forget_list_block.get("ok")),
         "notes_reconcile_ok": bool(nightly_steps.get("notes_reconcile_ok", {}).get("ok")),
         "embed_provider_ok": bool(nightly_steps.get("embed_provider_ok", {}).get("ok")),
-        "mark_stale_ok": bool(nightly_steps.get("mark_stale_ok", {}).get("ok")),
         "topics_embed_lag_ok": bool(topics_lag.get("ok")),
         "degraded_rate_ok": bool(degraded_rate.get("ok")),
         "launchers_ok": bool(launchers.get("ok")),
@@ -2645,116 +2635,6 @@ def _owed_page_cli(args: argparse.Namespace, project: str | None, status: str) -
     return 0
 
 
-def cmd_decisions(args: argparse.Namespace) -> int:
-    """O2 / Phase 2A: `khipu decisions list [--project] [--since] [--standing|
-    --superseded|--retracted|--all]`, `supersede OLD NEW [--reason] [--force]`,
-    `restore ID`, `retract ID --reason`, `links [--state]`, `confirm LINK_ID`,
-    `reject LINK_ID`, `backfill [--dry-run|--apply]`."""
-    from khipu.db import connect
-    from khipu import decisions as _decisions
-
-    sub_cmd = getattr(args, "decisions_cmd", None)
-
-    if sub_cmd == "supersede":
-        old_id, new_id = int(args.old_id), int(args.new_id)
-        reason = getattr(args, "reason", None)
-        force = bool(getattr(args, "force", False))
-        with connect() as conn:
-            with conn.cursor() as cur:
-                try:
-                    ok = _decisions.supersede(cur, old_id, new_id, reason=reason, force=force)
-                except ValueError as exc:
-                    print(json.dumps({"ok": False, "error": str(exc)}))
-                    return 1
-            conn.commit()
-        print(json.dumps({"ok": ok, "old_id": old_id, "new_id": new_id}))
-        return 0 if ok else 1
-
-    if sub_cmd == "restore":
-        decision_id = int(args.id)
-        with connect() as conn:
-            with conn.cursor() as cur:
-                try:
-                    ok = _decisions.restore(cur, decision_id)
-                except ValueError as exc:
-                    print(json.dumps({"ok": False, "error": str(exc)}))
-                    return 1
-            conn.commit()
-        print(json.dumps({"ok": ok, "id": decision_id}))
-        return 0 if ok else 1
-
-    if sub_cmd == "retract":
-        decision_id = int(args.id)
-        with connect() as conn:
-            with conn.cursor() as cur:
-                ok = _decisions.retract(cur, decision_id, getattr(args, "reason", None))
-            conn.commit()
-        print(json.dumps({"ok": ok, "id": decision_id}))
-        return 0 if ok else 1
-
-    if sub_cmd == "links":
-        with connect() as conn:
-            with conn.cursor() as cur:
-                rows = _decisions.list_links(
-                    cur, state=getattr(args, "state", None) or None,
-                    project=getattr(args, "project", None),
-                )
-        print(json.dumps(rows, indent=2, default=str))
-        return 0
-
-    if sub_cmd in ("confirm", "reject"):
-        link_id = int(args.link_id)
-        with connect() as conn:
-            with conn.cursor() as cur:
-                try:
-                    out = _decisions.resolve_link(cur, link_id, sub_cmd)
-                except ValueError as exc:
-                    print(json.dumps({"ok": False, "error": str(exc)}))
-                    return 1
-            conn.commit()
-        print(json.dumps(out, indent=2, default=str))
-        return 0 if out.get("ok") else 1
-
-    if sub_cmd == "backfill":
-        apply = bool(getattr(args, "apply", False))
-        with connect() as conn:
-            with conn.cursor() as cur:
-                report = _decisions.backfill_decisions(
-                    cur, apply=apply, limit=getattr(args, "limit", None)
-                )
-            if apply:
-                conn.commit()
-        print(json.dumps(report, indent=2, default=str))
-        return 0 if report.get("ok", True) else 1
-
-    # "list" (default)
-    since_raw = (getattr(args, "since", None) or "").strip()
-    since_dt = None
-    if since_raw:
-        from khipu.search_text import parse_time_filter
-
-        try:
-            since_dt = parse_time_filter(since_raw)
-        except ValueError as exc:
-            print(json.dumps({"ok": False, "error": f"--since: {exc}"}))
-            return 2
-    status = None
-    if getattr(args, "standing", False):
-        status = "standing"
-    elif getattr(args, "superseded", False):
-        status = "superseded"
-    elif getattr(args, "retracted", False):
-        status = "retracted"
-    elif getattr(args, "all", False):
-        status = "all"
-    with connect() as conn:
-        with conn.cursor() as cur:
-            rows = _decisions.list_decisions(
-                cur, project=getattr(args, "project", None), since=since_dt,
-                limit=int(getattr(args, "limit", None) or 50), status=status,
-            )
-    print(json.dumps(rows, indent=2, default=str))
-    return 0
 
 
 def _reembed_episode(cur, episode_id: int) -> bool:
@@ -3112,7 +2992,7 @@ def cmd_project_alias(args: argparse.Namespace) -> int:
 
 def cmd_hygiene(args: argparse.Namespace) -> int:
     """W5.2: `khipu hygiene paths [--dry-run|--apply]`, plus
-    `khipu hygiene commitments` (Owed quality, 2026-09-04)."""
+    `historical commitment cleanup` (Owed quality, 2026-09-04)."""
     if getattr(args, "hygiene_cmd", None) != "paths":
         print(json.dumps({
             "ok": False,
@@ -5923,52 +5803,7 @@ def build_parser() -> argparse.ArgumentParser:
     for writer in (hold, rpause, rlift, rclear, rnote, rprio, rrule, rdef, rtier, rcap):
         writer.add_argument("--op", default=None, help="Retry identity; reuse for the same change")
 
-    dec = sub.add_parser(
-        "decisions", help="Decisions registry: list / supersede / restore / retract / links (O2, Phase 2A)"
-    )
-    dec_sub = dec.add_subparsers(dest="decisions_cmd", required=True)
-    dec_list = dec_sub.add_parser("list", help="List decisions")
-    dec_list.add_argument("--project", default=None)
-    dec_list.add_argument("--since", default=None, help="ISO date or a window (7d, 24h)")
-    dec_list.add_argument("--limit", type=int, default=50)
-    dec_list_status = dec_list.add_mutually_exclusive_group()
-    dec_list_status.add_argument("--standing", action="store_true", help="Exclude superseded and retracted")
-    dec_list_status.add_argument("--superseded", action="store_true", help="Superseded only")
-    dec_list_status.add_argument("--retracted", action="store_true", help="Retracted only")
-    dec_list_status.add_argument("--all", action="store_true", help="Every row (default)")
-    dec_sup = dec_sub.add_parser("supersede", help="Mark OLD decision superseded by NEW")
-    dec_sup.add_argument("old_id", type=int)
-    dec_sup.add_argument("new_id", type=int)
-    dec_sup.add_argument("--reason", default=None, help="Why, in the user's own words")
-    dec_sup.add_argument(
-        "--force", action="store_true",
-        help="Allow superseding across different projects",
-    )
-    dec_restore = dec_sub.add_parser("restore", help="Undo a supersession")
-    dec_restore.add_argument("id", type=int)
-    dec_retract = dec_sub.add_parser("retract", help="Mark a decision wrong outright (not merely replaced)")
-    dec_retract.add_argument("id", type=int)
-    dec_retract.add_argument("--reason", default=None)
-    dec_links = dec_sub.add_parser("links", help="List supersede/conflict candidate links")
-    dec_links.add_argument("--project", default=None)
-    dec_links.add_argument(
-        "--state", default=None,
-        help="candidate | applied | rejected | restored (omit for every state)",
-    )
-    dec_confirm = dec_sub.add_parser("confirm", help="Confirm a candidate link, applying it")
-    dec_confirm.add_argument("link_id", type=int)
-    dec_reject = dec_sub.add_parser("reject", help="Reject a candidate link")
-    dec_reject.add_argument("link_id", type=int)
-    dec_bf = dec_sub.add_parser(
-        "backfill", help="Backfill the decisions table from existing episodes.decisions"
-    )
-    dec_bf.add_argument("--dry-run", dest="apply", action="store_false", default=False)
-    dec_bf.add_argument(
-        "--apply", dest="apply", action="store_true",
-        help="Actually write the backfill (idempotent; safe to re-run)",
-    )
-    dec_bf.add_argument("--limit", type=int, default=None)
-    dec.set_defaults(func=cmd_decisions)
+
 
     ep = sub.add_parser("episode", help="Episode maintenance (memory reliability W5.6)")
     ep_sub = ep.add_subparsers(dest="episode_cmd", required=True)

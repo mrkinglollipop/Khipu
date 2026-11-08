@@ -25,7 +25,7 @@
                           "prior_work.budget", "prior_work.items",
                           "search.filters", "search.hybrid"],
         "features": {
-          "auto_supersede": false, "decision_details": false,
+          
           "graph_candidates": false, "rerank": false,
           "time_interpretation": false, "validity_ranking": false
         }

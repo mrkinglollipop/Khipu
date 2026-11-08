@@ -616,10 +616,11 @@ def test_overlapping_carriers_new_evidence_under_g_lands_with_its_claims(pg):
     assert forget._forget_on_hub(db.connect, e, memory_root=pg.memory)["ok"]
     newer = {**pf, "summary": "New evidence collected after collateral forget",
              "open_loops": [{"text": CANON, "kind": "followup", "owner": "assistant"}]}
+    newer["deliverables"] = [{"kind": "file", "path": "docs/recovered-proof.md", "title": CANON}]
     assert source_key(newer) == g
     outbox.enqueue(newer, reason="new evidence under G")
     assert outbox.drain()["replayed"] == 1 and not outbox.jobs()
-    assert _rows(pg, "SELECT count(*) FROM commitments WHERE text = %s",
+    assert _rows(pg, "SELECT count(*) FROM deliverables WHERE title = %s",
                  (newer["open_loops"][0]["text"],)) == [(1,)]
     assert not _live(pg, f)
 
@@ -632,13 +633,14 @@ def test_a_distinct_capture_on_a_collateral_tombstones_legacy_key_lands(pg):
     distinct = {k: v for k, v in pf.items()
                 if k not in ("harness", "session_id", "transcript_range", "window_id", "part")}
     distinct["open_loops"] = [{"text": ALT, "kind": "followup", "owner": "assistant"}]
+    distinct["deliverables"] = [{"kind": "file", "path": "docs/recovered-proof.md", "title": ALT}]
     assert source_key(distinct) != g
     outbox.enqueue(distinct, reason="distinct source legacy collision")
     first = outbox.drain()
     assert first["failed"] == 1 and len(outbox.jobs()) == 1
     assert forget._forget_on_hub(db.connect, e, memory_root=pg.memory)["ok"]
     assert outbox.drain()["replayed"] == 1 and not outbox.jobs()
-    assert _rows(pg, "SELECT count(*) FROM commitments WHERE text = %s",
+    assert _rows(pg, "SELECT count(*) FROM deliverables WHERE title = %s",
                  (distinct["open_loops"][0]["text"],)) == [(1,)]
 
 
@@ -665,10 +667,11 @@ def test_7a2_p2_1_file_recovery_imports_g_beside_its_collateral_tombstone(pg, en
     assert forget._forget_on_hub(db.connect, e, memory_root=pg.memory)["ok"]
     assert g not in _refused(pg)
     pf["open_loops"] = [{"text": CANON, "kind": "followup", "owner": "assistant"}]
+    pf["deliverables"] = [{"kind": "file", "path": "docs/recovered-proof.md", "title": CANON}]
     _recover(pg, pf, entry)
     live = _live_ids(pg)
     assert len(live) == 1 and f not in live and not outbox.jobs(), live
-    assert _rows(pg, "SELECT count(*) FROM commitments WHERE text = %s", (CANON,)) == [(1,)]
+    assert _rows(pg, "SELECT count(*) FROM deliverables WHERE title = %s", (CANON,)) == [(1,)]
     assert _rows(pg, "SELECT count(*) FROM fact_claims WHERE episode_id = %s", (live[0],)) != [(0,)]
     _recover(pg, pf, entry)
     assert _live_ids(pg) == live and not outbox.jobs()
@@ -684,12 +687,13 @@ def test_7a2_p2_1_before_history_is_indexed_recovery_keeps_g_in_the_outbox(env):
     assert forget._forget_on_hub(db.connect, e, memory_root=env.memory)["ok"]
     assert g not in _refused(env)
     pf["open_loops"] = [{"text": CANON, "kind": "followup", "owner": "assistant"}]
+    pf["deliverables"] = [{"kind": "file", "path": "docs/recovered-proof.md", "title": CANON}]
     result = _recover(env, pf, "tail")
     assert result["inserted"] == 0 and len(outbox.jobs()) == 1
     assert f not in _live_ids(env)
     assert _index(env)["state"] == "ready"
     assert outbox.drain()["replayed"] == 1 and not outbox.jobs()
-    assert _rows(env, "SELECT count(*) FROM commitments WHERE text = %s", (CANON,)) == [(1,)]
+    assert _rows(env, "SELECT count(*) FROM deliverables WHERE title = %s", (CANON,)) == [(1,)]
 
 
 def test_7a2_p2_2_an_exact_retry_of_a_payload_key_capture_finds_its_live_episode(pg):
@@ -701,6 +705,7 @@ def test_7a2_p2_2_an_exact_retry_of_a_payload_key_capture_finds_its_live_episode
     pe = _payload(loop=None)
     pf = {"ts": "2026-10-23T17:01:02Z", "summary": "Synthetic payload-key capture for replay",
           "open_loops": [{"text": CANON, "kind": "followup", "owner": "assistant"}]}
+    pf["deliverables"] = [{"kind": "file", "path": "docs/recovered-proof.md", "title": CANON}]
     e, f = _write(pe), _write(dict(pf))
     shared = _payload(loop=None, summary="Source shared by both")
     _merge(pg, e, shared)
@@ -715,7 +720,7 @@ def test_7a2_p2_2_an_exact_retry_of_a_payload_key_capture_finds_its_live_episode
     outbox.enqueue(dict(pf), reason="exact replay after uncertain delivery")
     assert outbox.drain()["replayed"] == 1 and not outbox.jobs()
     assert _live_ids(pg) == [first["episode_id"]]
-    assert _rows(pg, "SELECT count(*) FROM commitments WHERE text = %s AND status = 'open'",
+    assert _rows(pg, "SELECT count(*) FROM deliverables WHERE title = %s",
                  (CANON,)) == [(1,)]
 
 

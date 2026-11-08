@@ -33,7 +33,7 @@ CREATE INDEX IF NOT EXISTS idx_commitments_opened_at
 CREATE UNIQUE INDEX IF NOT EXISTS uq_commitments_open_content
     ON commitments (project, content_hash) WHERE status = 'open';
 
--- Commitments join the embeddable corpus (open_from_episode embeds on the
+-- Commitments join the embeddable corpus (historical commitment capture embeds on the
 -- active profile via the existing embed helpers, same as episode/topic/media).
 ALTER TABLE memory_embeddings
     DROP CONSTRAINT IF EXISTS memory_embeddings_kind_check;

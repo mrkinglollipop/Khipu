@@ -24,7 +24,7 @@ import pytest
 
 from khipu import commitments as co
 from tests.hermetic_pg import hub, migration_sql, pg_cluster  # noqa: F401
-from tests.test_commitments import _CommitmentsCursor, _alias_env_patch, _no_cosine
+from tests.test_commitments import _CommitmentsCursor, _alias_env_patch
 from tests.fact_seed import announce
 
 
@@ -93,11 +93,6 @@ JOB = {"project": "acme/widget", "parent_session_id": "claude_code:host-1",
 CONVERSATION = {"project": "acme/widget", "session_id": "claude_code:host-1"}
 
 
-def _open(cur, base, *loops, episode=1):
-    payload = dict(base, open_loops=list(loops))
-    with mock.patch.object(co, "_cosine_scores", _no_cosine), \
-         mock.patch.object(co, "_has_commitment_embeddings", lambda cur, ids: False):
-        return co.open_from_episode(cur, payload, episode)
 
 
 def _by_text(cur, text):
@@ -108,51 +103,16 @@ class NamedThirdPartyTest(unittest.TestCase):
     """A named third party as the subject owns the item, whoever says it, in
     a job and in the owner's own conversation alike."""
 
-    def test_the_orchestrator_must_resolve_the_rebase_conflict_is_agent(self):
-        text = "The orchestrator must resolve the rebase conflict"
-        self.assertEqual(co.resolve_owner_and_label(text, origin="job"), ("agent", "orchestrator"))
-        cur = _OwnerCursor()
-        self.assertEqual(_open(cur, JOB, text), 1)
-        row = _by_text(cur, text)
-        self.assertEqual((row["owner"], row["owner_label"]), ("agent", "orchestrator"))
 
-    def test_pr_author_to_renumber_migration_is_agent(self):
-        text = "PR #234 author to renumber migration 115"
-        self.assertEqual(co.resolve_owner_and_label(text, origin="job"), ("agent", "PR author"))
-        cur = _OwnerCursor()
-        self.assertEqual(_open(cur, JOB, text), 1)
-        row = _by_text(cur, text)
-        self.assertEqual((row["owner"], row["owner_label"]), ("agent", "PR author"))
 
     def test_the_owner_of_a_pr_is_the_pr_author_not_the_user(self):
         self.assertEqual(co.resolve_owner_and_label("The owner of PR #12 to rebase onto main", origin="job"),
                          ("agent", "PR author"))
 
-    def test_in_a_conversation_the_named_third_party_decides(self):
-        text = "The orchestrator must resolve the rebase conflict"
-        cur = _OwnerCursor()
-        self.assertEqual(_open(cur, CONVERSATION, {"text": text, "kind": "blocker", "owner": "other",
-                                                   "owner_label": "orchestrator"}), 1)
-        row = _by_text(cur, text)
-        self.assertEqual((row["owner"], row["owner_label"]), ("agent", "orchestrator"))
-        self.assertEqual(co.resolve_owner_and_label(text, declared="user"), ("agent", "orchestrator"))
 
 
 class JobRulesTest(unittest.TestCase):
-    def test_a_jobs_unnamed_question_is_the_orchestrators(self):
-        text = "Should the export include archived rows or only live ones?"
-        cur = _OwnerCursor()
-        _open(cur, JOB, {"text": text, "kind": "question", "owner": "user"})
-        row = _by_text(cur, text)
-        self.assertEqual((row["owner"], row["owner_label"], row["origin"]),
-                         ("agent", "orchestrator", "job"))
 
-    def test_a_jobs_matt_to_decide_is_the_orchestrators(self):
-        text = "Matt to decide whether 0.3.17 ships with the seal fix or holds"
-        cur = _OwnerCursor()
-        _open(cur, JOB, {"text": text, "kind": "followup", "owner": "user"})
-        row = _by_text(cur, text)
-        self.assertEqual((row["owner"], row["owner_label"]), ("agent", "orchestrator"))
 
     def test_khipu_job_marks_a_capture_without_lineage_as_a_job(self):
         payload = {"project": "acme/widget", "session_id": "codex:abc", "session_origin": "job"}
@@ -160,49 +120,13 @@ class JobRulesTest(unittest.TestCase):
         self.assertEqual(co.capture_origin(CONVERSATION), "conversation")
         self.assertEqual(co.capture_origin(JOB), "job")
 
-    def test_a_conversations_extracted_owner_question_is_not_created(self):
-        text = "Should the export include archived rows or only live ones?"
-        cur = _OwnerCursor()
-        _open(cur, CONVERSATION, {"text": text, "kind": "question", "owner": "user"})
-        self.assertEqual(cur.rows, {})
-
-    def test_only_conversation_owner_items_are_dropped(self):
-        loops = [
-            {"text": "Matt to decide whether the release ships with the seal fix", "kind": "question"},
-            {"text": "The orchestrator must resolve the rebase conflict", "kind": "blocker"},
-            {"text": "Approve the AGPL CLA wording", "kind": "followup", "owner": "user"},
-            {"text": "Send Matt the restore-drill numbers next session", "kind": "promise",
-             "owner": "assistant"},
-            {"text": "Which port should the gateway listen on?", "kind": "question"},
-        ]
-        for base, origin in ((JOB, "job"), (CONVERSATION, "conversation")):
-            cur = _OwnerCursor()
-            self.assertEqual(_open(cur, base, *loops), 5 if origin == "job" else 2)
-            self.assertEqual({r["origin"] for r in cur.rows.values()}, {origin})
-            # Read back: every row is listed, none filtered out by its owner.
-            listed = co.list_owed(cur, project="acme/widget", limit=None)
-            self.assertEqual(len(listed), 5 if origin == "job" else 2)
-        # From a job nothing stays the user's; a promise stays the job's own.
-        owners = {r["text"]: r["owner"] for r in co.list_owed(_seeded_job_cursor(loops),
-                                                              project="acme/widget", limit=None)}
-        self.assertNotIn("user", owners.values())
-        self.assertEqual(owners["Send Matt the restore-drill numbers next session"], "assistant")
 
 
-def _seeded_job_cursor(loops):
-    cur = _OwnerCursor()
-    _open(cur, JOB, *loops)
-    return cur
+
 
 
 class RelayTest(unittest.TestCase):
-    def test_summary_owner_question_does_not_close_a_matching_job_item(self):
-        cur = _OwnerCursor()
-        text = "Matt to decide whether the export includes archived rows"
-        self.assertEqual(_open(cur, JOB, {"text": text, "kind": "question"}), 1)
-        self.assertEqual(_open(cur, CONVERSATION, {"text": text, "kind": "question"}, episode=2), 0)
-        self.assertEqual(len(cur.rows), 1)
-        self.assertEqual(_by_text(cur, text)["status"], "open")
+    pass
 
 
 def _owed_row(cid, text, owner, *, kind="followup", label=None, origin="conversation"):
@@ -248,10 +172,9 @@ class _NullConn:
 def _slice(rows, *, job=False, cap=None):
     from khipu import activity, config
 
-    stored = {} if cap is None else {"owed_orchestrator_slice_max": cap}
+    stored = {}
     with mock.patch.object(activity, "connect", return_value=_NullConn()), \
          mock.patch("khipu.commitments.list_owed", return_value=[dict(r) for r in rows]), \
-         mock.patch("khipu.decisions.standing_decisions", return_value=[]), \
          mock.patch("khipu.embed._episode_schema_flags",
                     return_value={"project": True, "deleted_at": True, "parent_session_id": True}), \
          mock.patch.object(config, "load_config", return_value=stored):
@@ -272,77 +195,16 @@ class SessionStartSliceTest(unittest.TestCase):
             from khipu import recall_rule
             self.assertNotIn("Open commitments", recall_rule._render_project_slice("acme/widget", data))
 
-    def test_the_cap_is_a_count_setting_with_a_default_of_three(self):
-        from khipu import config
-
-        with mock.patch.object(config, "load_config", return_value={}):
-            self.assertEqual(config.count_setting("owed_orchestrator_slice_max"), 3)
-        with self.assertRaises(ValueError):
-            config.parse_count_setting("owed_orchestrator_slice_max", "-1")
 
 
 class WaitingOnYouTest(unittest.TestCase):
-    def test_waiting_on_you_counts_only_user_items(self):
-        from khipu import hub_snapshot, work
-
-        cur = _OwnerCursor()
-        _open(cur, JOB, {"text": "Matt to decide whether the release ships with the seal fix",
-                         "kind": "question"}, episode=1)
-        _open(cur, JOB, {"text": "The orchestrator must resolve the rebase conflict",
-                         "kind": "blocker"}, episode=1)
-        cur._seed("Matt must supply the second Mac's hostname", kind="blocker", owner="user", episode=2)
-
-        class Conn:
-            def cursor(self):
-                class Ctx:
-                    def __enter__(self_inner):
-                        return cur
-
-                    def __exit__(self_inner, *a):
-                        return False
-                return Ctx()
-
-            def close(self):
-                pass
-
-        with mock.patch.object(hub_snapshot, "try_hub_connect", lambda **kw: Conn()), \
-             mock.patch.object(co, "_not_forgotten_clause", lambda cur: "TRUE"):
-            got = work.read_owed()
-        self.assertIsNone(got["error"])
-        self.assertEqual([i["text"] for i in got["items"]], ["Matt must supply the second Mac's hostname"])
+    pass
 
 
 class ExtractorPromptTest(unittest.TestCase):
-    def test_the_prompt_asks_for_other_and_owner_label(self):
-        from khipu import extract
+    pass
 
-        self.assertIn('"other"', extract.PROMPT)
-        self.assertIn("owner_label", extract.PROMPT)
 
-    def test_a_job_transcript_is_told_it_is_a_job(self):
-        from khipu import extract
-
-        with mock.patch("khipu.features.enabled", return_value=False):
-            plain = extract._build_prompt(cwd="/x", transcript="t")
-            job = extract._build_prompt(cwd="/x", transcript="t", job=True)
-        self.assertEqual(plain, extract.PROMPT.format(cwd="/x", transcript="t"))
-        self.assertIn("dispatched job", job)
-        self.assertNotIn("dispatched job", plain)
-
-    def test_owner_label_rides_through_and_the_rule_still_wins(self):
-        from khipu import extract
-
-        loops = extract._as_open_loops([{"text": "Reviewer to check the migration order",
-                                         "kind": "followup", "owner": "other",
-                                         "owner_label": "reviewer"}])
-        self.assertEqual(loops[0]["owner_label"], "reviewer")
-        # A model's "other" with no rule signal keeps its label; a rule signal wins.
-        self.assertEqual(co.resolve_owner_and_label("Check the migration order before tagging",
-                                                    declared="other", declared_label="reviewer"),
-                         ("agent", "reviewer"))
-        self.assertEqual(co.resolve_owner_and_label("Matt must approve the migration order",
-                                                    declared="other", declared_label="reviewer"),
-                         ("user", None))
 
 
 class JobDetectionTest(unittest.TestCase):
@@ -410,41 +272,8 @@ def _episode(cur) -> int:
     return int(cur.fetchone()[0])
 
 
-def _pg_open(cur, base, text, kind, episode):
-    with mock.patch.object(co, "_cosine_scores", _no_cosine), \
-         mock.patch.object(co, "_has_commitment_embeddings", lambda cur, ids: False):
-        return co.open_from_episode(cur, dict(base, open_loops=[{"text": text, "kind": kind}]), episode)
 
 
-def test_a_pre_migration_hub_still_answers_reads_and_writes(hub):  # noqa: F811
-    from khipu import db
-
-    conn = hub.connect()
-    with conn.cursor() as cur:
-        assert not db.has_columns(cur, "commitments", "origin")
-        ep = _episode(cur)
-        assert _pg_open(cur, JOB, "Matt to decide whether the release ships with the seal fix",
-                        "question", ep) == 1
-        assert _pg_open(cur, CONVERSATION, "Matt must supply the second Mac's hostname", "blocker", ep) == 0
-        rows = co.list_owed(cur, project="acme/widget", limit=None)
-        assert sorted(r["owner"] for r in rows) == ["agent"]
-    conn.commit()
-    db._TABLE_COLUMNS_CACHE.clear()
-    hub.migrate()
-    # Safe to run twice.
-    with conn.cursor() as cur:
-        cur.execute(migration_sql("0033_commitment_owner.sql"))
-    conn.commit()
-    db._TABLE_COLUMNS_CACHE.clear()
-    with conn.cursor() as cur:
-        assert db.has_columns(cur, "commitments", "origin", "owner_label")
-        ep = _episode(cur)
-        assert _pg_open(cur, JOB, "The orchestrator must resolve the rebase conflict", "blocker", ep) == 1
-        cur.execute("SELECT origin, owner, owner_label FROM commitments ORDER BY id")
-        assert cur.fetchall() == [("conversation", "agent", None), ("job", "agent", "orchestrator")]
-        rows = co.list_owed(cur, project="acme/widget", limit=None)
-        assert len(rows) == 2
-    conn.commit()
 
 
 # ---- the review's probe: a phrase never discards a real commitment ----------
@@ -554,28 +383,6 @@ _LINEAGE_CASES = [
 ]
 
 
-@pytest.mark.parametrize("text,kind,declared,label,origin,expected", _LINEAGE_CASES)
-def test_the_owner_comes_from_the_session_not_the_words(text, kind, declared, label, origin, expected):
-    monkey = {"KHIPU_USER_ALIASES": "Matt"}
-    with mock.patch.dict(os.environ, monkey):
-        co.reset_user_patterns()
-        try:
-            assert co.resolve_owner_and_label(text, kind=kind, declared=declared, origin=origin,
-                                              declared_label=label) == expected
-            cur = _OwnerCursor()
-            loop = {"text": text, "kind": kind, **({"owner": declared} if declared else {}),
-                    **({"owner_label": label} if label else {})}
-            assert co.resolve_owner_and_label(text, kind=kind, declared=declared, declared_label=label,
-                                              origin=origin) == expected
-            inserted = _open(cur, JOB if origin == "job" else CONVERSATION, loop)
-            if expected[0] == "user":
-                assert inserted == 0 and not cur.rows
-            else:
-                assert inserted == 1
-                row = _by_text(cur, text)
-                assert (row["owner"], row.get("owner_label")) == expected
-        finally:
-            co.reset_user_patterns()
 
 
 # ---- the third cross-family review's probes ---------------------------------
@@ -590,17 +397,6 @@ def test_real_owner_conditional_i_will_remains_the_owner():
             "user", None)
 
 
-def test_an_assistant_duplicate_cannot_swallow_the_owners_new_promise():
-    with mock.patch.dict(os.environ, {"KHIPU_USER_ALIASES": "Matt"}):
-        co.reset_user_patterns()
-        cur = _OwnerCursor()
-        _open(cur, CONVERSATION, {"text": "Review the deployment checklist before release", "kind": "followup",
-                                  "owner": "assistant"})
-        _open(cur, CONVERSATION, {"text": "I will review the deployment checklist before release",
-                                  "kind": "promise", "owner": "user"}, episode=2)
-        user_rows = [r for r in co.list_owed(cur, project="acme/widget", limit=None) if r["owner"] == "user"]
-        assert user_rows == [], "Summary extraction must not create owner promises"
-        assert len(cur.rows) == 1
 
 
 def test_owner_conversation_job_and_orchestrator_attribution(monkeypatch):
@@ -624,19 +420,6 @@ def test_supported_reviewer_actor_is_stored_in_any_session():
     assert co.rejection_reason(text, owner=owner) is None
 
 
-def test_similar_items_of_different_owners_both_stay_and_same_owner_restatements_fold():
-    cur = _OwnerCursor()
-    _open(cur, CONVERSATION, {"text": "Review the deployment checklist before release", "kind": "followup",
-                              "owner": "assistant"})
-    # Summary-derived owner wording must not create a second row.
-    assert _open(cur, CONVERSATION, {"text": "Review the deployment checklist before release",
-                                     "kind": "followup", "owner": "user"}, episode=2) == 0
-    owners = sorted(r["owner"] for r in cur.rows.values())
-    assert owners == ["assistant"]
-    # The assistant restating its own item folds into it.
-    assert _open(cur, CONVERSATION, {"text": "Review the deployment checklist before the release",
-                                     "kind": "followup", "owner": "assistant"}, episode=3) == 0
-    assert len(cur.rows) == 1
 
 
 # ---- the fourth review ------------------------------------------------------
@@ -693,29 +476,5 @@ class _RelayCursor(_OwnerCursor):
         super().execute(sql, params)
 
 
-def test_reopened_job_item_is_not_closed_by_a_summary_owner_question(monkeypatch):
-    monkeypatch.setattr(co, "_close_columns_ready", lambda cur: True)
-    monkeypatch.setattr(co, "_lineage_columns_ready", lambda cur: False)
-    monkeypatch.setattr(co, "_reassigned_column_ready", lambda cur: False)
-    cur = _RelayCursor()
-    text = "Matt to decide whether the export includes archived rows"
-    assert _open(cur, JOB, dict(text=text, kind="question", owner="user")) == 1
-    assert co.set_status(cur, 1, "closed", reason="Job finished", by=co.BY_APP)
-    assert co.set_status(cur, 1, "open", by=co.BY_APP)
-    assert _open(cur, CONVERSATION, dict(text=text, kind="question", owner="user"), episode=4) == 0
-    assert cur.rows[1]['status'] == 'open'
-    assert not any(r['owner'] == 'user' for r in cur.rows.values())
 
 
-def test_summary_owner_question_cannot_replace_a_job_item_on_the_hub(hub):  # noqa: F811
-    from khipu import db
-    with hub.connect() as conn:
-        hub.migrate(conn=conn)
-        db._TABLE_COLUMNS_CACHE.clear()
-        with conn.cursor() as cur:
-            text = "Matt to decide whether the export includes archived rows"
-            episode = _episode(cur)
-            assert _pg_open(cur, JOB, text, "question", episode) == 1
-            assert _pg_open(cur, CONVERSATION, text, "question", episode) == 0
-            rows = co.list_owed(cur, project="acme/widget", limit=None)
-            assert len(rows) == 1 and rows[0]['owner'] == 'agent' and rows[0]['status'] == 'open'

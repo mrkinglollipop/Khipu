@@ -8,9 +8,8 @@ from unittest.mock import patch
 
 import pytest
 
-from khipu import commitments as co, db, hub_snapshot as hs
+from khipu import commitments as co, hub_snapshot as hs
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
-from tests.fact_seed import announce
 from tests.replica_copy import certify
 
 
@@ -79,47 +78,6 @@ def test_recall_graph_expansion_obeys_requested_filters(monkeypatch, semantic, f
     con.close()
 
 
-def test_decision_alias_supersession_through_mcp():
-    from khipu import mcp_server as srv, decisions, owner_writes
-
-    con = sqlite3.connect(':memory:')
-    con.executescript('''
-    CREATE TABLE project_aliases(alias TEXT, project TEXT);
-    INSERT INTO project_aliases VALUES('owner/old-name','owner/new-name');
-    CREATE TABLE decisions(id INTEGER, project TEXT, text TEXT, rationale TEXT, decided_at TEXT, episode_id INTEGER, session_id TEXT, superseded_by INTEGER, created_at TEXT);
-    INSERT INTO decisions VALUES(1,'owner/old-name','Use old implementation',NULL,'2026-10-20',NULL,NULL,NULL,'2026-10-20');
-    INSERT INTO decisions VALUES(2,'owner/new-name','Use corrected implementation',NULL,'2026-10-21',NULL,NULL,NULL,'2026-10-21');
-    ''')
-    class Cursor:
-        @property
-        def rowcount(self): return self.inner.rowcount
-        def __enter__(self): return self
-        def __exit__(self,*_): pass
-        def execute(self, sql, params=()):
-            self.inner=con.execute(sql.replace('%s','?').replace(' FOR UPDATE',''),params)
-            return self
-        def fetchone(self): return self.inner.fetchone()
-        def fetchall(self): return self.inner.fetchall()
-    class Conn:
-        def __enter__(self): return self
-        def __exit__(self,*_): pass
-        def cursor(self): return Cursor()
-
-    with patch.object(db,'connect',return_value=Conn()), patch.object(decisions,'_evidence_ready',return_value=False), patch.object(decisions,'_links_ready',return_value=False), patch.object(decisions,'_not_forgotten_clause',return_value=None), patch.object(owner_writes,'annotate',return_value={}), patch.object(owner_writes,'run',side_effect=lambda _tool,args,**_:srv._decisions_update_on_hub(args)), patch.object(owner_writes,'apply_on_hub',side_effect=lambda conn,cur,tool,args,write,echo:write()):
-        # Adapt PostgreSQL ANY without replacing the real alias resolver.
-        original_execute=Cursor.execute
-        def execute(self, sql, params=()):
-            if 'project = ANY(%s)' in sql:
-                params=list(params)
-                group=params.pop(0)
-                sql=sql.replace('project = ANY(%s)','project IN ('+','.join('%s' for _ in group)+')')
-                params=[*group,*params]
-            return original_execute(self,sql,params)
-        Cursor.execute=execute
-        result=srv._tool_decisions({'project':'owner/new-name','status':'all'})
-        assert {r['project'] for r in result['results']} == {'owner/new-name'}
-        srv._tool_decisions_update({'action':'supersede','id':1,'by':2})
-        assert con.execute('SELECT superseded_by FROM decisions WHERE id=1').fetchone()[0] == 2
 
 
 @pytest.mark.parametrize('version', [6, 8, hs.SNAPSHOT_SCHEMA_VERSION])

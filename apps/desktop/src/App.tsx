@@ -859,7 +859,6 @@ const NOT_CONFIGURED_LABEL: Record<string, string> = {
   // a Mac that just updated) — skipped, not red; see healthRows.tsx LABELS.
   notes_reconcile: "Notes reconciled by the nightly",
   embed_provider: "Embedding provider reachable",
-  mark_stale: "Stale commitments aged out",
 };
 
 /** Milliseconds, as a person reads them: sub-second in ms, above that in
@@ -1439,7 +1438,7 @@ export default function App() {
   }, [owedPages]);
   const [owedMoreBusy, setOwedMoreBusy] = useState<OwedListKey | null>(null);
   // Many at once (slice 5): the ids ticked in the open list, the dialog for
-  // Close… or Move to…, and Tidy this list….
+  // Close… or Move to….
   const [owedSelected, setOwedSelected] = useState<ReadonlySet<number>>(new Set());
   const [owedChangeMode, setOwedChangeMode] = useState<"close" | "move" | null>(null);
   const [owedStatus, setOwedStatus] = useState<OwedStatus>("open");
@@ -2601,12 +2600,9 @@ export default function App() {
     void loadOwed("open", false);
   }, [dsnOk, owedOpenCount, loadOwed]);
 
-  // Owed changes underneath the app: an agent closes an item, a capture
-  // auto-closes one, the nightly merges duplicates. The screen used to show
-  // whatever it read when the tab opened until someone pressed Refresh
-  // (Matt, 2026-09-05: "does it update near immediately?"). Re-read every
-  // minute while Owed is open, and whenever the window regains focus; the
-  // badge alone is refreshed on the same cadence from any tab.
+  // Other conversations can change these items. Re-read every minute while
+  // Owed is open and whenever the window regains focus; refresh the badge
+  // on the same cadence from any tab.
   useEffect(() => {
     if (!dsnOk) return;
     const refresh = () => {
@@ -6512,8 +6508,7 @@ export default function App() {
         </div>
       </Dialog>
 
-      {/* Owed, many at once: Close… / Move to… with a reason, and Tidy this
-          list…, each through its own fixed-argv command. */}
+      {/* Manual bulk changes use their fixed-argv command. */}
       <OwedChangeDialog
         mode={owedChangeMode}
         count={owedSelected.size}

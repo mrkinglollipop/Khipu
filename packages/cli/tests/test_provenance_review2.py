@@ -191,7 +191,7 @@ def test_poison_gap_prefix_does_not_starve_healthy_new_gap(pg):
     real = provenance.record_claim
 
     def fail_all(cur, kind, *a, **kw):
-        if kind == "decision":
+        if kind == "deliverable":
             raise RuntimeError("synthetic first-pass failure")
         return real(cur, kind, *a, **kw)
 
@@ -199,12 +199,12 @@ def test_poison_gap_prefix_does_not_starve_healthy_new_gap(pg):
     with mock.patch.object(provenance, "record_claim", fail_all):
         for i in range(provenance.GAP_REPLAY_LIMIT + 1):
             ids.append(capture.write_pg(_payload(
-                loop=None, decision=f"Use release policy {i} for subsystem {i}"))["episode_id"])
+                loop=None, title=f"Release policy {i}", path=f"docs/release-policy-{i}.md"))["episode_id"])
     healthy = ids[-1]
     attempted = []
 
     def fail_prefix(cur, kind, *a, **kw):
-        if kind == "decision":
+        if kind == "deliverable":
             attempted.append(kw.get("episode_id"))
             if kw.get("episode_id") != healthy:
                 raise RuntimeError("persistent malformed old input")
@@ -215,7 +215,7 @@ def test_poison_gap_prefix_does_not_starve_healthy_new_gap(pg):
             provenance.replay_gaps(conn)
             provenance.replay_gaps(conn)
     with pg.connect() as conn:
-        facts = conn.execute("SELECT count(*) FROM decisions WHERE episode_id=%s", (healthy,)).fetchone()[0]
+        facts = conn.execute("SELECT count(*) FROM deliverables WHERE episode_id=%s", (healthy,)).fetchone()[0]
     assert healthy in attempted and facts == 1
 
 
@@ -227,23 +227,25 @@ def test_current_file_recovery_can_import_fact_bearing_episode(pg, method):
     """A current recovery writer imports a missing fact-bearing file row
     with its claims (the writer gate refused it on bb0be6de)."""
     pg.memory.mkdir()
-    payload = _payload(loop=None, decision="Keep the release train weekly")
+    payload = _payload(loop=None, decision="Keep the release train weekly", title="Release checklist")
     (pg.memory / "episodes.jsonl").write_text(json.dumps(payload) + "\n")
     getattr(mirror, method)(pg.memory)
     with pg.connect() as conn:
-        rows = conn.execute("SELECT summary FROM episodes").fetchall()
-        claims = conn.execute("SELECT count(*) FROM fact_claims WHERE kind='decision'").fetchone()[0]
-    assert rows == [(payload["summary"],)]
+        rows = conn.execute("SELECT summary, decisions FROM episodes").fetchall()
+        assert conn.execute("SELECT count(*) FROM decisions").fetchone() == (0,)
+        claims = conn.execute("SELECT count(*) FROM fact_claims WHERE kind='deliverable'").fetchone()[0]
+    assert rows == [(payload["summary"], payload["decisions"])]
     assert claims == 1
 
 
 def test_current_legacy_mirror_deferral_has_durable_outbox_recovery(pg):
     """Control: a bare mirror refusal is queued by mirror_after_capture."""
-    payload = _payload(loop=None, decision="Keep the release train weekly")
+    payload = _payload(loop=None, decision="Keep the release train weekly", title="Release checklist")
     assert mirror.mirror_after_capture(payload) is None
     assert len(outbox.jobs()) == 1
     report = outbox.drain()
     assert report["replayed"] == 1 and not outbox.jobs(), report
     with pg.connect() as conn:
-        assert conn.execute("SELECT count(*) FROM episodes").fetchone() == (1,)
-        assert conn.execute("SELECT count(*) FROM fact_claims WHERE kind='decision'").fetchone() == (1,)
+        assert conn.execute("SELECT decisions FROM episodes").fetchall() == [(payload["decisions"],)]
+        assert conn.execute("SELECT count(*) FROM decisions").fetchone() == (0,)
+        assert conn.execute("SELECT count(*) FROM fact_claims WHERE kind='deliverable'").fetchone() == (1,)

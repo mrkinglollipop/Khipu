@@ -307,7 +307,7 @@ synthetic; no slice reads a real tracker or writes the live hub.
 
 ### Slice 1: owner and origin at capture (M)
 
-Inspect `commitments.py` (`resolve_owner`, `_user_signal`, `open_from_episode`, `close_session_plan`,
+Inspect `commitments.py` (`resolve_owner`, `_user_signal`, `historical commitment capture`, `historical session closure`,
 `finish_owed_rows`), `extract.py` (`PROMPT`, `_as_open_loops`) and how `session_capture.py` fills
 `parent_session_id` before writing the migration and the rules.
 
@@ -322,7 +322,7 @@ Inspect `commitments.py` (`resolve_owner`, `_user_signal`, `open_from_episode`, 
 
 ### Slice 2: auto-close by pull request and by decision (M)
 
-Inspect `auto_close`, `set_status`, `work.py`'s summary reader and `ledger.py`'s `refs` before writing.
+Inspect `historical closing`, `set_status`, `work.py`'s summary reader and `ledger.py`'s `refs` before writing.
 
 - Build: `prs` parsing and backfill; the three PR sources; the all-PRs-done rule; decision settles with the
   strict match and "Looks settled" suggestions; `close_reason`, `closed_by`, `close_rule_key`; reopen
@@ -403,7 +403,7 @@ Matt approved this scope and answered its questions:
 7. **Staleness never hides Matt's items.** Recommended by the orchestrator under Matt's no-loss rule, because
    aging his items into `stale` after weeks of silence broke the invariant that nothing automatic closes,
    merges, hides or reassigns an item he owns. Staleness is now an automatic rule (`stale` in
-   `commitments.AUTOMATIC_RULES`), so `mark_stale` passes the owner guard and leaves his items open. An item
+   `commitments.AUTOMATIC_RULES`), so `historical aging` passes the owner guard and leaves his items open. An item
    of his unmentioned past the window that would stale anyone else's (14 days for a follow-up or promise, 30
    for a blocker or question, a live snooze excepted) carries `quiet_weeks` and lists after his active items:
    in the app's Owed under Needs you as one "Quiet for N weeks" group per week count, and in `khipu_owed` and
@@ -432,8 +432,8 @@ and his own "done" in a conversation).
   app with one tap: **Close all that look done**, or **Close** on one item. A reopen after such a close
   withdraws the suggestion and remembers its evidence, so the same evidence never suggests it again.
 - **Job and orchestrator items keep auto-close** by finished-PR evidence and the other rules, as before.
-- **The single write path enforces it.** `commitments.close_by_rule`, `commitments.auto_reassign` and
-  `commitments.mark_stale` read the item's owner under the row lock at the moment of the write, never from
+- **The single write path enforces it.** `commitments.historical close rule`, `commitments.historical owner assignment` and
+  `commitments.historical aging` read the item's owner under the row lock at the moment of the write, never from
   the caller's earlier read, and the write itself repeats the check (the stored owner must still be the one
   read). An automatic writer that finds the owner is Matt is refused; a close becomes a Looks done
   suggestion, an owner change stays a clean-up proposal. `tests/test_owed_owner_guard.py` enumerates every
@@ -444,7 +444,7 @@ and his own "done" in a conversation).
   owners. The guard (`commitments.row_guard`) reads the stored owner, so a legacy item stored as Matt's
   is his however its text reads today, and the clean-up keeps any change to it as a proposal, whatever
   owner it would propose.
-- **Every close waits on every pull request.** `close_by_rule` refuses to close any item while a pull
+- **Every close waits on every pull request.** `historical close rule` refuses to close any item while a pull
   request it was ever said to need (its text, latest wording, stored `prs` and other repositories' refs)
   is not shown merged or closed, by the PR rule's records or by git or gh lines in the evidence. A rule
   with no such evidence (an ended session, a duplicate, a relay, a re-judge) leaves it for the PR rule.

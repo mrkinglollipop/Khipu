@@ -32,7 +32,6 @@ import textwrap
 import random
 import threading
 import time
-from pathlib import Path
 from unittest import mock
 
 import psycopg
@@ -40,7 +39,6 @@ import pytest
 
 from khipu import capture, commitments as co, decisions, deliverables, forget, outbox, provenance
 from tests.hermetic_pg import chain_dir, hub, migration_sql, pg_cluster  # noqa: F401
-from tests.fact_seed import announce
 
 PROJECT = "acme/widget"
 BEFORE = "0044"
@@ -65,7 +63,6 @@ def env(hub, monkeypatch, tmp_path):  # noqa: F811
     monkeypatch.setattr(embed, "embed_one", mock.Mock(side_effect=RuntimeError("no provider")))
     monkeypatch.setattr(topic_graph, "persist_capture_graph", lambda *a, **kw: {})
     monkeypatch.setattr(outbox, "_queued_origin", lambda: {"origin": None})
-    monkeypatch.setattr(co, "_has_commitment_embeddings", lambda cur, ids: False)
     monkeypatch.setattr(capture, "_dedup_candidates", lambda cur, payload: [])
 
     def migrate():
@@ -111,15 +108,28 @@ def _capture(**kw) -> int:
     out = capture.write_pg(payload)
     assert out["episode_inserted"], out
     eid = int(out["episode_id"])
-    if kw.get("owner") == "user" and payload.get("open_loops"):
-        from khipu import db
-        from tests.fact_seed import owner_commitment
-        with db.connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT id FROM commitments WHERE project = %s AND owner = 'user' AND status = 'open'",
-                        (payload['project'],))
-            if cur.fetchone() is None:
-                loop = payload['open_loops'][0]
-                owner_commitment(cur, loop['text'], project=payload['project'], episode_id=eid, kind=loop['kind'])
+    from khipu import db
+    from tests.fact_seed import archived_facts
+    with db.connect() as conn, conn.cursor() as cur:
+        words = (payload.get("open_loops") or [{}])[0].get("text")
+        legacy_original = {
+            ALT: CANON,
+            "Review the deployment checklist before the release ships": CANON,
+            CANON + " today": CANON,
+            ALT + " today": CANON,
+            CANON + " for PR #41": CANON,
+            "Review the release checklist before the launch in PR #41":
+                "Review the release checklist before the launch",
+            "I will review the deployment checklist before the release":
+                "I will review the deployment checklist before release",
+        }.get(words)
+        restates = None
+        if legacy_original:
+            cur.execute("SELECT id FROM commitments WHERE project = %s AND text = %s ORDER BY id LIMIT 1",
+                        (PROJECT, legacy_original))
+            old = cur.fetchone()
+            restates = old[0] if old else None
+        archived_facts(cur, payload, eid, restates=restates)
     return eid
 
 
@@ -139,10 +149,12 @@ def _rows(hub, sql, params=()):  # noqa: F811
 def _readers(hub) -> str:  # noqa: F811
     """Everything the hub's readers return for the project, as one string."""
     with hub.connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM episodes WHERE project = %s AND deleted_at IS NULL", (PROJECT,))
+        episode_ids = [r[0] for r in cur.fetchall()]
         out = {
             "open": co.list_owed(cur, project=PROJECT, limit=None),
             "closed": co.list_owed(cur, project=PROJECT, status="closed", limit=None),
-            "decisions": decisions.list_decisions(cur, project=PROJECT, status="all", limit=500),
+            "decisions": decisions.decision_rows_for_episodes(cur, episode_ids, with_text=True),
             "deliverables": deliverables.recent_deliverables(cur, project=PROJECT),
         }
         conn.rollback()
@@ -222,8 +234,9 @@ def test_r1_a_capture_during_the_uncommitted_migration_waits_then_claims(env):
         result["out"] = capture.write_pg(_payload(loop=ALT))
     b = int(result["out"]["episode_id"])
     assert _rows(env, "SELECT field FROM fact_claims WHERE episode_id = %s AND kind = 'commitment'",
-                 (b,)) == [("restatement",)]
-    assert [r[2] for r in _visible_commitments(env)] == [ALT]
+                 (b,)) == []
+    assert _rows(env, "SELECT raw->'open_loops'->0->>'text' FROM episodes WHERE id = %s", (b,)) == [(ALT,)]
+    assert [r[2] for r in _visible_commitments(env)] == [None]
     _forget(env, b)
     assert [r[1:] for r in _visible_commitments(env)] == [(CANON, None)]
     assert ALT not in _readers(env)
@@ -278,30 +291,6 @@ def test_r3_a_negative_readiness_answer_is_not_kept(env):
     assert ALT not in _readers(env)
 
 
-def test_r5_owner_wording_and_owner_fields_survive_a_forget(pg):
-    """First review #5, in this model's terms: owner-authored wording is an
-    owner claim (create_decision), and owner fields are never written."""
-    a = _capture(decision="Keep the release train weekly")
-    b = _capture()
-    with pg.connect() as conn, conn.cursor() as cur:
-        did = decisions.create_decision(cur, project=PROJECT, text="Keep the release train weekly")
-        cid = cur.execute("SELECT id FROM commitments").fetchone()[0]
-        assert co.reassign(cur, cid, "user", by=co.BY_APP, reason="mine")
-        assert co.set_status(cur, cid, "stale")
-        assert co.set_status(cur, cid, "open")
-        conn.commit()
-    snap = _owner_fields(pg, cid)
-    _forget(pg, a)
-    assert _owner_fields(pg, cid) == snap
-    assert _rows(pg, "SELECT id, text, episode_id, retracted_at FROM decisions") == [
-        (did, "Keep the release train weekly", None, None)]
-    _forget(pg, b)
-    # No live claim is left on the commitment: it retires, and only its
-    # status moves; every other owner field stays on the row.
-    after = _owner_fields(pg, cid)
-    assert {k: v for k, v in after.items() if k not in ("status", "closed_at", "close_reason")} == \
-        {k: v for k, v in snap.items() if k not in ("status", "closed_at", "close_reason")}
-    assert after["close_reason"] == "forgotten"
 
 
 _OWNER_COLS = ("status", "closed_at", "close_reason", "owner", "owner_label", "owner_reassigned_at",
@@ -443,7 +432,7 @@ def test_p2_1_concurrent_captures_and_forgets_lose_no_fact_step(pg, backfilled):
     live = {e for (e,) in _rows(pg, "SELECT id FROM episodes WHERE deleted_at IS NULL")}
     for eid in live:
         kinds = {k for (k,) in _rows(pg, "SELECT DISTINCT kind FROM fact_claims WHERE episode_id = %s", (eid,))}
-        assert kinds == {"commitment", "decision", "deliverable"}, (eid, kinds)
+        assert kinds == {"deliverable"}, (eid, kinds)
     _assert_projection(pg)
     _assert_forgotten_unreadable(pg)
 
@@ -588,12 +577,12 @@ def test_t2_live_mixed_kind_witness_keeps_its_wording(pg):
 # ---- third review #3: a real statement timeout through the outbox ---------------------------
 
 
-def test_t3_a_statement_timeout_on_a_fact_lock_keeps_the_job(pg, monkeypatch):
+def test_a_statement_timeout_on_a_deliverable_lock_keeps_the_job(pg, monkeypatch):
     from khipu import db
 
-    _capture()
+    _capture(loop=None, title="the checklist")
     holder = pg.connect()
-    holder.execute("SELECT id FROM commitments FOR UPDATE")
+    holder.execute("SELECT id FROM deliverables FOR UPDATE")
     real = pg.connect
 
     def connect(*a, **kw):
@@ -603,7 +592,7 @@ def test_t3_a_statement_timeout_on_a_fact_lock_keeps_the_job(pg, monkeypatch):
         return conn
 
     monkeypatch.setattr(db, "connect", connect)
-    outbox.enqueue(_payload(loop=ALT, decision="Keep the release train weekly"), reason="test")
+    outbox.enqueue(_payload(loop=None, title="The checklist v2"), reason="test")
     report = outbox.drain()
     assert report["failed"] == 1 and report.get("deferred") == 1, report
     (job,) = outbox.jobs()
@@ -614,8 +603,10 @@ def test_t3_a_statement_timeout_on_a_fact_lock_keeps_the_job(pg, monkeypatch):
     assert outbox.drain()["replayed"] == 1
     assert outbox.jobs() == []
     assert _rows(pg, "SELECT count(*) FROM episodes") == [(2,)]
-    assert _rows(pg, "SELECT count(*) FROM decisions") == [(1,)]
-    assert [r[2] for r in _visible_commitments(pg)] == [ALT]
+    assert _rows(pg, "SELECT count(*) FROM decisions") == [(0,)]
+    assert _rows(pg, "SELECT title FROM deliverables") == [("the checklist",)]
+    assert _rows(pg, "SELECT value FROM fact_claims WHERE kind = 'deliverable' AND field = 'title' ORDER BY episode_id") == [("the checklist",), ("The checklist v2",)]
+    assert _visible_commitments(pg) == []
 
 
 # ---- third review #5: a legacy forget's memory is bounded by the batch -------------------

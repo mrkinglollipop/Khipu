@@ -60,10 +60,6 @@ class CaptureTest(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        for name in ("open_from_episode", "auto_close", "close_session_plan"):
-            self.stack.enter_context(mock.patch("khipu.commitments." + name, return_value=0))
-        for name in ("insert_decisions_from_episode", "detect_reversals_from_episode"):
-            self.stack.enter_context(mock.patch("khipu.decisions." + name, return_value=0))
         self.stack.enter_context(mock.patch("khipu.deliverables.insert_deliverables_from_episode", return_value=0))
         self.stack.enter_context(mock.patch("khipu.topic_graph.persist_capture_graph", return_value={}))
         self.stack.enter_context(mock.patch("khipu.config.path_setting", return_value=None))
