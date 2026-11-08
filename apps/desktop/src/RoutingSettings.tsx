@@ -3542,7 +3542,7 @@ function ProvidersList({ view }: { view: RouteView }) {
               {p.models_never?.length ? ` · never ${listWords(p.models_never)}` : ""}
             </span>
           </span>
-          <span className="end">{p.use === "on_request" ? <Tag>On request</Tag> : null}</span>
+          <span className="end">{p.use === "on_request" ? <Tag>On request</Tag> : p.use === "second_opinion" ? <Tag>Second opinions</Tag> : null}</span>
         </div>
       ))}
     </div>
