@@ -100,7 +100,6 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "project.separate": (("name",), ()),
     "direction.off": ((), ()),
     "direction.on": ((), ()),
-    "direction.acknowledge": ((), ()),
     "direction.set": (("key", "value"), ()),
     "direction.undo": (("id",), ("holds", "over_newer", "owner_words")),
     "forget.send": ((), ()),
@@ -445,7 +444,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["project", "keep-separate"], [v["a"], v["b"]]
     if action == "project.separate":
         return ["project", "separate"], [v["name"]]
-    if action in ("direction.off", "direction.on", "direction.acknowledge"):
+    if action in ("direction.off", "direction.on"):
         return ["owner-direction", action.partition(".")[2]], []
     if action == "direction.set":
         if v["key"] not in _DIRECTION_KEYS:

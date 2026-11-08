@@ -111,7 +111,7 @@ Settings has thirteen sections. Database is open first.
 | Database | The connection state and where it is stored. Buttons: Recheck connection, connect to a server you run or another Mac (opens the setup step), and Move this memory to another database. |
 | Capture & models | Choose how captures are stored, the summary models and the daily summariser budget. Keys includes Gemini, Claude API, OpenAI, OpenRouter, an optional local-endpoint key and an optional GLM Coding Plan key. |
 | Accounts and routing | Manage tracked accounts, inline plan usage and sign-in, priorities, your note, standing rules, holds, reset checks, what conversations are told, job runner folders and the lane map. Review recent changes. See [routing.md](routing.md). |
-| Owner actions | Review owner changes made in conversations, the app or terminal, with eligible Undo controls. Acknowledge tamper alarms and manage owner-direction settings. |
+| Owner actions | Review owner changes made in conversations, the app or terminal, with eligible Undo controls. Manage owner-direction settings. |
 | Work | Manage ledger projects, runner summary-file sources, Owed items hidden from Waiting on you, and Work/ledger size, timing and retention limits. |
 | Projects | Review canonical and older project names, same-project questions and kept-separate pairs. Owner actions can merge names, keep them separate or separate an older name again. |
 | Optional features | Switches for Search and memory, the Local recall service, Routing, and a group of options marked "Measured, not recommended". |

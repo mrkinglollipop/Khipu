@@ -1010,7 +1010,7 @@ def test_every_owner_command_takes_owner_direction(home):
     commands += [("accounts", c) for c in ("track", "rename", "stop", "move", "decline", "offer-again",
                                             "auto-track", "request")]
     commands += [("config",), ("owner-direction", "off"), ("owner-direction", "on"), ("owner-direction", "set"),
-                 ("owner-direction", "undo"), ("owner-direction", "acknowledge")]
+                 ("owner-direction", "undo")]
     for path in commands:
         flags = {o for a in sub(parser, *path)._actions for o in a.option_strings}
         assert {"--from-app", "--owner-direction"} <= flags, path

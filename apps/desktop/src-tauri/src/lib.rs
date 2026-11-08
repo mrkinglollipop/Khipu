@@ -2556,7 +2556,6 @@ async fn khipu_route_check(account: String) -> Result<String, String> {
 
 const OWNER_DIRECTION_SHOW_ARGV: &[&str] = &["owner-direction", "show"];
 const OWNER_DIRECTION_ACTIONS_ARGV: &[&str] = &["owner-direction", "actions", "--json"];
-const OWNER_DIRECTION_ACKNOWLEDGE_ARGV: &[&str] = &["owner-direction", "acknowledge", "--from-app"];
 /// The keys `khipu owner-direction set` takes.
 const OWNER_DIRECTION_KEYS: &[&str] = &["latest_window_h", "session_binding", "trust", "untrust"];
 
@@ -2623,11 +2622,6 @@ async fn khipu_owner_request_decline(id: String) -> Result<String, String> {
 #[tauri::command]
 async fn khipu_owner_direction_actions() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(OWNER_DIRECTION_ACTIONS_ARGV)).await
-}
-
-#[tauri::command]
-async fn khipu_owner_direction_acknowledge() -> Result<String, String> {
-    run_khipu_cli_async(fixed_argv(OWNER_DIRECTION_ACKNOWLEDGE_ARGV)).await
 }
 
 #[tauri::command]
@@ -5466,7 +5460,6 @@ pub fn run() {
             khipu_owner_direction_actions,
             khipu_owner_request_decline,
             khipu_owner_direction_undo,
-            khipu_owner_direction_acknowledge,
             khipu_owner_direction_switch,
             khipu_owner_direction_set,
             khipu_projects_list,
@@ -6127,10 +6120,6 @@ mod settings_command_tests {
     fn owner_direction_commands_are_fixed_verbs_marked_from_the_app() {
         assert_eq!(fixed_argv(OWNER_DIRECTION_SHOW_ARGV), v(&["owner-direction", "show"]));
         assert_eq!(fixed_argv(OWNER_DIRECTION_ACTIONS_ARGV), v(&["owner-direction", "actions", "--json"]));
-        assert_eq!(
-            fixed_argv(OWNER_DIRECTION_ACKNOWLEDGE_ARGV),
-            v(&["owner-direction", "acknowledge", "--from-app"])
-        );
         assert_eq!(
             owner_direction_undo_argv("a1b2c3d4", false).unwrap(),
             v(&["owner-direction", "undo", "--from-app", "--", "a1b2c3d4"])

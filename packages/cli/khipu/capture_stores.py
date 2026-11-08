@@ -149,13 +149,12 @@ STORES: tuple[Store, ...] = (
           "old model mismatch rows hold account, model and project labels and are no longer written",
           "owner words",
           _w("owner_turns._record", "owner_turns._write_private")),
-    Store("owner actions", "data folder owner-actions.jsonl and its sealed segments owner-actions.NNNNNN.jsonl, its head owner-actions.head.json and lock, "
+    Store("owner actions", "data folder owner-actions.jsonl and any older segments owner-actions.NNNNNN.jsonl, its lock, "
           "owner-direction-pending.json, owner-requests.json and their .tmp rewrites (owner_files.PATTERNS)",
           "each owner action with the owner's quoted words, widenings waiting for a second turn, and "
           "changes held for the owner to confirm (the action and its arguments)",
           "owner words",
-          _w("owner_direction._append", "owner_direction._log_locked", "owner_direction._write_private",
-             "owner_direction._seal")),
+          _w("owner_direction._append", "owner_direction._log_locked", "owner_direction._write_private")),
     Store("routing delivery words", "capture home state/recall--*.routing.json and their rewrite temps; "
           "the nightly removes a ledger unused for routing_ledger_keep_days",
           "cached routing rules, proposals and notices, including owner words and a "

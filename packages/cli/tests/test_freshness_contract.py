@@ -411,7 +411,7 @@ class NightlyLastJsonContractTest(unittest.TestCase):
                     mock.patch.object(jobs, "_summary_kind_backfill", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}), \
                     contextlib.ExitStack() as storage_steps:
-                for name in ("_storage_sweep", "_owner_actions_chain", "_fact_changes_prune", "_receipt_prune"):
+                for name in ("_storage_sweep", "_fact_changes_prune", "_receipt_prune"):
                     storage_steps.enter_context(mock.patch.object(jobs, name, return_value={"ok": True}))
                 jobs.run_nightly()
             payload = json.loads((Path(data_td) / "nightly-last.json").read_text())
@@ -422,7 +422,7 @@ class NightlyLastJsonContractTest(unittest.TestCase):
              "summary_kind_backfill", "query_cache_prune", "routing_ledger_prune", "provenance_backfill", "commitments_mark_stale",
              "ledger",
              "project_renames", "snapshot_refresh", "recall_eval",
-             "storage_sweep", "owner_actions_chain", "fact_changes_prune", "receipt_prune"},
+             "storage_sweep", "fact_changes_prune", "receipt_prune"},
         )
         for step in payload["steps"]:
             self.assertIn("ok", step)

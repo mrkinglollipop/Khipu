@@ -1,9 +1,8 @@
 /* Settings -> Owner actions (docs/plans/2026-10-16-owner-direction.md, 2.5
    2.8 and section 4). "Every owner action" lists every owner change, however
    it was made (by direction in a conversation, in the app, on a terminal),
-   newest first, with one Undo per line that can be undone, and a banner when
-   the log's hash chain is broken; below it, the switches and fields of the
-   check itself.
+   newest first, with one Undo per line that can be undone; below it, the
+   switches and fields of the check itself.
 
    The app is the owner, so every change here applies at once: each write is
    one fixed-argv Tauri command that runs `khipu owner-direction ... --from-app`,
@@ -157,6 +156,7 @@ export const ACTION_LABELS: Record<string, string> = {
   "work.not_same": "Marked two commitments as different",
   "direction.off": "Turned owner direction off",
   "direction.on": "Turned owner direction on",
+  // An older version of Khipu wrote this line; it is still shown.
   "direction.acknowledge": "Acknowledged the tamper alarm",
   "direction.set": "Changed an owner direction setting",
   "direction.undo": "Undid an owner action",
@@ -388,17 +388,7 @@ function canUndo(a: OwnerAction): boolean {
   );
 }
 
-/** The log's hash chain (`owner-direction actions --json`, `chain`). */
-export type ChainState = {
-  ok: boolean;
-  lines: number;
-  first_bad: { line: number; id?: string | null; kind?: string | null; why: string } | null;
-  note?: string;
-  /** A break found earlier, kept until you acknowledge it. */
-  alarm?: { at?: string | null; first_bad: unknown } | null;
-};
-
-type ActionsShape = { ok?: boolean; actions: OwnerAction[]; chain?: ChainState };
+type ActionsShape = { ok?: boolean; actions: OwnerAction[] };
 
 /** How the change was authorised, in words. */
 function sourceWords(a: OwnerAction): string {
@@ -412,17 +402,6 @@ function sourceWords(a: OwnerAction): string {
     default:
       return "How this was authorised is not recorded.";
   }
-}
-
-/** The broken chain's banner text: which entry, and what that means. */
-export function chainWords(chain: ChainState | undefined): string | null {
-  const bad = chain && !chain.ok ? chain.first_bad : null;
-  if (!bad) return null;
-  const which = `line ${bad.line}${bad.id ? ` (${bad.id})` : ""}`;
-  return (
-    `The owner-actions log was changed outside Khipu at ${which}: ${bad.why}. ` +
-    "That entry and the ones after it may not be what Khipu wrote, so check them before you rely on them."
-  );
 }
 
 export function OwnerActions({ active }: { active: boolean }) {
@@ -454,7 +433,6 @@ export function OwnerActions({ active }: { active: boolean }) {
 
   const conf = show.data?.settings;
   const rows = log.data?.actions ?? [];
-  const broken = chainWords(log.data?.chain);
   const seen = Object.entries(show.data?.turns ?? {}).flatMap(([h, row]) =>
     Object.keys(row.entrypoints ?? {}).map((e) => `${h}:${e}`),
   );
@@ -509,33 +487,6 @@ export function OwnerActions({ active }: { active: boolean }) {
       <div className="section-card">
         <div className="section-head">Every owner action</div>
         <div className="section-body">
-          {broken ? (
-            <p className="set-error" role="alert">
-              {broken}
-            </p>
-          ) : null}
-          {log.data?.chain?.alarm ? (
-            <div className="opt-row">
-              <button
-                type="button"
-                className="sm"
-                disabled={busy !== null}
-                onClick={() => void write("od-ack", "khipu_owner_direction_acknowledge", {})}
-              >
-                {busy === "od-ack" ? <Loader2 size={14} className="spin" aria-hidden /> : null}
-                Acknowledge
-              </button>
-              <p className="opt-what">
-                The warning stays until you acknowledge it, here or by telling a conversation. Acknowledging is
-                listed below with an Undo.
-              </p>
-              {errors["od-ack"] ? (
-                <p className="set-error" role="alert">
-                  {errors["od-ack"]}
-                </p>
-              ) : null}
-            </div>
-          ) : null}
           {log.error && !log.data ? (
             <p className="set-error" role="alert">
               Could not read the list: {log.error}

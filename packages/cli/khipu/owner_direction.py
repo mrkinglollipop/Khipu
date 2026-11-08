@@ -37,24 +37,12 @@ from khipu import owner_turns
 
 PURGE_DELAY_S = 24 * 3600
 LOG_NAME = "owner-actions.jsonl"
-HEAD_NAME = "owner-actions.head.json"
-# The log is kept in sealed segments so an append never reads the whole of it.
-# When the current log (``LOG_NAME``) holds ``SEGMENT_MAX_LINES`` lines it is
-# renamed to ``owner-actions.<six digit number>.jsonl`` and a fresh one starts;
-# the fresh log's first line chains to the sealed segment's last hash, so the
-# chain runs unbroken through every segment. No segment is ever removed:
-# ``read_log`` and the all-segment check (``verify_log``) read them all.
-SEGMENT_MAX_LINES = 2000
+# An earlier version kept the log in numbered segments beside the current one
+# (``owner-actions.<six digits>.jsonl``). Khipu no longer writes them, but any
+# that exist are still lines of the log: ``read_log`` and the owner-words scan
+# read them, oldest first. Lines from that time carry ``v``, ``prev`` and
+# ``hash`` fields; nothing reads those now.
 _SEGMENT = re.compile(r"^owner-actions\.(\d{6})\.jsonl$")
-# A break found in the log (a changed line, lines cut from its end) is kept
-# here, apart from the log and its head, until the owner acknowledges it: a
-# later append rewrites the head and could otherwise make a cut end look
-# whole again.
-ALARM_NAME = "owner-actions.alarm.json"
-# Every line Khipu writes to the log carries this version. Lines without one
-# may lead the log (written before it was chained); after the first
-# versioned line, a line without it, or with an older one, is a break.
-LOG_VERSION = 2
 _SESSION_VARS = ("KHIPU_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
 
 _clock = time.time
@@ -97,7 +85,7 @@ ACTIONS: frozenset[str] = frozenset({
     "accounts.request.undo", "config.usage_accounts", "config.routing_setting", "config.answer_request.confirm",
     "config.answer_request.undo", "promote.gate_ignore", "promote.gate_ignore.cancel",
     "ledger.restore", "ledger.purge", "ledger.project", "ledger.add", "ledger.set", "ledger.remove", "work.hide", "work.unhide",
-    "work.same", "work.not_same", "owed.change", "owed.tidy", "direction.off", "direction.on", "direction.acknowledge", "direction.set",
+    "work.same", "work.not_same", "owed.change", "owed.tidy", "direction.off", "direction.on", "direction.set",
     "direction.undo", "project.alias_add", "project.alias_remove", "project.merge", "project.keep_separate",
     "project.separate", "forget.send", "forget.here", "forget.not_same",
 })
@@ -137,7 +125,7 @@ SETTLE_ACTIONS: frozenset[str] = frozenset({
     "route.rule.retire", "config.answer_request.confirm", "config.answer_request.undo", "accounts.request.confirm",
     "accounts.request.undo", "route.tier_table.confirm", "route.tier_table.set", "route.tier_table.clear",
     "owed.correct_job_origin.confirm", "project.merge", "project.keep_separate", "forget.send", "forget.here",
-    "forget.not_same", "direction.acknowledge", "route.hold.end", "route.clear", "route.cap.set",
+    "forget.not_same", "route.hold.end", "route.clear", "route.cap.set",
     "route.override.end", "route.override.keep",
 })
 # A conversation's override changes only that conversation's advice, so
@@ -1299,6 +1287,10 @@ def log_path() -> Path:
     return data_dir() / LOG_NAME
 
 
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _write_private(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -1306,65 +1298,6 @@ def _write_private(path: Path, text: str) -> None:
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(text)
     os.replace(tmp, path)
-
-
-# The log is hash-chained (scope 2.8): each line carries ``v``
-# (``LOG_VERSION``), ``prev``, the hash of the line before it, and ``hash``,
-# over its own canonical form. The words are in that form only as
-# ``words_sha``, so forgetting an episode can scrub a line's words (``"words":
-# null, "scrubbed": true``) without breaking the chain. Lines from before the
-# chain (no version and no hash on any of them) may lead the log; the first
-# chained line's ``prev`` is then ``LEGACY`` plus the digest of those lines,
-# so changing them breaks the chain too.
-#
-# A chain alone can't show lines cut from its end, so every append also
-# writes the chain's length and last hash to a second file beside the log
-# (``HEAD_NAME``); verify compares the two.
-_UNHASHED = ("hash", "words", "scrubbed")
-LEGACY = "legacy:"
-
-
-def _sha(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _line_hash(line: dict) -> str:
-    body = {k: v for k, v in line.items() if k not in _UNHASHED}
-    return _sha(json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str))
-
-
-def _legacy_form(text: str) -> str:
-    """A line from before the chain as its digest sees it: words only as
-    their hash, so scrubbing them (``scrub_words``) leaves the digest as it
-    was, while any other change to the line still breaks the chain."""
-    try:
-        row = json.loads(text)
-    except ValueError:
-        return text
-    if not isinstance(row, dict) or ("words" not in row and "words_sha" not in row):
-        return text
-    words = row.get("words")
-    body = {k: v for k, v in row.items() if k not in _UNHASHED}
-    body["words_sha"] = _sha(words) if isinstance(words, str) else row.get("words_sha")
-    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
-
-
-def _legacy_prev(lines: list[str]) -> str:
-    return LEGACY + _sha("".join(_legacy_form(text) + "\n" for text in lines))
-
-
-def _prev_of(raw: str) -> str:
-    lines = raw.splitlines()
-    last = next((text for text in reversed(lines) if text.strip()), None)
-    if last is None:
-        return ""
-    try:
-        row = json.loads(last)
-    except ValueError:
-        row = None
-    if isinstance(row, dict) and isinstance(row.get("hash"), str):
-        return row["hash"]
-    return _legacy_prev(lines)
 
 
 @contextlib.contextmanager
@@ -1382,28 +1315,8 @@ def _log_locked():
         os.close(lock_fd)
 
 
-def head_path() -> Path:
-    return log_path().with_name(HEAD_NAME)
-
-
-def _chained(raw: str) -> int:
-    count = 0
-    for text in raw.splitlines():
-        try:
-            row = json.loads(text)
-        except ValueError:
-            continue
-        if isinstance(row, dict) and ("hash" in row or "v" in row):
-            count += 1
-    return count
-
-
-def segment_name(seq: int) -> str:
-    return f"owner-actions.{seq:06d}.jsonl"
-
-
 def _sealed_paths() -> list[Path]:
-    """The sealed segments, oldest first (name order is sequence order)."""
+    """Segments an earlier version sealed, oldest first (name order is sequence order)."""
     folder = log_path().parent
     try:
         names = sorted(n for n in os.listdir(folder) if _SEGMENT.match(n))
@@ -1412,110 +1325,35 @@ def _sealed_paths() -> list[Path]:
     return [folder / n for n in names]
 
 
-def _segment_seq(path: Path) -> int:
-    return int(_SEGMENT.match(path.name).group(1))
-
-
 def _log_files() -> list[Path]:
-    """Every file that holds log lines, in order: sealed segments, then the log."""
+    """Every file that holds log lines, in order: older segments, then the log."""
     return [*_sealed_paths(), log_path()]
 
 
-def _file_tail(path: Path) -> str:
-    """What the next line chains to after this segment: its last line's hash,
-    found by reading the end of the file (the whole of it for a segment of
-    lines from before the chain)."""
-    try:
-        size = path.stat().st_size
-        chunk = 65536
-        with open(path, "rb") as fh:
-            while True:
-                fh.seek(max(0, size - chunk))
-                lines = [t for t in fh.read(min(size, chunk)).split(b"\n") if t.strip()]
-                if len(lines) >= 2 or size <= chunk:
-                    break
-                chunk *= 4
-        row = json.loads(lines[-1]) if lines else None
-        if isinstance(row, dict) and isinstance(row.get("hash"), str):
-            return row["hash"]
-    except ValueError:
-        pass
-    return _prev_of(path.read_text(encoding="utf-8"))
-
-
-def _seal(path: Path, raw: str, sealed: list[Path]) -> str:
-    """With the log lock held: rename the current log to the next sealed
-    segment and restart the head beside it. Returns the hash the next line
-    chains to."""
-    tail = _prev_of(raw)
-    seq = (_segment_seq(sealed[-1]) if sealed else 0) + 1
-    dest = path.with_name(segment_name(seq))
-    if dest.exists():
-        raise OSError(f"{dest.name} already exists")
-    os.replace(path, dest)
-    fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    try:
-        _write_private(head_path(), json.dumps({"v": 2, "seq": seq, "lines": 0, "head": tail}) + "\n")
-    except OSError:
-        pass  # the check reads a head one segment behind as a seal that was cut short
-    return tail
-
-
 def _append(line: dict) -> dict:
-    """Append one line to the chain, under a lock so two writers never
-    chain to the same line, and on disk before it returns; then the chain's
-    new length and head beside it. A head that could not be written leaves
-    the check red (the log is ahead of it), never the change undone. Only the
-    current segment is read and checked; a full current segment is sealed
-    first (``SEGMENT_MAX_LINES``)."""
+    """Append one line to the log, under a lock so two writers never
+    interleave, and on disk before it returns."""
     with _log_locked() as path:
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            raw = ""
         line = json.loads(json.dumps(line, ensure_ascii=False, default=str))
-        for key in ("prev", "hash", "scrubbed"):
-            line.pop(key, None)
-        if isinstance(line.get("words"), str):
-            line["words_sha"] = _sha(line["words"])
-        else:
-            line.pop("words_sha", None)
+        # A last line that was cut short (a crash mid-write) must not swallow this one.
         try:
-            before = _verify_chain(current_only=True, raw=raw)
-        except Exception:  # noqa: BLE001 - the check never stops an owner's change from being logged
-            before = None
-        if before is not None and before["first_bad"]:
-            _raise_alarm(before["first_bad"])
-        sealed = _sealed_paths()
-        incoming = _file_tail(sealed[-1]) if sealed else ""
-        if raw.count("\n") >= SEGMENT_MAX_LINES:
-            incoming = _seal(path, raw, sealed)
-            sealed, raw = _sealed_paths(), ""
-        line["v"] = LOG_VERSION
-        line["prev"] = _prev_of(raw) or incoming
-        line["hash"] = _line_hash(line)
+            with open(path, "rb") as fh:
+                fh.seek(-1, os.SEEK_END)
+                lead = "" if fh.read(1) == b"\n" else "\n"
+        except OSError:  # no log yet, or an empty one
+            lead = ""
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
-            fh.write(("\n" if raw and not raw.endswith("\n") else "") + json.dumps(line, ensure_ascii=False) + "\n")
+            fh.write(lead + json.dumps(line, ensure_ascii=False) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
-        try:
-            _write_private(head_path(), json.dumps({"v": 2, "seq": len(sealed), "lines": _chained(raw) + 1,
-                                                    "head": line["hash"]}) + "\n")
-        except OSError:
-            pass
     return line
 
 
 def scrub_words(sessions, *, protected_sessions=()) -> int:
     """Forget's owner words scan on the log: blank the quoted words of every
     line these sessions wrote or acted for (``"words": null, "scrubbed":
-    true``). ``words_sha`` and the hash stay, so the chain still holds and
-    the action and its Undo stay. Returns how many lines were scrubbed;
+    true``); the action and its Undo stay. Returns how many lines were scrubbed;
     raises OSError when the log can't be read or rewritten. A line linked
     to a protected live session keeps its words even if its other session
     is being forgotten."""
@@ -1537,7 +1375,6 @@ def scrub_words(sessions, *, protected_sessions=()) -> int:
                 if (isinstance(row, dict) and isinstance(row.get("words"), str)
                         and (row.get("session") in names or row.get("via_session") in names)
                         and row.get("session") not in protected and row.get("via_session") not in protected):
-                    row["words_sha"] = row.get("words_sha") or _sha(row["words"])
                     row["words"], row["scrubbed"] = None, True
                     text, count = json.dumps(row, ensure_ascii=False), count + 1
                 out.append(text)
@@ -1547,264 +1384,8 @@ def scrub_words(sessions, *, protected_sessions=()) -> int:
     return total
 
 
-def _head() -> dict | None | type:
-    """The chain's length and head as last written beside the log: None
-    when there is no such file, ``ValueError`` when it can't be read."""
-    try:
-        data = json.loads(head_path().read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError):
-        return ValueError
-    if not (isinstance(data, dict) and isinstance(data.get("lines"), int) and isinstance(data.get("head"), str)):
-        return ValueError
-    return data
-
-
-def alarm_path() -> Path:
-    return log_path().with_name(ALARM_NAME)
-
-
-def read_alarm() -> dict | None:
-    """The tamper alarm, while it waits for the owner's acknowledgement."""
-    try:
-        data = json.loads(alarm_path().read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError):
-        # An alarm file that can't be read is still an alarm.
-        return {"at": None, "first_bad": {"line": 0, "id": None, "kind": None,
-                                          "why": "the record of an earlier break can't be read"}}
-    return data if isinstance(data, dict) and isinstance(data.get("first_bad"), dict) else None
-
-
-def _raise_alarm(bad: dict) -> None:
-    """Keep the first break found until the owner acknowledges it. Best
-    effort: the live check still shows a break it can see."""
-    if read_alarm() is not None:
-        return
-    try:
-        _write_private(alarm_path(), json.dumps({"at": _iso(_clock()), "first_bad": bad}) + "\n")
-    except OSError:
-        pass
-
-
-def acknowledge_alarm() -> dict | None:
-    """The owner has seen the tamper alarm: it is cleared (the alarm it was,
-    or None when none was raised). A break the log still shows raises it
-    again at the next check."""
-    alarm = read_alarm()
-    with contextlib.suppress(FileNotFoundError):
-        alarm_path().unlink()
-    return alarm
-
-
-def verify_log() -> dict:
-    """Whether the log holds: the chain as it stands (``_verify_chain``), and
-    no tamper alarm waiting for the owner. A break found now raises the
-    alarm; while it waits, the log reads as broken at the entry it named,
-    however the log looks since, and ``alarm`` carries it."""
-    # Under the log's lock, so an append's seal (the rename and the head rewrite)
-    # is never caught half done and read as a break. Nothing here is called with
-    # the lock held; an append calls ``_verify_chain`` itself.
-    if log_path().parent.exists():
-        with _log_locked():
-            out = _verify_chain()
-    else:
-        out = _verify_chain()
-    if out["first_bad"]:
-        _raise_alarm(out["first_bad"])
-    alarm = read_alarm()
-    if alarm is None:
-        return out
-    if out["ok"]:
-        bad = dict(alarm["first_bad"])
-        bad["why"] = (f"{bad.get('why') or 'the log was changed'} (found {alarm.get('at') or 'earlier'}; this "
-                      "alarm stays until the owner acknowledges it)")
-        out = {"ok": False, "lines": out["lines"], "first_bad": bad}
-    out["alarm"] = alarm
-    return out
-
-
-def _split_rows(raw: str) -> tuple[list[str], list]:
-    texts = raw.splitlines()
-    rows: list = []
-    for text in texts:
-        try:
-            rows.append(json.loads(text) if text.strip() else None)
-        except ValueError:
-            rows.append(ValueError)
-    return texts, rows
-
-
-def _walk(texts: list[str], rows: list, incoming: str | None, base: int, segment: str) -> dict:
-    """The chain inside one segment. ``incoming`` is the hash the segment's
-    first line must chain to (None for the first segment of the log, which may
-    open with lines from before the chain); ``base`` is the number of lines in
-    the segments before it, so line numbers count from the first segment."""
-    count = sum(1 for r in rows if r is not None)
-
-    def bad(i: int, why: str) -> dict:
-        row = rows[i] if 0 <= i < len(rows) and isinstance(rows[i], dict) else {}
-        found = {"line": base + i + 1, "id": row.get("id"), "kind": row.get("kind"), "why": why}
-        if segment != LOG_NAME:
-            found["segment"] = segment
-        return {"ok": False, "lines": base + count, "first_bad": found}
-
-    first = next((i for i, r in enumerate(rows) if isinstance(r, dict) and ("hash" in r or "v" in r)), None)
-    res: dict = {"rows": rows, "count": count, "first": first, "chained": 0, "last": None, "bad": None, "bad_fn": bad}
-    if incoming is not None:
-        lead = next((i for i, r in enumerate(rows) if r is not None), None)
-        if lead is not None and first != lead:
-            res["bad"] = bad(lead, "it follows an earlier segment of the log, so it must be chained to it")
-            return res
-    start = first if first is not None else len(rows)
-    for i in range(start):
-        if rows[i] is ValueError:
-            res["bad"] = bad(i, "it is not a readable line")
-            return res
-    if first is not None:
-        prev = incoming if incoming is not None else (_legacy_prev(texts[:first]) if first else "")
-        chained, last = 0, None
-        for i in range(first, len(rows)):
-            row = rows[i]
-            if row is None:
-                continue
-            why = None
-            if not isinstance(row, dict):
-                why = "it is not a readable line"
-            elif not isinstance(row.get("hash"), str):
-                why = "it has no hash, so Khipu did not write it"
-            elif row.get("v") != LOG_VERSION:
-                why = "it has no version or an older one after the chain began, so Khipu did not write it"
-            elif row.get("prev") != prev:
-                if first and i == first and str(row.get("prev") or "").startswith(LEGACY):
-                    why = "a line written before the log was chained was changed"
-                else:
-                    why = "it does not follow the line before it: a line is missing or was changed"
-            elif _line_hash(row) != row["hash"]:
-                why = "it was changed after Khipu wrote it"
-            elif row.get("words") is not None and (not isinstance(row.get("words"), str)
-                                                  or row.get("words_sha") != _sha(row["words"])):
-                why = "its words do not match their hash"
-            if why:
-                res["bad"] = bad(i, why)
-                return res
-            prev, chained, last = row["hash"], chained + 1, i
-        res["chained"], res["last"] = chained, last
-    return res
-
-
-def _verify_chain(*, current_only: bool = False, raw: str | None = None) -> dict:
-    """Whether the log's hash chain holds: ``first_bad`` names the first line
-    that has no hash or a wrong one, no version or an older one after the
-    chain began, does not follow the line before it, or whose words do not
-    match their hash; or, by the head kept beside the log, the line where
-    lines Khipu wrote are missing from the end (line numbers count from 1,
-    through every sealed segment).
-
-    ``current_only`` (the append's check) reads the current segment alone,
-    chained to the last sealed segment's end; it reads them all when the head
-    does not agree with the segments on disk, and ``verify_log`` always does."""
-    sealed = _sealed_paths()
-    head = _head()
-    if current_only and sealed and (not isinstance(head, dict) or head.get("seq", 0) != len(sealed)):
-        current_only = False
-    base, incoming, last_sealed, note = 0, None, None, None
-    try:
-        if sealed and current_only:
-            incoming = _file_tail(sealed[-1])
-        elif sealed:
-            expected = 1
-            for seg in sealed:
-                if _segment_seq(seg) != expected:
-                    return {"ok": False, "lines": base, "first_bad": {
-                        "line": base + 1, "id": None, "kind": None, "segment": seg.name,
-                        "why": f"sealed segment {segment_name(expected)} is missing"}}
-                expected += 1
-                texts, rows = _split_rows(seg.read_text(encoding="utf-8"))
-                res = _walk(texts, rows, incoming, base, seg.name)
-                if res["bad"]:
-                    return res["bad"]
-                if note is None and incoming is None:
-                    first = res["first"]
-                    note = ("Every line was written before the log was chained." if first is None and res["count"]
-                            else f"The first {first} lines were written before the log was chained." if first else "")
-                tail = _prev_of("\n".join(texts)) or incoming
-                last_sealed = (res["chained"], tail)
-                incoming, base = tail, base + res["count"]
-    except OSError as err:
-        return {"ok": False, "lines": base, "first_bad": {"line": base + 1, "id": None, "kind": None,
-                                                           "why": f"the log can't be read ({err.strerror})"}}
-    if raw is None:
-        try:
-            raw = log_path().read_text(encoding="utf-8")
-        except FileNotFoundError:
-            raw = ""
-        except OSError as err:
-            return {"ok": False, "lines": base, "first_bad": {"line": base + 1, "id": None, "kind": None,
-                                                               "why": f"the log can't be read ({err.strerror})"}}
-    texts, rows = _split_rows(raw)
-    res = _walk(texts, rows, incoming, base, LOG_NAME)
-    if res["bad"]:
-        return res["bad"]
-    bad, first, chained, last = res["bad_fn"], res["first"], res["chained"], res["last"]
-    start = first if first is not None else len(rows)
-    if head is ValueError:
-        return bad(0, "the record of the log's length kept beside it can't be read")
-    if head is not None and head.get("seq", 0) != len(sealed):
-        if (head.get("seq", 0) == len(sealed) - 1 and last_sealed is not None
-                and head["lines"] == last_sealed[0] and head["head"] == last_sealed[1]):
-            head = {"lines": 0, "head": last_sealed[1], "seq": len(sealed)}  # a seal cut short before its head
-        else:
-            return bad(0, "the sealed segments of the log do not match the record kept beside it: "
-                          "one is missing or was added")
-    if head is None:
-        if chained or sealed:
-            return bad(first or 0, "the record of the log's length kept beside it is missing")
-    else:
-        end = (last + 1) if last is not None else start
-        if chained < head["lines"]:
-            gone = head["lines"] - chained
-            return bad(end, f"{gone} line{'s' if gone != 1 else ''} Khipu wrote {'are' if gone != 1 else 'is'} "
-                            "missing from the end of the log")
-        if chained == head["lines"] and chained and rows[last]["hash"] != head["head"]:
-            return bad(last, "the log's last line is not the one Khipu wrote last")
-        # An append that stopped before its head was written leaves the log
-        # one line ahead, chained to the head.
-        ahead = chained == head["lines"] + 1 and rows[last]["prev"] == head["head"]
-        if chained > head["lines"] and not ahead:
-            return bad(last, "the log has lines past the record of its length kept beside it")
-    out = {"ok": True, "lines": base + res["count"], "first_bad": None, "segments": len(sealed)}
-    if note is None:
-        if first is None and res["count"]:
-            note = "Every line was written before the log was chained."
-        elif first:
-            note = f"The first {first} lines were written before the log was chained."
-    if note:
-        out["note"] = note
-    return out
-
-
-def doctor_block() -> dict:
-    """Doctor's "owner actions log" row: red when the hash chain is broken,
-    naming the first bad line."""
-    chain = verify_log()
-    bad = chain.get("first_bad")
-    if bad:
-        what = f"line {bad['line']}" + (f" ({bad['id']})" if bad.get("id") else "")
-        summary = (f"The owner-actions log was changed outside Khipu at {what}: {bad['why']}. "
-                   "Check that entry in Owner actions.")
-        return {"ok": False, "chain": chain, "warnings": [summary], "summary": summary}
-    segments = f" in {chain['segments'] + 1} files" if chain.get("segments") else ""
-    summary = f"Owner-actions log: {chain['lines']} lines{segments}, chain intact."
-    if chain.get("note"):
-        summary += " " + chain["note"]
-    return {"ok": True, "chain": chain, "warnings": [], "summary": summary}
-
-
 def read_log() -> list[dict]:
-    """Every line, oldest first, through every sealed segment."""
+    """Every line, oldest first, through any segments an earlier version sealed."""
     out = []
     for path in _log_files():
         try:
@@ -1830,7 +1411,7 @@ def _new_id() -> str:
 
 
 # What a state line may add to the line it completes (``finish``).
-_LINE_FIELDS = ("kind", "id", "at", "target", "state", "prev", "hash", "words", "words_sha", "scrubbed")
+_LINE_FIELDS = ("kind", "id", "at", "target", "state", "v", "prev", "hash", "words", "words_sha", "scrubbed")
 
 
 def _merged(rows: list[dict]) -> dict[str, dict]:
@@ -2276,7 +1857,6 @@ def _routing_stamps() -> int:
 _PUSH_WORDS = {
     "direction.on": "Turned owner direction on", "direction.off": "Turned owner direction off",
     "direction.set": "Changed the owner-direction settings",
-    "direction.acknowledge": "Acknowledged the owner-actions tamper alarm",
     "direction.undo": "Undid an owner change",
     "ledger.restore": "Brought back a removed ledger row",
     "ledger.purge": "Removed a ledger row for good", "ledger.project": "Changed a ledger project",
@@ -2686,8 +2266,6 @@ def _before(want: dict):
                 **({"ids": []} if facts.get("change") == "undo" else {})}
     if action in ("direction.off", "direction.on"):
         return {"enabled": owner_turns.settings()["enabled"]}
-    if action == "direction.acknowledge":
-        return {"alarm": read_alarm()}
     if action == "direction.set":
         key, _, member = target.partition(" ")
         current = owner_turns.settings()
@@ -2897,14 +2475,6 @@ def _undo_direction(line, via):
             raise ValueError(f"Khipu's Undo snapshot has no prior value for {key}; nothing was changed")
         values = {key: settings[key]}
     return {"ok": True, "settings": owner_turns.write_settings(values)}
-
-
-def _undo_acknowledge(line, via):
-    """The alarm the owner acknowledged comes back, as it was."""
-    alarm = (line.get("before") or {}).get("alarm")
-    if isinstance(alarm, dict) and read_alarm() is None:
-        _write_private(alarm_path(), json.dumps(alarm) + "\n")
-    return {"ok": True, "alarm": read_alarm()}
 
 
 def _b(line: dict) -> dict:
@@ -3294,7 +2864,6 @@ _UNDO = {
     "direction.off": _undo_direction,
     "direction.on": _undo_direction,
     "direction.set": _undo_direction,
-    "direction.acknowledge": _undo_acknowledge,
 }
 
 
@@ -3927,7 +3496,7 @@ def _set_values(key: str, raw: str) -> dict:
 
 
 def run_cli(args) -> int:
-    """``khipu owner-direction``: show, set, on, off, acknowledge, actions,
+    """``khipu owner-direction``: show, set, on, off, actions,
     undo."""
     from khipu import routing
 
@@ -3942,12 +3511,9 @@ def run_cli(args) -> int:
         run_due()
         rows = actions()
         rows.reverse()
-        chain = verify_log()
         if getattr(args, "json", False):
-            _print({"ok": True, "actions": rows, "chain": chain})
+            _print({"ok": True, "actions": rows})
         else:
-            if chain["first_bad"]:
-                print(doctor_block()["summary"])
             for x in rows:
                 print(f"{x['id']}  {x['at']}  {x['action']} {x['target']}  ({x.get('auth')}, {x['state']})")
             if not rows:
@@ -4011,21 +3577,6 @@ def run_cli(args) -> int:
                 _print({"ok": False, "error": routing.terminal_refusal(), "code": "owner_only"})
                 return 2
             out = {"ok": True, "settings": owner_turns.write_settings({"enabled": True})}
-            _print(finish(out) or out)
-            return 0
-        if cmd == "acknowledge":
-            verify_log()  # a break the log shows now raises the alarm first
-            if read_alarm() is None:
-                _print({"ok": True, "acknowledged": None, "line": "No tamper alarm is waiting."})
-                return 0
-            want = intent("direction.acknowledge", "alarm")
-            via = routing._owner_via(args, want)
-            if via is None:
-                _print({"ok": False, "error": routing.terminal_refusal(), "code": "owner_only"})
-                return 2
-            alarm = acknowledge_alarm()
-            out = {"ok": True, "acknowledged": alarm, "chain": verify_log(),
-                   "line": "The tamper alarm is acknowledged."}
             _print(finish(out) or out)
             return 0
         if cmd == "off":
@@ -4094,9 +3645,6 @@ def add_parser(sub) -> None:
     pick.add_argument("--yes", dest="answer_yes", action="store_true")
     pick.add_argument("--no", dest="answer_no", action="store_true")
     ans.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
-    ack = verbs.add_parser("acknowledge", help="Acknowledge the tamper alarm on the owner-actions log")
-    ack.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
-    add_owner_flags(ack)
     st = verbs.add_parser("set", help="Change a setting: latest_window_h, session_binding, trust or "
                                       "untrust")
     st.add_argument("key")

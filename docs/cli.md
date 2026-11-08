@@ -102,7 +102,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | Command | What it does |
 | --- | --- |
 | `ledger` | Project work rows: add, set, get, list, loose-ends, needs-owner (alias needs-matt), render, check, remove, removed, restore, purge, projects, project, import, and export. |
-| `owner-direction` | Direction settings, owner-actions log, tamper acknowledgement, and Undo; see below. |
+| `owner-direction` | Direction settings, owner-actions log, and Undo; see below. |
 | `capture` | Capture an episode from a JSON payload on stdin. Routed by `capture_mode`. Flags: `--payload-file`, `--mode legacy|dual|hub`. `capture now` flags a session for capture at its next Stop, whatever the cadence (`--note`, `--harness`, `--session-id`; the last two default to the most recently active local session). |
 | `episode` | `episode forget ID` soft-deletes an episode and removes its vectors. `episode edit ID --summary S` corrects it and re-embeds. |
 | `topic` | `topic purge SLUG --yes` hard-deletes an already tombstoned topic from the hub database (with its revisions and vectors). It immediately purges this Mac's replica too; a replica failure is reported as partial, and that copy then needs a successful full refresh. |
@@ -114,7 +114,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 
 `ledger` uses `--project` to select a project and `--json` for JSON output. Writes accept `--op-id` for safe retries. `ledger export --tracker-json` exports the tracker shape. `ledger project` can rename, hide, or show a project.
 
-`owner-direction` supports `show`, `actions [--json]`, `on`, `off`, `acknowledge`, `set KEY VALUE`, and `undo ID`. Direction defaults on, with session binding on and a six-hour eligible-owner-turn window. Supported owner commands accept `--owner-direction` from a conversation with a recent hook-recorded eligible owner turn and verified prompt-hook provenance. The check does not inspect the owner's words; submit only changes the owner requested. Background and dispatched jobs are refused.
+`owner-direction` supports `show`, `actions [--json]`, `on`, `off`, `set KEY VALUE`, and `undo ID`. Direction defaults on, with session binding on and a six-hour eligible-owner-turn window. Supported owner commands accept `--owner-direction` from a conversation with a recent hook-recorded eligible owner turn and verified prompt-hook provenance. The check does not inspect the owner's words; submit only changes the owner requested. Background and dispatched jobs are refused.
 
 ## Embeddings and libraries
 

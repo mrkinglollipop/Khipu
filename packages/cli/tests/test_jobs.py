@@ -106,7 +106,7 @@ class JobsRunTest(unittest.TestCase):
                 self.assertEqual(jobs.run_nightly(), expected)
             script.assert_called_once()
             self.assertFalse(record.call_args_list[0].kwargs["ok"])
-            self.assertEqual(record.call_count, 17)
+            self.assertEqual(record.call_count, 16)
 
     def test_run_nightly_writes_nightly_last_json_with_every_step(self):
         """F3/D1: nightly-last.json is the persisted evidence Phase 6 will
@@ -126,7 +126,7 @@ class JobsRunTest(unittest.TestCase):
             names,
             ["sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
              "summary_kind_backfill", "query_cache_prune", "routing_ledger_prune", "storage_sweep",
-             "owner_actions_chain", "provenance_backfill", "fact_changes_prune",
+             "provenance_backfill", "fact_changes_prune",
              "commitments_mark_stale",
              "ledger", "receipt_prune", "project_renames",
              "recall_eval", "snapshot_refresh"],
