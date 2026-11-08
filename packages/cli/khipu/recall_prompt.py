@@ -3139,11 +3139,15 @@ def _outcome_for(reason: str, hits: list[Any]) -> str:
 
 
 def _thread_memory_hits(thread: str, *, progress: dict | None = None) -> list[dict[str, Any]]:
-    """Read authoritative standing decisions and open, unsnoozed commitments.
+    """Read this thread's decisions and open, unsnoozed commitments.
 
-    The replica has decision state but no commitment table. On a hub failure
-    it can supply decisions; raw open_loops are never treated as still open.
-    The caller bounds this entire leg by the existing search deadline.
+    Decisions come from ``episodes.decisions``, the per-episode strings every
+    capture still writes. The old decisions registry is no longer written, so
+    it is read only to leave out a string that an archived row marks
+    superseded or retracted. The replica has no commitment table. On a hub
+    failure it can supply decisions; raw open_loops are never treated as
+    still open. The caller bounds this entire leg by the existing search
+    deadline.
     """
     from khipu import hub_snapshot
     from khipu.db import has_columns
@@ -3171,15 +3175,25 @@ def _thread_memory_hits(thread: str, *, progress: dict | None = None) -> list[di
         try:
             con.execute("PRAGMA busy_timeout = 2")
             cols = hub_snapshot._snapshot_table_columns(con, "decisions")
-            retracted = "AND d.retracted_at IS NULL" if "retracted_at" in cols else ""
-            fence = hub_snapshot.forget_fence_sql(con, "d", "episode_id")
+            ecols = hub_snapshot._snapshot_table_columns(con, "episodes")
+            if "decisions" not in ecols:
+                raise LookupError("replica episodes carry no decisions")
+            archived = ""
+            if {"episode_id", "text", "superseded_by"} <= cols:
+                gone = "d.superseded_by IS NOT NULL"
+                if "retracted_at" in cols:
+                    gone += " OR d.retracted_at IS NOT NULL"
+                archived = ("AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.episode_id = e.id "
+                            f"AND d.text = j.value AND ({gone}))")
+            fence = hub_snapshot.forget_fence_sql(con, "e", "id")
             rows = con.execute(
-                "SELECT 'decision', d.id, d.text, d.episode_id, d.decided_at "
-                "FROM decisions d JOIN episodes e ON e.id = d.episode_id "
+                "SELECT 'decision', e.id || '.' || j.key, j.value, e.id, e.ts "
+                "FROM episodes e, json_each(CASE WHEN json_valid(e.decisions) "
+                "AND json_type(e.decisions) = 'array' THEN e.decisions ELSE '[]' END) j "
                 "WHERE CASE WHEN json_valid(e.raw) THEN "
                 "json_extract(e.raw, '$.t3_thread_id') END = ? "
-                "AND e.deleted_at IS NULL AND d.superseded_by IS NULL "
-                f"{retracted}{fence} ORDER BY d.decided_at DESC, d.id DESC LIMIT 3", (thread,),
+                "AND e.deleted_at IS NULL AND j.type = 'text' AND trim(j.value) <> '' "
+                f"{archived}{fence} ORDER BY e.ts DESC, e.id DESC, j.key LIMIT 3", (thread,),
             ).fetchall()
             local_hits = rows_to_hits(rows)
             for hit in local_hits:
@@ -3198,15 +3212,20 @@ def _thread_memory_hits(thread: str, *, progress: dict | None = None) -> list[di
             with conn.cursor() as cur:
                 cur.execute("SET TRANSACTION READ ONLY")
                 cur.execute("SET LOCAL statement_timeout = '1000ms'")
-                retracted = "AND d.retracted_at IS NULL" if has_columns(cur, "decisions", "retracted_at") else ""
+                gone = "d.superseded_by IS NOT NULL"
+                if has_columns(cur, "decisions", "retracted_at"):
+                    gone += " OR d.retracted_at IS NOT NULL"
                 cur.execute(
-                    "SELECT * FROM (SELECT 'decision' AS kind, d.id, d.text, "
-                    "d.episode_id, d.decided_at AS ts FROM decisions d "
-                    "JOIN episodes e ON e.id = d.episode_id "
+                    "SELECT * FROM (SELECT 'decision' AS kind, e.id::text || '.' || j.n AS id, "
+                    "j.text, e.id AS episode_id, e.ts FROM episodes e "
+                    "CROSS JOIN LATERAL jsonb_array_elements_text(CASE WHEN "
+                    "jsonb_typeof(e.decisions) = 'array' THEN e.decisions ELSE '[]'::jsonb END) "
+                    "WITH ORDINALITY AS j(text, n) "
                     "WHERE e.raw->>'t3_thread_id' = %s AND e.deleted_at IS NULL "
-                    f"AND d.superseded_by IS NULL {retracted} "
-                    "ORDER BY d.decided_at DESC, d.id DESC LIMIT 3) standing "
-                    "UNION ALL SELECT * FROM (SELECT 'commitment' AS kind, c.id, c.text, "
+                    "AND btrim(j.text) <> '' AND NOT EXISTS (SELECT 1 FROM decisions d "
+                    f"WHERE d.episode_id = e.id AND d.text = j.text AND ({gone})) "
+                    "ORDER BY e.ts DESC, e.id DESC, j.n LIMIT 3) standing "
+                    "UNION ALL SELECT * FROM (SELECT 'commitment' AS kind, c.id::text, c.text, "
                     "c.opened_episode, c.opened_at AS ts FROM commitments c "
                     "JOIN episodes e ON e.id = c.opened_episode "
                     "WHERE e.raw->>'t3_thread_id' = %s AND e.deleted_at IS NULL "

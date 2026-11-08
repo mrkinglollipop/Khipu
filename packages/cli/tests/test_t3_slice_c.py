@@ -394,34 +394,35 @@ def test_switch_legs_share_deadline():
             release.set()
 
 
-def test_thread_reader_uses_current_state_across_sessions():
-    from tests.fixtures.t3_slice_c import memory_fixture
-    con, Connection = memory_fixture()
-    con.execute("INSERT INTO decisions VALUES (3, 'Superseded rule', 1, '2026-10-08', 1, NULL)")
-    con.execute("INSERT INTO decisions VALUES (4, 'Retracted rule', 1, '2026-10-08', NULL, '2026-10-08')")
-    con.execute("INSERT INTO decisions VALUES (5, 'Other thread', 30, '2026-10-08', NULL, NULL)")
-    con.execute("INSERT INTO commitments VALUES (6, 'Already closed', 2, '2026-10-08', 'closed', NULL)")
-    con.execute("INSERT INTO commitments VALUES (7, 'Snoozed', 2, '2026-10-08', 'open', '2999-01-01')")
-    con.execute("INSERT INTO commitments VALUES (8, 'Other thread', 30, '2026-10-08', 'open', NULL)")
-    con.execute("INSERT INTO commitments VALUES (9, 'Forgotten episode', 4, '2026-10-08', 'open', NULL)")
-    con.execute("UPDATE episodes SET deleted_at='2026-10-08' WHERE id=4")
-    with mock.patch.object(hs, 'try_hub_connect', return_value=Connection()), \
-         mock.patch('khipu.db.has_columns', return_value=True):
-        hits=rp._thread_memory_hits(THREAD)
-    con.close()
-    assert [(h['kind'],h['id']) for h in hits] == [('decision','1'),('commitment','2')]
-    assert [h['episode_id'] for h in hits] == [1,2]
+# The hub half of the thread reader now runs Postgres-only SQL (jsonb array
+# unnesting); its hermetic checks live in test_thread_decisions_from_episodes_pg.py.
 
-
-def test_thread_reader_replica_does_not_revive_raw_open_loops(replica):
+def test_thread_reader_replica_reads_episode_decisions_not_the_registry(replica):
     with sqlite3.connect(replica) as con:
-        con.execute("INSERT INTO decisions (id,text,episode_id,decided_at) VALUES (1,'Keep budget',1,'2026-10-07')")
-        con.execute("INSERT INTO decisions (id,text,episode_id,decided_at,superseded_by) VALUES (2,'Old budget',1,'2026-10-08',1)")
-        con.execute("UPDATE episodes SET raw=? WHERE id=1", (json.dumps({'t3_thread_id':THREAD, 'open_loops':['already closed']}),))
+        raw = json.dumps({'t3_thread_id':THREAD, 'open_loops':['already closed']})
+        con.execute("UPDATE episodes SET raw=?, decisions=? WHERE id=1",
+                    (raw, json.dumps(['Keep budget', 'Old budget', 'Retracted budget'])))
+        con.execute("UPDATE episodes SET decisions=? WHERE id=2", ('not json',))
+        # Archived registry rows only take a string out; nothing here adds one.
+        con.execute("INSERT INTO decisions (id,text,episode_id,decided_at,superseded_by) "
+                    "VALUES (2,'Old budget',1,'2026-10-08',1)")
+        con.execute("INSERT INTO decisions (id,text,episode_id,decided_at,retracted_at) "
+                    "VALUES (3,'Retracted budget',1,'2026-10-08','2026-10-09')")
     with mock.patch.object(hs,'try_hub_connect',side_effect=ConnectionError('offline')):
         hits=rp._thread_memory_hits(THREAD)
-    assert [(h['kind'],h['id']) for h in hits] == [('decision','1')]
+    assert [(h['kind'],h['snippet']) for h in hits] == [('decision','Keep budget')]
     assert hits[0]['status'] == 'standing (replica)'
+    assert hits[0]['episode_id'] == 1
+
+
+def test_thread_reader_replica_without_registry_rows_returns_new_decisions(replica):
+    with sqlite3.connect(replica) as con:
+        con.execute("UPDATE episodes SET raw=?, decisions=? WHERE id=1",
+                    (json.dumps({'t3_thread_id':THREAD}), json.dumps(['Ship behind a switch'])))
+        assert con.execute("SELECT count(*) FROM decisions").fetchone()[0] == 0
+    with mock.patch.object(hs,'try_hub_connect',side_effect=ConnectionError('offline')):
+        hits=rp._thread_memory_hits(THREAD)
+    assert [h['snippet'] for h in hits] == ['Ship behind a switch']
 
 
 def test_priority_survives_topical_search_timeout():
