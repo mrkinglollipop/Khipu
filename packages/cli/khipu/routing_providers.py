@@ -6,6 +6,7 @@ import re
 
 # Adapter names describe existing local probes; http-quota is reserved for 9b.
 ADAPTERS = frozenset({"claude", "codex", "grok", "muse", "glm", "http-quota", "none"})
+USES = frozenset({"normal", "on_request", "second_opinion"})
 FIELDS = frozenset({"id", "label", "family", "login", "probe", "host", "lane_names",
                     "models_allowed", "models_never", "use"})
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
@@ -25,7 +26,7 @@ def checked(value):
         return None
     if value.get("login", "none") not in {"folder", "none"} or value.get("probe", "none") not in ADAPTERS:
         return None
-    if value.get("use", "normal") not in {"normal", "on_request"}:
+    if value.get("use", "normal") not in USES:
         return None
     from khipu.routing_sources import _key_like, _redacted
 
@@ -52,6 +53,8 @@ def advisory(provider: dict, model: str | None, *, include_use: bool = True) -> 
         warnings.append(f"{label}: model {model or 'unknown'} is outside models_allowed ({', '.join(allowed)}).")
     if include_use and provider.get("use") == "on_request":
         warnings.append(f"{label}: use: on_request; follow the owner's request when choosing this provider.")
+    if include_use and provider.get("use") == "second_opinion":
+        warnings.append(f"{label}: use: second_opinion; second opinions and reviews only, never builds or fixes.")
     return warnings
 
 
@@ -60,8 +63,8 @@ def line(provider: dict) -> str:
     for field in ("models_allowed", "models_never"):
         if field in provider:
             parts.append(f"{field}: [{', '.join(provider[field])}]")
-    if provider.get("use") == "on_request":
-        parts.append("use: on_request")
+    if provider.get("use") in ("on_request", "second_opinion"):
+        parts.append(f"use: {provider['use']}")
     return f"Provider {provider.get('label') or provider['id']}: " + "; ".join(parts) if parts else ""
 
 

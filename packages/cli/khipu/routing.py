@@ -2032,7 +2032,7 @@ _REASON_CODES = frozenset(set(HOLD_REASONS) | set(DOWN_REASONS)
 _AUTHOR_KINDS = frozenset({"owner", "conversation", "check", "seed",
                            "migration", "runner"})
 _PROVIDER_LOGINS = frozenset({"folder", "none"})
-_PROVIDER_USES = frozenset({"normal", "on_request"})
+_PROVIDER_USES = frozenset({"normal", "on_request", "second_opinion"})
 _DECLINE_WHY = frozenset({"you stopped tracking it"})
 
 # Field shapes: "id" a safe identifier, "time" an ISO time or date,
