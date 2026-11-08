@@ -465,15 +465,18 @@ def _generate_claude_cli(prompt: str, *, model_id: str, timeout: int = 60, retri
         _synth_budget_take()
         try:
             sid = synth_cli.new_session()
-            with tempfile.TemporaryDirectory(prefix="work-", dir=synth_cli.root()) as cwd:
-                # Keep per-call cwd isolation, but do not leave a Claude project
-                # namespace/transcript behind for each temporary directory.
-                argv = [cli, "-p", "--no-session-persistence", "--setting-sources", "", "--model", model_id,
-                        "--system-prompt", CLAUDE_CLI_SYSTEM_PROMPT,
-                        "--output-format", "json", "--max-turns", "1", "--disallowedTools",
-                        "Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,Agent", "--session-id", sid]
-                result = subprocess.run(argv, input=prompt, text=True, capture_output=True,
-                                        cwd=cwd, env=env, timeout=timeout, check=False)
+            # One fixed, empty working directory for every call (see
+            # synth_cli.work_dir): a fresh directory per call made Claude
+            # Code create a ~/.claude/projects folder for each.
+            cwd = synth_cli.work_dir()
+            persistence = (["--no-session-persistence"]
+                           if synth_cli.supports_flag(cli, "--no-session-persistence", env) else [])
+            argv = [cli, "-p", *persistence, "--setting-sources", "", "--model", model_id,
+                    "--system-prompt", CLAUDE_CLI_SYSTEM_PROMPT,
+                    "--output-format", "json", "--max-turns", "1", "--disallowedTools",
+                    "Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,Agent", "--session-id", sid]
+            result = subprocess.run(argv, input=prompt, text=True, capture_output=True,
+                                    cwd=cwd, env=env, timeout=timeout, check=False)
             data = json.loads(result.stdout)
             text = data.get("result")
             if not isinstance(text, str):
@@ -526,8 +529,8 @@ def _generate_codex_cli(prompt: str, *, model_id: str, timeout: int = 60, retrie
         _synth_budget_take()
         try:
             synth_cli.new_session()
-            with tempfile.TemporaryDirectory(prefix="work-", dir=synth_cli.root()) as cwd, \
-                    tempfile.NamedTemporaryFile(dir=synth_cli.root()) as output:
+            cwd = synth_cli.work_dir()
+            with tempfile.NamedTemporaryFile(dir=synth_cli.root()) as output:
                 argv = [cli, "exec", "--json", "--ephemeral", "-s", "read-only",
                         "--skip-git-repo-check", "-m", model_id, "-o", output.name, "-C", cwd,
                         # The user's own Codex config (MCP servers, hooks) cost 30 s

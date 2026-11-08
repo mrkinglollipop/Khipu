@@ -48,7 +48,8 @@ def test_summariser_litter_is_skipped_before_stat_or_memory_scan(tmp_path, monke
     projects = tmp_path / 'projects'
     litter = [projects / name for name in (
         '-Users-matt--config-khipu-state-synth-cli-work-ab12cd34',
-        '-Volumes-Cloud-Storage-khipu-state-synth-cli-work-a-b_c123')]
+        '-Volumes-Cloud-Storage-khipu-state-synth-cli-work-a-b_c123',
+        '-Users-matt--config-khipu-state-synth-cli-work')]
     for folder in litter:
         _write(folder / 'memory' / 'internal.md', 'Internal summariser data')
     # Ordinary projects, including a similar name, must still be scanned.

@@ -287,10 +287,11 @@ def _claude_project_dirs(root: Path) -> list[Path]:
     if not root.is_dir():
         return []
     # Old summariser calls used state/synth-cli/work-<tempfile suffix> as
-    # cwd. Claude encoded that path as a project slug. Reject by name before
-    # even stat-ing it: tens of thousands of these can outlive the temp cwd.
+    # cwd; current ones use the fixed state/synth-cli/work. Claude encoded
+    # that path as a project slug. Reject by name before even stat-ing it:
+    # tens of thousands of the old ones can outlive the temp cwd.
     return sorted(p for p in root.iterdir()
-                  if not re.search(r"-state-synth-cli-work-[a-z0-9_-]{8}$", p.name)
+                  if not re.search(r"-state-synth-cli-work(-[a-z0-9_-]{8})?$", p.name)
                   and p.is_dir())
 
 
