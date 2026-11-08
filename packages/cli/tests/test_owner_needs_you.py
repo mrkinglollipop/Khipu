@@ -102,7 +102,7 @@ def _held_pause(world) -> str:
     world["t3"].message(THREAD, time.time() - 5, text="pause Codex")
     _t3_hook_turn()
     _be(world, T3_SESSION)
-    ok, out = owner_act.act("route.pause", {"account": "Codex"})
+    ok, out = owner_act.act("direction.request", {"action": "route.pause", "args": {"account": "Codex"}})
     assert ok and out["pending"] is True, out
     return out["request"]
 
@@ -113,7 +113,7 @@ def _ask_then_yes(world, action: dict, words: str = "Yes, go ahead") -> tuple[bo
         world["t3"].message(THREAD, time.time() - 1, text="what needs my confirmation?")
     _t3_hook_turn()
     _be(world, T3_SESSION)
-    ok, out = owner_act.act(action["action"], action["args"])
+    ok, out = owner_act.act("direction.request", {"action": action["action"], "args": action["args"]})
     if not ok:
         assert out["code"] == "version_moved", out
         return ok, out
@@ -489,31 +489,21 @@ def test_a_setting_answer_pinned_to_what_was_shown_never_lands_on_a_newer_reques
 
 
 def test_the_routing_copy_switch_is_settable_from_a_t3_conversation_end_to_end(world):
-    """The owner says "turn on the routing copy" in T3: held, plain words, his yes."""
+    """The owner says "turn on the routing copy" in T3: his own direction (class A,
+    2026-11-07) applies at once, logged as his, with its Undo."""
     world["t3"].message(THREAD, time.time() - 1, text="turn on the routing copy between my Macs")
     _t3_hook_turn()
     _be(world, T3_SESSION)
     ok, out = owner_act.act("config.routing_setting", {"key": "routing_replication_live", "value": True})
-    assert ok and out["pending"] is True and out["applied"] is False, out
-    assert "Copy routing between your Macs" in out["ask"] and "to on" in out["ask"]
-    assert _setting()["value"] is False
-    # Waiting, it is on the list, and nothing has answered it yet.
-    item = _one("held")
-    assert "Copy routing between your Macs" in item["words"]
-    assert not IDS.search(item["words"]) and item["settle"]["confirm"]["action"] == "direction.confirm"
-    # The agent can't answer: no typed message since the ask.
-    ok, refused = owner_act.act("direction.confirm", {"request": out["request"]})
-    assert not ok and refused["code"] == "not_confirmed" and _setting()["value"] is False
-    assert "Nothing" in refused["error"] or "nothing" in refused["error"]
-    world["t3"].message(THREAD, time.time() + 1, text="yes turn it on")
-    _t3_hook_turn(prompt="yes turn it on")
-    ok, done = owner_act.act("direction.confirm", {"request": out["request"]})
-    assert ok, done
+    assert ok and not out.get("pending") and out["owner_action"], out
     assert _setting()["value"] is True and _setting()["pending"] is False
     assert not _items()
-    # Logged as an owner's change, undoable from its line.
     line = owner_direction.actions()[-1]
     assert line["action"] == "config.routing_setting" and line["session"] == T3_SESSION
+    assert line["binding"] == "t3" and line["instant"]["source"] == "t3"
+    ok, undone = owner_act.act("direction.undo", {"id": out["owner_action"]})
+    assert ok, undone
+    assert _setting()["value"] is False
 
 
 def test_an_account_list_request_settles_and_undoes(world):
@@ -870,7 +860,7 @@ def _owner_types(world, text: str) -> None:
 def _earlier_ask(world) -> None:
     """Some older question Khipu put in this thread, about something else."""
     _owner_types(world, "pause Grok")
-    ok, out = owner_act.act("route.pause", {"account": "Grok"})
+    ok, out = owner_act.act("direction.request", {"action": "route.pause", "args": {"account": "Grok"}})
     assert ok and out["pending"] is True, out
 
 
@@ -909,7 +899,8 @@ def test_the_question_alone_does_not_confirm_a_held_kind(world):
 
 def test_the_question_alone_does_not_confirm_a_request_already_held(world):
     _owner_types(world, "turn on the routing copy")
-    ok, held = owner_act.act("config.routing_setting", {"key": "routing_replication_live", "value": "true"})
+    ok, held = owner_act.act("direction.request", {"action": "config.routing_setting",
+                                                   "args": {"key": "routing_replication_live", "value": "true"}})
     assert ok and held["pending"] is True, held
     _owner_types(world, "what needs my confirmation?")
     _items()
@@ -920,7 +911,8 @@ def test_the_question_alone_does_not_confirm_a_request_already_held(world):
 
 def test_thanks_before_the_read_does_not_confirm_the_routing_copy(world):
     _owner_types(world, "turn on the routing copy")
-    ok, held = owner_act.act("config.routing_setting", {"key": "routing_replication_live", "value": "true"})
+    ok, held = owner_act.act("direction.request", {"action": "config.routing_setting",
+                                                   "args": {"key": "routing_replication_live", "value": "true"}})
     assert ok and held["pending"] is True, held
     _owner_types(world, "thanks")
     _items()
@@ -954,14 +946,16 @@ def test_a_yes_newer_than_the_read_confirms_a_held_kind_with_one_yes(world):
     settle = _settle("setting")
     _owner_types(world, "yes, turn it on")
     ok, out = _act_on(settle)
-    assert ok and out.get("pending") is not True and out["confirmed"]["source"] == "t3", out
+    assert ok and out.get("pending") is not True, out
+    assert owner_direction._find(out["owner_action"])["instant"]["source"] == "t3"
     assert _setting()["value"] is True and _setting()["pending"] is False
     assert owner_direction.actions()[-1]["action"] == "config.answer_request.confirm"
 
 
 def test_a_yes_newer_than_the_read_confirms_a_request_already_held_with_one_yes(world):
     _owner_types(world, "turn on the routing copy")
-    ok, held = owner_act.act("config.routing_setting", {"key": "routing_replication_live", "value": "true"})
+    ok, held = owner_act.act("direction.request", {"action": "config.routing_setting",
+                                                   "args": {"key": "routing_replication_live", "value": "true"}})
     assert ok, held
     _owner_types(world, "what needs my confirmation?")
     settle = _settle("held")
@@ -1163,8 +1157,8 @@ def test_a_priority_exception_cannot_break_out_of_its_quotes(world):
     assert 'x".' not in item["words"] and "x'" in item["words"]
     # And in the ask an amend carries for it.
     _owner_types(world, "add docs to Claude")
-    ok, held = owner_act.act("route.priority.amend", {"account": "Claude", "append": "and docs",
-                                                      "expect": routing.priority_version()})
+    ok, held = owner_act.act("direction.request", {"action": "route.priority.amend", "args": {
+        "account": "Claude", "append": "and docs", "expect": routing.priority_version()}})
     assert ok and 'x".' not in held["ask"], held
 
 

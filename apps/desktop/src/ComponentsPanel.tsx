@@ -35,9 +35,7 @@ type StatusPayload = {
     port?: number;
   };
   postgres_probe?: { ok?: boolean; error?: string } | null;
-  graphify?: { semver?: string; path?: string; source?: string };
   postgres_upgrade?: UpgradeInfo | null;
-  graphify_upgrade?: UpgradeInfo | null;
   error?: string;
 };
 
@@ -78,19 +76,14 @@ export function ComponentsPanel({ active }: { active: boolean }) {
     void reload();
   }, [active, reload]);
 
-  const runUpgrade = useCallback(async (kind: "postgres" | "graphify") => {
+  const runUpgrade = useCallback(async (kind: "postgres") => {
     setBusy(kind);
     setMsg(null);
     try {
-      const cmd = kind === "postgres" ? "upgrade_postgres" : "upgrade_graphify";
-      const raw = await invoke<string>(cmd);
+      const raw = await invoke<string>("upgrade_postgres");
       const out = parse(raw);
       if (out?.ok) {
-        setMsg(
-          kind === "postgres"
-            ? `Postgres upgraded to ${String(out.image ?? out.server_version ?? "new image")}.`
-            : `Graphify upgraded to ${String(out.semver ?? "new version")}.`,
-        );
+        setMsg(`Postgres upgraded to ${String(out.image ?? out.server_version ?? "new image")}.`);
       } else {
         setMsg(String(out?.error ?? raw));
       }
@@ -110,13 +103,10 @@ export function ComponentsPanel({ active }: { active: boolean }) {
   );
 
   const pg = status?.postgres;
-  const gy = status?.graphify;
   const docker = status?.docker;
   const postgresProbe = status?.postgres_probe;
   const pgUp = status?.postgres_upgrade;
-  const gyUp = status?.graphify_upgrade;
   const pgRemote = pg?.mode === "remote" || pg?.source === "dsn";
-  const gyExternal = gy?.source === "env";
 
   return (
     <div className="panel-body">
@@ -126,9 +116,7 @@ export function ComponentsPanel({ active }: { active: boolean }) {
             ? "Checking components…"
             : busy === "postgres"
               ? "Upgrading Postgres…"
-              : busy === "graphify"
-                ? "Upgrading Graphify…"
-                : null
+              : null
         }
       />
       <div className="section-card">
@@ -200,47 +188,6 @@ export function ComponentsPanel({ active }: { active: boolean }) {
                 : "Postgres up to date"}
             </button>
           </div>
-        </div>
-      </div>
-
-      <div className="section-card">
-        <div className="section-head" title="Graphify">Graph builder</div>
-        <div className="section-body">
-          {gyExternal ? (
-            <p className="muted">
-              External Graphify install — <code>{gy?.path ?? "?"}</code> (managed outside
-              the app; upgrade it where you installed it).
-            </p>
-          ) : gy?.semver ? (
-            <p className="muted">
-              Installed <code className="nowrap">{gy.semver}</code>
-              {gy.path ? (
-                <>
-                  {" "}
-                  at <code>{gy.path}</code>
-                </>
-              ) : null}
-            </p>
-          ) : (
-            <p className="muted">The graph builder is not installed — finish Welcome → Graph first.</p>
-          )}
-          {gyExternal ? null : (
-            <div className="toolbar">
-              <button
-                type="button"
-                className={gyUp?.available ? "primary" : undefined}
-                disabled={busy != null || !gyUp?.available || !gy?.semver}
-                onClick={() => void runUpgrade("graphify")}
-              >
-                {busy === "graphify" ? (
-                  <Loader2 size={14} className="spin" aria-hidden />
-                ) : null}
-                {gyUp?.available
-                  ? `Upgrade to ${gyUp.target ?? "new version"}`
-                  : "Graphify up to date"}
-              </button>
-            </div>
-          )}
         </div>
       </div>
 

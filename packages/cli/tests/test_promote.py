@@ -1595,7 +1595,6 @@ _LOCAL_FAILURES = {
     "jobs_ok": ("khipu.jobs.job_status", {"queue_drain": {"last_exit": 1, "expected": True}}),
     "index_freshness_ok": ("khipu.jobs.index_freshness", {"ok": False}),
     "synth_budget_ok": ("khipu.embed.budget_status", {"exhausted": True}),
-    "graph_backup_ok": ("khipu.graph_backup.local_health", {"ok": False}),
     "bundle_seal_ok": ("khipu.bundle_seal.check", {"ok": False}),
     "prompt_recall_snapshot_ok": ("khipu.hub_snapshot.prompt_recall_snapshot_status", {"ok": False}),
     "prompt_recall_outcomes_ok": ("khipu.recall_prompt.prompt_recall_outcomes", {"ok": False}),
@@ -1767,16 +1766,14 @@ def test_credential_reads_never_migrate_inside_an_isolated_run(home, monkeypatch
 
 
 def test_isolation_outranks_live_overrides(home, monkeypatch, tmp_path):
-    from khipu import graph_backup, outbox, recall_eval
+    from khipu import outbox, recall_eval
 
     iso = tmp_path / "iso"
     monkeypatch.setenv("KHIPU_OUTBOX", str(home / "live-outbox"))
-    monkeypatch.setenv("KHIPU_GRAPH_SNAPSHOT_DIR", str(home / "live-graph"))
     monkeypatch.setenv("KHIPU_RECALL_GOLDEN", str(home / "golden.jsonl"))
     assert outbox.outbox_dir() == home / "live-outbox"
     monkeypatch.setenv("KHIPU_ISOLATED_DIR", str(iso))
     assert outbox.outbox_dir() == iso / "outbox" and outbox.dead_dir() == iso / "outbox" / "dead"
-    assert graph_backup._default_snapshot_dir() == iso / "backups" / "graph"
     assert recall_eval.default_golden_path() == iso / "recall-golden.jsonl"
     outbox.enqueue({"ts": "2026-10-14T00:00:00Z", "summary": "gate", "session_id": "claude_code:khipu-gate-o"},
                    reason="test")

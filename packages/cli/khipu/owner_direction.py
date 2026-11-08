@@ -83,31 +83,35 @@ ACTIONS: frozenset[str] = frozenset({
     "route.tier_table.clear", "accounts.track", "accounts.rename", "accounts.stop",
     "accounts.move", "accounts.decline", "accounts.offer_again", "accounts.auto_track", "accounts.request.confirm",
     "accounts.request.undo", "config.usage_accounts", "config.routing_setting", "config.answer_request.confirm",
-    "config.answer_request.undo", "promote.gate_ignore", "promote.gate_ignore.cancel", "ledger.import",
+    "config.answer_request.undo", "promote.gate_ignore", "promote.gate_ignore.cancel",
     "ledger.restore", "ledger.purge", "ledger.project", "ledger.add", "ledger.set", "ledger.remove", "work.hide", "work.unhide",
     "work.same", "work.not_same", "owed.change", "owed.tidy", "direction.off", "direction.on", "direction.set",
     "direction.undo", "project.alias_add", "project.alias_remove", "project.merge", "project.keep_separate",
-    "project.separate", "forget.send", "forget.here", "forget.not_same", "outbox.merge_preferences",
-    "outbox.span_covered",
+    "project.separate", "forget.send", "forget.here", "forget.not_same",
 })
 
-# Actions a recent owner turn does not make: ``khipu_owner_act`` always holds
-# them with this question, and the command's ``--owner-direction`` passes only
-# in the replay of a request ``confirm`` proved he answered (``replaying``).
-CONFIRM_ONLY: dict[str, str] = {
-    "outbox.span_covered": ("Retire the dead outbox jobs `khipu outbox span-covered` counts? Each has a live episode "
-                            "whose range contains its own and which holds every evidence field it carries. Summaries "
-                            "are not compared and a range does not prove the same text, so each job's own summary "
-                            "then stays only in the local record; nothing is written to the hub."),
-}
+# Owner changes come in three classes (owner decision 2026-11-07). A: his own
+# direction, applied as soon as a turn proves he typed it, with a receipt and
+# an Undo, in every front end (T3 included). B: an answer to a request someone
+# else made (``ANSWER_ACTIONS``): he has to have been shown it first. C: a
+# change that can't be taken back (``CLASS_C``): ``khipu_owner_act`` holds it
+# with its own words for his yes even when he asked for it himself.
+# Every action not named here is A, so the C list is kept by hand.
+CLASS_C: frozenset[str] = frozenset({"forget.send", "forget.here", "forget.not_same", "ledger.purge"})
 
-# Routing changes that apply as soon as the owner types them (2026-11-03, owner
-# decision): account priority and its exceptions, standing rules, the note,
-# pauses, holds and lifts. They still need the check below (a provably owner
-# turn); a turn that fails it keeps today's refusal or hold. Forget, purge,
-# permissions and trust settings, secrets and every other action are not here,
-# so they keep the explicit confirm they need.
-ROUTING_INSTANT: frozenset[str] = frozenset({
+
+def class_c(action: str, values: dict | None = None) -> bool:
+    """Whether ``action`` with ``values`` is a change that can't be taken back."""
+    return action in CLASS_C
+
+
+# A clean-up an agent planned (B) with no Needs-you item of its own: always
+# held with these words, and the command's ``--owner-direction`` passes only
+# in the replay of a request ``confirm`` proved he answered (``replaying``).
+PLANNED_ASKS: dict[str, str] = {}
+
+# The routing changes whose direction pushes a receipt to every conversation.
+RECEIPTED: frozenset[str] = frozenset({
     "route.pause", "route.lift", "route.note.set", "route.note.end", "route.rule.add", "route.rule.edit",
     "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
     "route.hold.add", "route.hold.end", "route.priority.set", "route.priority.amend", "route.priority.confirm",
@@ -127,27 +131,18 @@ SETTLE_ACTIONS: frozenset[str] = frozenset({
 # A conversation's override changes only that conversation's advice, so
 # nothing about it is pushed to the others (no receipt line, no push words).
 LOCAL_ONLY_ROUTING: frozenset[str] = frozenset({"route.override.grant", "route.override.end", "route.override.keep"})
-# The routing changes that answer a request waiting on the owner, not a change
-# of his own. His typed message can be the direction for a change of his own;
-# an answer needs him to have been shown what it answers, so in T3 it applies at
-# once only on a message newer than an ask in that thread showing it
-# (``_shown_read``). A conversation's own request applied on the owner's turn
-# (``REQUEST_APPLIED``) is the change he typed, and stays as it was.
+# Class B: answers to a request someone else made, never a change of the
+# owner's own. His typed message can be the direction for a change of his own;
+# an answer needs him to have been shown what it answers, so in T3 it applies
+# only on a message newer than a read in that thread showing it
+# (``_shown_read``), and is held and asked otherwise. A conversation's own
+# request applied on the owner's turn (``REQUEST_APPLIED``) is the change he
+# typed, and stays as it was.
 ANSWER_ACTIONS: frozenset[str] = frozenset({
     "route.priority.confirm", "route.priority.undo", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
+    "route.tier_table.confirm", "accounts.request.confirm", "accounts.request.undo", "config.answer_request.confirm",
+    "config.answer_request.undo", "owed.correct_job_origin.confirm", "project.merge", "project.keep_separate",
 })
-
-
-def instant_allowed(action: str, target: str | None = None) -> bool:
-    """Whether ``action`` is a routing change that applies as soon as the
-    owner types it. An Undo (``direction.undo``) counts only when it undoes
-    one of those: undoing a trust, permission or forget action never does."""
-    if action in ROUTING_INSTANT:
-        return True
-    if action == "direction.undo" and target:
-        line = _find(str(target))
-        return bool(line and line.get("action") in ROUTING_INSTANT)
-    return False
 
 
 # ---- the session --------------------------------------------------------------------------
@@ -175,7 +170,7 @@ def _title(name: str) -> str:
 # ---- the check ---------------------------------------------------------------------------
 
 
-def check(action: str, *, env=None, now: float | None = None, instant: bool = False, reading: bool = False) -> dict:
+def check(action: str, *, env=None, now: float | None = None, reading: bool = False) -> dict:
     """A recorded owner turn in this conversation, or the replay of its answer.
 
     T3 uses its owner-message rows. Native fronts use their recorded typed
@@ -211,24 +206,23 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
     except DirectionRefused:
         if any(t.get("entrypoint") in ("t3", "t3-unverified") for t in owner_turns.turns(session, now)):
             # A T3 conversation (or one whose hook could not read T3's record in
-            # time, which T3's record is asked again here): its turns never count directly, so the
-            # change is held for the owner to confirm (``hold``, ``confirm``).
-            # T3's own record decides whether it is a job (``_t3_bound``).
+            # time, which T3's record is asked again here): its hook turns never
+            # count directly; T3's own record of the owner's messages does
+            # (``_t3_turn``). T3's own record decides whether it is a job (``_t3_bound``).
             with t3.owner_read_budget():
                 _t3_bound(environ, session, now)
-                stamp = _instant_t3(environ, session, now, action) if instant else None
+                stamp = _t3_turn(environ, session, now, action)
             if stamp is not None:
                 return stamp
-            raise DirectionRefused("confirm_needed", _HOLD_WHY) from None
+            raise DirectionRefused("confirm_needed", _ANSWER_HOLD_WHY) from None
         raise
     if not reading and action in SETTLE_ACTIONS and not REQUEST_APPLIED.get():
         _not_the_reading_turn(session, turn)
     stamp = {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
              "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),
              "binding": "session" if turn.get("harness") in owner_turns.SESSION_ONLY_HARNESSES else "hook"}
-    if instant:
-        stamp["instant"] = {"source": "hook", "turn": turn["turn"], "turn_at": turn.get("at"),
-                            "window_h": conf["latest_window_h"]}
+    stamp["instant"] = {"source": "hook", "turn": turn["turn"], "turn_at": turn.get("at"),
+                        "window_h": conf["latest_window_h"]}
     return stamp
 
 
@@ -247,13 +241,16 @@ def _recent_turn(session: str, conf: dict, now: float, recorded: list[dict] | No
         raise DirectionRefused("no_recorded_turn",
                                "The owner has not typed in this conversation, so it can't make an owner's change "
                                "(a background or dispatched job never can). Ask the owner to say it in a "
-                               "conversation they are typing in.")
+                               "conversation they are typing in. If they did, Khipu's prompt hook may not be "
+                               "installed in this front end.")
     turn = usable[-1]
     return turn
 
 
-_HOLD_WHY = ("This is a T3 conversation, so the change waits for the owner to confirm it. Ask for it with "
-             "khipu_owner_act: Khipu holds it and tells you what to ask the owner.")
+_ANSWER_HOLD_WHY = ("This answers a request the owner has not been shown in this T3 conversation, so it waits for "
+                    "their yes. Ask for it with khipu_owner_act: Khipu holds it and tells you what to ask the owner.")
+_NO_T3_MESSAGE = ("T3's record shows no message the owner typed in this conversation, so it can't make an owner's "
+                  "change (a dispatched job or a relayed message never can). Nothing was changed.")
 _ASK_NOW = ("Not confirmed yet: no message the owner typed in this conversation since they were last asked, "
             "so nothing was changed. Ask the owner to confirm now, in this conversation, then call "
             "direction.confirm again.")
@@ -402,12 +399,16 @@ def _read_rows() -> list[dict]:
         return []
 
 
+def _thread_read(thread: str) -> dict | None:
+    """The latest read of the list in this T3 thread, when there was one."""
+    return next((row for row in _read_rows()
+                 if _t3_parts((row.get("t3_snapshots") or {}).get(thread)) is not None), None)
+
+
 def _shown_read(thread: str, answer: str | None) -> dict | None:
     """The read in this T3 thread that showed ``answer``, when one did."""
-    for row in _read_rows():
-        if _t3_parts((row.get("t3_snapshots") or {}).get(thread)) is not None:
-            return row if answer and answer in (row.get("shown") or []) else None
-    return None
+    row = _thread_read(thread)
+    return row if row is not None and answer and answer in (row.get("shown") or []) else None
 
 
 def _not_the_reading_turn(session: str, turn: dict) -> None:
@@ -481,7 +482,8 @@ def note_read(shown: list[str], *, env=None, now: float | None = None) -> str | 
 
 def _seed(thread: str | None, session: str, answer: str) -> dict | None:
     """The boundary of the read that showed ``answer``: a hold made after the
-    owner replied to that read starts from it, so his one yes counts."""
+    owner replied to that read starts from it, so one yes to the list counts
+    (class B). A class C hold is never seeded: it is asked on its own."""
     for row in _read_rows():
         if thread is not None and _t3_parts((row.get("t3_snapshots") or {}).get(thread)) is not None:
             return ({"t3_snapshots": {thread: json.loads(json.dumps(row["t3_snapshots"][thread]))}}
@@ -497,12 +499,12 @@ def reviewed_hold(request: dict) -> bool:
     args, files = request.get("args"), request.get("files")
     if not isinstance(args, dict):
         return False
-    key = {"ledger.import": "file", "owed.tidy": "plan"}.get(request.get("action"))
+    key = {"owed.tidy": "plan"}.get(request.get("action"))
     return not key or not args.get(key) or (isinstance(files, dict) and str(args[key]) in files)
 
 
 def _review_files(action: str, args: dict) -> dict:
-    key = {"ledger.import": "file", "owed.tidy": "plan"}.get(action)
+    key = {"owed.tidy": "plan"}.get(action)
     if not key or not args.get(key):
         return {}
     from khipu import safe_read
@@ -564,7 +566,7 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
             elif any(t.get("entrypoint") in ("t3", "t3-unverified") for t in turns_):
                 with t3.owner_read_budget():
                     thread, _ = _t3_bound(environ, session, now)
-                    seeded = _seed(thread, session, signature(action, args))
+                    seeded = None if class_c(action, args) else _seed(thread, session, signature(action, args))
                     extra = {**seeded, "seeded": True} if seeded else {
                         "t3_snapshots": {thread: _t3_boundary(None, _t3_read(thread, (), None), session)}}
             else:
@@ -574,8 +576,9 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
                 if not usable:
                     raise DirectionRefused("no_recorded_turn",
                                            "The owner has not typed in this conversation, so it can't ask for an "
-                                           "owner's change (a background or dispatched job never can).")
-                seeded = _seed(None, session, signature(action, args))
+                                           "owner's change (a background or dispatched job never can). If they did, "
+                                           "Khipu's prompt hook may not be installed in this front end.")
+                seeded = None if class_c(action, args) else _seed(None, session, signature(action, args))
                 extra = {**seeded, "seeded": True} if seeded else {
                     "asks": {session: _ask_boundary(None, turns_, now, session)}}
             request = {"id": "req-" + secrets.token_hex(6), "action": action, "args": args, "state": "pending",
@@ -798,59 +801,36 @@ def _t3_proof(environ, session: str, request: dict, now: float) -> dict | None:
     return _ASK_NOW
 
 
-def _t3_baseline(thread: str) -> tuple[str, dict] | None:
-    """(request id, snapshot) of the latest known ask boundary any held
-    request recorded for this T3 thread, or None when there is none. Only a
-    snapshot that bounds something counts (``_t3_parts``); a request Forget
-    scrubbed holds none."""
-    try:
-        rows = _read_requests(requests_path())
-    except OSError:
-        return None
-    best = None
-    for row in rows:
-        snapshots = row.get("t3_snapshots")
-        snapshot = snapshots.get(thread) if isinstance(snapshots, dict) else None
-        parts = _t3_parts(snapshot)
-        if parts is None:
-            continue
-        rank = parts[1] if parts[1] is not None else float("-inf")
-        if best is None or rank > best[0]:
-            best = (rank, str(row.get("id")), snapshot)
-    return None if best is None else (best[1], best[2])
+def _t3_turn(environ, session: str, now: float, action: str) -> dict | None:
+    """The owner's message in this T3 thread that makes ``action``,
+    independent of hook text.
 
-
-def _instant_t3(environ, session: str, now: float, action: str | None = None) -> dict | None:
-    """A T3 owner's message for an instant change, independent of hook text.
-
-    Existing answering actions use their shown ask. An own request keeps the
-    owner's interpretation tradeoff and needs no earlier question.
+    His own direction (class A) needs no earlier question: a message he typed
+    in the thread proves it, as it does for a conversation's own request
+    (``REQUEST_APPLIED``). A settle the list offers needs a message after this
+    thread's latest read of it, as outside T3 (``_not_the_reading_turn``). An
+    answer to someone else's request (``ANSWER_ACTIONS``) also needs that read
+    to have shown it: None when it did not or the owner has not replied, so it
+    is held and asked.
     """
-    from khipu import t3
-
-    try:
-        thread = _t3_thread_of(session)
-        answered = _shown_read(thread, ANSWERING.get()) if action in ANSWER_ACTIONS else None
-        if action in ANSWER_ACTIONS and not REQUEST_APPLIED.get() and answered is None:
-            return None
-        base = ((answered["id"], answered["t3_snapshots"][thread]) if answered is not None
-                else None if REQUEST_APPLIED.get() else _t3_baseline(thread))
-        if base is None:
-            if not REQUEST_APPLIED.get():
-                return None
-            # An own request needs the current typed message, not an earlier question.
-            request_id, snapshot = None, {"ids": [], "latest_ts": 0}
-        else:
-            request_id, snapshot = base
-        stamp = _t3_proof(environ, session, {"t3_snapshots": {thread: json.loads(json.dumps(snapshot))}}, now)
-    except DirectionRefused:
+    thread = _t3_thread_of(session)
+    own = REQUEST_APPLIED.get()
+    read = None if own or action not in SETTLE_ACTIONS | ANSWER_ACTIONS else _thread_read(thread)
+    answer = action in ANSWER_ACTIONS and not own
+    if answer and (read is None or _shown_read(thread, ANSWERING.get()) is None):
         return None
+    snapshot = read["t3_snapshots"][thread] if read is not None else {"ids": [], "latest_ts": 0}
+    stamp = _t3_proof(environ, session, {"t3_snapshots": {thread: json.loads(json.dumps(snapshot))}}, now)
     if not isinstance(stamp, dict):
-        return None
+        if answer:
+            return None
+        if read is not None:
+            raise DirectionRefused("not_confirmed", _SAME_TURN)
+        raise DirectionRefused("no_recorded_turn", _NO_T3_MESSAGE)
     proved = stamp.pop("confirmed")
     stamp["instant"] = {"source": "t3", "message": proved["message"], "message_at": proved["message_at"],
                         "message_sha256": proved["message_sha256"],
-                        **({"after_ask": request_id} if request_id is not None else {})}
+                        **({"after_ask": read["id"]} if read is not None else {})}
     return stamp
 
 
@@ -864,7 +844,8 @@ def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
     conf = owner_turns.settings()
     turn = next((t for t in reversed(recorded) if owner_turns.eligible(t, conf)[0]), None)
     if turn is None:
-        raise DirectionRefused("no_recorded_turn", "No typed owner reply was recorded in this conversation.")
+        raise DirectionRefused("no_recorded_turn", "No typed owner reply was recorded in this conversation. Khipu's "
+                                                   "prompt hook may not be installed in this front end.")
     asks = request.get("asks")
     if not isinstance(asks, dict):
         asks = request["asks"] = {}
@@ -978,6 +959,10 @@ def confirm(request_id: str, *, env=None, now: float | None = None, remote: dict
                     member = owner_turns._t3_membership(session)
                     if member == "unverified":
                         raise DirectionRefused("t3_unreadable", _T3_UNREADABLE_WHY)
+                    if _listed_since_asked(state, request, session):
+                        _ask_alone(environ, session, request, now, t3_member=member == "t3")
+                        _save(path, state, now)
+                        raise DirectionRefused("not_confirmed", _ASK_ALONE.format(ask=request.get("ask") or ""))
                     stamp = _proof(environ, session, request, now)
             if isinstance(stamp, str):
                 _save(path, state, now)
@@ -992,6 +977,50 @@ def confirm(request_id: str, *, env=None, now: float | None = None, remote: dict
         raise DirectionRefused("log_unwritable", f"Khipu can't read or write the held requests ({err}), so nothing "
                                                  "was changed.") from None
     return request, stamp
+
+
+_ASK_ALONE = ("Not confirmed: this can't be taken back, so a yes to a list never settles it. Nothing was changed. "
+              "Ask the owner about it on its own: {ask} Once they reply, call direction.confirm again.")
+
+
+def permanent(request: dict) -> bool:
+    """A held request that can't be taken back (class C), one mirrored from
+    another Mac included (its holder says so; a forget or a purge always is)."""
+    remote = request.get("remote")
+    if request.get("action") == "direction.remote" and isinstance(remote, dict):
+        action = str(remote.get("action") or "")
+        return remote.get("permanent") is True or class_c(action, None)
+    return class_c(request.get("action", ""), request.get("args"))
+
+
+def _listed_since_asked(state: dict, request: dict, session: str) -> bool:
+    """A class C request this conversation read the list after its own ask
+    here: the owner's next yes may answer the list, so it is asked alone
+    again. Each conversation's own ask counts only for that conversation."""
+    if not permanent(request):
+        return False
+    asked = _float(((request.get("asked_alone") or {}).get(session)) or request.get("created_ts"))
+    return any(r.get("action") == READ_ACTION and r.get("session") == session and _float(r.get("settled_ts")) > asked
+               for r in state["requests"])
+
+
+def _ask_alone(environ, session: str, request: dict, now: float, *, t3_member: bool) -> None:
+    """Put a class C request's own ask again in this conversation: only a
+    message after now answers it here."""
+    if not isinstance(request.get("asked_alone"), dict):
+        request["asked_alone"] = {}
+    request["asked_alone"][session] = now
+    if t3_member:
+        thread = _t3_refusals(environ, session)
+        snapshots = request.get("t3_snapshots")
+        if not isinstance(snapshots, dict):
+            snapshots = request["t3_snapshots"] = {}
+        snapshots[thread] = _t3_boundary(snapshots.get(thread), _t3_read(thread, (), None), session)
+        return
+    asks = request.get("asks")
+    if not isinstance(asks, dict):
+        asks = request["asks"] = {}
+    asks[session] = _ask_boundary(asks.get(session), owner_turns.turns(session, now), now, session)
 
 
 DECLINE_ACTION = "direction.decline"
@@ -1478,7 +1507,16 @@ def gate(want: dict | None, *, env=None, now: float | None = None) -> dict:
         raise DirectionRefused("not_by_direction",
                                "That change can't be made by direction: it needs the Khipu app or a yes typed on a "
                                "terminal.")
-    stamp = check(want["action"], env=env, now=now, instant=instant_allowed(want["action"], want["target"]))
+    confirmed = _CONFIRMED.get()
+    if class_c(want["action"], want.get("facts")) and (confirmed is None or confirmed["action"] != want["action"]):
+        # A class C change (a forget, a purge, a catch-up import) can never be
+        # taken back: by direction it applies only as the replay of a held
+        # request the owner answered (``khipu_owner_act`` holds it), never
+        # straight from a command run with ``--owner-direction``.
+        raise DirectionRefused("class_c",
+                               "That can't be undone, so it needs its own yes: ask for it through khipu_owner_act, "
+                               "which shows the owner its words first. Nothing was changed.")
+    stamp = check(want["action"], env=env, now=now)
     want.pop("over_newer", None)
     want.pop("owner_words", None)
     before = _before(want)
@@ -1563,54 +1601,6 @@ def record_owed_undo_scope(batch: str, ids: list[int]) -> None:
     pend["before"] = before
 
 
-def record_preference_merges(entries: list[dict]) -> None:
-    """Persist one transaction's preference additions (episode ids, exact
-    strings, prior lists) before it commits: the Undo of the merge."""
-    pend = _PENDING.get()
-    line = (pend or {}).get("line")
-    if not pend or pend["intent"]["action"] != "outbox.merge_preferences" or line is None:
-        raise OSError("the owner action must be recorded before preferences can be merged")
-    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
-             "state": "pending", "preference_merges": entries})
-
-
-_RESOLVING_ACTIONS = ("outbox.merge_preferences", "outbox.span_covered")
-
-
-def record_preference_resolutions(jobs: list[dict]) -> None:
-    """Persist the held jobs a merge is about to archive as resolved (record
-    id, job name, where it was held) before any moves: the Undo puts them
-    back."""
-    pend = _PENDING.get()
-    line = (pend or {}).get("line")
-    if not pend or pend["intent"]["action"] not in _RESOLVING_ACTIONS or line is None:
-        raise OSError("the owner action must be recorded before held lines can be resolved")
-    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
-             "state": "pending", "preference_resolutions": jobs})
-
-
-def record_preference_commits(episode_ids: list[int]) -> None:
-    """Mark one transaction's recorded additions committed, after its commit
-    returns: Undo reverts only entries proven committed."""
-    pend = _PENDING.get()
-    line = (pend or {}).get("line")
-    if not pend or pend["intent"]["action"] != "outbox.merge_preferences" or line is None:
-        raise OSError("the owner action must be recorded before a merge commit can be marked")
-    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
-             "state": "pending", "preference_commits": [{"episode_id": int(i)} for i in episode_ids]})
-
-
-def preference_merges(line_id: str, key: str = "preference_merges") -> list[dict]:
-    """Every addition a merge recorded (or, with ``preference_resolutions``,
-    every job it resolved), in log order. Read from the raw log: the merged
-    view keeps only the last state line's fields."""
-    out: list[dict] = []
-    for row in read_log():
-        if row.get("kind") == "state" and row.get("target") == line_id:
-            out += [e for e in row.get(key) or [] if isinstance(e, dict)]
-    return out
-
-
 def record_setting_before(key: str, data: dict) -> None:
     """Record the exact replaced state while the setter holds both locks."""
     from khipu import routing
@@ -1681,19 +1671,6 @@ def record_owner_write(tool: str, args: dict) -> None:
     _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
              "state": "pending", "owner_write": write})
     pend["owner_write"] = write
-
-
-def import_source(path, project: str, *, catch_up: bool = False) -> dict | None:
-    """The parsed tracker read by this import's gate; never stored in the log."""
-    pend = _PENDING.get()
-    if pend is None:
-        return None
-    want = pend["intent"]
-    facts = want.get("facts") or {}
-    if (want["action"] != "ledger.import" or want["target"] != str(path)
-            or facts.get("project") != project or catch_up):
-        return None
-    return want.get("_import_source")
 
 
 def _ahead_line(want: dict, stamp: dict, before) -> dict:
@@ -1809,22 +1786,11 @@ def _abandon() -> None:
             state = _hub_write_state(write)
         elif pend["line"].get("inverse_writes"):
             state = _inverse_state(pend["line"]["inverse_writes"])
-        elif pend["intent"]["action"] in _RESOLVING_ACTIONS and _merge_recorded(pend["line"]["id"]):
-            # Batches before the failure committed and their Undo is logged:
-            # unconfirmed, so Undo still runs.
-            state = "pending"
         try:
             _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": pend["line"]["id"],
                      "state": state, **outcome})
         except OSError:
             pass
-
-
-def _merge_recorded(line_id: str) -> bool:
-    try:
-        return bool(preference_merges(line_id) or preference_merges(line_id, "preference_resolutions"))
-    except Exception:  # noqa: BLE001 - an unreadable log can't show a merge to undo
-        return False
 
 
 _INCOMPLETE = ("The change was made and its Undo is recorded, but Khipu could not write that it finished, so "
@@ -1892,7 +1858,7 @@ _PUSH_WORDS = {
     "direction.on": "Turned owner direction on", "direction.off": "Turned owner direction off",
     "direction.set": "Changed the owner-direction settings",
     "direction.undo": "Undid an owner change",
-    "ledger.import": "Imported a tracker into the ledger", "ledger.restore": "Brought back a removed ledger row",
+    "ledger.restore": "Brought back a removed ledger row",
     "ledger.purge": "Removed a ledger row for good", "ledger.project": "Changed a ledger project",
     "ledger.add": "Added a ledger row", "ledger.set": "Changed a ledger row", "ledger.remove": "Removed a ledger row",
     "work.hide": "Hid a work item", "work.unhide": "Showed a hidden work item",
@@ -1912,8 +1878,6 @@ _PUSH_WORDS = {
     "forget.send": "Sent this Mac's forgets the hub lacked to the hub",
     "forget.here": "Forgot a hub episode this Mac had forgotten by id",
     "forget.not_same": "Marked a hub episode as not the one forgotten on this Mac",
-    "outbox.merge_preferences": "Merged preferences held only in memory-file lines into the hub",
-    "outbox.span_covered": "Retired dead outbox jobs whose range and evidence fields another episode holds",
 }
 
 
@@ -2055,7 +2019,7 @@ def _receipt_text(want: dict, stamp: dict, line: dict, result, before=None) -> t
             what = "Undid: " + str(undone["receipt"]["what"])
         elif stamp.get("auth") != "direction":
             return None
-        elif action in ROUTING_INSTANT:
+        elif action in RECEIPTED:
             what = _receipt_what(want, result, before)
         else:
             return None
@@ -2100,7 +2064,6 @@ _UNREADABLE = object()  # what it changes can't be read now: a direction is refu
 
 # Why a change has no undo, in words the app shows beside it.
 _NO_UNDO_WHY = {
-    "ledger.import": "A catch-up import can't be undone: it changes rows that were already there.",
     "forget.send": "A forget sent to the hub can't be undone: the hub keeps the episodes forgotten.",
     "forget.here": "A forget can't be undone: the hub keeps the episode forgotten.",
     "forget.not_same": "Not undone from its record line: forget that hub episode instead if it was the same one.",
@@ -2256,23 +2219,6 @@ def _before(want: dict):
         from khipu import promote
 
         return {"checks": list(promote.gate_ignore_status().get("value") or [])}
-    if action == "ledger.import":
-        facts = want.get("facts") or {}
-        if facts.get("catch_up") or not facts.get("project"):
-            return _NO_UNDO
-        from khipu import ledger_import
-
-        try:
-            source = ledger_import.read_tracker(target)
-        except Exception:  # noqa: BLE001 - the import itself says what is wrong with the file
-            return _UNREADABLE
-        digest = source["digest"]
-        try:
-            had = ledger_import.done_imports(facts["project"], digest)
-        except Exception:  # noqa: BLE001 - an import needs the database too
-            return _UNREADABLE
-        want["_import_source"] = source
-        return {"project": facts["project"], "digest": digest, "had": had}
     if action == "ledger.project":
         from khipu import ledger
 
@@ -2318,13 +2264,6 @@ def _before(want: dict):
         facts = want.get("facts") or {}
         return {"project": target, "change": facts.get("change"), "batch": facts.get("batch"),
                 **({"ids": []} if facts.get("change") == "undo" else {})}
-    if action == "outbox.merge_preferences":
-        # Each transaction's additions are written ahead as their own state
-        # line (``record_preference_merges``) before it commits.
-        return {"change": "apply"}
-    if action == "outbox.span_covered":
-        # Each batch's jobs are written ahead (``record_preference_resolutions``).
-        return {"change": "apply"}
     if action in ("direction.off", "direction.on"):
         return {"enabled": owner_turns.settings()["enabled"]}
     if action == "direction.set":
@@ -2761,15 +2700,6 @@ def _undo_project_group(line, via):
     return project_group.run_undo(line["action"], line["target"], line.get("result"))
 
 
-def _undo_import(line, via):
-    from khipu import ledger_import
-
-    before = _b(line)
-    if not before.get("digest"):
-        raise ValueError("Khipu can't tell which import this was, so it can't undo it")
-    return ledger_import.undo_import(before["project"], before["digest"], before.get("had"))
-
-
 def _undo_owed_change(line, via):
     from khipu import owed_tidy
 
@@ -2805,38 +2735,6 @@ def _undo_owed_tidy(line, via):
     if not out.get("ok"):
         raise ValueError(out.get("error") or f"batch {batch} could not be undone")
     return {"ok": True, **counted, "left_alone": out.get("left_alone") or []}
-
-
-_INCLUDE_UNPROVEN: contextvars.ContextVar[bool] = contextvars.ContextVar("khipu_include_unproven", default=False)
-
-
-def _undo_outbox_preferences(line, via):
-    from khipu import outbox_preferences
-
-    entries = preference_merges(line["id"])
-    resolved = preference_merges(line["id"], "preference_resolutions")
-    if not (entries or resolved):
-        result = line.get("result") or {}
-        if (int(result.get("episodes_merged") or 0) == 0 and int(result.get("lines_resolved") or 0) == 0
-                and line["state"] == "applied"):
-            return {"ok": True, "restored": 0, "left_alone": []}
-        raise ValueError("Khipu has no record of which preferences this merge added, so it can't undo it")
-    # Committed: a batch's own marker, or the finished result's episode list
-    # (written only after every batch committed).
-    committed = {int(c["episode_id"]) for c in preference_merges(line["id"], "preference_commits")}
-    committed |= {int(i) for i in (line.get("result") or {}).get("episode_ids") or []}
-    return outbox_preferences.undo(entries, resolved, committed, include_unproven=_INCLUDE_UNPROVEN.get(),
-                                   retract_reason=f"undo of owner action {line['id']} "
-                                                  "(outbox merge-line-preferences --include-decisions)")
-
-
-def _undo_span_covered(line, via):
-    from khipu import outbox_span_covered
-
-    entries = preference_merges(line["id"], "preference_resolutions")
-    if not entries and not (line["state"] == "applied" and not int((line.get("result") or {}).get("retired") or 0)):
-        raise ValueError("Khipu has no record of which jobs this retired, so it can't undo it")
-    return outbox_span_covered.undo(entries)
 
 
 def _ledger_undo(verb: str):
@@ -2946,7 +2844,6 @@ _UNDO = {
     "config.answer_request.undo": _undo_setting,
     "promote.gate_ignore": _undo_gate_ignore,
     "promote.gate_ignore.cancel": _undo_gate_ignore,
-    "ledger.import": _undo_import,
     "ledger.restore": _ledger_undo("remove"),
     "ledger.add": _ledger_undo("remove"),
     "ledger.set": _undo_ledger_set,
@@ -2964,8 +2861,6 @@ _UNDO = {
     "owed.change": _undo_owed_change,
     "owed.tidy": _undo_owed_tidy,
     "owed.correct_job_origin.confirm": _undo_owed_change,
-    "outbox.merge_preferences": _undo_outbox_preferences,
-    "outbox.span_covered": _undo_span_covered,
     "direction.off": _undo_direction,
     "direction.on": _undo_direction,
     "direction.set": _undo_direction,
@@ -3503,18 +3398,12 @@ def _refuse_over_newer(line: dict, over_newer: bool) -> None:
         ahead["facts"] = facts
 
 
-def undo(line_id: str, via: str, *, holds: dict | None = None, over_newer: bool = False,
-         include_unproven: bool = False) -> dict:
+def undo(line_id: str, via: str, *, holds: dict | None = None, over_newer: bool = False) -> dict:
     """Apply the inverse of a logged action. Its ``undo`` line is written
     ahead by the owner gate (``gate``/``noted``) and completed by
     ``finish``. Refused (``NewerChange``) when a newer change touched the
-    same target, unless ``over_newer``. ``include_unproven`` (a preference
-    merge only) also reverts episodes whose commit was never proven."""
-    token = _INCLUDE_UNPROVEN.set(include_unproven)
-    try:
-        return _undo(line_id, via, holds, over_newer)
-    finally:
-        _INCLUDE_UNPROVEN.reset(token)
+    same target, unless ``over_newer``."""
+    return _undo(line_id, via, holds, over_newer)
 
 
 def _undo(line_id: str, via: str, holds: dict | None, over_newer: bool = False) -> dict:

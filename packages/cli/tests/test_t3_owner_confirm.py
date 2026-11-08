@@ -178,7 +178,8 @@ def _paused() -> bool:
 
 
 def _hold_in_t3(world, *, ago: float = 0.0, request_message: bool = True) -> str:
-    """The agent in the owner's T3 conversation asks for a pause: it is held.
+    """The agent in the owner's T3 conversation holds a pause for his yes
+    (``direction.request``; his own direction would apply at once).
     The owner's own request is in T3's projection first when the thread has
     no message yet (``request_message``): a hold on an empty projection is
     unknown, so a confirm only takes a fresh snapshot."""
@@ -189,7 +190,7 @@ def _hold_in_t3(world, *, ago: float = 0.0, request_message: bool = True) -> str
     real = owner_direction._clock
     world["mp"].setattr(owner_direction, "_clock", lambda: real() - ago)
     try:
-        ok, out = owner_act.act("route.pause", {"account": "Codex"})
+        ok, out = owner_act.act("direction.request", {"action": "route.pause", "args": {"account": "Codex"}})
     finally:
         world["mp"].setattr(owner_direction, "_clock", real)
     assert ok and out["pending"] is True and out["applied"] is False, out
@@ -210,7 +211,7 @@ def _confirm_id(request: str):
 # ---- T3: the owner's message in T3's record decides ----------------------------------------------
 
 
-def test_a_direct_action_in_t3_is_held_not_applied(world):
+def test_a_request_held_in_t3_is_pending_not_applied(world):
     request = _hold_in_t3(world)
     (row,) = owner_direction._read_requests(owner_direction.requests_path())
     assert (row["id"], row["action"], row["args"], row["state"]) == (request, "route.pause", {"account": "Codex"},

@@ -775,7 +775,7 @@ describe("Setup › Accounts step, saves carry the version they read", () => {
 });
 
 describe("Setup › the rail", () => {
-  it("the rail shows seven steps with Accounts sixth, and Welcome lists the Accounts line", async () => {
+  it("the rail shows six steps with Accounts fifth, and Welcome lists the Accounts line", async () => {
     invokeMock.mockImplementation(async () => "{}");
     render(
       <Welcome
@@ -788,9 +788,9 @@ describe("Setup › the rail", () => {
     );
     const rail = screen.getByRole("list", { name: "Setup progress" });
     const items = within(rail).getAllByRole("listitem");
-    expect(items).toHaveLength(7);
-    expect(items[5]).toHaveTextContent("Accounts");
-    expect(screen.getByText(/Setup is seven steps/)).toBeInTheDocument();
+    expect(items).toHaveLength(6);
+    expect(items[4]).toHaveTextContent("Accounts");
+    expect(screen.getByText(/Setup is six steps/)).toBeInTheDocument();
     expect(screen.getByText(/see how much of each plan is left/)).toBeInTheDocument();
   });
 });

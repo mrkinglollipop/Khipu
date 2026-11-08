@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import socket
-import sqlite3
 import tempfile
 import threading
 import unittest
@@ -14,19 +13,6 @@ from pathlib import Path
 from unittest import mock
 
 from khipu import config, join, jobs, launchd_gen, setup, sources
-
-
-class SourceBoundaryRegressionTest(unittest.TestCase):
-    def test_code_root_does_not_claim_a_sibling_prefix(self) -> None:
-        doc = {
-            "sources": [
-                {"id": "code:app", "kind": "code_ast", "root": "/code/app"},
-            ]
-        }
-        self.assertIsNone(sources._code_source_id_for_path("/code/app-backup/main.py", doc))
-        self.assertEqual(
-            sources._code_source_id_for_path("/code/app/main.py", doc), "code:app"
-        )
 
 
 class CorruptDocumentMutationRegressionTest(unittest.TestCase):
@@ -55,7 +41,7 @@ class CorruptDocumentMutationRegressionTest(unittest.TestCase):
         raw = b'{"sources": {}}'
         path.write_bytes(raw)
         with self.assertRaises(ValueError):
-            sources.add_code_root(self.dir / "code")
+            sources.set_enabled("conversation_memory", False)
         self.assertEqual(path.read_bytes(), raw)
 
 
@@ -97,7 +83,6 @@ class EmbedBackfillRegressionTest(unittest.TestCase):
             mock.patch.object(jobs, "_prune_query_cache", return_value={"ok": True}),
             mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True}),
             mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}),
-            mock.patch.object(jobs, "_briefs_build_if_on", return_value=None),
             mock.patch.object(jobs, "_write_job_state") as write_state,
         ):
             self.assertEqual(jobs.run_nightly(), 1)
@@ -137,7 +122,6 @@ class EmbedProviderIntegrationRegressionTest(unittest.TestCase):
                 mock.patch.object(jobs, "_prune_query_cache", return_value={"ok": True}),
                 mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True}),
                 mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}),
-                mock.patch.object(jobs, "_briefs_build_if_on", return_value=None),
             ):
                 rc = jobs.run_nightly()
                 state = jobs._read_job_state("nightly")
@@ -407,69 +391,6 @@ class NightlyHealthRegressionTest(unittest.TestCase):
 
 
 class NightlyAggregateRegressionTest(unittest.TestCase):
-    def test_rv4_07_failed_brief_reaches_nightly_state_and_health(self) -> None:
-        from khipu import briefs
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(jobs, "ensure_data_dir", return_value=Path(tmp)), \
-                    mock.patch.object(jobs, "_drain_sessions", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_run_script", return_value=0), \
-                    mock.patch.object(jobs, "_reconcile_notes_if_due", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_embed_backfill", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_prune_query_cache", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}), \
-                    mock.patch("khipu.features.enabled", return_value=True), \
-                    mock.patch("khipu.db.connect", return_value=mock.MagicMock()), \
-                    mock.patch.object(briefs, "acquire_build_lock", return_value=True), \
-                    mock.patch.object(briefs, "release_build_lock"), \
-                    mock.patch.object(briefs, "select_for_build", return_value={"available": True, "topics": ["a"]}), \
-                    mock.patch.object(briefs, "build_many", return_value=[{"status": "failed", "error": "provider"}]), \
-                    mock.patch.object(jobs, "_nightly_log"):
-                rc = jobs.run_nightly()
-                self.assertEqual(rc, 1)
-                self.assertEqual(jobs._read_job_state("nightly")["exit"], 1)
-                with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
-                        mock.patch.object(jobs, "_job_entry", return_value={"last_exit": rc,
-                            "last_exit_ts": datetime.now(timezone.utc).isoformat(), "plist_loaded": True}):
-                    health = jobs.nightly_step_health()
-                self.assertFalse(health["briefs_build_ok"]["ok"])
-                self.assertTrue(health["briefs_build_ok"]["applicable"])
-
-    def test_rv4_07_disabled_briefs_do_not_gate_health(self) -> None:
-        with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
-                mock.patch.object(jobs, "_job_entry", return_value={}), \
-                mock.patch.object(jobs, "nightly_last", return_value={"steps": [
-                    {"name": "briefs_build", "ok": False, "error": "old provider failure"}]}), \
-                mock.patch("khipu.features.enabled", return_value=False):
-            health = jobs.nightly_step_health()
-        self.assertTrue(health["briefs_build_ok"]["ok"])
-        self.assertFalse(health["briefs_build_ok"]["applicable"])
-
-    def test_briefs_error_or_unavailable_result_is_unhealthy(self) -> None:
-        # A provider or table error for a topic is status "error"/"unavailable".
-        # A recorded per-topic "failed" brief beside built ones is not a failed
-        # night (tests/test_jobs_briefs.py covers that side).
-        from khipu import briefs, features
-
-        chosen = {"available": True, "topics": ["a", "b"]}
-        results = [
-            {"status": "ok"},
-            {"status": "error", "error": "provider"},
-        ]
-        conn = mock.MagicMock()
-        with (
-            mock.patch.object(briefs, "acquire_build_lock", return_value=True),
-            mock.patch.object(briefs, "release_build_lock"),
-            mock.patch.object(briefs, "select_for_build", return_value=chosen),
-            mock.patch.object(briefs, "build_many", return_value=results),
-            mock.patch.object(features, "enabled", return_value=True),
-            mock.patch("khipu.db.connect") as connect,
-            mock.patch.object(jobs, "_nightly_log"),
-        ):
-            connect.return_value.__enter__.return_value = conn
-            out = jobs._briefs_build_if_on()
-        self.assertFalse(out["ok"])
-
     def test_library_nested_failure_overrides_top_level_ok(self) -> None:
         fake_library = mock.Mock()
         fake_library.nightly.return_value = {
@@ -726,33 +647,6 @@ class SourceRegistryBoundaryRegressionTest(unittest.TestCase):
             with mock.patch.object(sources, "sources_file", return_value=registry):
                 with self.assertRaises(sources.InvalidSourcesDocument):
                     sources.load_sources()
-
-    def test_graph_sync_refuses_corrupt_registry_before_pg_mutation(self) -> None:
-        from khipu import graph_sync
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            db = root / "graph.sqlite"
-            con = sqlite3.connect(db)
-            con.executescript(
-                "CREATE TABLE nodes (id TEXT PRIMARY KEY, type TEXT, bucket TEXT, name TEXT, "
-                "payload TEXT, source_path TEXT, built_at TEXT, frozen INTEGER);"
-                "CREATE TABLE edges (src TEXT, dst TEXT, type TEXT, weight REAL, payload TEXT, built_at TEXT);"
-                "INSERT INTO nodes VALUES ('pg-only','concept','code','x',NULL,'/code/a.py',NULL,0);"
-            )
-            con.commit()
-            con.close()
-            registry = root / "graph_sources.json"
-            registry.write_text("{broken")
-            with (
-                mock.patch.object(sources, "sources_file", return_value=registry),
-                # Only the producer mirrors; a non-producer skips before reading the registry.
-                mock.patch.object(graph_sync, "is_graph_producer", return_value=True),
-                mock.patch("khipu.db.connect") as connect,
-            ):
-                with self.assertRaises(sources.InvalidSourcesDocument):
-                    graph_sync.sync_from_sqlite(db)
-            connect.assert_not_called()
 
 
 class LocalMoveGuardRegressionTest(unittest.TestCase):

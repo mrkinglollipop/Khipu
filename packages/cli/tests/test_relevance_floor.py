@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """khipu.relevance: the all-or-nothing abstention gate behind ``relevance_floor``.
 
 Everything here runs against fakes or the synthetic corpus: no database, no
@@ -82,6 +79,20 @@ def test_a_row_with_neither_field_is_not_evidence():
     assert not relevance.is_evidence({"lexical_hits": None, "cosine": None}, FLOOR, 2)
     kept, info = relevance.gate([{"kind": "topic", "id": "t", "via": "topic:x"}], 3)
     assert kept == [] and info["abstained"] is True
+
+
+def test_an_exact_phrase_row_is_evidence_without_cosine_or_keyword_hits():
+    # A session-id query has no cosine, and the id is not in the row text as
+    # tokens, so the row matched through an identity index: lexical_hits is 0.
+    row = {"kind": "episode", "id": "1", "exact_phrase": True, "lexical_hits": 0}
+    assert relevance.is_evidence(row, FLOOR, 3)
+    assert relevance.is_evidence({"exact_phrase": True}, FLOOR, 3)
+    assert relevance.is_evidence({"exact_phrase": True, "cosine": 0.1}, FLOOR, 3, {"p@1": 0.9})
+    for not_exact in (False, None, 1, "true"):
+        assert not relevance.is_evidence({"exact_phrase": not_exact, "lexical_hits": 0}, FLOOR, 3)
+    kept, info = relevance.gate([{"id": "a", "cosine": 0.1}, row], 3)
+    assert [r["id"] for r in kept] == ["a", "1"]
+    assert info["evidence_rows"] == 1 and info["abstained"] is False
 
 
 def test_the_list_comes_back_unchanged_when_any_row_is_evidence():

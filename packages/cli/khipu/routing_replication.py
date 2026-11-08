@@ -238,15 +238,27 @@ def _apply_remote_settings(state):
         was_set = row.get("value_set") is True
         from khipu.config import load_config
 
-        here = routing.synced_value(load_config(), key) if key in routing.SYNCED_FEATURES else routing.settings()[key]
-        if here != value:
+        config = load_config()
+        here = routing.synced_value(config, key) if key in routing.SYNCED_FEATURES else routing.settings(config)[key]
+        # A conversation here asked for this same value: the owner's change there
+        # answers it too, so it is not asked again on this Mac.
+        same_ask = here == value and key in routing._setting_requests(config)
+        if here != value or same_ask:
             where = mac_label(row.get("mac"))
             stamp = {"auth": "other_mac", "words": f"the same change made on {where}"}
             owner_direction.noted(owner_direction.intent("config.routing_setting", key, facts={"from": where}), stamp)
             try:
                 with routing._lock(), mutate_config() as data:
                     owner_direction.record_setting_before(key, data)
+                    asks = routing._setting_requests(data)
+                    answered = key in asks and routing.settings(data)[key] == value
                     routing.store_setting(data, key, value, was_set)
+                    if answered:
+                        asks.pop(key)
+                        if asks:
+                            data[routing.SETTINGS_REQUEST_KEY] = asks
+                        else:
+                            data.pop(routing.SETTINGS_REQUEST_KEY, None)
             except Exception:
                 owner_direction.finish({"ok": False})
                 raise
@@ -462,7 +474,9 @@ def _wire_samples(local, now):
     groups = {}
     for event in local:
         if event.get("type") == "usage_sample" and event.get("id"):
-            parsed = routing.pace_sample(event)
+            # A window not started yet (0%, no reset) goes too: the other Mac
+            # reads it as idle, not as the old cycle's passed reset.
+            parsed = routing.pace_sample(event, unstarted=True)
             if parsed is not None:
                 sample = dict(parsed[1], _id=event["id"], window=parsed[0][1])
                 groups.setdefault((*parsed[0], sample["mac"], sample["source"]), []).append(sample)
@@ -552,7 +566,8 @@ def _request_rows():
         out.append((str(row["id"]), "held", state, str(row.get("action") or ""),
                     _sig(owner_direction.signature(row["action"], row["args"])), row.get("created_at"), ask, withheld,
                     (row.get("by") or {}).get("harness") if isinstance(row.get("by"), dict)
-                    and row["by"].get("kind") in (None, "conversation") else None, blocked))
+                    and row["by"].get("kind") in (None, "conversation") else None, blocked,
+                    owner_direction.class_c(row["action"], row["args"])))
     config = load_config()
     for key, waiting in routing._setting_requests(config).items():
         if key not in routing.SETTINGS:
@@ -563,11 +578,11 @@ def _request_rows():
                  f"{needs_you._setting_value(kind, before)} to {needs_you._setting_value(kind, config.get(key))}.")
         out.append((f"setting:{key}", "setting", "pending", "config.answer_request",
                     _sig(routing.setting_request_pin(key, waiting, config.get(key))), waiting.get("at"), words, False,
-                    None, None))
+                    None, None, False))
     return out
 
 
-def _request_event(request, kind, state, action, sig, asked_at, ask, withheld, by=None, blocked=None):
+def _request_event(request, kind, state, action, sig, asked_at, ask, withheld, by=None, blocked=None, permanent=False):
     from khipu import owner_direction
 
     event = {"type": "request_state", "request": request, "req_kind": kind, "req_state": state, "sig": sig,
@@ -578,6 +593,9 @@ def _request_event(request, kind, state, action, sig, asked_at, ask, withheld, b
         event["asked_harness"] = by
     if blocked in owner_direction.UNAPPLYABLE_WORDS:
         event["req_blocked"] = blocked
+    if permanent is True:
+        # It can't be taken back (class C), so the other Mac asks it on its own too.
+        event["req_permanent"] = True
     if action and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", action):
         event["req_action"] = action
     if isinstance(asked_at, str) and asked_at:
@@ -591,7 +609,7 @@ def _emit_request_states(rows, state):
     sent = state.setdefault("requests_published", {})
     batch = []
     for row in rows:
-        request, kind, st, action, sig, asked_at, ask, withheld, by, blocked = row
+        request, kind, st, action, sig, asked_at, ask, withheld, by, blocked, *_ = row
         # A waiting request is sent again when its refusal reason appears; an
         # older line without the reason slot is sent once more to carry it.
         key = [st, sig, blocked or ""] if st == "pending" else [st, sig]
@@ -620,7 +638,7 @@ def publish_requests():
         # Whatever was sent as waiting and is no longer here, a setting answered
         # or a held request withdrawn or dropped, is told as gone, so no other
         # Mac keeps asking the owner about it.
-        gone = [(request, "setting" if request.startswith("setting:") else "held", "gone", "", sig, None, "", False, None, None)
+        gone = [(request, "setting" if request.startswith("setting:") else "held", "gone", "", sig, None, "", False, None, None, False)
                 for request, (st, sig, *_rest) in (state.get("requests_published") or {}).items()
                 if request not in seen and st == "pending"]
         stale_format = state.get("requests_format") != REQUEST_LINE_FORMAT
@@ -631,6 +649,47 @@ def publish_requests():
         if sent or stale_format:
             state.setdefault("mac", routing._local_mac())
             _save(state)
+
+
+def refresh_for_owner(*, force=False):
+    """Before the owner is shown, or answers, something another Mac could
+    have settled: pull what the other Macs said (one bounded ``sync``; with
+    ``force`` false, none when one finished within ``POLL_SECONDS``), so a
+    request already settled there drops off here instead of being asked
+    again. Quiet on any failure: the record is then read as it stands."""
+    if not routing._replication_live() or not routing._hub_configured():
+        return
+    with contextlib.suppress(Exception):
+        sync() if force else sync_if_due()
+
+
+def settled_elsewhere(request_id):
+    """A mirrored request the holder settled before the owner answered it here
+    (``mirror_remote_requests``): the answer to give instead of sending his,
+    or None. A pending mirror is checked against the hub first."""
+    from khipu import owner_direction
+
+    def row():
+        try:
+            rows = owner_direction._read_requests(owner_direction.requests_path())
+        except (OSError, ValueError):
+            return None
+        return next((r for r in rows if r.get("id") == request_id and r.get("remote")), None)
+
+    mirror = row()
+    if mirror is None:
+        return None
+    if mirror.get("state") == "pending":
+        refresh_for_owner(force=True)
+        mirror = row()
+    # Answered here first ("answered", or a later state with this Mac's answer on it) is not this case.
+    if mirror is None or mirror.get("state") in ("pending", "answered") \
+            or mirror.get("confirmed") or mirror.get("declined"):
+        return None
+    where = mac_label((mirror.get("remote") or {}).get("mac"))
+    said = mirror.get("receipt") or f"It was already settled on {where}."
+    return {"ok": True, "applied": False, "sent": False, "already_settled": True, "request": request_id,
+            "line": f"{said} Your answer changed nothing, and nothing was sent to {where}."}
 
 
 def answer_remote(request, stamp, answer):
@@ -735,7 +794,7 @@ def mirror_remote_requests(state):
                              "files": None,
                              "remote": {"mac": mac, "request": request, "sig": row.get("sig"), "withheld": withheld,
                                         "kind": row.get("req_kind"), "action": row.get("req_action"),
-                                        "blocked": _blocked(row)}})
+                                        "blocked": _blocked(row), "permanent": row.get("req_permanent") is True}})
                 return True
             if current is None or current.get("state") not in ("pending", "answered", "applying"):
                 return False

@@ -9,7 +9,7 @@ from unittest import mock
 
 import pytest
 
-from khipu import cli, config, db, graph_backup as gb, join, join_pair, keychain
+from khipu import cli, config, db, join, join_pair, keychain
 
 
 @pytest.mark.parametrize("gateway", [
@@ -38,37 +38,11 @@ def test_import_gateway_query_and_spaced_userinfo(gateway, tmp_path, monkeypatch
     assert "gateway.example/join" in url
 
 
-def test_backup_status_omits_historical_stderr_and_exceptions(capsys):
-    raw = "unknown historical password and api-key and passphrase"
-    event = {"status": "fail", "detail": {"stderr": raw, "error": raw,
-             "nested": {"exception": raw}}, "created_at": None, "age_seconds": 0}
-    with (mock.patch.object(gb, "_resolve_producer", return_value=True),
-          mock.patch.object(gb, "local_health", return_value={"ok": True}),
-          mock.patch.object(gb, "latest_snapshot", return_value=None),
-          mock.patch.object(gb, "_live_graph", return_value=None),
-          mock.patch.object(gb, "has_r2_remote", return_value=True),
-          mock.patch.object(gb, "resolve_dest_remote", return_value="r2:fixture/graph"),
-          mock.patch.object(gb, "_latest_ops_event", return_value=event)):
-        assert cli.main(["graph-backup", "status"]) == 0
-    captured = capsys.readouterr()
-    assert raw not in captured.out + captured.err
-    body = json.loads(captured.out)
-    for item in (body["last_graph_snapshot"], body["last_graph_snapshot_offsite"],
-                 body["last_graph_restore_drill"], body["offsite"]["latest"]):
-        assert item["summary"] == "Backup operation failed; full details are stored in the log."
-        assert "ops_events.detail" in item["log_location"]
-    assert event["detail"]["stderr"] == raw
-
-
 COMMANDS = [
     (["join", "export", "--out", "unused"], join, "export_kit"),
     (["join", "import", "--file"], join, "import_kit"),
     (["join", "advertise"], join_pair, "advertise_join_kit"),
     (["join", "receive", "--pin", "123456"], join_pair, "receive_join_kit"),
-    (["graph-backup", "record-local"], gb, "record_local"),
-    (["graph-backup", "offsite"], gb, "run_offsite"),
-    (["graph-backup", "drill"], gb, "scratch_drill"),
-    (["graph-backup", "status"], gb, "status_payload"),
 ]
 
 

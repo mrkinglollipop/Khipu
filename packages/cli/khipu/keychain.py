@@ -59,6 +59,17 @@ def get_password(account: str, *, service: str = SERVICE) -> str | None:
     return val or None
 
 
+def held_but_unreadable(account: str) -> bool:
+    """Whether the Keychain lists ``account`` (attributes only, never the secret)
+    although ``get_password`` could not read it. A locked login Keychain, as over
+    ssh, hides every secret but still lists the item; that is "can't read it right
+    now", not "no key"."""
+    if not keychain_available():
+        return False
+    return any(_security("find-generic-password", "-s", service, "-a", account).returncode == 0
+               for service in (SERVICE, LEGACY_SERVICE))
+
+
 # The per-prompt routing read only asks whether a provider key exists (is
 # DeepSeek or GLM an account here, is there a spend to read). Each answer cost a
 # ``security`` process (15-20 ms on a loaded Mac, three per read, over half of

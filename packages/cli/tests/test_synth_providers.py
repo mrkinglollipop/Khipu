@@ -27,6 +27,8 @@ def isolated(tmp_path, monkeypatch):
         raise AssertionError('network forbidden')
     monkeypatch.setattr(socket, 'create_connection', blocked)
     monkeypatch.setattr(socket.socket, 'connect', blocked)
+    # The real flag check runs `claude --help`; tests that need it call it directly.
+    monkeypatch.setattr(synth_cli, 'supports_flag', lambda cli_path, flag, env=None: True)
 
 
 class Reply:
@@ -249,6 +251,46 @@ def test_doctor_selected_provider_key(provider, present, tmp_path):
         assert not doc['ok']
 
 
+@pytest.mark.parametrize('listed', [True, False])
+def test_doctor_locked_keychain_is_not_a_missing_key(listed):
+    """A Keychain that lists the key but cannot be read (locked, as over ssh) is not a failure."""
+    models.set_models_merge_role('synth', provider='gemini', model_id='m')
+    with ExitStack() as stack:
+        for patch in _green_doctor_patches():
+            if patch.attribute != 'secrets_status':
+                stack.enter_context(patch)
+        stack.enter_context(mock.patch.object(keychain, 'secrets_status', return_value={
+            'dsn_file': {'ok': True}, 'gemini_in_keychain': False}))
+        stack.enter_context(mock.patch.object(keychain, 'held_but_unreadable', return_value=listed))
+        stack.enter_context(mock.patch('khipu.probe.status', return_value={'ok': True}))
+        stack.enter_context(mock.patch('khipu.recall_prompt.prompt_recall_outcomes', return_value={'ok': True}))
+        stack.enter_context(mock.patch('khipu.drift.recall_quality', return_value={}))
+        output = stack.enter_context(redirect_stdout(io.StringIO()))
+        cli.cmd_doctor(cli.build_parser().parse_args(['doctor']))
+    doc = json.loads(output.getvalue())
+    assert doc['synth_provider_ok'] is listed
+    if listed:
+        assert doc['synth_provider']['key_present'] is None
+        assert doc['synth_provider']['note'] == "can't read the keychain right now"
+    else:
+        assert doc['synth_provider']['key_present'] is False and 'note' not in doc['synth_provider']
+
+
+def test_held_but_unreadable_asks_for_attributes_only():
+    done = mock.Mock(returncode=0)
+    with mock.patch.object(keychain, 'keychain_available', return_value=True), \
+         mock.patch.object(keychain, '_security', return_value=done) as run:
+        assert keychain.held_but_unreadable('gemini_api_key') is True
+    assert '-w' not in run.call_args.args and '-g' not in run.call_args.args
+    with mock.patch.object(keychain, 'keychain_available', return_value=True), \
+         mock.patch.object(keychain, '_security', return_value=mock.Mock(returncode=44)):
+        assert keychain.held_but_unreadable('gemini_api_key') is False
+    with mock.patch.object(keychain, 'keychain_available', return_value=False), \
+         mock.patch.object(keychain, '_security') as run:
+        assert keychain.held_but_unreadable('gemini_api_key') is False
+    run.assert_not_called()
+
+
 def test_empty_key_file_does_not_count_as_key(tmp_path):
     path = tmp_path / 'empty'
     path.write_text(' \n')
@@ -454,7 +496,7 @@ def test_cli_exact_argv_stdin_env_usage_budget_and_no_capture(provider, tmp_path
     def run(argv, **kw):
         calls.append((argv, kw))
         cwd = Path(kw['cwd'])
-        assert cwd.is_relative_to(tmp_path / 'state' / 'synth-cli')
+        assert cwd == tmp_path / 'state' / 'synth-cli' / 'work' == synth_cli.work_dir()
         assert list(cwd.iterdir()) == []
         if provider == 'claude-cli':
             assert kw['input'].encode() == prompt.encode() and kw['text']
@@ -494,7 +536,8 @@ def test_cli_exact_argv_stdin_env_usage_budget_and_no_capture(provider, tmp_path
     usage = cli._budget_status_all()['synth']['usage_by_provider'][provider]
     assert usage['estimated_usd'] == 0.0 and usage['billing'] == 'subscription'
     assert sc.queued_jobs() == [] and not sc.state_dir().exists()
-    assert not Path(calls[0][1]['cwd']).exists()
+    assert Path(calls[0][1]['cwd']) == synth_cli.work_dir() and synth_cli.work_dir().is_dir()
+    assert list(synth_cli.work_dir().iterdir()) == []
     if provider == 'codex-cli':
         assert not Path(calls[0][0][10]).exists()
         assert '00000000-0000-4000-8000-000000000001' in synth_cli.session_ids()
@@ -514,11 +557,11 @@ def test_concurrent_claude_calls_stay_isolated_and_cannot_capture(tmp_path, monk
         cwd = Path(kw['cwd'])
         sid = argv[-1]
         assert '--no-session-persistence' in argv
-        assert list(cwd.iterdir()) == []
-        (cwd / 'isolation-check').write_text(kw['input'])
+        # Both calls share the one fixed, empty directory: neither writes there.
+        assert cwd == synth_cli.work_dir() and list(cwd.iterdir()) == []
         calls.append((cwd, sid))
         barrier.wait()
-        assert (cwd / 'isolation-check').read_text() == kw['input']
+        assert list(cwd.iterdir()) == []
         assert sid in synth_cli.session_ids()
         payload = {'session_id': sid, 'cwd': str(cwd),
                    'transcript_path': str(cwd / 'session.jsonl')}
@@ -532,9 +575,67 @@ def test_concurrent_claude_calls_stay_isolated_and_cannot_capture(tmp_path, monk
         results = list(pool.map(lambda p: extract._generate_claude_cli(
             p, model_id='m', retries=0), ['first', 'second']))
     assert results == ['first', 'second']
-    assert len({cwd for cwd, _ in calls}) == len({sid for _, sid in calls}) == 2
-    assert all(not cwd.exists() for cwd, _ in calls)
+    assert len({cwd for cwd, _ in calls}) == 1 and len({sid for _, sid in calls}) == 2
+    assert synth_cli.work_dir().is_dir() and list(synth_cli.work_dir().iterdir()) == []
     assert sc.queued_jobs() == [] and not sc.state_dir().exists()
+
+
+def test_every_claude_call_uses_the_same_fixed_cwd_with_no_persistence(monkeypatch):
+    """23,736 ~/.claude/projects folders came from one random cwd per call."""
+    monkeypatch.setattr(synth_cli, 'binary', lambda name: name)
+    monkeypatch.setattr(extract, '_synth_budget_take', lambda: None)
+    monkeypatch.setattr(extract, '_record_usage', lambda *a, **kw: None)
+    seen = []
+
+    def run(argv, **kw):
+        seen.append((kw['cwd'], '--no-session-persistence' in argv))
+        return subprocess.CompletedProcess(argv, 0, json.dumps({'result': 'ok'}), '')
+
+    with mock.patch.object(extract.subprocess, 'run', side_effect=run):
+        for _ in range(3):
+            extract._generate_claude_cli('p', model_id='m', retries=0)
+    assert seen == [(synth_cli.work_dir(), True)] * 3
+    assert Path(seen[0][0]).name == 'work' and not (Path(seen[0][0]) / 'CLAUDE.md').exists()
+
+
+def test_old_claude_without_the_flag_is_called_without_it(monkeypatch):
+    monkeypatch.setattr(synth_cli, 'binary', lambda name: name)
+    monkeypatch.setattr(synth_cli, 'supports_flag', lambda cli_path, flag, env=None: False)
+    monkeypatch.setattr(extract, '_synth_budget_take', lambda: None)
+    monkeypatch.setattr(extract, '_record_usage', lambda *a, **kw: None)
+    argvs = []
+
+    def run(argv, **kw):
+        argvs.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps({'result': 'ok'}), '')
+
+    with mock.patch.object(extract.subprocess, 'run', side_effect=run):
+        assert extract._generate_claude_cli('p', model_id='m', retries=0) == 'ok'
+    assert '--no-session-persistence' not in argvs[0] and argvs[0][:2] == ['claude', '-p']
+
+
+def test_supports_flag_reads_help_caches_and_fails_open(tmp_path, monkeypatch):
+    monkeypatch.undo()  # drop the autouse stub; the real function runs below
+    monkeypatch.setenv('KHIPU_DATA_DIR', str(tmp_path))
+    monkeypatch.setattr(synth_cli, '_FLAG_SUPPORT', {})
+    counter = tmp_path / 'count'
+
+    def fake(name, help_text, code=0):
+        path = tmp_path / name
+        path.write_text('\n'.join(['#!/bin/sh', f'echo x >> {counter}', "cat <<'EOF'", help_text, 'EOF',
+                                   f'exit {code}', '']))
+        path.chmod(0o755)
+        return str(path)
+
+    new = fake('new-claude', '  --no-session-persistence  Disable session persistence')
+    old = fake('old-claude', '  --model <model>  Model')
+    broken = fake('broken-claude', '', code=2)
+    assert synth_cli.supports_flag(new, '--no-session-persistence') is True
+    assert synth_cli.supports_flag(new, '--no-session-persistence') is True
+    assert counter.read_text().count('x') == 1  # cached
+    assert synth_cli.supports_flag(old, '--no-session-persistence') is False
+    assert synth_cli.supports_flag(broken, '--no-session-persistence') is True  # unreadable help: fail open
+    assert synth_cli.supports_flag(str(tmp_path / 'missing'), '--no-session-persistence') is True
 
 
 @pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])

@@ -27,9 +27,8 @@ from pathlib import Path
 
 import pytest
 
-from khipu import agent_view, cli, ledger, ledger_import, mcp_server, routing, safe_read, work
+from khipu import agent_view, cli, ledger, ledger_export, mcp_server, routing, safe_read, work
 from tests import test_ledger as _tl
-from tests import test_ledger_import as _ti
 
 pg_dsn, hub = _tl.pg_dsn, _tl.hub
 PKG = Path(__file__).resolve().parents[1] / "khipu"
@@ -80,10 +79,6 @@ def private_backends(monkeypatch, tmp_path):
     view = {"rows": [_private_row()], "vocab": ledger.default_vocab(), "offline": True, "as_of": SAY, "pending": 0}
     history = [{"raw": {"at": "2026-10-15T10:00:00Z", "event": SAY}}]
     line = {"ok": True, "line": f"set one: {SAY}", "result": SAY}
-    report = {"ok": True, "result": "done", "words": SAY, "file": SAY, "project": "atlas", "masked": [SAY],
-              "other_keys": [SAY], "counts_in_file": {"rows": 1, "history": 1, "with_parent": 0,
-                                                      "by_state": {SAY: 1}, "by_kind": {SAY: 1},
-                                                      "missing_parent": [SAY]}}
 
     class Conn:
         def cursor(self): return self
@@ -102,9 +97,8 @@ def private_backends(monkeypatch, tmp_path):
     monkeypatch.setattr(ledger, "write", lambda op, **k: dict(line))
     monkeypatch.setattr(ledger, "purge", lambda conn, project, row_id: dict(line))
     monkeypatch.setattr(ledger, "_connect", Conn)
-    monkeypatch.setattr(ledger_import, "export_rows", lambda *a, **k: {"one": {"id": "one", "evidence": SAY,
+    monkeypatch.setattr(ledger_export, "export_rows", lambda *a, **k: {"one": {"id": "one", "evidence": SAY,
                                                                                "owner": "codex|/synthetic/login"}})
-    monkeypatch.setattr(ledger_import, "run_import", lambda *a, **k: copy.deepcopy(report))
     wait = {"source": "ledger", "key": "k", "project": "atlas", "id": "one", "title": SAY, "evidence": SAY}
     monkeypatch.setattr(work, "build_view", lambda *a, **k: {"format": "khipu-work-view", "note": SAY,
                                                             "waiting": [wait]})
@@ -205,7 +199,7 @@ def test_every_khipu_ledger_verb_answers_through_the_projection(private_backends
 def test_no_ledger_or_work_module_prints_around_the_emit():
     """The one emit is agent_view.emit: these modules have no print of their
     own, so no answer can leave without the projection."""
-    for name in ("ledger.py", "work.py", "ledger_import.py"):
+    for name in ("ledger.py", "work.py", "ledger_export.py"):
         text = (PKG / name).read_text(encoding="utf-8")
         assert not re.search(r"(?<![\w.])print\(", text), name
 
@@ -220,7 +214,7 @@ def test_export_json_uses_projection(monkeypatch, capsys):
         def close(self): pass
 
     monkeypatch.setattr(ledger, "_connect", Connection)
-    monkeypatch.setattr(ledger_import, "export_rows", lambda *a, **k: {
+    monkeypatch.setattr(ledger_export, "export_rows", lambda *a, **k: {
         "one": {"id": "one", "evidence": "/opt/project/private.txt", "owner": "codex|/synthetic/login",
                 "history": []}})
     args = cli.build_parser().parse_args(["ledger", "export", "--tracker-json", "--project", "atlas", "--json"])
@@ -234,7 +228,7 @@ def test_export_json_uses_projection(monkeypatch, capsys):
 
 _NORMALISERS = re.compile(r"os\.path\.(?:normpath|abspath|realpath)\(|\.resolve\(|expanduser\(")
 # The modules that take a path someone gave and read it (through safe_read).
-_READERS = ("work.py", "ledger.py", "ledger_import.py", "owner_direction.py")
+_READERS = ("work.py", "ledger.py", "owner_direction.py")
 
 
 def test_only_safe_read_parses_a_path_given_to_a_reader():
@@ -274,29 +268,12 @@ def test_each_reader_refuses_what_safe_read_refuses(tmp_path):
     path = tmp_path / "s.json"
     path.write_text("{}")
     for raw in (str(path) + "/", str(tmp_path) + "/./s.json", str(tmp_path) + "//s.json"):
-        with pytest.raises(ledger.LedgerError, match="Not read"):
-            ledger_import.read_tracker(raw)
         assert work.check_file(raw)[1] == [work.SOURCE_PROBLEMS["refused"]]
         with pytest.raises(ValueError, match="full path"):
             work.set_setting("work_projects", [{"project": "atlas", "file": raw}])
     # A setting keeps the path exactly as given.
     work.set_setting("work_projects", [{"project": "atlas", "file": str(path)}])
     assert work.settings()["work_projects"][0]["file"] == str(path)
-
-
-# Ported: normalising erased link/.. before safe_read saw it.
-def test_import_refuses_dot_segments_before_normalizing(tmp_path):
-    here = tmp_path / "here"
-    there = tmp_path / "there"
-    here.mkdir()
-    (there / "deep").mkdir(parents=True)
-    (here / "link").symlink_to(there / "deep", target_is_directory=True)
-    for base, name in [(here, "decoy"), (there, "named")]:
-        (base / "tracker.json").write_text(json.dumps({"rows": {name: {"id": name}}}))
-    raw = str(here) + "/link/../tracker.json"
-    assert json.loads(Path(raw).read_text())["rows"].keys() == {"named"}
-    with pytest.raises(ledger.LedgerError, match="Not read"):
-        ledger_import.read_tracker(raw)
 
 
 # ---- 3. one owner guard ---------------------------------------------------------------------
@@ -346,7 +323,10 @@ def test_a_direction_from_a_session_with_no_owner_turn_is_refused_and_changes_no
         want = owner_direction.intent(ledger.DIRECTION_ACTIONS[name], "atlas#one")
         with pytest.raises(ledger.LedgerError) as err:
             ledger.require(name, by_direction=True, intent=want)
-        assert err.value.reason == "no_recorded_turn", name
+        # A class C change (purge) is refused before the turn is even looked at:
+        # it applies by direction only as a confirmed replay.
+        expected = "class_c" if owner_direction.class_c(want["action"], want.get("facts")) else "no_recorded_turn"
+        assert err.value.reason == expected, name
     assert work.read_links() == {"same": [], "not_same": []} and work.read_hidden() == {}
 
 
@@ -373,7 +353,6 @@ def test_every_changing_verb_calls_the_guard_before_anything_else(monkeypatch, t
     monkeypatch.setattr(ledger, "require", guard)
     for name in ("load", "get", "write", "purge", "_connect", "removed_rows"):
         monkeypatch.setattr(ledger, name, touched)
-    monkeypatch.setattr(ledger_import, "run_import", touched)
     for name in ("set_hidden", "set_link", "read_owed", "build_view", "check_file"):
         monkeypatch.setattr(work, name, touched)
     for command in ("ledger", "work"):
@@ -396,7 +375,7 @@ def test_every_changing_verb_calls_the_guard_before_anything_else(monkeypatch, t
     assert seen[-1] == "ledger remove"
 
 
-@pytest.mark.parametrize("verb", ["hide", "unhide", "same", "not-same", "import", "catch-up"])
+@pytest.mark.parametrize("verb", ["hide", "unhide", "same", "not-same"])
 def test_an_owner_verb_refuses_a_conversation_and_a_piped_yes(monkeypatch, tmp_path, verb):
     """Routing's rule (routing.typed_yes): the app, or a yes typed on an
     interactive terminal. A piped yes is never asked for and never counts."""
@@ -404,15 +383,11 @@ def test_an_owner_verb_refuses_a_conversation_and_a_piped_yes(monkeypatch, tmp_p
     monkeypatch.setattr(sys, "stdin", io.StringIO("yes\n"))
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     calls: list = []
-    monkeypatch.setattr(ledger_import, "run_import", lambda *a, **k: calls.append(a))
     monkeypatch.setattr(work, "set_hidden", lambda *a: calls.append(a))
     monkeypatch.setattr(work, "set_link", lambda *a: calls.append(a))
     monkeypatch.setattr(work, "read_owed", lambda: {"items": [{"id": "42"}], "error": None})
     argv = {"hide": ["work", "hide", "42"], "unhide": ["work", "unhide", "42"],
-            "same": ["work", "same", "atlas#one", "42"], "not-same": ["work", "not-same", "atlas#one", "42"],
-            "import": ["ledger", "import", str(tmp_path / "t.json"), "--project", "atlas", "--json"],
-            "catch-up": ["ledger", "import", str(tmp_path / "t.json"), "--project", "atlas", "--catch-up",
-                         "--json"]}[verb]
+            "same": ["work", "same", "atlas#one", "42"], "not-same": ["work", "not-same", "atlas#one", "42"]}[verb]
     out, _err = _run(argv)
     assert calls == [] and json.loads(out)["ok"] is False
     assert work.read_links() == {"same": [], "not_same": []} and work.read_hidden() == {}
@@ -434,7 +409,7 @@ def test_a_from_app_claim_from_a_shell_is_refused_even_with_a_typed_yes(monkeypa
     monkeypatch.setattr(routing, "_caller", lambda: {"app": False, "chain": ["zsh"]})
     monkeypatch.setattr(sys, "stdin", io.StringIO("yes\n"))
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-    for command in ("ledger import", "ledger restore", "ledger purge", "ledger set"):
+    for command in ("ledger restore", "ledger purge", "ledger set"):
         with pytest.raises(ledger.LedgerError, match="only the Khipu app"):
             ledger.require(command, from_app=True)
 
@@ -473,87 +448,3 @@ def test_projection_cuts_path_words_even_when_token_contains_link():
 
 
 # ---- 5. a catch-up compares the whole ordered history ----------------------------------------
-
-
-# Ported: reordered history alone read as nothing new.
-def test_history_reorder_only_is_not_reported_as_nothing_new(monkeypatch):
-    original = {"id": "one", "title": "Title", "state": "QUEUED", "kind": "slice",
-                "history": [{"at": "2026-10-15T10:00:00Z", "event": "First"},
-                            {"at": "2026-10-15T11:00:00Z", "event": "Second"}]}
-    changed = copy.deepcopy(original)
-
-    class Cursor:
-        def execute(self, sql, params): self.sql = sql
-        def fetchall(self):
-            return [] if self.sql.startswith("SELECT DISTINCT") else [("one", ledger_import._row_digest(original))]
-
-    monkeypatch.setattr(ledger_import, "_snapshot", lambda *a: {"rows": {"one": original}})
-    for history in (list(reversed(original["history"])), original["history"][1:],
-                    [original["history"][0], {"at": "2026-10-15T11:00:00Z", "event": "Edited"}]):
-        changed["history"] = history
-        result = ledger_import._catch_up(Cursor(), "atlas", {"rows": {"one": changed}}, {},
-                                         {"one": None}, {}, ledger.default_vocab(), dry_run=False)
-        assert result["result"] == "refused" and result["reason"] == "history_rewritten", result
-
-
-# Ported: reordered history plus a changed field passed the check.
-def test_verifier_rejects_reordered_history_when_fields_change(monkeypatch):
-    history = [{"at": "2026-10-15T10:00:00Z", "event": "First"},
-               {"at": "2026-10-15T11:00:00Z", "event": "Second"}]
-    row = {"id": "one", "title": "Title", "state": "QUEUED", "kind": "slice", "history": history}
-    raw = [{"has_raw": True, "raw": h, "op_id": None} for h in history]
-    stored = {"seq": 1, "created_at": "2026-10-15T10:00:00Z", "link": "",
-              "removed_at": None, "removed_by": None, "removed_note": "", "refs": {}}
-    before = {"ids": {"one"}, "all": {"one": stored}, "rows": {"one": row}, "hist": {"one": raw}}
-    source = copy.deepcopy(row)
-    source["history"].reverse()
-    source["title"] = "Changed title"
-    after = copy.deepcopy(before)
-    after["rows"]["one"]["title"] = "Changed title"
-    after["hist"]["one"].append({"has_raw": False, "op_id": ledger_import.CATCH_UP_OP + "7"})
-    monkeypatch.setattr(ledger_import, "_snapshot", lambda *a: after)
-    result = ledger_import._verify_catch_up(None, "atlas", {"one": source},
-                                            {"new_rows": [], "updated": ["one"], "both": []}, {}, before)
-    assert result["ok"] is False, result
-
-
-def test_verifier_checks_every_rows_history_not_only_the_touched(monkeypatch):
-    history = [{"at": "2026-10-15T10:00:00Z", "event": "First"}]
-    row = {"id": "two", "title": "Title", "state": "QUEUED", "kind": "slice", "history": history}
-    stored = {"seq": 1, "created_at": None, "link": "", "removed_at": None, "removed_by": None,
-              "removed_note": "", "refs": {}}
-    before = {"ids": {"two"}, "all": {"two": stored}, "rows": {"two": row},
-              "hist": {"two": [{"has_raw": True, "raw": history[0], "op_id": None}]}}
-    monkeypatch.setattr(ledger_import, "_snapshot", lambda *a: copy.deepcopy(before))
-    source = dict(row, history=history + [{"at": "2026-10-15T12:00:00Z", "event": "Not brought in"}])
-    result = ledger_import._verify_catch_up(None, "atlas", {"two": source},
-                                            {"new_rows": [], "updated": [], "both": []}, {}, before)
-    assert result["ok"] is False and "two.history" in " ".join(result["fields_differ"]), result
-
-
-# Ported, against the scratch PostgreSQL.
-def test_reordered_history_only_catchup_refuses(hub, tmp_path):
-    doc = _ti._tracker(8)
-    path = _ti._write(tmp_path, doc)
-    assert _ti._import(path)[1]["result"] == "done"
-    first = next(iter(doc["rows"]))
-    doc["rows"][first]["history"].reverse()
-    path.write_text(json.dumps(doc))
-    rc, report = _ti._import(path, "--catch-up")
-    assert rc == 1 and report["result"] == "refused" and report["reason"] == "history_rewritten", report
-
-
-def test_reordered_history_with_field_change_changes_nothing(hub, tmp_path):
-    doc = _ti._tracker(8)
-    path = _ti._write(tmp_path, doc)
-    assert _ti._import(path)[1]["result"] == "done"
-    before = (_tl._sql(hub, "SELECT row_id, title, state FROM ledger_rows ORDER BY row_id"),
-              _tl._sql(hub, "SELECT count(*) FROM ledger_history"))
-    first = next(iter(doc["rows"]))
-    doc["rows"][first]["history"].reverse()
-    doc["rows"][first]["title"] = "A changed title"
-    path.write_text(json.dumps(doc))
-    rc, report = _ti._import(path, "--catch-up")
-    assert rc == 1 and report["result"] in ("refused", "rolled back"), report
-    assert (_tl._sql(hub, "SELECT row_id, title, state FROM ledger_rows ORDER BY row_id"),
-            _tl._sql(hub, "SELECT count(*) FROM ledger_history")) == before

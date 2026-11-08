@@ -191,7 +191,7 @@ def test_missing_driver_continues_independent_maintenance(tmp_path, monkeypatch)
     monkeypatch.setattr(jobs, '_drain_sessions', lambda: {'ok': True})
     later = ['_reconcile_notes_if_due', '_embed_backfill', '_prune_query_cache',
         '_mark_stale_commitments', '_provenance_nightly',
-        '_ledger_nightly', '_project_renames_sweep', '_refresh_snapshot', '_briefs_build_if_on']
+        '_ledger_nightly', '_project_renames_sweep', '_refresh_snapshot']
     mocks = []
     for name in later:
         fn = Mock(return_value={'ok': True})

@@ -8,18 +8,17 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
-from khipu import graph_backup, jobs
+from khipu import jobs
 
 MAINTENANCE = ('_reconcile_notes_if_due', '_embed_backfill', '_prune_query_cache',
                '_mark_stale_commitments',
                '_provenance_nightly', '_ledger_nightly', '_project_renames_sweep',
-               '_refresh_snapshot', '_briefs_build_if_on', '_storage_sweep',
+               '_refresh_snapshot', '_storage_sweep',
                '_fact_changes_prune', '_receipt_prune')
 
 
@@ -142,71 +141,6 @@ def test_driver_deadline_kills_process_group_and_continues(tmp_path, monkeypatch
                 os.killpg(int(ids.read_text().split()[0]), signal.SIGKILL)
             except ProcessLookupError:
                 pass
-
-
-def test_due_offsite_preflight_failure_replaces_older_success(tmp_path, monkeypatch):
-    from khipu import ops_events
-    now = datetime.now(timezone.utc)
-    old = now - timedelta(days=7, hours=1)
-    latest = {'status': 'ok', 'created_at': old, 'age_seconds': (now-old).total_seconds()}
-    monkeypatch.setattr(graph_backup, '_latest_ops_event', lambda kind, **kwargs: latest)
-    monkeypatch.setattr(graph_backup, 'resolve_dest_remote', lambda: 'r2:synthetic')
-    monkeypatch.setattr(graph_backup, 'resolve_rclone', lambda name: '/fake/rclone')
-    monkeypatch.setattr(graph_backup, 'has_r2_remote', lambda **kwargs: True)
-    monkeypatch.setattr(graph_backup, 'latest_snapshot', lambda: None)
-    def record(kind, status, detail, **kwargs):
-        assert kind == 'graph_snapshot_offsite'
-        latest.update(status=status, detail=detail, created_at=now, age_seconds=0)
-        return {'id': 1}
-    record_mock = Mock(side_effect=record)
-    monkeypatch.setattr(ops_events, 'record', record_mock)
-    jobs._offsite_if_due()
-    record_mock.assert_called_once()
-    assert latest['status'] == 'fail'
-    assert 'no snapshot found' in (tmp_path / 'job.out').read_text()
-    assert graph_backup.offsite_health(now=now, producer=True)['ok'] is False
-
-
-@pytest.mark.parametrize('stage', ['destination', 'binary', 'remote', 'empty', 'stat', 'integrity', 'schema', 'live', 'same_path', 'exception'])
-def test_every_offsite_preflight_failure_records_once(tmp_path, monkeypatch, stage):
-    from khipu import ops_events
-    snap = tmp_path / 'snapshot.sqlite'
-    snap.write_bytes(b'synthetic')
-    monkeypatch.setattr(graph_backup, 'resolve_dest_remote', lambda: 'r2:synthetic')
-    monkeypatch.setattr(graph_backup, 'resolve_rclone', lambda name: '/fake/rclone')
-    monkeypatch.setattr(graph_backup, 'has_r2_remote', lambda **kwargs: True)
-    monkeypatch.setattr(graph_backup, 'latest_snapshot', lambda: snap)
-    monkeypatch.setattr(graph_backup, '_integrity_check', lambda path: 'ok')
-    monkeypatch.setattr(graph_backup, '_required_graph_tables', lambda path: None)
-    monkeypatch.setattr(graph_backup, '_live_graph', lambda: tmp_path / 'live.sqlite')
-    monkeypatch.setattr(subprocess, 'run', Mock(side_effect=AssertionError('copy forbidden')))
-    if stage == 'destination':
-        monkeypatch.setattr(graph_backup, 'resolve_dest_remote', Mock(side_effect=ValueError('invalid')))
-    elif stage == 'binary':
-        monkeypatch.setattr(graph_backup, 'resolve_rclone', lambda name: None)
-    elif stage == 'remote':
-        monkeypatch.setattr(graph_backup, 'has_r2_remote', lambda **kwargs: False)
-    elif stage == 'empty':
-        snap.write_bytes(b'')
-    elif stage == 'stat':
-        snap.unlink()
-    elif stage == 'integrity':
-        monkeypatch.setattr(graph_backup, '_integrity_check', lambda path: 'corrupt')
-    elif stage == 'schema':
-        monkeypatch.setattr(graph_backup, '_required_graph_tables', lambda path: 'missing nodes')
-    elif stage == 'live':
-        monkeypatch.setattr(graph_backup, '_live_graph', lambda: None)
-    elif stage == 'same_path':
-        monkeypatch.setattr(graph_backup, '_live_graph', lambda: snap)
-    elif stage == 'exception':
-        monkeypatch.setattr(graph_backup, 'latest_snapshot', Mock(side_effect=OSError('synthetic discovery error')))
-    record = Mock(return_value={'id': 1})
-    monkeypatch.setattr(ops_events, 'record', record)
-    result = graph_backup.run_offsite()
-    assert result['ok'] is False and result['reason']
-    record.assert_called_once()
-    assert record.call_args.args[:2] == ('graph_snapshot_offsite', 'fail')
-    subprocess.run.assert_not_called()
 
 
 def test_nightly_lock_covers_independent_maintenance(tmp_path, monkeypatch):

@@ -9,19 +9,15 @@ JSON. Every fixture here is written raw (ensure_ascii=False) on purpose.
 
 from __future__ import annotations
 
-import base64
 import json
 import os
-import struct
 import subprocess
 import sys
 import tempfile
 import unittest
-import zlib
 from pathlib import Path
 from unittest import mock
 
-from khipu import session_capture as sc
 
 REPO = Path(__file__).resolve().parents[3]
 STOP_HOOK = REPO / "packages" / "cli" / "bin" / "khipu-stop-hook"
@@ -40,56 +36,10 @@ def _write_raw(path: Path, rows: list) -> Path:
     return path
 
 
-def _png_b64() -> str:
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
-        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
-
-    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
-    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
-           + chunk(b"IDAT", zlib.compress(b"\x00\x01\x02\x03", 9)) + chunk(b"IEND", b""))
-    return base64.b64encode(png).decode("ascii")
-
-
-class TranscriptImageLandTest(unittest.TestCase):
-    """land_transcript_images reads the same transcript window as capture."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.dir = Path(self.tmp.name)
-        self._env = mock.patch.dict(os.environ, {
-            "KHIPU_CAPTURE_HOME": str(self.dir / "kh"),
-            "KHIPU_DATA_DIR": str(self.dir / "data"),
-        })
-        self._env.start()
-        from khipu import sources
-
-        sources.save_sources({"sources": [{"id": "conversation_memory"}]})
-        sources.set_embed_media("conversation_memory", True)
-
-    def tearDown(self):
-        self._env.stop()
-        self.tmp.cleanup()
-
-    def test_image_record_whose_text_holds_a_line_separator_is_landed(self):
-        tp = _write_raw(self.dir / "img.jsonl", [{
-            "type": "user",
-            "message": {"role": "user", "content": [
-                {"type": "text", "text": "look at this\u2028please"},
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                                             "data": _png_b64()}},
-            ]},
-        }])
-        self.assertEqual(sc.land_transcript_images(tp)["landed"], 1)
-
-
 class EndToEndCaptureTest(unittest.TestCase):
-    """The shipped stop hook queues a raw transcript record intact, and the
-    drain's image pass lands the image from that same record and window."""
+    """The shipped stop hook queues a raw transcript record intact."""
 
     def test_every_awkward_code_point_survives_capture(self):
-        from khipu import sources
-
         pieces = ["sep\u2028line", "para\u2029graph", "next\u0085line", "nul\x00byte",
                   "emoji \U0001F600\U0001F44D", "CJK \u8bb0\u5fc6\u4e0d\u4e22", "ctl\x0b\x0c\x1c\x1d\x1e"]
         with tempfile.TemporaryDirectory() as td:
@@ -98,13 +48,9 @@ class EndToEndCaptureTest(unittest.TestCase):
             env.update(KHIPU_CAPTURE_HOME=str(khome), KHIPU_DATA_DIR=str(data),
                        KHIPU_CAPTURE_NO_DRAIN="1", KHIPU_MEMORY_ROOT=str(Path(td) / "mem"))
             with mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(khome), "KHIPU_DATA_DIR": str(data)}):
-                sources.save_sources({"sources": [{"id": "conversation_memory"}]})
-                sources.set_embed_media("conversation_memory", True)
                 tp = _write_raw(Path(td) / ".claude" / "projects" / "p" / "s.jsonl", [
                     {"type": "user", "message": {"role": "user", "content": [
                         {"type": "text", "text": "probe " + " | ".join(pieces) + " " + "x" * 300},
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                                                     "data": _png_b64()}},
                     ]}},
                     {"type": "assistant", "message": {"role": "assistant",
                                                       "content": "ack " + " | ".join(pieces) + " ack" * 40}},
@@ -121,10 +67,6 @@ class EndToEndCaptureTest(unittest.TestCase):
                 job = json.loads(jobs[0].read_text(encoding="utf-8"))
                 for piece in pieces:
                     self.assertEqual(job["transcript"].count(piece), 2, piece)
-                land = sc.land_transcript_images(Path(job["transcript_path"]),
-                                                 start_offset=int(job.get("offset_before") or 0),
-                                                 end_offset=job.get("offset_after"))
-                self.assertEqual(land["landed"], 1)
 
 
 class LineSplitHelperTest(unittest.TestCase):

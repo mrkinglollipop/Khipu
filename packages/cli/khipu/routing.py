@@ -187,7 +187,6 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_push_start": ("switch", True, "Tell conversations at the start and after compaction"),
     "routing_push_prompt": ("switch", True, "Tell conversations before each prompt"),
     "routing_push_delegation": ("switch", True, "Tell conversations before handing work to another agent"),
-    "routing_dispatch_scripts": ("names", [], "Your own scripts that hand work to another agent, by file name"),
     "routing_delivery_live_after": ("duration", 12 * 3600, "How long a delivery identity counts as live"),
     "routing_delivery_slack": ("count", 2, "Extra delivery points before stalled delivery turns red"),
     "routing_ledger_keep_days": ("count", 7, "Remove a conversation's routing delivery ledger after this many unused days (0: never)"),
@@ -2129,7 +2128,8 @@ _REPLICATION_FIELDS: dict[str, dict[str, Any]] = {
     "request_state": {"request": "id", "req_kind": frozenset({"held", "setting"}),
                       "req_state": frozenset({"pending", "applied", "declined", "failed", "stale", "gone"}),
                       "req_action": "id", "sig": "revision_id", "asked_at": "time", "withheld": "bool",
-                      "asked_harness": "name", "req_blocked": frozenset({"expired", "out_of_date"})},
+                      "asked_harness": "name", "req_blocked": frozenset({"expired", "out_of_date"}),
+                      "req_permanent": "bool"},
     "request_answer": {"request": "id", "req_answer": frozenset({"confirm", "decline"}), "sig": "revision_id",
                        "answer_harness": "name", "message_sha": "revision_id"},
     # A pace reading crosses whole, under the shapes the fold reads it with
@@ -2593,7 +2593,8 @@ _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub
                  "batch_n", "window_mins")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
-                  "observed", "observed_turn", "session_logs", "silent", "unmatched", "receipt", "value_set", "enabled", "snapshot", "withheld")
+                  "observed", "observed_turn", "session_logs", "silent", "unmatched", "receipt", "value_set", "enabled", "snapshot", "withheld",
+                  "req_permanent")
 _AUTHOR_FIELDS = ("kind", "harness", "project", "session", "provider_session", "name", "file", "mac")
 _HOLD_KINDS = ("account", "machine", "all")
 
@@ -4254,11 +4255,15 @@ def _effective_priority(priority: dict) -> dict:
             "by": priority["pending_by"], "replaced": rows(replaced["entries"]) if replaced else None}
 
 
-def pace_sample(event: dict) -> tuple[tuple[str, str], dict] | None:
+def pace_sample(event: dict, *, unstarted: bool = False) -> tuple[tuple[str, str], dict] | None:
     """((account, window), sample) for a ``usage_sample`` line the pace
     calculation reads, or None for one the fold ignores (no witness time, no
     reset time, an unusable window or reading). The fold and the log
-    compaction (``routing_compact``) both ask here what a sample is."""
+    compaction (``routing_compact``) both ask here what a sample is.
+
+    With ``unstarted``, a 0% reading with no reset time is read too: a window
+    that has not started (an idle GLM reports no reset), marked ``unstarted``
+    with no reset. Only ``routing_pace.compute_pace`` and the wire read those."""
     from khipu import routing_pace
 
     witness, reset = _parse(event.get("witness_at")), _parse(event.get("resets_at"))
@@ -4266,12 +4271,15 @@ def pace_sample(event: dict) -> tuple[tuple[str, str], dict] | None:
     window = event.get("window") if routing_pace.window_params(
         event.get("window"), mins * 60 if mins else None, reset) else None
     used = event.get("used_pct")
-    if not (window and witness and reset and isinstance(event.get("account"), str)
+    not_started = unstarted and reset is None and used == 0 and not isinstance(used, bool)
+    if not (window and witness and (reset or not_started) and isinstance(event.get("account"), str)
             and isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used)):
         return None
     sample = {"t": witness, "used": float(used), "reset": reset, "mac": event.get("mac") or "legacy",
               "source": event.get("source") or "probe", "cycle": event.get("cycle"),
               "t_err": event.get("t_err") if isinstance(event.get("t_err"), int) else 0}
+    if not_started:
+        sample["unstarted"] = True
     if mins and window not in routing_pace.WINDOWS:
         sample["window_s"] = mins * 60
     return (event["account"], window), sample
@@ -4487,7 +4495,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         if kind in entry_model.OBSERVATIONS:
             continue
         if kind == "usage_sample":
-            parsed = pace_sample(event)
+            parsed = pace_sample(event, unstarted=True)
             if parsed is not None:
                 pace_samples.setdefault(parsed[0], []).append(parsed[1])
             continue
@@ -4950,6 +4958,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                     priority, entry["key"], now),
                 now, w, failed_reader=_failed_reader(entry, pace_samples.get((entry["key"], w), []), mac, now))
                 for w in windows]
+            _pace.mark_not_reported(entry["pace"], {w: pace_samples.get((entry["key"], w), []) for w in windows}, now)
         mine = [c for (a, _w, _k2, _purpose), c in sorted(pace_caps.items(), key=lambda kv: (kv[0][0], kv[0][1] or "", kv[0][2], kv[0][3] != "job"))
                 if a == entry["key"]]
         if mine:
@@ -6580,9 +6589,9 @@ def runner_cap_flags(view: dict, account: str | None = None) -> list[dict]:
     report only: the runner's files are read through routing_sources'
     registration, never written, and no runner number becomes a fact.
     When ``account`` (a key) is given, only that account's flags are kept."""
-    from khipu import routing_scanner, routing_sources
+    from khipu import routing_runner_caps, routing_sources
 
-    return routing_scanner.compare_runner_caps(
+    return routing_runner_caps.compare_runner_caps(
         routing_sources.runner_budget_declarations(view.get("source_cache") or {}),
         view.get("accounts") or [], account_key=account)
 
@@ -8451,7 +8460,7 @@ def pending_amend_refusal(version: str, *, combine: bool = True) -> str:
            f"it before amending it (khipu_owner_act route.priority.confirm or route.priority.undo, each with expect "
            f"{version})")
     if combine:
-        out += (", or ask for the amend again through khipu_owner_act, whose ask names that request so one yes "
+        out += (", or hold the amend with khipu_owner_act direction.request, whose ask names that request so one yes "
                 "confirms it and applies the amendment")
     return out
 
@@ -9282,7 +9291,8 @@ def note_line(note: dict, now: datetime) -> str:
 # figures can't be read says so and gets no pace, never a guess.
 
 # The pace counts as "a lot left, little time" from this many times the
-# window's own even pace (100% over its whole length); below it, "plenty of time".
+# window's own even pace (100% over its whole length); below it, "plenty of time",
+# unless under ``routing_pace.NEARLY_OUT_LEFT_PCT`` is left: then "nearly out".
 PACE_HURRY = 1.5
 _WINDOW_MINUTES = {"five_hour": 300, "daily": 1440, "weekly": 10080}
 # Figures older than this may be out of date (an early reset, a burst of
@@ -9393,8 +9403,13 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
     seconds = (resets - now).total_seconds()
     pace = left / (seconds / 3600)
     even = 100.0 / (_window_minutes(window) / 60)
+    from khipu import routing_pace
+
     if left <= 0:
         words = "nothing left until it resets"
+    elif routing_pace.nearly_out(used):
+        # Whatever the rate: 4% left is never plenty of time.
+        words = "nearly out"
     else:
         words = "a lot left, little time" if pace >= even * PACE_HURRY else "plenty of time"
     fact = {"readable": True, "window": usage._window_words(window), "used_pct": used, "left_pct": left,
@@ -9474,8 +9489,9 @@ def headline_pace(entry: dict) -> dict | None:
         obj = pace.get(pace.get("headline") or "plan") or pace.get("plan") or {}
         verdict = obj.get("verdict")
         eta = _parse(obj.get("runs_out_at") or obj.get("reaches_cap_at"))
+        # A window its reader no longer reports is never the one to read first.
         return (0 if verdict in ("limit_reached", "cap_reached", "over") else
-                1 if eta else 2 if verdict == "near" else 3,
+                1 if eta else 2 if verdict == "near" else 4 if pace.get("not_reported") else 3,
                 eta.timestamp() if eta else float("inf"))
 
     return min(paces, key=rank)
@@ -10561,21 +10577,6 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     recipients = delivery.get("recipients") or {}
     out["changes"] = [dict(change, recipients=recipients.get(change.get("version")))
                        for change in out["changes"]]
-    # Owner-local only, like the directions above: today's rule 12 model
-    # mismatches (labels, never brief text, session ids or paths).
-    from khipu import routing_mismatches
-
-    out["model_mismatches"] = routing_mismatches.today(now)
-    # Owner-local only: file paths and quoted owner words from the scan
-    # report never enter the fold or any routing delivery projection.
-    from khipu import routing_scan_report
-
-    try:
-        out["routing_file_copies"] = routing_scan_report.report(now)
-    except Exception:  # noqa: BLE001 - a damaged scan report must not break the route view
-        out["routing_file_copies"] = {"status": "not_checked", "scanned_at": None,
-                                      "files_checked": 0, "hits": [], "hits_total": 0,
-                                      "more_not_shown": 0, "too_large": []}
     return out
 
 

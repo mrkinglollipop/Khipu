@@ -642,3 +642,130 @@ def test_a_label_is_derived_from_a_shared_id_when_no_mac_holds_one():
     assert routing._label_for_key("claude:second") == "Claude second"
     assert routing._label_for_key("codex:main") == "Codex"
     assert routing._label_for_key("claude|/some/home") == "Claude (home)"
+
+
+def test_a_forget_held_on_the_other_mac_is_never_settled_by_a_yes_to_a_list(macs, monkeypatch):
+    """Class C across Macs: B's list yes doesn't answer A's held forget; its own ask then a yes does."""
+    from khipu import forget
+
+    a, b = macs
+    both_on(a, b)
+    monkeypatch.setattr(forget, "unsent_forgets", lambda: {"ok": True, "strings": [], "count": 1,
+                                                           "ids": [{"id": 9, "summary": "the roof"}]})
+    a.say("forget the roof one on the hub too", "sF")
+    bad, held = a.act("forget.here", {"id": "9"}, "sF")
+    assert not bad and held["pending"] is True, held
+    request = held["request"]
+    sync_all(a, b)
+    b.say("what needs my confirmation?", "sB")
+    item = _item_on(b, request)
+    assert item.get("permanent") is True and "asked on its own" in item["confirm_does"], item
+    b.say("yes", "sB")
+    bad, out = b.act("direction.confirm", {"request": f"rm-{request}"}, "sB")
+    assert bad and out["code"] == "not_confirmed" and "list" in out["error"], out
+    assert not [e for e in (b.activate() or rr.remote_events()) if e.get("type") == "request_answer"]
+    b.say("yes, forget it", "sB")
+    bad, out = b.act("direction.confirm", {"request": f"rm-{request}"}, "sB")
+    assert not bad and out["sent"] is True, out
+
+
+# ---- what the other Mac already settled is never asked again here ------------------------------
+
+
+def _answers_sent(mac):
+    mac.activate()
+    return [e for e in routing._read_event_lines()[0] if e.get("type") == "request_answer"]
+
+
+def _settled_on_a(a, request):
+    """The owner says yes on A itself, and A's next tick tells the hub."""
+    a.say("yes, pause it", "sH")
+    bad, out = a.act("direction.confirm", {"request": request}, "sH")
+    assert not bad, out
+    assert a.paused()
+    sync_all(a)
+
+
+def test_a_request_the_other_mac_settled_drops_off_this_macs_list_before_it_is_shown(macs):
+    """The 11-05/11-06 double asks: B still listed what A had settled, because B had not pulled since."""
+    a, b = macs
+    both_on(a, b)
+    request = a.hold_pause()
+    sync_all(a, b)
+    assert _item_on(b, request)
+    _settled_on_a(a, request)
+    b.advance(60)  # the owner reads his list on B a minute later; B has not pulled since
+    keys = [i["key"] for i in b.waiting("sB")["items"]]
+    assert f"held:rm-{request}" not in keys, keys
+    b.say("yes, pause it", "sB")
+    bad, out = b.act("direction.confirm", {"request": f"rm-{request}"}, "sB")
+    assert not bad and out["already_settled"] is True and out.get("sent") is not True, out
+    assert "Studio" in out["line"] and "changed nothing" in out["line"], out
+    assert not _answers_sent(b)
+    (row,) = [r for r in b.mirrors() if r["request"] == request]
+    assert row["state"] == "applied"
+
+
+@pytest.mark.parametrize("answer", ["direction.confirm", "direction.decline"])
+def test_an_answer_here_to_what_the_other_mac_already_settled_says_so_and_changes_nothing(macs, answer):
+    """No list read first: the answer itself checks the synced record before anything is sent."""
+    a, b = macs
+    both_on(a, b)
+    request = a.hold_pause()
+    sync_all(a, b)
+    _settled_on_a(a, request)
+    b.advance(60)
+    b.say("yes, pause it" if answer == "direction.confirm" else "no, leave it", "sB")
+    bad, out = b.act(answer, {"request": f"rm-{request}"}, "sB")
+    assert not bad and out["already_settled"] is True and out["applied"] is False, out
+    assert "settled on Studio" in out["line"] and "changed nothing" in out["line"], out
+    assert not _answers_sent(b)
+    sync_all(b, a)
+    assert a.paused()  # A's own yes stands; nothing from B reached it
+    a.activate()
+    assert len([x for x in a.log() if x.get("action") == "route.pause"]) == 1
+
+
+def test_a_setting_the_owner_confirmed_on_one_mac_settles_the_same_waiting_ask_on_the_other(macs):
+    """Episode 116546, "I already told you": the same setting asked on each Mac is answered once."""
+    a, b = macs
+    both_on(a, b)
+    for mac in (a, b):
+        mac.activate()
+        routing.set_setting(KEY, "850", request={"request": "make summaries a bit longer",
+                                                 "by": {"kind": "conversation", "harness": "codex"},
+                                                 "at": routing._iso(mac.now)})
+    sync_all(a, b, a)
+    (item,) = [i for i in a.waiting("sA")["items"] if i["key"] == "setting:" + KEY]
+    a.say("yes", "sA")
+    bad, out = a.act(item["settle"]["confirm"]["action"], item["settle"]["confirm"]["args"], "sA")
+    assert not bad, out
+    assert routing._setting_requests(a.config_now()) == {}
+    sync_all(a)
+    b.advance(60)
+    keys = [i["key"] for i in b.waiting("sB")["items"]]
+    assert "setting:" + KEY not in keys and "held:rm-setting:" + KEY not in keys, keys
+    assert routing._setting_requests(b.config_now()) == {} and b.config_now()[KEY] == 850
+    # Logged on B like any change from the other Mac, so Undo there puts the ask back.
+    (line,) = [x for x in b.log() if x.get("kind") == "action" and x.get("target") == KEY]
+    assert line["auth"] == "other_mac" and "Studio" in line["words"]
+    assert (line.get("before") or {}).get("request"), line
+    # B tells A its own ask is gone, so A stops listing it too.
+    sync_all(b, a)
+    a.advance(60)
+    keys = [i["key"] for i in a.waiting("sA")["items"]]
+    assert "held:rm-setting:" + KEY not in keys, keys
+
+
+def test_a_different_value_from_the_other_mac_leaves_this_macs_ask_waiting(macs):
+    """Only the same change is the same answer: a conversation's other value here still waits for him."""
+    a, b = macs
+    both_on(a, b)
+    b.activate()
+    routing.set_setting(KEY, "850", request={"request": "make summaries a bit longer",
+                                             "by": {"kind": "conversation", "harness": "codex"},
+                                             "at": routing._iso(b.now)})
+    a.activate()
+    routing.set_setting(KEY, "900")
+    sync_all(a, b)
+    assert KEY in routing._setting_requests(b.config_now())

@@ -541,9 +541,6 @@ def components_status() -> dict[str, Any]:
     postgres = (
         versions.get("postgres") if isinstance(versions.get("postgres"), dict) else {}
     )
-    graphify = (
-        versions.get("graphify") if isinstance(versions.get("graphify"), dict) else {}
-    )
 
     postgres_probe: dict[str, Any] | None = None
     if not postgres:
@@ -558,17 +555,6 @@ def components_status() -> dict[str, Any]:
         else:
             postgres_probe = {"ok": False, "error": probe.get("error")}
 
-    if not graphify:
-        from khipu.jobs import graphify_nightly_path
-
-        script = graphify_nightly_path()
-        if script is not None:
-            graphify = {
-                "semver": "external",
-                "path": str(script.parent),
-                "source": "env",
-            }
-
     rows, matrix_meta = effective_matrix(refresh=False)
     app = khipu_app_version()
     mode = str(postgres.get("mode") or "local_docker")
@@ -576,7 +562,6 @@ def components_status() -> dict[str, Any]:
     postgres_upgrade: dict[str, Any] | None = None
     if mode == "local_docker":
         current_image = str(postgres.get("image") or "")
-        current_graphify = str(graphify.get("semver") or "")
         candidates: list[dict[str, Any]] = []
         for row in rows:
             if not isinstance(row, dict):
@@ -585,7 +570,7 @@ def components_status() -> dict[str, Any]:
             if not target_image or target_image == current_image:
                 continue
             matched = match_row_for_install(
-                graphify_semver=str(row.get("graphify_semver") or current_graphify),
+                graphify_semver=str(row.get("graphify_semver") or ""),
                 graphify_tarball_url=str(row.get("graphify_tarball_url") or ""),
                 postgres_image=target_image,
                 pgvector_min=str(row.get("pgvector_min") or ""),
@@ -619,41 +604,6 @@ def components_status() -> dict[str, Any]:
                 "current_tag": current_image.rsplit(":", 1)[-1],
             }
 
-    graphify_upgrade: dict[str, Any] | None = None
-    current_gy = str(graphify.get("semver") or "")
-    if current_gy and graphify.get("source") != "env":
-        gy_candidates: list[dict[str, Any]] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            target = str(row.get("graphify_semver") or "")
-            if not target or target == current_gy:
-                continue
-            matched = match_row_for_install(
-                graphify_semver=target,
-                graphify_tarball_url=str(row.get("graphify_tarball_url") or ""),
-                postgres_image=str(
-                    postgres.get("image") or row.get("postgres_image") or ""
-                ),
-                pgvector_min=str(row.get("pgvector_min") or ""),
-                mode="remote" if mode == "remote" else "local_docker",
-                app_semver=app,
-            )
-            if matched is not None:
-                gy_candidates.append(row)
-        if gy_candidates:
-            chosen_gy = max(
-                gy_candidates,
-                key=lambda r: Version(str(r.get("graphify_semver") or "0")),
-            )
-            graphify_upgrade = {
-                "available": True,
-                "current": current_gy,
-                "target": str(chosen_gy.get("graphify_semver") or ""),
-            }
-        else:
-            graphify_upgrade = {"available": False, "current": current_gy}
-
     return {
         "ok": True,
         "khipu_app": versions.get("khipu_app") or khipu_app_version(),
@@ -662,9 +612,7 @@ def components_status() -> dict[str, Any]:
         "pending": pending,
         "postgres": postgres,
         "postgres_probe": postgres_probe,
-        "graphify": graphify,
         "postgres_upgrade": postgres_upgrade,
-        "graphify_upgrade": graphify_upgrade,
         "matrix": matrix_meta,
         "versions_path": str(versions_path()),
     }
@@ -898,10 +846,6 @@ def upgrade_postgres() -> dict[str, Any]:
         return {"ok": False, "error": "upgrade_requires_local_docker"}
 
     current_image = str(postgres.get("image") or "")
-    graphify = (
-        versions.get("graphify") if isinstance(versions.get("graphify"), dict) else {}
-    )
-    current_graphify = str(graphify.get("semver") or "")
     if not current_image:
         return {"ok": False, "error": "postgres_image_not_installed"}
 
@@ -915,7 +859,7 @@ def upgrade_postgres() -> dict[str, Any]:
         if not target_image or target_image == current_image:
             continue
         pending_probe = {
-            "graphify_semver": str(row.get("graphify_semver") or current_graphify),
+            "graphify_semver": str(row.get("graphify_semver") or ""),
             "graphify_tarball_url": str(row.get("graphify_tarball_url") or ""),
             "pgvector_min": str(row.get("pgvector_min") or ""),
             "postgres_image": target_image,
@@ -1078,15 +1022,3 @@ def upgrade_postgres() -> dict[str, Any]:
         "server_version": probe["server_version"],
         "pgvector": probe["pgvector"],
     }
-
-
-def install_graphify_stub() -> dict[str, Any]:
-    from khipu.components_graphify import install_graphify
-
-    return install_graphify(first_run=True)
-
-
-def upgrade_graphify_stub() -> dict[str, Any]:
-    from khipu.components_graphify import upgrade_graphify
-
-    return upgrade_graphify()

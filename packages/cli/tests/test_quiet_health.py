@@ -185,6 +185,19 @@ def test_idle_delivery_is_fine_but_anything_unreadable_is_not():
     assert health.delivery_ok({"status": "red", "reasons": ["prompt-skips"]}) is False
 
 
+def test_a_mac_whose_every_identity_is_idle_is_not_unchecked_but_a_live_one_is():
+    """An idle Mac (all identities green and idle, no hook outcomes in the hour) reads fine; one live identity
+    without hook outcomes stays unknown."""
+    idle_row = {"identity": "a", "status": "green", "idle": True}
+    live_row = {"identity": "b", "status": "green"}
+    base = {"status": "unknown", "missing": ["recent hook outcomes"], "reasons": []}
+    assert health.delivery_ok(dict(base, identities=[idle_row, idle_row])) is True
+    assert health.delivery_ok(dict(base, identities=[idle_row, live_row])) is False
+    assert health.delivery_ok(dict(base, identities=[live_row])) is False
+    other = dict(base, missing=["recent hook outcomes", "delivery ledger unreadable"], identities=[idle_row])
+    assert health.delivery_ok(other) is False
+
+
 def test_a_malformed_delivery_ledger_is_red_and_the_summary_says_it_could_not_be_checked(replay):
     folder = recall_prompt._dedup_path("ledger").parent
     folder.mkdir(parents=True, exist_ok=True)

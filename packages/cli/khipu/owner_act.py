@@ -76,7 +76,6 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "config.answer_request.undo": (("key",), ("expect",)),
     "promote.gate_ignore": (("checks",), ()),
     "promote.gate_ignore.cancel": ((), ()),
-    "ledger.import": (("file",), ("project", "catch_up")),
     "ledger.restore": (("id",), ("project",)),
     "ledger.purge": (("id",), ("project",)),
     "ledger.project": (("project",), ("rename", "hide", "show")),
@@ -106,16 +105,12 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "forget.send": ((), ()),
     "forget.here": (("id",), ()),
     "forget.not_same": (("id",), ()),
-    # Undone through direction.undo with the id this returns.
-    "outbox.merge_preferences": ((), ("include_content", "include_decisions")),
-    # Always held (owner_direction.CONFIRM_ONLY). Undone through direction.undo.
-    "outbox.span_covered": ((), ()),
 }
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
 _INTS = {"rule"}
 _RULE_ENTITY = re.compile(r"rule-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_FLAGS = {"keep_priority", "catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions", "indefinite", "helpers", "whole_folder"}
+_FLAGS = {"keep_priority", "hide", "show", "sensitive_only", "over_newer", "indefinite", "helpers", "whole_folder"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
             "change": ("close", "reopen", "reassign"), "to": ("user", "assistant", "agent"),
             "reason": ("machine-busy", "disk-low", "keep", "outage", "other")}
@@ -408,9 +403,9 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
             raise _bad("a project is hidden or shown, not both")
         return ["ledger", "project", "--json", *_opts(v, "project", "rename", "hide", "show")], []
     if action.startswith("ledger."):
-        keys = ("project", "catch_up", "title", "kind", "parent", "state", "evidence", "owner", "note", "link",
+        keys = ("project", "title", "kind", "parent", "state", "evidence", "owner", "note", "link",
                 "if_state", "children")
-        return ["ledger", verb, "--json", *_opts(v, *keys)], [v["file"] if verb == "import" else v["id"]]
+        return ["ledger", verb, "--json", *_opts(v, *keys)], [v["id"]]
     if action in ("work.hide", "work.unhide"):
         return ["work", verb], [v["commitment"]]
     if action == "owed.change":
@@ -463,10 +458,6 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["episode", "forget-pending", f"--forget-here={v['id']}"], []
     if action == "forget.not_same":
         return ["episode", "forget-pending", f"--not-same={v['id']}"], []
-    if action == "outbox.merge_preferences":
-        return ["outbox", "merge-line-preferences", "--apply", *_opts(v, "include_content", "include_decisions")], []
-    if action == "outbox.span_covered":
-        return ["outbox", "span-covered", "--apply", "--json"], []
     raise Refused("not_by_direction", "That change can't be made by direction.")
 
 
@@ -587,7 +578,7 @@ def act(action, args) -> tuple[bool, dict]:
         if action == "route.override.grant":
             args = _with_frozen_subject(args)
         values = _values(action, args)
-        pending = _priority_pending(action, values)
+        pending = _priority_pending(action, values, asked=held)
         if pending is None and not owner_direction.REQUEST_APPLIED.get():
             from khipu import needs_you
 
@@ -598,25 +589,26 @@ def act(action, args) -> tuple[bool, dict]:
         full = full_argv(head, positionals, ["--owner-direction"])
     except Refused as err:
         return False, err.refusal()
-    if action in owner_direction.CONFIRM_ONLY:
-        return _held_on_a_read(_hold(action, values, ask=owner_direction.CONFIRM_ONLY[action]))
+    if action in owner_direction.PLANNED_ASKS or owner_direction.class_c(action, values):
+        # Class C, or a clean-up an agent planned: always held, with its own words.
+        from khipu import needs_you
+
+        ask = owner_direction.PLANNED_ASKS.get(action) or needs_you.ask_for(action, values)
+        return _held_on_a_read(_hold(action, values, ask=ask))
     token = owner_direction.ANSWERING.set(owner_direction.signature(action, values))
     try:
         proof = None
         if not held:
             try:
-                proof = owner_direction.check(action, instant=owner_direction.instant_allowed(action, values.get("id")))
+                proof = owner_direction.check(action)
             except owner_direction.DirectionRefused as refused:
                 if refused.code == "not_confirmed":
                     return False, refused.refusal()  # the turn that read the list: no hold, nothing to ask yet
-                # Anything but a T3 conversation's hold runs the command as before.
+                # An answer the owner has not been shown here is held and asked;
+                # anything else runs the command, which refuses as before.
                 held = refused.code == "confirm_needed"
                 if pending is not None and not held:
                     return False, refused.refusal()
-            else:
-                # The owner's words asked for the amend, never for the waiting
-                # request it would confirm: his yes to the ask naming both is.
-                held = pending is not None and action == "route.priority.amend"
         if held:
             if pending is not None:
                 return _held_on_a_read(_hold(action, values, ask=pending[1]))
@@ -645,15 +637,18 @@ def _held_on_a_read(hold: tuple[bool, dict]) -> tuple[bool, dict]:
     return True, out
 
 
-def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
-    """For a priority amend while a conversation's request waits in the
-    priority: (its values with ``confirm_pending``, the pin of the request
-    and the priority it replaced as shown, the ask naming every
+def _priority_pending(action: str, values: dict, *, asked: bool) -> tuple[dict, str] | None:
+    """For a priority amend the agent holds (``direction.request``) while a
+    conversation's request waits in the priority: (its values with
+    ``confirm_pending``, the pin of the request and the priority it
+    replaced as shown, the ask naming every
     change that request makes the owner's and the amendment), so one yes
     settles both. The amend's ``expect`` must be the version the ask shows:
     a newer request is refused at the confirm, never confirmed unseen.
     ``Refused`` naming route.priority.confirm and route.priority.undo when
-    the request can't be shown whole in the ask. None otherwise."""
+    the request can't be shown whole in the ask. An amend made at once
+    (``asked`` false) never takes the waiting request live with it: refused
+    naming the settles, and the request stays waiting. None otherwise."""
     if action != "route.priority.amend":
         return None
     from khipu import routing
@@ -668,6 +663,8 @@ def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
     if str(values.get("expect") or "").strip() != version:
         raise Refused("version_moved", f"the priority changed after it was read (it is now version {version}); "
                                        "read it again")
+    if not asked:
+        raise Refused("priority_pending", routing.pending_amend_refusal(version))
     changes = routing.pending_priority_changes(view)
     if held.get("proposal_withheld") or not changes:
         raise Refused("priority_pending", routing.pending_amend_refusal(version, combine=False))
@@ -681,10 +678,10 @@ def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
     words = "; ".join(routing.their_words(c) for c in changes)
     from khipu import owner_direction
 
-    asked = held.get("owner_request")
+    asked_as = held.get("owner_request")
     amend = owner_direction.ask_line(action, {k: v for k, v in values.items() if k not in ("confirm_pending", "expect")})
     ask = (f"A priority request from {held.get('pending_by') or 'a conversation'} is waiting for you (version "
-           f"{version}" + (f", asked as \"{routing.their_words(asked)}\"" if asked else "") + f"). Confirming it makes these yours: "
+           f"{version}" + (f", asked as \"{routing.their_words(asked_as)}\"" if asked_as else "") + f"). Confirming it makes these yours: "
            f"{words}. Confirm that request, then " + amend[len("Confirm "):])
     # Whatever the caller passed, the pin is the request as this ask shows it.
     return dict(values, confirm_pending=routing.pending_priority_pin(view)), ask
@@ -748,7 +745,7 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
         # Never a hold: a turn that cannot be proved owner's is left alone.
         checking = owner_direction.REQUEST_APPLIED.set(True)
         try:
-            owner_direction.check(action, instant=True)
+            owner_direction.check(action)
         finally:
             owner_direction.REQUEST_APPLIED.reset(checking)
     except (owner_direction.DirectionRefused, routing.RouteError, StopIteration, KeyError):
@@ -794,6 +791,9 @@ def _confirm(args, *, terminal: bool = False) -> tuple[bool, dict]:
 
     if not isinstance(args, dict) or set(args) != {"request"} or not isinstance(args["request"], str):
         return False, _bad(f"{CONFIRM} takes request, the held request's id").refusal()
+    settled = _settled_elsewhere(args["request"])
+    if settled:
+        return True, settled
     try:
         request, stamp = owner_direction.confirm(args["request"], terminal=terminal)
     except owner_direction.DirectionRefused as refused:
@@ -805,6 +805,16 @@ def _confirm(args, *, terminal: bool = False) -> tuple[bool, dict]:
     if owner_background.is_long(request["action"], request.get("args") or {}):
         return owner_background.start(request)
     return _apply_confirmed(request, stamp)
+
+
+def _settled_elsewhere(request_id: str) -> dict | None:
+    """A request another Mac holds and already settled: the owner's answer here
+    changes nothing and is not sent (``routing_replication.settled_elsewhere``)."""
+    if not request_id.startswith("rm-"):
+        return None
+    from khipu import routing_replication
+
+    return routing_replication.settled_elsewhere(request_id)
 
 
 def _apply_confirmed(request: dict, stamp: dict) -> tuple[bool, dict]:
@@ -860,6 +870,9 @@ def _decline(args, *, terminal: bool = False) -> tuple[bool, dict]:
 
     if not isinstance(args, dict) or set(args) != {"request"} or not isinstance(args["request"], str):
         return False, _bad(f"{DECLINE} takes request, the held request's id").refusal()
+    settled = _settled_elsewhere(args["request"])
+    if settled:
+        return True, settled
     try:
         request = owner_direction.decline(args["request"], terminal=terminal)
     except owner_direction.DirectionRefused as refused:

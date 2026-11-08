@@ -1,7 +1,7 @@
 """Reading a file someone else's tool wrote, without being led somewhere else.
 
-The one way Khipu reads a project's summary file (work.py) and an old tracker
-file (ledger_import.py). Before anything is opened, the path is refused when
+The one way Khipu reads a project's summary file (work.py) and a file the owner
+names for a held change (owner_direction). Before anything is opened, the path is refused when
 it is in a private place or in a login folder (``agent_view.in_login_folder``:
 the same list the scrubs use, each harness's own variable included). Then its
 folder is reached one folder at a time from ``/`` with ``O_NOFOLLOW`` (only a

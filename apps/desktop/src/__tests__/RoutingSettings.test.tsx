@@ -132,7 +132,6 @@ function config(extra: Record<string, unknown> = {}) {
       routing_push_start: setting(true),
       routing_push_prompt: setting(true),
       routing_push_delegation: setting(true),
-      routing_dispatch_scripts: setting([], []),
       routing_reset_check: setting(true),
       routing_reset_check_wait: setting(120),
       routing_reset_check_retries: setting([600, 1800]),
@@ -1084,7 +1083,7 @@ describe("Settings -> Routing: holds", () => {
     fireEvent.change(screen.getByLabelText("Longest words"), { target: { value: "0" } });
     fireEvent.click(within(screen.getByRole("form", { name: "Change: Longest words in a hold" })).getByRole("button", { name: "Save" }));
     await waitFor(() => expect(calls("khipu_config_set")).toEqual([{ key: "routing_hold_chars", value: "0" }]));
-    openRare("Sizes, timing and hand-off scripts");
+    openRare("Sizes and timing");
     expect(screen.getByRole("button", { name: "Change: Longest line" })).toBeEnabled();
   });
 
@@ -1132,33 +1131,6 @@ describe("Settings -> Routing: telling conversations", () => {
     expect(calls("khipu_config_set")[1]).toEqual({ key: "routing_push_delegation", value: "on" });
   });
 
-  it("saves your dispatch scripts as file names, and refuses a folder", async () => {
-    answers.khipu_config_show = () =>
-      calls("khipu_config_set").length ? config({ routing_dispatch_scripts: setting(["dispatch.py", "run-job.sh"], []) }) : config();
-    await page();
-    openRare("Sizes, timing and hand-off scripts");
-    const row = screen.getByText("Your hand-off scripts").closest(".row-item") as HTMLElement;
-    expect(within(row).getByText("None")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Change your hand-off scripts" }));
-    const form = screen.getByRole("form", { name: "Change your hand-off scripts" });
-    const input = within(form).getByLabelText("File names");
-    fireEvent.change(input, { target: { value: "scripts/dispatch.py" } });
-    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
-    expect(await within(form).findByRole("alert")).toHaveTextContent(/no folder/);
-    expect(calls("khipu_config_set")).toEqual([]);
-    // A name that starts with a dash would read as an option: refused, as the CLI and Rust do.
-    fireEvent.change(input, { target: { value: "-c" } });
-    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
-    expect(await within(form).findByRole("alert")).toHaveTextContent(/no folder/);
-    expect(calls("khipu_config_set")).toEqual([]);
-    fireEvent.change(input, { target: { value: " dispatch.py, run-job.sh,dispatch.py " } });
-    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
-    await waitFor(() =>
-      expect(calls("khipu_config_set")).toEqual([{ key: "routing_dispatch_scripts", value: '["dispatch.py","run-job.sh"]' }]),
-    );
-    await waitFor(() => expect(within(row).getByText("dispatch.py, run-job.sh")).toBeInTheDocument());
-  });
-
   it("locks the master switch when the environment decides it", async () => {
     answers.khipu_features_show = { features: { routing_push: { enabled: false, source: "env" } } };
     await page();
@@ -1168,7 +1140,7 @@ describe("Settings -> Routing: telling conversations", () => {
 
   it("shows every size and time, each removable on the spot", async () => {
     await page();
-    openRare("Sizes, timing and hand-off scripts");
+    openRare("Sizes and timing");
     await screen.findByText("1,500 characters");
     for (const words of ["400 characters", "50 ms", "20 changes or 6 hours", "12 hours", "30 minutes", "5 minutes"]) {
       expect(screen.getByText(words)).toBeInTheDocument();
@@ -1185,7 +1157,7 @@ describe("Settings -> Routing: telling conversations", () => {
   it("shows the CLI's refusal of a size", async () => {
     answers.khipu_config_set = { ok: false, error: "routing_stale_after must be a whole number of 0 or more" };
     await page();
-    openRare("Sizes, timing and hand-off scripts");
+    openRare("Sizes and timing");
     await screen.findByText("1,500 characters");
     fireEvent.click(screen.getByRole("button", { name: "Change: Treat a report as out of date after" }));
     fireEvent.change(screen.getByLabelText("Out of date after"), { target: { value: "0" } });
@@ -1545,115 +1517,6 @@ describe("Settings -> Routing: checks and copies", () => {
     expect(document.querySelector('[data-settings-group="checks"]')).toHaveTextContent("2 directions not in Khipu");
     expect(screen.queryByText("Nothing to fix")).toBeNull();
     expect(invokeMock.mock.calls.filter(([cmd]) => /dismiss|owner_act/.test(String(cmd)))).toHaveLength(0);
-  });
-
-  it("lists today's model mismatches with the brief's tag and offers no owner action", async () => {
-    const v = view();
-    const at = new Date().toISOString();
-    Object.assign(v, { model_mismatches: [
-      { at, task: "fix-round", expected: "sonnet", actual: "opus", guessed: false, account: "Claude Code", model: "opus", project: "project-a" },
-      { at, task: "tests", expected: "sonnet", actual: "opus", guessed: true, account: "Claude (.claude-second)", model: "opus", project: null },
-    ] });
-    answers.khipu_route_view = v;
-    await page();
-    const list = screen.getByRole("list", { name: "Model mismatches today" });
-    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
-    expect(list).toHaveTextContent("A fix round went to Opus; your table says Sonnet");
-    expect(list).toHaveTextContent("Claude Code in project-a");
-    expect(list).toHaveTextContent("From the brief");
-    expect(list).toHaveTextContent("Tests went to Opus; your table says Sonnet");
-    expect(list).toHaveTextContent("guessed from the brief's words");
-    expect(list).not.toHaveTextContent("null");
-    expect(within(list).queryAllByRole("button")).toHaveLength(0);
-    expect(document.querySelector('[data-settings-group="checks"]')).toHaveTextContent("2 model mismatches today");
-    expect(screen.queryByText("Nothing to fix")).toBeNull();
-    expect(invokeMock.mock.calls.filter(([cmd]) => /dismiss|owner_act/.test(String(cmd)))).toHaveLength(0);
-  });
-
-  it("shows routing copies found in files without offering an owner action", async () => {
-    const v = view();
-    Object.assign(v, { routing_file_copies: {
-      status: "checked", scanned_at: "2026-10-21T18:10:00Z", files_checked: 14,
-      hits: [
-        { file: "~/Projects/project-a/CLAUDE.md", line: 42, quote: "Main account tight until Mon 2026-10-19", superseded: true },
-        { file: "~/.claude/projects/x/memory/note.md", line: 4, quote: "Codex on credits, limited, until Oct 20", superseded: true },
-      ],
-    } });
-    answers.khipu_route_view = v;
-    await page();
-    const list = screen.getByRole("list", { name: "Copies of routing found in files" });
-    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
-    expect(list).toHaveTextContent("~/Projects/project-a/CLAUDE.md line 42");
-    expect(list).toHaveTextContent("“Main account tight until Mon 2026-10-19”");
-    expect(screen.getByText("Conversations are told Khipu's record wins over these.")).toBeInTheDocument();
-    expect(within(list).queryAllByRole("button")).toHaveLength(0);
-    expect(document.querySelector('[data-settings-group="checks"]')).toHaveTextContent("2 copies in files");
-    expect(screen.queryByText("Nothing to fix")).toBeNull();
-  });
-
-  it("shows the total count and how many copies are not shown, not every row", async () => {
-    const v = view();
-    Object.assign(v, { routing_file_copies: {
-      status: "checked", scanned_at: "2026-10-21T18:10:00Z", files_checked: 3,
-      hits: [{ file: "RepoA/CLAUDE.md", line: 1, quote: "Prefer Codex first", superseded: true }],
-      hits_total: 501, more_not_shown: 500, too_large: ["~/big.md"],
-    } });
-    answers.khipu_route_view = v;
-    await page();
-    const list = screen.getByRole("list", { name: "Copies of routing found in files" });
-    expect(within(list).getAllByRole("listitem")).toHaveLength(1);
-    expect(screen.getByText("500 more not shown.")).toBeInTheDocument();
-    expect(screen.getByText(/Too large to read: ~\/big\.md\./)).toBeInTheDocument();
-    expect(document.querySelector('[data-settings-group="checks"]')).toHaveTextContent("501 copies in files");
-  });
-
-  it("keeps files never looked at apart from nothing found, with no action", async () => {
-    const v = view();
-    Object.assign(v, { routing_file_copies: { status: "not_checked", scanned_at: null, files_checked: 0, hits: [] } });
-    answers.khipu_route_view = v;
-    await page();
-    expect(screen.getByText("Khipu hasn't looked at your files yet")).toBeInTheDocument();
-    expect(screen.queryByText("Nothing to fix")).toBeNull();
-    expect(document.querySelector('[data-settings-group="checks"]')).toHaveTextContent("Files not looked at yet");
-    const group = screen.getByRole("region", { name: "Checks and copies" });
-    expect(within(group).queryByRole("button", { name: /look now/i })).toBeNull();
-  });
-
-  it.each(["checked", "incomplete", "stale"])("shows scan evidence and time for %s reports with hits", async (status) => {
-    Object.assign(answers.khipu_route_view = view(), { routing_file_copies: {
-      status, scanned_at: "2026-10-14T15:30:00Z", files_checked: 1,
-      hits: [{ file: "Repo/AGENTS.md", line: 1, quote: "Prefer Codex first", superseded: true }],
-      skipped: [{ file: "~/Documents/notes", reason: "protected_path" },
-        { file: "Repo/slow.md", reason: "timeout", message: "Couldn't read in time." }],
-      too_large: ["Repo/big.md"],
-    } });
-    await page();
-    const group = screen.getByRole("region", { name: "Checks and copies" });
-    expect(within(group).getByRole("list", { name: "Copies of routing found in files" })).toHaveTextContent("Prefer Codex first");
-    expect(group).toHaveTextContent(/Files last looked at.*11:30 AM/);
-    expect(group).toHaveTextContent("~/Documents/notes");
-    expect(group).toHaveTextContent(/protected/i);
-    expect(group).toHaveTextContent("Couldn't read in time.");
-    expect(group).toHaveTextContent("Too large to read: Repo/big.md.");
-    expect(group).not.toHaveTextContent("Khipu hasn't looked at your files yet");
-    if (status === "stale") expect(group).toHaveTextContent(/out of date/i);
-    if (status === "incomplete") expect(group).toHaveTextContent(/incomplete/i);
-  });
-
-  it.each(["incomplete", "stale"])("explains %s scans with no hits", async (status) => {
-    Object.assign(answers.khipu_route_view = view(), { routing_file_copies: {
-      status, scanned_at: "2026-10-14T15:30:00Z", files_checked: 0, hits: [],
-      skipped: [{ file: "candidate discovery", reason: "candidate_limit" }],
-    } });
-    await page();
-    const group = screen.getByRole("region", { name: "Checks and copies" });
-    expect(group).toHaveTextContent(/Files last looked at.*11:30 AM/);
-    expect(group).toHaveTextContent(/candidate limit/i);
-    expect(group).not.toHaveTextContent("Khipu hasn't looked at your files yet");
-    expect(group).not.toHaveTextContent("Nothing to fix");
-    const summary = document.querySelector('[data-settings-group="checks"]');
-    expect(summary).toHaveTextContent(status === "stale" ? /out of date/i : /incomplete/i);
-    expect(summary).not.toHaveTextContent("Files not looked at yet");
   });
 
   const TIERS = {
@@ -2256,7 +2119,7 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
       routing_ledger_keep_days: setting(7),
     });
     await page();
-    openRare("Sizes, timing and hand-off scripts");
+    openRare("Sizes and timing");
     await screen.findByText("512 KB");
     for (const [name, words] of [
       ["How long a limit reported without a time lasts", "30 minutes"],

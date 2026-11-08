@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """khipu.rerank: the optional reranking stage of explicit search.
 
 The provider is always a stub (``khipu.rerank._call_model`` is the one seam);

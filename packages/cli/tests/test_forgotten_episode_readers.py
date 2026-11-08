@@ -206,13 +206,20 @@ class StatusRecentCapturesTest(_CacheCase):
 
 
 class HubGraphEpisodeTopicsTest(_CacheCase):
-    def test_a_forgotten_seed_episode_yields_no_topics(self):
+    def test_the_leg_reads_only_live_episodes_as_seeds_and_as_mentions(self):
+        """The hub leg is one statement (real Postgres runs it in
+        test_pg_scratch); on a hub with ``deleted_at`` both the seed episode
+        join and the recent-mention scan must keep forgotten episodes out."""
+        import time
+
         from khipu import graph_candidates as gc
 
         cur = _EpisodeTableCur()
-        self.assertEqual(gc._hub_episode_topics(cur, "2", seed_rank=0, seed_key="episode:2"), [])
-        live = gc._hub_episode_topics(cur, "1", seed_rank=0, seed_key="episode:1")
-        self.assertEqual([r["id"] for r in live], ["live-topic"])
+        gc.hub_candidates(cur, [{"kind": "episode", "id": "2"}, {"kind": "topic", "id": "live-topic"}],
+                          deadline=time.monotonic() + 5)
+        statement = next(s for s in cur.statements if s.startswith("WITH "))
+        self.assertIn("JOIN episodes ep ON ep.id::text = s.sid AND ep.deleted_at IS NULL", statement)
+        self.assertIn("FROM episodes WHERE deleted_at IS NULL ORDER BY ts DESC", statement)
 
 
 class DecisionBackfillTest(_CacheCase):

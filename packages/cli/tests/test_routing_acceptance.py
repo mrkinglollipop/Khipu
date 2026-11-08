@@ -1326,31 +1326,6 @@ def test_gateway_closed_field_checker_traverses_nested_history_and_lists():
         assert_gateway_fields(value)
 
 
-# ---- 14: scanner gets synthetic files, never Matt's files -------------------------------
-
-
-@pytest.mark.parametrize("line,flag", [
-    ("Main Claude account tight until Mon 2026-10-19", True),
-    ("Delegation order: second Claude account first", True),
-    ("| Codex | Good for builds | Weak at narration |", False),
-    ("| Codex | Good for builds | Evidence 2026-10-14 |", False),
-    ("> on 2026-10-14 Matt paused Claude", False),
-    ("History: on 2026-10-14 Matt paused Claude.", False),
-    ("Run codex exec to reach the Codex lane.", False),
-], ids=["live-level", "live-order", "capability", "evidence-date", "quote", "past-history", "lane-howto"])
-@future("13", "doctor must report scanner evidence from imported routing-state copies")
-def test_14_scanner_live_claims_and_false_positives(replay, line, flag):
-    document = replay.root / "AGENTS.md"
-    document.write_text(line + "\n")
-    replay.configure(routing_scan_files=[str(document)])
-    body = routing.doctor_block(now=replay.now)
-    checks = body.get("routing_copies")
-    expect(isinstance(checks, list), True, "14: doctor has no routing-copy scanner evidence")
-    assert bool(checks) == flag
-    if flag:
-        assert checks[0]["line"] == 1 and checks[0]["file"] == str(document)
-
-
 # ---- 15: each delivery-health red condition and evidence-based recovery -----------------
 
 

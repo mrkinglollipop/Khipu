@@ -68,6 +68,22 @@ class World:
             return rc, (json.loads(text[start:]) if start >= 0 else {"text": text})
 
 
+def run_confirmed(world, action: str, args: dict, yes: str = "yes, go ahead") -> tuple[bool, dict]:
+    """A class C change as the owner gets it: ``khipu_owner_act`` holds it, he types
+    his yes, ``direction.confirm`` claims the request and its command is replayed
+    (the real held-request path; a C command by direction applies no other way)."""
+    from khipu import owner_act, owner_background
+
+    world.say("go ahead with that")  # the ask needs a typed turn in this conversation
+    ok, held = owner_act.act(action, args)
+    assert ok and held["pending"] and held["applied"] is False, held
+    world.say(yes)
+    ok, done = owner_act.act("direction.confirm", {"request": held["request"]})
+    if ok and done.get("started"):
+        ok, done = owner_background.run(done["request"])
+    return ok, done
+
+
 @pytest.fixture
 def world(tmp_path, monkeypatch, khipu_app):
     data = tmp_path / "data"
@@ -132,6 +148,7 @@ def test_refusal_no_recorded_turn_when_the_hook_did_not_run(world):
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check()
     assert err.value.code == "no_recorded_turn"
+    assert "prompt hook may not be installed" in str(err.value)
 
 
 def test_refusal_no_recorded_turn_for_a_dispatched_job(world):
@@ -232,12 +249,11 @@ def test_refusal_before_unreadable(world, monkeypatch):
 
 def test_every_change_by_direction_is_logged_with_an_undo(world):
     # Confirming a seeded rule was the last change without one (the sixth
-    # review); the only change with no Undo, a catch-up import, is refused by
-    # direction (test_refusal_not_by_direction). Sending this Mac's waiting
-    # forgets to the hub has none either: a forget is never undone (fact
+    # review). Sending this Mac's waiting
+    # forgets to the hub has none: a forget is never undone (fact
     # provenance design, section 9), and an agent may forget without
     # direction at all (khipu_forget).
-    assert set(owner_direction._NO_UNDO_WHY) == {"ledger.import", "forget.send", "forget.here", "forget.not_same"}
+    assert set(owner_direction._NO_UNDO_WHY) == {"forget.send", "forget.here", "forget.not_same"}
     routing._write({"type": "rule_add", "n": 1, "text": "never run the fast tier", "seeded": True,
                     "written_by": {"kind": "seed", "file": "rules.json"}, "via": "seed"})
     world.say()
@@ -350,7 +366,7 @@ _T3_WHY = ("a T3 conversation can't be told apart from T3's own scheduled or rel
            "a change asked for there waits for the owner to confirm it")
 
 
-def test_a_t3_conversation_the_owner_typed_in_is_held_for_confirmation(t3_conversation):
+def test_a_t3_conversations_hook_turn_alone_never_makes_the_change(t3_conversation):
     from khipu import t3
 
     assert t3.thread_for_session(OWNER) is None  # behind the newest window
@@ -358,9 +374,10 @@ def test_a_t3_conversation_the_owner_typed_in_is_held_for_confirmation(t3_conver
     (row,) = owner_turns.turns(OWNER)
     assert row["entrypoint"] == "t3" and row["eligible"] is False and row["why"] == _T3_WHY
     assert not row.get("dispatched")
+    # T3's own record of the owner's messages decides (class A, 2026-11-07); here it can't be read.
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check("config.routing_setting")
-    assert err.value.code == "confirm_needed"
+    assert err.value.code == "t3_unreadable"
     rc, out = t3_conversation.run(["config", "--set", "routing_prompt_budget_ms", "500"], True)
     assert rc != 0, out
 
@@ -400,12 +417,12 @@ def test_another_t3_conversations_turn_is_refused(t3_conversation):
     assert err.value.code == "no_recorded_turn"
 
 
-def test_an_old_t3_turn_still_only_holds_the_change(t3_conversation):
+def test_an_old_t3_turn_is_proved_by_t3s_record_too(t3_conversation):
     _t3_say(ago=7 * 3600)
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check("config.routing_setting")
-    # No age limit on a hold: it changes nothing until the owner confirms.
-    assert err.value.code == "confirm_needed"
+    # No age limit and no hold: T3's own record decides, and here it can't be read.
+    assert err.value.code == "t3_unreadable"
 
 
 # ---- apply, log, undo --------------------------------------------------------------------------
@@ -500,9 +517,8 @@ def test_purge_by_direction_is_scheduled_runs_a_day_later_and_undo_cancels_it(wo
     purged: list = []
     monkeypatch.setattr(ledger, "_connect", lambda: type("C", (), {"close": lambda self: None})())
     monkeypatch.setattr(ledger, "purge", lambda conn, project, row: purged.append((project, row)) or {"ok": True})
-    world.say("purge T-12 from the atlas ledger")
-    rc, out = world.run(["ledger", "purge", "T-12", "--project", "atlas", "--json"], True)
-    assert rc == 0 and out["state"] == "scheduled" and purged == []
+    ok, out = run_confirmed(world, "ledger.purge", {"id": "T-12", "project": "atlas"}, "yes, purge T-12")
+    assert ok and out["state"] == "scheduled" and purged == [], out
     (line,) = _log()
     assert line["state"] == "scheduled" and line["runs_at"]
     owner_direction.run_due(now=time.time() + 3600)
@@ -512,8 +528,8 @@ def test_purge_by_direction_is_scheduled_runs_a_day_later_and_undo_cancels_it(wo
     owner_direction.run_due(now=time.time() + 26 * 3600)
     assert purged == [("atlas", "T-12")]
 
-    world.say("purge T-13 from the atlas ledger")
-    rc, out = world.run(["ledger", "purge", "T-13", "--project", "atlas", "--json"], True)
+    ok, out = run_confirmed(world, "ledger.purge", {"id": "T-13", "project": "atlas"}, "yes, purge T-13")
+    assert ok, out
     second = _log()[-1]
     world.say("undo the purge of T-13")
     rc, out = world.run(["owner-direction", "undo", second["id"]], True)
@@ -827,7 +843,7 @@ def _be_with(world, session, monkeypatch, env):
         monkeypatch.setenv(name, value)
 
 
-def test_a_t3_top_level_thread_with_the_sdk_child_markers_is_held(t3_conversation, monkeypatch):
+def test_a_t3_top_level_thread_with_the_sdk_child_markers_is_proved_by_t3s_record(t3_conversation, monkeypatch):
     _t3_say(**_T3_SDK_ENV)
     row = owner_turns.turns(OWNER)[-1]
     assert row["entrypoint"] == "t3" and row["eligible"] is False and row["why"] == _T3_WHY
@@ -835,7 +851,7 @@ def test_a_t3_top_level_thread_with_the_sdk_child_markers_is_held(t3_conversatio
     _be_with(t3_conversation, OWNER, monkeypatch, _T3_SDK_ENV)
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check("config.routing_setting")
-    assert err.value.code == "confirm_needed"
+    assert err.value.code == "t3_unreadable"
 
 
 def test_a_t3_child_lookup_that_never_completes_fails_closed(t3_conversation, monkeypatch):

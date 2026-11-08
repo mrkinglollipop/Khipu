@@ -1,8 +1,3 @@
-# --bypass-harness (sonnet lane): authored by a dispatched on-sub
-# Agent(model="sonnet") subagent for the "gaps become oracles" layer 2 of
-# docs/plans/2026-09-05-setup-that-cannot-strand-you.md — the "stranger's
-# first run" no reviewer has to remember to do by hand. Requires Docker; see
-# test_setup_contract.py for the pure-unit layer 1.
 """First-run end to end against a real, scratch Postgres 19 + pgvector
 cluster: connect an EMPTY database, seed a couple of rows through the real
 capture writer, move the whole database to a second scratch database (dry

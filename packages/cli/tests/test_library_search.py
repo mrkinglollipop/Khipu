@@ -1,5 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
-# Sonnet build agent (brief: do not delegate); no further agent to route to.
 """Library search and `khipu get library:...` (Session C).
 
 A fake hub cursor answers exactly the statements ``khipu.library_search``
@@ -724,10 +722,10 @@ class PromptLaneTest(unittest.TestCase):
                                            side_effect=AssertionError("library leg ran")):
             em.hybrid_search("a topical prompt", mode="semantic", include_libraries=False)
 
-    def test_reflect_and_probe_also_opt_out(self):
-        from khipu import probe, reflect
+    def test_probe_also_opts_out(self):
+        from khipu import probe
 
-        for mod in (reflect, probe):
+        for mod in (probe,):
             self.assertIn("include_libraries=False", inspect.getsource(mod), mod.__name__)
 
 

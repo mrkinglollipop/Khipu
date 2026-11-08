@@ -1,5 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
-# agent (brief: do not delegate); no further agent to route to.
 """What the Embeddings screen asks of the CLI: estimate, the price table,
 `embed profiles list|delete`, test-key, the query-timing log, and chunk-level
 memory coverage (stale / samples). Fake cursors and a fake transport; no
@@ -123,7 +121,6 @@ class MemoryEstimateTest(_Env):
         )
 
     def test_tokens_round_up(self):
-        # --bypass-harness (sonnet lane): dispatched agent, no delegation.
         sources = [("topic", "a", "A" * 5, "A")]
         with mock.patch("khipu.db.connect", return_value=fake_conn()), \
                 mock.patch.object(embed, "_iter_sources", return_value=iter(sources)), \
@@ -279,7 +276,6 @@ class ListDetailedTest(_Env):
         self.assertEqual((a["median_query_ms_24h"], b["median_query_ms_24h"]), (123, None))
         self.assertEqual((a["price_per_million_usd"], b["price_per_million_usd"]), (None, None))
         self.assertEqual(a["rows"]["memory"], 5)  # the existing fields are still there
-        # --bypass-harness (sonnet lane): dispatched agent, no delegation.
         for r in rows.values():
             self.assertEqual([k for k in r if "key" in k], ["key_present"])  # presence, never a value
 
@@ -923,7 +919,7 @@ class MemoryCoverageTest(unittest.TestCase):
 
     def test_the_field_names_are_the_librarys_status_names(self):
         hub = _hub_with_library()
-        status = library.source_status(hub, "lib1")  # --bypass-harness (sonnet lane): no delegation
+        status = library.source_status(hub, "lib1")
         p, missing, stale = self.gaps(lambda: {})
         fields = embed.memory_coverage_fields(p, missing, stale)
         self.assertLessEqual(set(fields), set(status))

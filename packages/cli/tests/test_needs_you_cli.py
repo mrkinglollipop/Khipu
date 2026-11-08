@@ -79,7 +79,8 @@ def test_saved_end_in_past_is_decline_only(world, monkeypatch):
     from datetime import datetime, timezone
     end = time.time() + 60
     until = datetime.fromtimestamp(end, timezone.utc).isoformat()
-    ok, held = _ask_in_t3(world, "route.priority.set", {"entries": ["Codex"], "expect": routing.priority_version(), "until": until})
+    ok, held = _ask_in_t3(world, "direction.request", {"action": "route.priority.set", "args": {
+        "entries": ["Codex"], "expect": routing.priority_version(), "until": until}})
     assert ok, held
     monkeypatch.setattr(owner_direction, "_clock", lambda: end + 1)
     item = needs_you.waiting(key="held:" + held["request"], record_read=False)["items"][0]

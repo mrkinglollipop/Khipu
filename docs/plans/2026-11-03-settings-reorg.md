@@ -51,7 +51,7 @@ Who (my estimate, no usage data): **D** owner daily, **R** owner rarely, **N** n
 | Delivery health, live, who has it; what each hears, pace news, old off | Telling | Who heard what | R | Conversations | – |
 | Other Macs and the cloud | Telling | Is each copy current? | R | Macs | – |
 | Tell conversations; 3 moments | Telling | When they hear | R | Conversations | S |
-| Dispatch scripts (names) | Telling | Your hand-off scripts | N | Rarely | S |
+| Dispatch scripts (names), removed 2026-11-07 with the shell half of the delegation hook | Telling | Your hand-off scripts | N | Rarely | S |
 | Longest summary, update, helper block, line, rule, note; most rules, rules shown | Sizes | Length limits | N | Rarely | S |
 | Resend-after, out-of-date, unstated limit | Sizes | Fact lifetimes | N | Rarely | S |
 | Warn: slow, disagreement, not refreshed | Sizes | When to warn | N | Rarely | S |

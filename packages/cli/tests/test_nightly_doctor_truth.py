@@ -236,7 +236,7 @@ def test_disk_space_stats_the_inactive_live_slot(tmp_path, monkeypatch):
     assert out["ok"] is False
 
 
-# ---- 4. Doctor rows for every nightly step; prune/briefs tell the truth ----
+# ---- 4. Doctor rows for every nightly step; prune tells the truth ----
 
 
 def test_doctor_reads_summary_kind_routing_prune_and_project_renames(tmp_path, monkeypatch):
@@ -270,64 +270,6 @@ def test_routing_ledger_prune_budget_exhaustion_is_visible_and_the_next_run_fini
     assert big.exists()
     out = rlp.prune(keep_days=7, now=time.time(), folder=tmp_path)
     assert not big.exists() and out["removed"] == 1 and not out.get("deferred")
-
-
-def test_briefs_lock_held_is_deferred_not_built_zero_green(tmp_path, monkeypatch):
-    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(jobs, "ensure_data_dir", lambda: tmp_path)
-
-    class _Conn:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def cursor(self):
-            return self
-
-        def commit(self):
-            pass
-
-    with mock.patch("khipu.features.enabled", return_value=True), \
-            mock.patch("khipu.db.connect", return_value=_Conn()), \
-            mock.patch("khipu.briefs.acquire_build_lock", return_value=False), \
-            mock.patch.object(jobs, "_nightly_log"):
-        out = jobs._briefs_build_if_on()
-    assert out["ok"] is True
-    assert isinstance(out.get("deferred"), str) and "lock" in out["deferred"].lower()
-    assert out.get("reason") != "lock held" or "deferred" in out
-
-
-def test_briefs_deferred_two_nights_running_goes_red(tmp_path, monkeypatch):
-    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(jobs, "ensure_data_dir", lambda: tmp_path)
-    yesterday = (datetime.now(timezone.utc) - timedelta(hours=20)).isoformat()
-    previous = {"name": "briefs_build", "ok": True, "deferred": "lock held", "ts": yesterday,
-                "counts": {"built": 0}, "error": None}
-
-    class _Conn:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def cursor(self):
-            return self
-
-        def commit(self):
-            pass
-
-    with mock.patch("khipu.features.enabled", return_value=True), \
-            mock.patch("khipu.db.connect", return_value=_Conn()), \
-            mock.patch("khipu.briefs.acquire_build_lock", return_value=False), \
-            mock.patch.object(jobs, "_nightly_log"):
-        monkeypatch.setattr(jobs, "_PREVIOUS_BRIEFS_STEP", previous)
-        out = jobs._briefs_build_if_on()
-    assert out["ok"] is False
-    assert "deferred" in str(out.get("deferred") or out.get("error") or "").lower() or "lock" in str(
-        out.get("error") or "").lower()
 
 
 # ---- 5. Promote: judge the candidate against live; thin sample is yellow ----

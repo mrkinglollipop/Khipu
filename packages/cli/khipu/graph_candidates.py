@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Bounded graph-candidate expansion (Phase 3, session A; "BUILD — graph
 candidates", docs/plans/2026-09-27-memory-reasoning-scope.md).
 
@@ -9,22 +6,21 @@ Two backends behind one shape, not one shared query: the hub (PostgreSQL,
 ``replica_candidates``) serves the local prompt lane and the stale-replica
 payload. Both take the caller's already-fused list, seed from its top 5
 rows, and return additional candidate rows plus whether the leg missed its
-own deadline. Finished expansions are kept when a later one misses (a miss
-no longer drops wiki hits already fetched). Finding 7
-(docs/research/hindsight-plan-review-2026-09-28.md): no episode nodes, no
-persisted episode-to-topic edge, and never the unstable SQL/PGQ path —
-every expansion below is a plain join or EXISTS/unnest against
-``edges``/``topics``/``episodes``, with the hub's reverse topic→episode
-lookup served from an in-process slug map (no migration) like the replica.
+own deadline. Finding 7 (docs/research/hindsight-plan-review-2026-09-28.md):
+no episode nodes, no persisted episode-to-topic edge, and never the unstable
+SQL/PGQ path — every expansion below is a plain join or EXISTS/unnest
+against ``edges``/``topics``/``episodes``.
 
 Expansions, each a plain join:
   (a) topic seed  -> topics it links to/from via ``wiki_link``
   (b) episode seed -> topic pages named in its own ``topics`` array
-  (c) topic seed  -> most recent episodes that name it (the reverse of (b);
-      served from an in-process slug map on both legs — the replica builds
-      it in the background, the hub builds it from the most recent episodes
-      (bounded, short TTL, newest-ts stamp) under the leg deadline; a build
-      that fails or times out reports ``missed``)
+  (c) topic seed  -> most recent episodes that name it (the reverse of (b))
+
+The hub runs all three for every seed as one statement (it is across the
+network, so round trips are the cost; see the hub section); a timeout
+reports ``missed`` with no candidates. The replica runs them seed by seed,
+serving (c) from an in-process slug map it builds in the background, and
+keeps finished expansions when a later one misses.
 
 A caller is responsible for the ``graph_candidates`` switch check
 (``khipu.features.enabled``) and for feeding the result back into
@@ -63,21 +59,6 @@ def _check_deadline(deadline: float) -> None:
 def _remaining_ms(deadline: float) -> int:
     _check_deadline(deadline)
     return max(1, int((deadline - time.monotonic()) * 1000))
-
-
-class _PgDeadlineCursor:
-    """Cursor proxy that reapplies the shared absolute deadline per query."""
-
-    def __init__(self, cur: Any, deadline: float):
-        self._cur, self._deadline = cur, deadline
-
-    def execute(self, sql: str, params: Any = None):
-        timeout = f"{_remaining_ms(self._deadline)}ms"
-        self._cur.execute("SELECT set_config('statement_timeout', %s, true)", (timeout,))
-        return self._cur.execute(sql, params)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._cur, name)
 
 
 class _SqliteDeadlineConnection:
@@ -159,169 +140,182 @@ def _seeds(fused: Sequence[Mapping[str, Any]]) -> list[tuple[int, Mapping[str, A
 
 
 # ---- hub (PostgreSQL) --------------------------------------------------
+#
+# The hub is usually across the network (Tailscale from a Mac: 40-50 ms a
+# round trip, spikes past 150 ms). Measured on the live hub 2026-11-07, every
+# query this leg ran took under 40 ms on the server, yet the leg missed its
+# 400 ms deadline on every search: it ran two round trips per query (the
+# per-query statement_timeout and the query), two to four queries per seed,
+# up to five seeds, and fetched every wiki neighbour's body (12,500 for the
+# `khipu` topic) to keep three. So the whole leg is now one statement for
+# every seed and all three expansions, bounded per seed in SQL, pipelined
+# with its setup, then one cleanup: two round trips whatever the seeds.
+
+# Python's ``topic_graph.topic_slug_from_label`` in SQL: lowercase, runs of
+# anything but a-z0-9 to "-", trim "-", cut at 80. Every non-ASCII character
+# becomes "-" either way, so the two agree for every label except the two
+# non-ASCII letters that lowercase into ASCII (the Kelvin sign and the dotted
+# capital I) — the same caveat the replica's LIKE prefilter documents.
+_PG_SLUG = "left(btrim(regexp_replace(lower({x}), '[^a-z0-9]+', '-', 'g'), '-'), 80)"
+# ``topic_graph.peel_topic_id``: trim, then drop one "topic:"/"memory_topic:".
+_PG_PEEL = "regexp_replace(btrim({x}), '^(topic:|memory_topic:)', '')"
+# A JSONB ``topics`` value that is not an array names nothing (and must not
+# make jsonb_array_elements_text raise for the whole leg).
+_PG_TOPIC_LABELS = (
+    "jsonb_array_elements_text(CASE WHEN jsonb_typeof({x}) = 'array' "
+    "THEN {x} ELSE '[]'::jsonb END)"
+)
+# Rows kept per seed and relation in SQL. _select_candidates keeps at most
+# PER_SEED_CAP per seed after dropping rows an earlier seed already took (at
+# most TOTAL_CAP), so this many always leaves it the same choice it would
+# make from the full list.
+_HUB_PER_SEED_ROWS = TOTAL_CAP + PER_SEED_CAP
+# The reverse lookup (c) reads only the most recent live episodes (older ones
+# are a rarer target and each slug keeps just PER_SEED_CAP of them anyway).
+_HUB_RECENT_EPISODES = 2000
+_HUB_SAVEPOINT = "khipu_graph_candidates_deadline"
 
 
-def _hub_topic_wiki(cur, slug: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
-    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
+def _hub_candidates_sql(
+    seeds: Sequence[tuple[int, Mapping[str, Any]]],
+    exclude: set[tuple[str, str]],
+    *,
+    live_episodes: bool,
+) -> tuple[str, dict[str, Any]]:
+    """One statement answering every seed: (a) and (c) for topic seeds, (b)
+    for episode seeds. Each row is ``(seed_rank, seed_kind, seed_id, relation,
+    kind, id, title, snippet, recency_epoch)``."""
     from khipu import topic_graph
 
-    aliases = topic_graph.topic_aliases(slug)
-    cur.execute(
-        "SELECT dst FROM edges WHERE src = ANY(%(a)s) AND type = %(t)s "
-        "UNION "
-        "SELECT src FROM edges WHERE dst = ANY(%(a)s) AND type = %(t)s",
-        {"a": aliases, "t": topic_graph.WIKI_EDGE},
-    )
-    others = {topic_graph.peel_topic_id(r[0]) for r in cur.fetchall()}
-    others.discard(slug)
-    if not others:
-        return []
-    cur.execute(
-        "SELECT slug, title, body, updated_at, created_at FROM topics "
-        "WHERE slug = ANY(%(s)s) AND deleted_at IS NULL",
-        {"s": sorted(others)},
-    )
-    out = []
-    for oslug, title, body, updated_at, created_at in cur.fetchall():
-        out.append({
-            "kind": "topic", "id": oslug, "label": title or oslug,
-            "snippet": (body or "")[:4000],
-            "_seed_rank": seed_rank, "_seed_key": seed_key,
-            "_relation": topic_graph.WIKI_EDGE,
-            "_recency": _ts_key(updated_at or created_at),
-        })
-    return out
-
-
-# Hub-side slug -> recent episodes, same role as the replica's ``_SLUG_CACHE``:
-# one in-process map so topic→episode expansion is a bounded lookup instead of
-# an unindexed JSONB scan per seed inside the 400 ms hub budget. No migration.
-_HUB_SLUG_LOCK = threading.Lock()
-_HUB_SLUG_CACHE: dict[str, Any] = {}
-# A reused map is trusted this long without any query; after it, one cheap
-# ``max(ts)`` stamp decides between refreshing the age and rebuilding.
-_HUB_SLUG_TTL_S = 5.0
-# The build reads only the most recent live episodes (older ones are a rarer
-# reverse-lookup target and each slug keeps just PER_SEED_CAP of them anyway).
-_HUB_SLUG_BUILD_LIMIT = 2000
-
-
-def _hub_slug_map_key(cur) -> str | None:
-    """Cheap generation stamp: newest episode ts (no full count, no new index)."""
-    try:
-        cur.execute("SELECT max(ts) FROM episodes")
-        row = cur.fetchone()
-    except Exception:  # noqa: BLE001 — caller treats None as a failed stamp
-        return None
-    if not row:
-        return None
-    return str(row[0]) if row[0] is not None else ""
-
-
-def _build_hub_slug_map(cur) -> dict[str, list[tuple[Any, Any, Any]]]:
-    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
-    from khipu import topic_graph
-    from khipu.db import has_columns
-
-    live = "WHERE deleted_at IS NULL " if has_columns(cur, "episodes", "deleted_at") else ""
-    cur.execute(
-        "SELECT id, ts, left(summary, 200), topics FROM episodes "
-        f"{live}ORDER BY ts DESC LIMIT %(cap)s",
-        {"cap": _HUB_SLUG_BUILD_LIMIT},
-    )
-    out: dict[str, list[tuple[Any, Any, Any]]] = {}
-    for eid, ts, summary, topics in cur.fetchall():
-        labels = topics or []
-        if isinstance(labels, str):
-            try:
-                labels = json.loads(labels)
-            except (ValueError, TypeError):
-                continue
-        for slug in {topic_graph.topic_slug_from_label(str(label)) for label in labels or []}:
-            if not slug:
-                continue
-            bucket = out.setdefault(slug, [])
-            if len(bucket) < PER_SEED_CAP:
-                bucket.append((ts, eid, summary))
-    return out
-
-
-def _hub_episode_slug_map(cur) -> dict[str, list[tuple[Any, Any, Any]]]:
-    """Process-local hub slug map, shared by every seed in a leg. A stamp or
-    build that fails or runs out of budget raises ``DeadlineMissed`` so the
-    leg reports ``missed`` instead of silently returning an empty expansion."""
-    # forget-fence source: per-prompt push candidates (cached map); prior_work_for_prompt fences them
-    now = time.monotonic()
-    with _HUB_SLUG_LOCK:
-        cached = dict(_HUB_SLUG_CACHE)
-    if cached.get("map") is not None and now - cached.get("at", 0.0) < _HUB_SLUG_TTL_S:
-        return cached["map"]
-    key = _hub_slug_map_key(cur)
-    if key is None:
-        raise DeadlineMissed()
-    if cached.get("map") is not None and cached.get("key") == key:
-        with _HUB_SLUG_LOCK:
-            _HUB_SLUG_CACHE["at"] = now
-        return cached["map"]
-    try:
-        by_slug = _build_hub_slug_map(cur)
-    except Exception as exc:  # noqa: BLE001 — a failed/timed-out build is a miss
-        raise DeadlineMissed() from exc
-    with _HUB_SLUG_LOCK:
-        _HUB_SLUG_CACHE.update({"key": key, "map": by_slug, "at": time.monotonic()})
-    return by_slug
-
-
-def _hub_topic_recent_episodes(cur, slug: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
-    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
-    by_slug = _hub_episode_slug_map(cur)
-    return [
-        {
-            "kind": "episode", "id": str(eid), "label": (summary or "")[:200],
-            "snippet": (summary or "")[:4000],
-            "_seed_rank": seed_rank, "_seed_key": seed_key,
-            "_relation": _CAPTURE_TOPIC_RELATION,
-            "_recency": _ts_key(ts),
-        }
-        for ts, eid, summary in by_slug.get(slug, [])
+    t_rank, t_sid, t_a1, t_a2, t_a3 = [], [], [], [], []
+    e_rank, e_sid = [], []
+    for rank, seed in seeds:
+        sid = str(seed.get("id"))
+        if seed.get("kind") == "topic":
+            aliases = topic_graph.topic_aliases(sid) or [sid]
+            aliases = (aliases + [aliases[0]] * 3)[:3]
+            t_rank.append(rank)
+            t_sid.append(sid)
+            t_a1.append(aliases[0])
+            t_a2.append(aliases[1])
+            t_a3.append(aliases[2])
+        else:
+            e_rank.append(rank)
+            e_sid.append(sid)
+    params: dict[str, Any] = {
+        "t_rank": t_rank, "t_sid": t_sid, "t_a1": t_a1, "t_a2": t_a2, "t_a3": t_a3,
+        "e_rank": e_rank, "e_sid": e_sid,
+        "ex_topics": sorted(i for k, i in exclude if k == "topic"),
+        "ex_episodes": sorted(i for k, i in exclude if k == "episode"),
+        "wiki": topic_graph.WIKI_EDGE, "capture": _CAPTURE_TOPIC_RELATION,
+        "cap": _HUB_PER_SEED_ROWS, "recent": _HUB_RECENT_EPISODES,
+    }
+    # (c) can only match a seed id that is itself a slug (a "note:..." id
+    # never is). Every whole word of a slug is in its label as written, so
+    # ILIKE on the episode's topics text discards most recent episodes
+    # before any slug is computed, as the replica's prefilter does.
+    c_sids = [sid for sid in t_sid if sid and topic_graph.topic_slug_from_label(sid) == sid]
+    words = [_slug_prefilter_word(sid) for sid in c_sids]
+    params["c_sid"] = c_sids
+    params["c_like"] = [f"%{w}%" for w in words] if all(words) else []
+    live = "deleted_at IS NULL" if live_episodes else "TRUE"
+    ctes = [
+        "tseed AS (SELECT * FROM unnest(%(t_rank)s::int[], %(t_sid)s::text[], "
+        "%(t_a1)s::text[], %(t_a2)s::text[], %(t_a3)s::text[]) AS s(rank, sid, a1, a2, a3))",
+        "eseed AS (SELECT * FROM unnest(%(e_rank)s::int[], %(e_sid)s::text[]) AS s(rank, sid))",
     ]
-
-
-def _hub_episode_topics(cur, episode_id: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
-    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
-    from khipu import topic_graph
-
-    from khipu.db import has_columns
-
-    # A forgotten seed episode links nothing, the same as the replica leg's
-    # live view.
-    live = " AND deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
-    cur.execute(f"SELECT topics FROM episodes WHERE id::text = %s{live}", (episode_id,))
-    row = cur.fetchone()
-    if row is None or not row[0]:
-        return []
-    slugs: list[str] = []
-    for label in row[0]:
-        s = topic_graph.topic_slug_from_label(str(label))
-        if s and s not in slugs:
-            slugs.append(s)
-    if not slugs:
-        return []
-    cur.execute(
-        "SELECT slug, title, body, updated_at, created_at FROM topics "
-        "WHERE slug = ANY(%(s)s) AND deleted_at IS NULL",
-        {"s": slugs},
+    topic_cols = (
+        "t.slug, t.title, left(t.body, 4000), "
+        "coalesce(extract(epoch FROM coalesce(t.updated_at, t.created_at)), 0)::float8"
     )
+    parts = []
+    if t_rank:
+        # (a) topic seed -> topics it links to/from via wiki_link.
+        parts.append(
+            "SELECT s.rank, 'topic'::text, s.sid, %(wiki)s::text, 'topic'::text, n.* FROM tseed s "
+            "CROSS JOIN LATERAL ("
+            f"SELECT {topic_cols} AS rec FROM topics t WHERE t.slug IN ("
+            f"SELECT {_PG_PEEL.format(x='e.dst')} FROM edges e "
+            "WHERE e.src IN (s.a1, s.a2, s.a3) AND e.type = %(wiki)s "
+            f"UNION SELECT {_PG_PEEL.format(x='e.src')} FROM edges e "
+            "WHERE e.dst IN (s.a1, s.a2, s.a3) AND e.type = %(wiki)s) "
+            "AND t.deleted_at IS NULL AND t.slug <> s.sid "
+            "AND t.slug <> ALL(%(ex_topics)s::text[]) "
+            "ORDER BY rec DESC LIMIT %(cap)s) n"
+        )
+    if c_sids:
+        # (c) topic seed -> the most recent live episodes that name it.
+        prefilter = " AND r.topics::text ILIKE ANY(%(c_like)s::text[])" if params["c_like"] else ""
+        ctes.append(
+            "recent AS MATERIALIZED (SELECT id, ts, left(summary, 4000) AS summary, topics "
+            f"FROM episodes WHERE {live} ORDER BY ts DESC LIMIT %(recent)s)"
+        )
+        ctes.append(
+            "named AS MATERIALIZED (SELECT DISTINCT r.id, r.ts, r.summary, l.slug FROM recent r "
+            f"CROSS JOIN LATERAL (SELECT {_PG_SLUG.format(x='lbl')} AS slug "
+            f"FROM {_PG_TOPIC_LABELS.format(x='r.topics')} AS lbl) l "
+            f"WHERE l.slug = ANY(%(c_sid)s::text[]){prefilter})"
+        )
+        parts.append(
+            "SELECT s.rank, 'topic'::text, s.sid, %(capture)s::text, 'episode'::text, x.* FROM tseed s "
+            "CROSS JOIN LATERAL (SELECT n.id::text, NULL::text, n.summary, "
+            "coalesce(extract(epoch FROM n.ts), 0)::float8 AS rec FROM named n "
+            "WHERE n.slug = s.sid AND n.id::text <> ALL(%(ex_episodes)s::text[]) "
+            "ORDER BY n.ts DESC LIMIT %(cap)s) x"
+        )
+    if e_rank:
+        # (b) episode seed -> topic pages named in its own topics array. A
+        # forgotten seed episode links nothing, like the replica's live view.
+        ep_live = " AND ep.deleted_at IS NULL" if live_episodes else ""
+        parts.append(
+            "SELECT s.rank, 'episode'::text, s.sid, %(capture)s::text, 'topic'::text, x.* FROM eseed s "
+            f"JOIN episodes ep ON ep.id::text = s.sid{ep_live} "
+            f"CROSS JOIN LATERAL (SELECT {topic_cols} AS rec FROM topics t WHERE t.slug IN ("
+            f"SELECT {_PG_SLUG.format(x='lbl')} FROM {_PG_TOPIC_LABELS.format(x='ep.topics')} AS lbl) "
+            "AND t.deleted_at IS NULL AND t.slug <> ALL(%(ex_topics)s::text[]) "
+            "ORDER BY rec DESC LIMIT %(cap)s) x"
+        )
+    sql = "WITH " + ", ".join(ctes) + " " + " UNION ALL ".join(parts)
+    return sql, params
+
+
+def _hub_rows_to_raw(rows: Sequence[Sequence[Any]]) -> list[dict[str, Any]]:
     out = []
-    for oslug, title, body, updated_at, created_at in cur.fetchall():
+    for rank, skind, sid, relation, kind, rid, title, snippet, recency in rows:
+        snippet = snippet or ""
+        label = (title or rid) if kind == "topic" else snippet[:200]
         out.append({
-            "kind": "topic", "id": oslug, "label": title or oslug,
-            "snippet": (body or "")[:4000],
-            "_seed_rank": seed_rank, "_seed_key": seed_key,
-            "_relation": _CAPTURE_TOPIC_RELATION,
-            "_recency": _ts_key(updated_at or created_at),
+            "kind": kind, "id": str(rid), "label": label, "snippet": snippet[:4000],
+            "_seed_rank": int(rank), "_seed_key": f"{skind}:{sid}",
+            "_relation": relation, "_recency": float(recency or 0.0),
         })
     return out
+
+
+def _is_timeout(exc: BaseException, deadline: float) -> bool:
+    return (
+        time.monotonic() >= deadline
+        or exc.__class__.__name__ in {"QueryCanceled", "QueryCanceledError"}
+        or "statement timeout" in str(exc).lower()
+    )
+
+
+def _pipelined(cur):
+    """psycopg's pipeline mode on a real connection (the savepoint, the
+    timeout and the statement leave in one flush: one round trip, not three);
+    a no-op for anything else, so a stand-in cursor runs the same calls in
+    order."""
+    import contextlib
+
+    try:
+        import psycopg
+
+        conn = getattr(cur, "connection", None)
+        if isinstance(conn, psycopg.Connection) and psycopg.Pipeline.is_supported():
+            return conn.pipeline()
+    except Exception:  # noqa: BLE001 — no pipeline is only one more round trip
+        pass
+    return contextlib.nullcontext()
 
 
 def hub_candidates(
@@ -331,70 +325,44 @@ def hub_candidates(
     """``(candidates, missed)`` for the hub (PostgreSQL) leg. ``deadline`` is
     an absolute ``time.monotonic()`` value the caller computes (typically
     ``time.monotonic() + HUB_LEG_DEADLINE_S``), so a test can pass an
-    already-expired one to force the miss path deterministically. When a
-    later expansion misses the deadline, finished expansions are kept
-    (``missed`` is still ``True``); only a miss before any expansion returns
-    an empty candidate list."""
+    already-expired one to force the miss path deterministically.
+
+    Two round trips whatever the seeds: a pipelined savepoint, the remaining
+    budget as a local ``statement_timeout`` and the one statement from
+    ``_hub_candidates_sql``; then ``ROLLBACK TO``/``RELEASE`` of the
+    savepoint (the rollback also undoes the timeout; the leg only reads). A
+    timeout reports ``missed`` with no candidates."""
+    from khipu.db import has_columns
+
     exclude = {(str(r.get("kind")), str(r.get("id"))) for r in fused}
     seeds = _seeds(fused)
     if not seeds:
         return [], False
-    previous_timeout: str | None = None
-    savepoint = "khipu_graph_candidates_deadline"
-    savepoint_started = False
-    needs_rollback = False
-    raw: list[dict[str, Any]] = []
-    missed = False
     try:
         _check_deadline(deadline)
-        cur.execute(f"SAVEPOINT {savepoint}")
-        savepoint_started = True
-        cur.execute("SELECT current_setting('statement_timeout')")
-        row = cur.fetchone()
-        previous_timeout = str(row[0]) if row else "0"
-        bounded_cur = _PgDeadlineCursor(cur, deadline)
-        for rank, seed in seeds:
-            try:
-                _check_deadline(deadline)
-                skind, sid = seed.get("kind"), str(seed.get("id"))
-                seed_key = f"{skind}:{sid}"
-                if skind == "topic":
-                    raw.extend(_hub_topic_wiki(bounded_cur, sid, seed_rank=rank, seed_key=seed_key))
-                    _check_deadline(deadline)
-                    raw.extend(_hub_topic_recent_episodes(
-                        bounded_cur, sid, seed_rank=rank, seed_key=seed_key))
-                else:
-                    raw.extend(_hub_episode_topics(
-                        bounded_cur, sid, seed_rank=rank, seed_key=seed_key))
-                _check_deadline(deadline)
-            except DeadlineMissed:
-                needs_rollback = True
-                missed = True
-                break
-            except Exception as exc:
-                timed_out = (
-                    time.monotonic() >= deadline
-                    or exc.__class__.__name__ in {"QueryCanceled", "QueryCanceledError"}
-                    or "statement timeout" in str(exc).lower()
-                )
-                needs_rollback = savepoint_started
-                if timed_out:
-                    missed = True
-                    break
-                raise
+        live_episodes = has_columns(cur, "episodes", "deleted_at")
+        sql, params = _hub_candidates_sql(seeds, exclude, live_episodes=live_episodes)
+        timeout = f"{_remaining_ms(deadline)}ms"
     except DeadlineMissed:
-        needs_rollback = True
         return [], True
+    savepoint_started = False
+    try:
+        with _pipelined(cur):
+            cur.execute(f"SAVEPOINT {_HUB_SAVEPOINT}")
+            savepoint_started = True
+            cur.execute("SELECT set_config('statement_timeout', %s, true)", (timeout,))
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+    except Exception as exc:
+        if _is_timeout(exc, deadline):
+            return [], True
+        raise
     finally:
-        if savepoint_started and needs_rollback:
-            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-        if savepoint_started and previous_timeout is not None:
+        if savepoint_started:
             cur.execute(
-                "SELECT set_config('statement_timeout', %s, true)",
-                (previous_timeout,),
+                f"ROLLBACK TO SAVEPOINT {_HUB_SAVEPOINT}; RELEASE SAVEPOINT {_HUB_SAVEPOINT}"
             )
-            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
-    return _select_candidates(raw, exclude=exclude), missed
+    return _select_candidates(_hub_rows_to_raw(rows), exclude=exclude), False
 
 
 # ---- replica (SQLite) ---------------------------------------------------

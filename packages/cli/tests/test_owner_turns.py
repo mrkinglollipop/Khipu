@@ -374,10 +374,6 @@ BRIEF = "Build the owner turns recorder and run its tests before reporting back.
     ("spawn_agent", {"message": BRIEF, "task_name": "build"}),
     ("mcp__t3__delegate_task", {"prompt": BRIEF, "target": {}}),
     ("delegate_task", {"target": {"providerInstanceId": "codex_2"}, "work": {"text": BRIEF}}),
-    ("Bash", {"command": f"CLAUDE_CONFIG_DIR=x claude -p {json.dumps(BRIEF)} --model opus"}),
-    ("Bash", {"command": f"cd /work && claude --model opus -p {json.dumps(BRIEF)}"}),
-    ("Bash", {"command": f"codex exec -m gpt -c model_reasoning_effort=high {json.dumps(BRIEF)}"}),
-    ("shell", {"command": ["codex", "exec", "--full-auto", BRIEF]}),
 ])
 def test_each_delegation_notes_its_brief(home, monkeypatch, tool, tool_input):
     monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
@@ -386,7 +382,14 @@ def test_each_delegation_notes_its_brief(home, monkeypatch, tool, tool_input):
     assert brief is not None and brief["parent"] == "parent-1"
 
 
+# Shell commands are no longer read (the shell half of the delegation hook
+# was removed on 2026-11-07). A job a shell starts runs on a front end the
+# owner check never trusts (``claude -p`` is sdk-cli, ``codex exec``
+# codex_exec, see the entrypoint table above), so its brief needs no note.
 @pytest.mark.parametrize("tool,tool_input", [
+    ("Bash", {"command": f"CLAUDE_CONFIG_DIR=x claude -p {json.dumps(BRIEF)} --model opus"}),
+    ("Bash", {"command": f"codex exec -m gpt -c model_reasoning_effort=high {json.dumps(BRIEF)}"}),
+    ("shell", {"command": ["codex", "exec", "--full-auto", BRIEF]}),
     ("Bash", {"command": "claude -p \"$(cat brief.md)\""}),
     ("Bash", {"command": "claude -p < brief.md"}),
     ("Bash", {"command": "claude -p --allowedTools Bash Read"}),
@@ -454,6 +457,18 @@ def test_a_failed_t3_lookup_never_hands_back_a_trusted_entrypoint(home, monkeypa
     assert entry == "t3-unverified"
     ok, why = owner_turns.eligible({"entrypoint": entry, "harness": harness, "typed": True, "text": "x"})
     assert not ok and why.startswith("Khipu could not read T3's record")
+
+
+def test_a_t3_file_without_its_thread_table_is_not_t3(home, monkeypatch):
+    # A leftover or odd T3 file (no thread table) must not make every plain turn "t3-unverified".
+    db = home["tmp"] / "other.sqlite"
+    with sqlite3.connect(db) as con:
+        con.execute("CREATE TABLE unrelated (id TEXT)")
+    monkeypatch.setenv("KHIPU_T3_DB", str(db))
+    assert owner_turns._t3_membership(SESSION) == "none"
+    entry = owner_turns.entrypoint_of("claude_code", {"CLAUDE_CODE_ENTRYPOINT": "cli"}, {}, SESSION)
+    assert entry == "cli"
+    assert owner_turns.eligible({"entrypoint": entry, "harness": "claude_code", "typed": True, "text": "x"})[0]
 
 
 def test_no_t3_database_keeps_the_native_entrypoint(home, monkeypatch):

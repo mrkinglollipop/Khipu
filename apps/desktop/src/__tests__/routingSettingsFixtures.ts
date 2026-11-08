@@ -103,7 +103,6 @@ export function config(extra: Record<string, unknown> = {}) {
       routing_push_start: setting(true),
       routing_push_prompt: setting(true),
       routing_push_delegation: setting(true),
-      routing_dispatch_scripts: setting([], []),
       routing_reset_check: setting(true),
       routing_reset_check_wait: setting(120),
       routing_reset_check_retries: setting([600, 1800]),

@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Unit tests for khipu.timeparse (Phase 3, session A). Every grammar
 production, both directions of each boundary, zone handling, ambiguity
 returning None, and the boost preference (never an exclusion)."""

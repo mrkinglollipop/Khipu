@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import time
 
-from khipu import cli, embed, migrate
+from khipu import cli, embed, features, migrate
 from khipu.search_text import explicit_search_tokens, search_tokens, order_search_evidence
 from tests.hermetic_pg import hub, pg_cluster
 from tests.test_audit_recall_search import configure_hub
@@ -88,6 +88,23 @@ def test_agent_session_identity(hub,monkeypatch):
         for mode in ("hybrid","literal","semantic"):
             out=embed.hybrid_search(q,mode=mode)
             assert len(out['results'])==1 and out['results'][0]['exact_phrase']
+
+
+def test_hybrid_session_id_survives_the_relevance_floor(hub,monkeypatch):
+    # 2026-11-07: with relevance_floor on, hybrid abstained on a bare session id
+    # (no cosine, id not in the text as tokens) while literal returned the row.
+    configure_hub(monkeypatch,hub)
+    # configure_hub pins every feature off; turn on only the floor.
+    monkeypatch.setattr(features,'enabled',lambda name: name=='relevance_floor')
+    conn=hub.connect()
+    sid='claude_code:27916820-7db2-4539-918d-9eec66980f42'
+    conn.execute("INSERT INTO episodes (ts,summary,raw,session_id) VALUES (now(),'invented session','{}',%s)",(sid,)); conn.commit()
+    monkeypatch.setattr(embed,'_cosine_candidates',lambda *a,**k: [])
+    for q in (sid,sid.partition(':')[2]):
+        out=embed.hybrid_search(q,mode='hybrid')
+        assert len(out['results'])==1 and out['results'][0]['exact_phrase']
+        assert out['relevance_floor']['applied'] and not out['relevance_floor']['abstained']
+        assert out['relevance_floor']['evidence_rows']==1
 
 
 def test_quotes(hub,monkeypatch,tmp_path):

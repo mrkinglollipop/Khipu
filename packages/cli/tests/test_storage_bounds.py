@@ -345,7 +345,7 @@ def test_the_nightly_records_each_new_step(homes, monkeypatch):
                "_prune_query_cache", "_prune_routing_ledgers", "_storage_sweep",
                "_commitment_close_rules", "_fact_changes_prune", "_mark_stale_commitments",
                "_provenance_nightly", "_ledger_nightly", "_receipt_prune", "_project_renames_sweep",
-               "_recall_eval_step", "_refresh_snapshot", "_briefs_build_if_on", "_capture_previous_briefs_step"):
+               "_recall_eval_step", "_refresh_snapshot"):
         monkeypatch.setattr(jobs, fn, lambda *a, **k: {"ok": True})
     monkeypatch.setattr(jobs, "_run_script", lambda *a, **k: 0)
     monkeypatch.setattr(jobs, "_write_job_state", lambda *a, **k: None)

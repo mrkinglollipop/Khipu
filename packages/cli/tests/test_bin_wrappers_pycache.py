@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — already running as a dispatched on-sub
-# Sonnet build agent (khipu-memory-system-53e7a0 worktree task); nothing to
-# route further.
 """Every khipu launcher must redirect CPython bytecode caching OUTSIDE any
 signed .app bundle — see khipu.paths.pycache_dir. Release 0.3.15 skipped this:
 running the bundled Python wrote __pycache__/*.pyc inside Contents/Resources/

@@ -2,7 +2,7 @@
 
 Scope: docs/plans/2026-10-19-repo-renames.md, slice D (conversation part).
 
-* ``show``: the answer behind ``khipu_project`` and ``khipu project show``:
+* ``show``: the answer behind ``khipu project show``:
   the canonical name, every name in the group with where it came from, what
   each holds, and the "same project?" pairs involving the group.
 * The owner actions (``alias_add``, ``alias_remove``, ``merge``,
@@ -531,9 +531,9 @@ def _slice_name(name: Any) -> str:
     """A project name as the slice shows it: in backticks only when it is of
     the safe shape (and short), else a fixed stand-in; never its raw text."""
     if not identity.safe_project_name(name):
-        return "(a project name with unusual characters; ask khipu_project)"
+        return "(a project name with unusual characters; `khipu project show`)"
     if len(name) > _SLICE_NAME_CHARS:
-        return "(a long project name; ask khipu_project)"
+        return "(a long project name; `khipu project show`)"
     return f"`{name}`"
 
 

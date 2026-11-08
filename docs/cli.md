@@ -13,7 +13,7 @@ python3 -m khipu <command>
 
 Most commands need the Python dependencies on `PYTHONPATH` first; [packages/cli/README.md](../packages/cli/README.md) shows the one-time setup. To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
 
-There are 65 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
+There are 57 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
 
 ## Health and status
 
@@ -48,8 +48,6 @@ There are 65 top-level commands; the reference below includes storage, ledger, w
 | `get ID` | Load one record by id. |
 | `graph ID` | Neighbours of a graph node. `--hops`, `--limit`. |
 | `recall` | Recall tooling (warm service, logs, evaluation). |
-| `reflect QUESTION` | Answer from memory with cited evidence. `--project`. Needs the `reflect` switch. |
-| `briefs` | Source-backed topic briefs: `plan` (topics whose brief is missing or stale), `build` (`--topic`, `--limit`, needs the `briefs` switch), `show SLUG`. |
 
 ### search
 
@@ -112,10 +110,9 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | `reconcile` | Full sync of memory files into Postgres. |
 | `regen-memory` | Write the `MEMORY.from-khipu.md` sidecar from topics. `--index` rebuilds the live `MEMORY.md`. |
 | `provenance` | Fact provenance maintenance: `backfill` proves legacy restaters' claims; `index` indexes episode source identities and sweeps refused carriers. |
-| `topic-graph` | `topic-graph backfill` updates topic links and graph edges from topic files. |
-| `outbox` | The offline queue for captures whose database write failed: `drain`, `status`, `retry-dead`, and `span-covered`, which counts (or with `--apply` retires) dead jobs whose range and evidence fields another episode holds; a retired job's own summary stays only in its local record. `retry-dead` leaves jobs refused for not announcing their source identities held. |
+| `outbox` | The offline queue for captures whose database write failed: `drain`, `status` and `retry-dead`. `retry-dead` leaves jobs refused for not announcing their source identities held. |
 
-`ledger` uses `--project` to select a project and `--json` for JSON output. Writes accept `--op-id` for safe retries. `ledger import FILE` supports `--dry-run` and `--catch-up`; `ledger export --tracker-json` exports the tracker shape. `ledger project` can rename, hide, or show a project.
+`ledger` uses `--project` to select a project and `--json` for JSON output. Writes accept `--op-id` for safe retries. `ledger export --tracker-json` exports the tracker shape. `ledger project` can rename, hide, or show a project.
 
 `owner-direction` supports `show`, `actions [--json]`, `on`, `off`, `set KEY VALUE`, and `undo ID`. Direction defaults on, with session binding on and a six-hour eligible-owner-turn window. Supported owner commands accept `--owner-direction` from a conversation with a recent hook-recorded eligible owner turn and verified prompt-hook provenance. The check does not inspect the owner's words; submit only changes the owner requested. Background and dispatched jobs are refused.
 
@@ -125,11 +122,10 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | --- | --- |
 | `embed` | Vectors and embedding profiles. |
 | `library` | Folders of `.txt` and `.md` files indexed as a search space. |
-| `embed-media-backfill` | Embed PNG and JPEG files under sources that have `embed_media` on. `--dry-run`, `--yes` (needed over 1000 images), `--limit`, `--source-id`, `--profile`. |
 | `embed-backfill` | Job-mode alias for `embed backfill --job`. |
 | `library-backfill NAME` | Job-mode alias for `library backfill NAME --job`. |
 | `models` | Per-role model settings: `show`, `set`, `welcome`. |
-| `sources` | Graph membership: `list`, `enable`, `disable`, `set-embed-media`, `add`, `remove`, `export`. |
+| `sources` | Memory sources: `list`, `enable`, `disable`, `remove`. |
 
 ### embed
 
@@ -148,7 +144,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 - `enable`, `disable`, `set-profile NAME PROFILE`.
 - `scan NAME [--allow-rebuild]`: pick up file changes.
 - `backfill NAME`: embed documents. `--limit`, `--stale`, `--profile`, `--job`, `--job-id`.
-- `import NAME PATH`: load vectors computed elsewhere (a graphify SQLite file or `.jsonl`). `--strip-prefix`, `--profile`, `--batch`.
+- `import NAME PATH`: load vectors computed elsewhere (an embeddings SQLite file or `.jsonl`). `--strip-prefix`, `--profile`, `--batch`.
 
 ### models
 
@@ -209,9 +205,7 @@ With `--at-owner-request`, a conversation can record `priority set`, `rule add`,
 | `backup-local` | Zip the Mac-local data folder. `--out PATH`. |
 | `import-local` | Restore it. `--source ZIP|DIR`. Merges and skips existing files by default; `--replace` overwrites. |
 | `snapshot` | Offline read replica: `refresh` (hub must be up), `status`, and `heal` (background recovery stages and refresh of an old copy). |
-| `graph-backup` | Graph snapshot backup, on the Mac that builds the graph: `record-local`, `offsite`, `status`, `drill`. |
-| `graph-sync` | Mirror the graph file into Postgres. `--dry-run`, `--check` (exits 2 on drift). |
-| `components` | Postgres and Graphify install, status and upgrades: `status`, `install {postgres,graphify}`, `upgrade {postgres,graphify}`, `check-remote [--full]`, `bootstrap-local-backup`, the single-purpose forms `install-local-postgres`, `install-graphify`, `upgrade-postgres` and `upgrade-graphify`, plus helpers for the app (`status-json`, `select-compat-row`). |
+| `components` | Postgres install, status and upgrades: `status`, `install postgres`, `upgrade postgres`, `check-remote [--full]`, `bootstrap-local-backup`, the single-purpose forms `install-local-postgres` and `upgrade-postgres`, plus helpers for the app (`status-json`, `select-compat-row`). |
 
 - `db move`: `--to DSN` or `--new-local`, `--dry-run`, `--into-nonempty`. It copies and verifies before switching and never writes to the source.
 - `db connect`: `--dsn`, `--use-stored`, `--root-crt`, `--no-jobs`, `--no-prove`.
@@ -245,7 +239,6 @@ Zero is setting-specific: `replica_refresh_after=0` refreshes at every check; `h
 | `sessions` | Session capture queue: `drain`, `sweep`, `status`, `liveness`. |
 | `aegis` | Older name for `sessions`. Same queue, same drain. Its `status` defaults to `--harness aegis`, where `sessions status` defaults to `all`. |
 | `gateway` | `gateway token set` and `gateway token status` for the gateway bearer token. |
-| `grok-bot-config` | Prints the account-level cloud-agent config and the secret name to add. |
 | `t3` | Khipu for providers inside T3 Code. `t3 antigravity add\|remove --project DIR [--dry-run]` writes or removes Khipu's `.agents/` files in one project (the same files `integrations install antigravity --project` writes), `status --project DIR` reports them, and `list` shows every project added and the runtime version. |
 
 - Harness choices for `integrations`: `all`, `claude_code`, `cursor`, `aegis`, `codex`, `grok_build`, `grok_bot`, `antigravity`. Flags: `--dry-run`, `--home`, `--project`, `--no-verify`. There is no top-level `install` command.
@@ -260,14 +253,13 @@ Zero is setting-specific: `replica_refresh_after=0` refreshes at every check; `h
 | `promote` | Gate a ref in the inactive live slot and make it live on a pass. |
 | `nightly` | Run the nightly memory wiki job once. |
 | `monthly` | Run the monthly wiki classification once. |
-| `graph-build` | Run the graph build once. |
 | `backfill` | `backfill identity` derives repo and project for episodes. `--dry-run`, `--apply`, `--limit`. |
 | `project` | Project identity: backfill, alias add/list/remove, show NAME, list, merge A B --show-as NAME, keep-separate A B, separate NAME, and renames check. Grouped names read as one project; owner merge/separation decisions control grouping. |
 | `hygiene` | `hygiene paths` finds and purges bad path graph nodes. `hygiene commitments` re-judges open commitments. |
 
 ### jobs
 
-Job names: `nightly`, `monthly`, `graph_build`, `notes_watch`, `queue_drain`, `recall_daemon`, `replica_refresh`. `install` with no name schedules the six jobs other than `recall_daemon` (the default set). `refresh` with no name re-renders every installed job whose plist is stale and never installs a new one. `uninstall` with no name removes all seven, including `recall_daemon`. `recall_daemon` is opt-in: `khipu jobs install recall_daemon`.
+Job names: `nightly`, `monthly`, `notes_watch`, `queue_drain`, `recall_daemon`, `replica_refresh`. `install` with no name schedules the five jobs other than `recall_daemon` (the default set). `refresh` with no name re-renders every installed job whose plist is stale and never installs a new one. `uninstall` with no name removes all six, including `recall_daemon`. `recall_daemon` is opt-in: `khipu jobs install recall_daemon`.
 
 ### promote
 
@@ -298,4 +290,4 @@ These are launchers, not commands you normally run by hand. `khipu integrations 
 
 For the MCP tools these launchers serve, see [mcp-tools.md](mcp-tools.md). For the routing record, see [routing.md](routing.md). For jobs, backups and the gateway, see [operations.md](operations.md).
 
-Owner actions that scan or change batches return “Started; it will finish on its own.” after authorization. They run in a detached process, so closing or timing out the conversation does not stop them. Owner actions records the final outcome and counts, including how many dead outbox jobs were retired. `outbox span-covered` keeps its read-only dry run; `--apply` starts the confirmed work.
+Owner actions that scan or change batches return “Started; it will finish on its own.” after authorization. They run in a detached process, so closing or timing out the conversation does not stop them. Owner actions records the final outcome and counts.

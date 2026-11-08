@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """The mandatory scenario suite (Phase 1, session B;
 docs/plans/2026-09-27-memory-reasoning-scope.md, "Local evaluation and
 acceptance"). One test (or small class) per scenario in that list, run on the

@@ -241,8 +241,7 @@ fn python_version(path: &PathBuf) -> Option<(u32, u32)> {
 /// `KHIPU_PYTHON` / LSEnvironment is trusted as-is (the working happy path —
 /// do not add a version check there). Only the `which python3` fallback is
 /// gated: `/usr/bin/python3` is 3.9 on this Mac and the CLI needs 3.11+
-/// (`typing.TypeAlias` etc.) — see audit F6. Same rejection message shape as
-/// `ops/scripts/soak_probe.sh` uses for the same trap.
+/// (`typing.TypeAlias` etc.) — see audit F6.
 fn khipu_python() -> Result<PathBuf, String> {
     if let Some(v) = env_first(&["KHIPU_PYTHON", "ALZY_PYTHON"]) {
         let p = PathBuf::from(&v);
@@ -495,7 +494,7 @@ fn app_cli_timeout_secs() -> u64 {
 fn cli_has_no_time_limit(args: &[String]) -> bool {
     let first = args.first().map(String::as_str).unwrap_or("");
     match first {
-        "backup-local" | "import-local" | "doctor" | "nightly" | "graph-build" | "monthly" | "embed-backfill"
+        "backup-local" | "import-local" | "doctor" | "nightly" | "monthly" | "embed-backfill"
         | "library-backfill" | "join" => true,
         "db" => matches!(args.get(1).map(String::as_str), Some("move" | "preflight" | "connect")),
         // The Owed clean-up: a plan may make its capped model calls, and an
@@ -723,14 +722,12 @@ async fn khipu_capture_now() -> Result<String, String> {
 // read it as a flag). The gateway token travels on stdin. None of these verbs
 // join `ALLOWED_SUBCOMMANDS`.
 
-/// The ten switches in `khipu.features.FEATURES`.
+/// The eight switches in `khipu.features.FEATURES`.
 const FEATURE_NAMES: &[&str] = &[
     "validity_ranking",
     "time_interpretation",
     "relevance_floor",
     "rerank",
-    "reflect",
-    "briefs",
     "graph_candidates",
     "decision_details",
     "auto_supersede",
@@ -741,7 +738,6 @@ const FEATURE_NAMES: &[&str] = &[
 const JOB_NAMES: &[&str] = &[
     "nightly",
     "monthly",
-    "graph_build",
     "notes_watch",
     "queue_drain",
     "recall_daemon",
@@ -756,7 +752,6 @@ const PATH_KEYS: &[&str] = &[
     "memory_root",
     "memory_repo",
     "capture_v2",
-    "graph_sqlite",
     "gemini_key_file",
 ];
 const COSINE_FLOOR_KEY: &str = "relevance.cosine_floor";
@@ -818,30 +813,12 @@ const SYNTH_FALLBACKS: &[&str] = &["gemini", "none"];
 /// `config --set usage_accounts JSON` / `config --unset usage_accounts`: the
 /// accounts Home -> Plans reads (Settings -> Capture & models -> Plans).
 const USAGE_ACCOUNTS_KEY: &str = "usage_accounts";
-const GRAPH_BACKUP_REMOTE_KEY: &str = "graph_backup_remote";
 /// Owed's limits (`khipu.config.COUNT_SETTINGS`): whole numbers of 0 or
 /// more, 0 for no limit, each `config --set KEY N` or `config --unset=KEY`.
 const OWED_COUNT_KEYS: &[&str] = &["owed_orchestrator_slice_max", "owed_page_max", "owed_bulk_max", "owed_tidy_calls"];
 /// Whether Owed's close rules ask GitHub, read-only, if a pull request merged.
 const OWED_GITHUB_KEY: &str = "owed_pr_check_github";
 
-/// An rclone `remote:path` (the CLI checks it again): one token, the remote
-/// name first, so it can never read as a flag.
-fn checked_backup_remote(value: &str) -> Result<String, String> {
-    let v = value.trim().trim_end_matches('/');
-    let (remote, path) = v.split_once(':').unwrap_or(("", ""));
-    let ok = v.len() <= 512
-        && !remote.is_empty()
-        && !path.is_empty()
-        && remote.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && remote.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
-        && !v.chars().any(|c| c.is_control() || c.is_whitespace());
-    if ok {
-        Ok(v.to_string())
-    } else {
-        Err(format!("graph_backup_remote must look like r2:bucket/folder, got {value:?}"))
-    }
-}
 /// Settings -> Data, "This Mac's copy": how old the copy may get before the
 /// background job updates it, how often the job looks, and how long a failed
 /// database connection is remembered. Lengths of time in
@@ -1069,9 +1046,6 @@ const ROUTING_SWITCH_KEYS: &[&str] = &[
     "routing_usage_login_cursor",
     "routing_usage_login_opencode",
 ];
-/// The owner's own dispatch scripts, by file name (phase 6).
-const ROUTING_DISPATCH_SCRIPTS_KEY: &str = "routing_dispatch_scripts";
-const ROUTING_DISPATCH_SCRIPTS_MAX: usize = 16;
 const ROUTING_RETRIES_KEY: &str = "routing_reset_check_retries";
 const ROUTING_SOURCES_KEY: &str = "routing_sources";
 const ROUTING_LANE_MAP_KEY: &str = "routing_lane_map";
@@ -1297,35 +1271,6 @@ fn routing_key(key: &str) -> bool {
         || key == ROUTING_SOURCES_KEY
         || key == ROUTING_LANE_MAP_KEY
         || key == ROUTING_TABLE_KEY
-        || key == ROUTING_DISPATCH_SCRIPTS_KEY
-}
-
-/// The dispatch scripts: a JSON list of file names only (letters, digits,
-/// dots, dashes and underscores; no folder), re-serialised.
-fn checked_dispatch_scripts(raw: &str) -> Result<String, String> {
-    let bad = || "dispatch scripts must be a JSON list of file names".to_string();
-    let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|_| bad())?;
-    let items = value.as_array().ok_or_else(bad)?;
-    if items.len() > ROUTING_DISPATCH_SCRIPTS_MAX {
-        return Err(format!("at most {ROUTING_DISPATCH_SCRIPTS_MAX} dispatch scripts"));
-    }
-    let mut out: Vec<String> = Vec::with_capacity(items.len());
-    for item in items {
-        let name = item.as_str().ok_or_else(bad)?.trim();
-        let plain = !name.is_empty()
-            && name.chars().count() <= 64
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-            && name != "."
-            && name != ".."
-            && !name.starts_with('-');
-        if !plain {
-            return Err(format!("{name:?} must be a file name only: letters, digits, dots, dashes and underscores"));
-        }
-        if !out.iter().any(|n| n == name) {
-            out.push(name.to_string());
-        }
-    }
-    serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
 /// A file's full path, one line, starting with `/` or `~/` (so never with
@@ -1422,9 +1367,6 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     }
     if key == ROUTING_TABLE_KEY {
         return checked_routing_path("the routing table file", v);
-    }
-    if key == ROUTING_DISPATCH_SCRIPTS_KEY {
-        return checked_dispatch_scripts(v);
     }
     if key == ROUTING_RETRIES_KEY {
         if has_control(v) { return Err("retry times must be one line".to_string()); }
@@ -1533,7 +1475,6 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
             }
             Ok(set("synth_fallback", v.to_string()))
         }
-        GRAPH_BACKUP_REMOTE_KEY => Ok(set(GRAPH_BACKUP_REMOTE_KEY, checked_backup_remote(value)?)),
         k if OWED_COUNT_KEYS.contains(&k) => Ok(set(k, parse_daily_calls(k, value)?)),
         OWED_GITHUB_KEY => {
             let v = value.trim();
@@ -1573,7 +1514,6 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
     if !PATH_KEYS.contains(&key)
         && key != COSINE_FLOOR_KEY
         && key != USAGE_ACCOUNTS_KEY
-        && key != GRAPH_BACKUP_REMOTE_KEY
         && !OWED_COUNT_KEYS.contains(&key)
         && key != OWED_GITHUB_KEY
         && minute_key(key).is_none()
@@ -3051,35 +2991,6 @@ fn ledger_restore_argv(project: &str, id: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
-/// The ledger inbox, `<data dir>/ledger-inbox/` (`paths.ledger_inbox`): where
-/// a project's orchestrator copies its old tracker, and where Choose file
-/// opens. Khipu never writes, moves or deletes the original.
-fn ledger_inbox_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("ledger-inbox")
-}
-
-/// A tracker file to import: one full path as the file dialog gives it, not
-/// trimmed, with no control character. The CLI's own reader (`safe_read`)
-/// decides the rest, the login-folder refusal included.
-fn checked_tracker_path(raw: &str) -> Result<String, String> {
-    if !raw.starts_with('/') || raw.len() > 4096 || raw.ends_with('/') || has_control(raw) {
-        return Err("choose the tracker file again; that is not a full path to one file".to_string());
-    }
-    Ok(raw.to_string())
-}
-
-/// `ledger import --json --from-app --project=P [--dry-run] -- PATH`: Check
-/// this file (a dry run, nothing written) and Import. The path travels after
-/// `--`, so it can never become a flag.
-fn ledger_import_argv(project: &str, path: &str, dry_run: bool) -> Result<Vec<String>, String> {
-    let mut argv = ledger_base("import", project, true)?;
-    if dry_run {
-        argv.push("--dry-run".to_string());
-    }
-    argv.extend(["--".to_string(), checked_tracker_path(path)?]);
-    Ok(argv)
-}
-
 /// `work hide|unhide -- ID`: Khipu's own record of a commitment hidden from
 /// Waiting on you until its words change.
 fn work_hide_argv(id: &str, hide: bool) -> Result<Vec<String>, String> {
@@ -3411,24 +3322,6 @@ async fn khipu_ledger_removed(project: String) -> Result<String, String> {
 #[tauri::command]
 async fn khipu_ledger_restore(project: String, id: String) -> Result<String, String> {
     run_khipu_cli_async(ledger_restore_argv(&project, &id)?).await
-}
-
-/// The ledger inbox's full path, made (owner only) when missing.
-#[tauri::command]
-async fn khipu_ledger_inbox() -> Result<String, String> {
-    let inbox = ledger_inbox_dir(&khipu_data_dir()?);
-    std::fs::create_dir_all(&inbox).map_err(|e| format!("Khipu couldn't make its ledger inbox: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o700));
-    }
-    Ok(inbox.to_string_lossy().into_owned())
-}
-
-#[tauri::command]
-async fn khipu_ledger_import(project: String, path: String, dry_run: bool) -> Result<String, String> {
-    run_khipu_cli_async(ledger_import_argv(&project, &path, dry_run)?).await
 }
 
 #[tauri::command]
@@ -4607,11 +4500,6 @@ async fn bootstrap_local_backup() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn install_graphify() -> Result<String, String> {
-    run_khipu_cli_async(vec!["components".into(), "install-graphify".into()]).await
-}
-
-#[tauri::command]
 async fn components_status() -> Result<String, String> {
     run_khipu_cli_async(vec!["components".into(), "status-json".into()]).await
 }
@@ -4619,11 +4507,6 @@ async fn components_status() -> Result<String, String> {
 #[tauri::command]
 async fn upgrade_postgres() -> Result<String, String> {
     run_khipu_cli_async(vec!["components".into(), "upgrade-postgres".into()]).await
-}
-
-#[tauri::command]
-async fn upgrade_graphify() -> Result<String, String> {
-    run_khipu_cli_async(vec!["components".into(), "upgrade-graphify".into()]).await
 }
 
 #[tauri::command]
@@ -4959,7 +4842,7 @@ fn join_receive_sync(passphrase: String, pin: String, out_path: Option<String>) 
 /// This list is exactly what the front end invokes, enumerated from every
 /// `runKhipu([...])` call site in `App.tsx`, `Welcome.tsx`, and
 /// `IntegrationsPanel.tsx` rather than assumed. The first pass kept five more
-/// — `sessions`, `git-sync`, `outbox`, `embed`, `graph-sync` — that no pane
+/// — `sessions`, `git-sync`, `outbox`, `embed` — that no pane
 /// should call through `run_khipu`. Welcome first-run activates cloud embed
 /// via `models welcome` (in-process), not the `embed` subcommand. The
 /// boundary must not hand a compromised webview paid Gemini calls
@@ -4988,10 +4871,10 @@ const ALLOWED_SUBCOMMANDS: &[&str] = &[
     "episode", "owed", "storage",
 ];
 
-/// Fire-and-forget job runners — long-running consolidate/graphify passes.
+/// Fire-and-forget job runners — long-running consolidate passes.
 /// Deliberately separate from `ALLOWED_SUBCOMMANDS`: these spawn detached and
 /// return immediately; the UI must not block on `.output()`.
-const SPAWN_ALLOWED_SUBCOMMANDS: &[&str] = &["nightly", "graph-build", "monthly"];
+const SPAWN_ALLOWED_SUBCOMMANDS: &[&str] = &["nightly", "monthly"];
 
 /// Env the desktop runner adds for selected CLI verbs. Search from Recall must
 /// not look like an agent in the query log (guides "Ask your agent" tick).
@@ -5087,7 +4970,7 @@ fn spawn_detached_cli(args: &[String], label: &str) -> Result<(u32, PathBuf), St
 }
 
 /// Engine stdout for spawnable jobs — same stems as `jobs.py` `_JOB_SPECS`
-/// (`khipu-nightly` / `khipu-monthly` / `khipu-graph`) under
+/// (`khipu-nightly` / `khipu-monthly`) under
 /// `~/Library/Logs/Khipu/`, falling back to `~/Library/Logs/<KHIPU_LEGACY_LOG_DIR>`
 /// when that env var is set and the Khipu dir does not exist yet (an upgrade
 /// whose launchd jobs still write to the product's pre-rename log directory).
@@ -5096,7 +4979,6 @@ fn engine_job_log_path(subcommand: &str) -> PathBuf {
     let stem = match subcommand {
         "nightly" => "khipu-nightly",
         "monthly" => "khipu-monthly",
-        "graph-build" => "khipu-graph",
         other => other,
     };
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -5606,8 +5488,6 @@ pub fn run() {
             khipu_ledger_remove,
             khipu_ledger_removed,
             khipu_ledger_restore,
-            khipu_ledger_inbox,
-            khipu_ledger_import,
             khipu_work_hide,
             khipu_work_same,
             khipu_owed_change,
@@ -5677,10 +5557,8 @@ pub fn run() {
             select_compat_row,
             install_local_postgres,
             bootstrap_local_backup,
-            install_graphify,
             components_status,
             upgrade_postgres,
-            upgrade_graphify,
             check_remote_postgres,
             dsn_configured,
             health_snapshot,
@@ -6109,7 +5987,7 @@ mod run_khipu_guard_tests {
         // calls and vector deletes, model extraction, PG writes, and a git
         // push that opens and merges PRs. Welcome first-run uses
         // `models welcome` (in-process activate), not `embed`.
-        for s in ["sessions", "git-sync", "outbox", "embed", "graph-sync"] {
+        for s in ["sessions", "git-sync", "outbox", "embed"] {
             assert!(!ALLOWED_SUBCOMMANDS.contains(&s),
                     "`{s}` is not called by any pane and must not be reachable");
         }
@@ -6509,23 +6387,12 @@ mod settings_command_tests {
             assert!(config_set_argv(k, bad).is_err(), "{k}={bad}");
         }
         assert_eq!(config_unset_argv("routing_reset_check").unwrap(), v(&["config", "--from-app", "--unset=routing_reset_check"]));
-        // Phase 6: the push before handing work to another agent, and the
-        // owner's dispatch scripts, by file name only.
+        // Phase 6: the push before handing work to another agent. The owner's
+        // dispatch scripts went with the shell half of the hook (2026-11-07).
         assert_eq!(config_set_argv("routing_push_delegation", "off").unwrap(), v(&["config", "--from-app", "--set", "routing_push_delegation", "off"]));
         assert_eq!(config_unset_argv("routing_push_delegation").unwrap(), v(&["config", "--from-app", "--unset=routing_push_delegation"]));
         assert!(config_set_argv("routing_push_delegation", "yes").is_err());
-        assert_eq!(
-            config_set_argv("routing_dispatch_scripts", r#"[" dispatch.py ", "run-job.sh", "dispatch.py"]"#).unwrap(),
-            v(&["config", "--from-app", "--set", "routing_dispatch_scripts", r#"["dispatch.py","run-job.sh"]"#])
-        );
-        assert_eq!(config_set_argv("routing_dispatch_scripts", "[]").unwrap(), v(&["config", "--from-app", "--set", "routing_dispatch_scripts", "[]"]));
-        assert_eq!(config_unset_argv("routing_dispatch_scripts").unwrap(), v(&["config", "--from-app", "--unset=routing_dispatch_scripts"]));
-        for bad in [r#"["/bin/dispatch.py"]"#, r#"["a b"]"#, r#"[".."]"#, r#"["-x"]"#, r#"["-c"]"#, r#"["a\nb"]"#, r#"[3]"#,
-                    "dispatch.py", r#"{"a": 1}"#] {
-            assert!(config_set_argv("routing_dispatch_scripts", bad).is_err(), "{bad}");
-        }
-        let many: Vec<String> = (0..17).map(|i| format!("\"s{i}.py\"")).collect();
-        assert!(config_set_argv("routing_dispatch_scripts", &format!("[{}]", many.join(","))).is_err());
+        assert!(config_set_argv("routing_dispatch_scripts", "[]").is_err());
         // Replication between Macs is an owner switch from the app.
         assert_eq!(config_set_argv("routing_replication_live", "on").unwrap(), v(&["config", "--from-app", "--set", "routing_replication_live", "on"]));
         assert_eq!(config_set_argv("routing_replication_live", "off").unwrap(), v(&["config", "--from-app", "--set", "routing_replication_live", "off"]));
@@ -6736,18 +6603,6 @@ mod settings_command_tests {
     }
 
     #[test]
-    fn the_graph_backup_remote_is_one_remote_path() {
-        assert_eq!(
-            config_set_argv("graph_backup_remote", " r2:my-bucket/graph/ ").unwrap(),
-            v(&["config", "--set", "graph_backup_remote", "r2:my-bucket/graph"])
-        );
-        for bad in ["", "bucket", "r2:", ":path", "--set:x", "r2:a b", "r2:a\n--x"] {
-            assert!(config_set_argv("graph_backup_remote", bad).is_err(), "accepted {bad:?}");
-        }
-        assert_eq!(config_unset_argv("graph_backup_remote").unwrap(), v(&["config", "--unset=graph_backup_remote"]));
-    }
-
-    #[test]
     fn the_summariser_fallback_is_gemini_or_none() {
         assert_eq!(config_set_argv("synth_fallback", "gemini").unwrap(), v(&["config", "--set", "synth_fallback", "gemini"]));
         assert_eq!(config_set_argv("synth_fallback", " none ").unwrap(), v(&["config", "--set", "synth_fallback", "none"]));
@@ -6821,7 +6676,7 @@ mod settings_command_tests {
 
     #[test]
     fn every_switch_builds_an_on_and_an_off_argv() {
-        assert_eq!(FEATURE_NAMES.len(), 10);
+        assert_eq!(FEATURE_NAMES.len(), 8);
         for n in FEATURE_NAMES {
             assert_eq!(feature_set_argv(n, true).unwrap(), v(&["features", "--set", n, "on"]));
             assert_eq!(feature_set_argv(n, false).unwrap(), v(&["features", "--set", n, "off"]));
@@ -6855,7 +6710,7 @@ mod settings_command_tests {
         for n in JOB_NAMES {
             assert!(job_argv("install", n).is_ok());
         }
-        assert_eq!(JOB_NAMES.len(), 7);
+        assert_eq!(JOB_NAMES.len(), 6);
     }
 
     #[test]
@@ -6923,7 +6778,7 @@ mod settings_command_tests {
     fn user_aliases_and_paths_refuse_flags_and_control_characters() {
         assert_eq!(config_set_argv("user_aliases", "matt, matthew").unwrap(), v(&["config", "--set", "user_aliases", "matt, matthew"]));
         assert_eq!(config_set_argv("user_aliases", "").unwrap(), v(&["config", "--set", "user_aliases", ""]));
-        for key in ["user_aliases", "memory_root", "memory_repo", "capture_v2", "graph_sqlite", "gemini_key_file"] {
+        for key in ["user_aliases", "memory_root", "memory_repo", "capture_v2", "gemini_key_file"] {
             for bad in ["-x", "--unset", "--set-gateway-url=https://x", "a\nb", "a\0b", "a\tb"] {
                 assert!(config_set_argv(key, bad).is_err(), "{key} accepted {bad:?}");
             }
@@ -7245,7 +7100,7 @@ mod embeddings_command_tests {
             assert!(!SPAWN_ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of SPAWN_ALLOWED_SUBCOMMANDS");
         }
         assert_eq!(ALLOWED_SUBCOMMANDS.len(), 15);
-        assert_eq!(SPAWN_ALLOWED_SUBCOMMANDS, &["nightly", "graph-build", "monthly"]);
+        assert_eq!(SPAWN_ALLOWED_SUBCOMMANDS, &["nightly", "monthly"]);
         assert_eq!(JOB_SPAWN_VERBS, &["embed-backfill", "library-backfill"]);
     }
 
@@ -8538,37 +8393,6 @@ mod work_command_tests {
             ledger_restore_argv("atlas", "s-1").unwrap(),
             vec!["ledger", "restore", "--json", "--from-app", "--project=atlas", "--", "s-1"]
         );
-    }
-
-    #[test]
-    fn import_runs_the_fixed_argv_with_the_path_after_the_separator() {
-        assert_eq!(
-            ledger_import_argv("owner/atlas", "/data/ledger-inbox/tracker.json", true).unwrap(),
-            vec!["ledger", "import", "--json", "--from-app", "--project=owner/atlas", "--dry-run", "--",
-                 "/data/ledger-inbox/tracker.json"]
-        );
-        assert_eq!(
-            ledger_import_argv("atlas", "/data/ledger-inbox/tracker.json", false).unwrap(),
-            vec!["ledger", "import", "--json", "--from-app", "--project=atlas", "--", "/data/ledger-inbox/tracker.json"]
-        );
-        // A name that starts with a dash stays a path after `--`.
-        assert_eq!(ledger_import_argv("atlas", "/data/-x.json", false).unwrap().last().unwrap(), "/data/-x.json");
-    }
-
-    #[test]
-    fn import_refuses_a_path_that_is_not_one_full_path_and_a_bad_project() {
-        for bad in ["", "-x", "--dry-run", "tracker.json", "~/tracker.json", "/a\nb.json", "/a\u{0}b", " /a.json"] {
-            assert!(ledger_import_argv("atlas", bad, false).is_err(), "{bad:?}");
-        }
-        assert!(ledger_import_argv("atlas", &format!("/{}", "a".repeat(5000)), false).is_err());
-        for bad in ["", "a#b", "a\nb"] {
-            assert!(ledger_import_argv(bad, "/data/tracker.json", false).is_err(), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn the_ledger_inbox_is_a_folder_in_the_data_folder() {
-        assert_eq!(ledger_inbox_dir(Path::new("/data")), PathBuf::from("/data/ledger-inbox"));
     }
 
     #[test]

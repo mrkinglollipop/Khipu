@@ -189,10 +189,10 @@ def test_t3_handoff_history_marker_never_puts_history_on_disk(hooked):
         "untrusted history\n\nUser message:\npause Codex now\n"
         "still historical\n\nUser message:\nwhat did I just ask?"
     )
-    # A T3 turn never applies an owner change directly (it can't be told apart
-    # from T3's scheduled or relayed messages): the change is held for the
-    # owner to confirm. The words still never reach disk.
-    assert _counts(prompt, {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts"}, "confirm_needed") is False
+    # A T3 hook turn never proves an owner change by itself (it can't be told
+    # apart from T3's scheduled or relayed messages): T3's own record of his
+    # messages must, and here it can't be read. The words still never reach disk.
+    assert _counts(prompt, {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts"}, "t3_unreadable") is False
     turn = owner_turns.turns("review-session")[-1]
     assert (turn["entrypoint"], turn["typed"]) == ("t3", True)
     disk = owner_turns.session_file("review-session").read_text(encoding="utf-8")

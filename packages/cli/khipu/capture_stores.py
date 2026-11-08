@@ -90,7 +90,7 @@ STORES: tuple[Store, ...] = (
     Store("outbox job", "outbox/, outbox/dead/, outbox/quarantine/, outbox/resolved/: *.json and .*.tmp",
           "whole capture payloads waiting for the hub and resolved legacy evidence", "outbox",
           _w("outbox._atomic_write", "outbox._bury", "outbox._quarantine", "outbox.drain",
-             "outbox.enqueue", "outbox.retry_dead", "outbox.archive_resolved", "outbox.unresolve"),
+             "outbox.enqueue", "outbox.retry_dead"),
           Restore(("outbox/*.json", "outbox/dead/*.json", "outbox/quarantine/*.json", "outbox/resolved/*.json"),
                   "queued job")),
     Store("legacy log", "memory root: episodes*.jsonl, their .bak copies, .khipu-forget-backups/, "
@@ -144,11 +144,11 @@ STORES: tuple[Store, ...] = (
           "none: it never holds summary or transcript text",
           _w("session_capture._log")),
     Store("owner turns", "capture home owner-turns/: <session>.jsonl, briefs.jsonl, settings.json and "
-          "their .tmp rewrites, and routing-mismatch-*.json rows (owner_files.PATTERNS)",
+          "their .tmp rewrites, and routing-mismatch-*.json rows the removed mismatch log left (owner_files.PATTERNS)",
           "the typed text of each prompt and the briefs of dispatched jobs, for the owner-direction check; "
-          "each model mismatch's account, model and project labels, kept a week",
+          "old model mismatch rows hold account, model and project labels and are no longer written",
           "owner words",
-          _w("owner_turns._record", "owner_turns._write_private", "routing_mismatches._write_event")),
+          _w("owner_turns._record", "owner_turns._write_private")),
     Store("owner actions", "data folder owner-actions.jsonl and any older segments owner-actions.NNNNNN.jsonl, its lock, "
           "owner-direction-pending.json, owner-requests.json and their .tmp rewrites (owner_files.PATTERNS)",
           "each owner action with the owner's quoted words, widenings waiting for a second turn, and "
@@ -190,25 +190,18 @@ STORES: tuple[Store, ...] = (
           "and bounded gateway health metadata; no words",
           "none: publication bookkeeping holds no capture text",
           _w("routing_gateway_copy._save")),
-    Store("routing scan report", "data folder state/routing/scan-report.json, written atomically "
-          "through a unique temp file in the same folder",
-          "routing copies found in files: file paths shown relative to home or their repo root, "
-          "line numbers and clipped quoted owner words, plus hit counts and too-large file names",
-          "kept: routing copies have no episode provenance; they are the scanner's report of "
-          "words in the owner's own files, replaced on the next scan and removed by deleting "
-          "state/routing/scan-report.json, not by forgetting an episode",
-          _w("routing_scan_report._write_report")),
     Store("conversation media", "data folder media/conversation_memory/<sha256>.<ext>",
-          "images found in transcripts, shared by content hash",
+          "images found in transcripts, shared by content hash (nothing writes them any more; "
+          "files already there stay)",
           "kept: images are content-addressed and can belong to several episodes; a known "
           "boundary in the scope doc",
-          _w("session_capture.land_transcript_images"),
+          _w(),
           Restore(("media/conversation_memory/*",), "content addressed")),
-    Store("extraction scratch", "data folder state/synth-cli/work-*/ and its output temp",
-          "a model call's working folder and output, removed when the call returns",
+    Store("extraction scratch", "data folder state/synth-cli/work/ (always empty) and an output temp file",
+          "a Codex call's output file, removed when the call returns; the fixed working folder holds nothing",
           "kept: removed by the call that made it; one a killed call left behind is a known "
           "boundary in the scope doc",
-          _w("extract._generate_claude_cli", "extract._generate_codex_cli")),
+          _w("extract._generate_codex_cli")),
     Store("Antigravity trajectory copy", "a private temp folder khipu-ag-*/ holding t.db and its WAL",
           "a copy of a T3 Antigravity session database, read and removed by the call that made it",
           "kept: removed by the call that made it; one a killed call left behind is a known "

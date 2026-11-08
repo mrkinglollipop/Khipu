@@ -68,14 +68,15 @@ def test_astra_probe_a_same_meaning_local_append_keeps_the_answer(idle):
 
 
 def test_an_equal_reading_no_fold_has_read_is_not_excused_unless_it_cannot_matter(replay):
-    """Codex: 12% at 200, 140 and 80 minutes ago. The buffered view says "last
-    reading 1.3 h old"; a current 12% makes it idle with a known allowance."""
+    """Codex: 12% at 230, 170 and 110 minutes ago, past the hour and a half a
+    quiet reading may be. The buffered view says "last reading 1.8 h old"; a
+    current 12% makes it idle with a known allowance."""
     routing.report(account="Codex", state="open", author=AUTHOR)
     reset = replay.now + timedelta(hours=3)
-    replay.write(*[sample(replay.now - timedelta(minutes=m), 12.0, window="five_hour", reset=reset) for m in (200, 140, 80)])
+    replay.write(*[sample(replay.now - timedelta(minutes=m), 12.0, window="five_hour", reset=reset) for m in (230, 170, 110)])
     view, generation = answer(replay)
     pace = next(p for a in view["accounts"] if a["key"] == "codex|" for p in a["pace"] if p["window"] == "five_hour")
-    assert pace["why"] == "last reading 1.3 h old"
+    assert pace["why"] == "last reading 1.8 h old"
     raw_append(sample(replay.now, 12.0, window="five_hour", reset=reset))
     assert routing_generation.stale_input(generation) == "events:usage_sample"
     routing._poll_refold(replay.now)

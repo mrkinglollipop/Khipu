@@ -46,11 +46,15 @@ def test_an_owner_amend_is_refused_while_a_request_waits(direction_world):
     direction_world.say("add to Codex")
     ok, out = owner_act.act("route.priority.amend", {"account": "Codex", "append": "x",
                                                      "expect": routing.priority_version()})
-    # Held, never applied: the owner's words asked for the amend, not for the
-    # waiting request it would confirm; the ask names that request.
+    # Refused, never applied: the owner's words asked for the amend, not for the
+    # waiting request it would confirm (class A, 2026-11-07: no hold either).
+    assert not ok and out["code"] == "priority_pending" and "route.priority.confirm" in out["error"], out
+    assert routing.read_view()["priority"]["pending"] is True
+    # Held by choice (direction.request), the ask names that request.
+    ok, out = owner_act.act("direction.request", {"action": "route.priority.amend", "args": {
+        "account": "Codex", "append": "x", "expect": routing.priority_version()}})
     assert ok and out["pending"] is True and out["applied"] is False, out
     assert "INJECTED BY CONVERSATION" in out["ask"]
-    assert routing.read_view()["priority"]["pending"] is True
 
 
 # ---- P1: every other entry is carried over byte for byte, and undo restores the stored line --

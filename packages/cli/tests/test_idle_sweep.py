@@ -266,8 +266,7 @@ class IdleSweepTest(unittest.TestCase):
 
     def test_drainer_sweeps_before_listing_jobs_and_passes_event_to_capture(self):
         self.session()
-        with mock.patch.object(sc, "land_transcript_images", return_value={}), \
-                mock.patch("khipu.config.capture_mode", return_value="hub"), \
+        with mock.patch("khipu.config.capture_mode", return_value="hub"), \
                 mock.patch("khipu.extract.extract_memory", return_value={"summary": "captured"}), \
                 mock.patch("khipu.capture.capture", return_value=0) as capture, \
                 mock.patch("khipu.hub_snapshot.sync_decision_changes", return_value={"ok": True}), \
@@ -491,7 +490,6 @@ class IdleSweepTest(unittest.TestCase):
             return {"summary": "captured"}
 
         with mock.patch.object(sc.time, "monotonic", side_effect=lambda: clock[0]), \
-                mock.patch.object(sc, "land_transcript_images", return_value={}), \
                 mock.patch("khipu.config.capture_mode", return_value="hub"), \
                 mock.patch("khipu.extract.extract_memory", side_effect=extract), \
                 mock.patch("khipu.capture.capture", return_value=0), \

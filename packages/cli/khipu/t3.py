@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """What Khipu knows about T3 Code (pingdotgg/t3code), read-only.
 
 T3 lets one thread switch provider and account mid-conversation. Three facts of
@@ -246,8 +243,9 @@ def session_thread_ids_result(sid: str) -> tuple[list[str] | None, bool]:
     row names native session ``sid``, from one whole-table read-only scan
     under the same deadline as ``thread_for_session_result``. Unlike that
     lookup, two matching threads stay two (not None), so a caller deciding
-    permission can tell "no thread" from "ambiguous". A missing database,
-    lock, timeout or failing query is ``(None, False)``."""
+    permission can tell "no thread" from "ambiguous". A readable database
+    with no thread table or column is ``([], True)``; a missing database,
+    lock, timeout or other failing query is ``(None, False)``."""
     if not sid:
         return [], True
     path = Path(os.environ.get("KHIPU_T3_DB") or Path.home() / ".t3/userdata/statev2.sqlite")
@@ -264,7 +262,16 @@ def session_thread_ids_result(sid: str) -> tuple[list[str] | None, bool]:
             (sid,),
         ).fetchall()
         return sorted({str(r[0]) for r in rows if r and r[0]}), True
-    except (OSError, ValueError, sqlite3.Error):
+    except sqlite3.Error as exc:
+        # A database that opens and answers but has no thread table or column
+        # has no thread for this session: a settled "none", not a failure (a
+        # leftover or odd T3 file must not make every plain turn look like T3).
+        # Locks, timeouts and a file that will not read stay unverified.
+        text = str(exc).lower()
+        if "no such table" in text or "no such column" in text:
+            return [], True
+        return None, False
+    except (OSError, ValueError):
         return None, False
     finally:
         if con is not None:

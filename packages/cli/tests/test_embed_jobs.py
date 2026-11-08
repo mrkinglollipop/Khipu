@@ -1,5 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched on-sub
-# agent (brief: do not delegate); no further agent to route to.
 """Embedding jobs with receipts (khipu.embed_jobs, the --job paths of
 `embed backfill` and `library backfill`). Progress files live in a temp data
 dir; the hub is the in-memory fake the library tests use; no network."""
@@ -76,7 +74,6 @@ class JobFileTest(_DataDir):
         self.assertEqual(embed_jobs.validate_job_id("memory-1.a_b"), "memory-1.a_b")
 
     def test_generated_ids_are_valid_and_distinct(self):
-        # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
         ids = [embed_jobs.new_job_id("library:biblical") for _ in range(20)]
         for job_id in ids:
             self.assertRegex(job_id, embed_jobs.JOB_ID_RE.pattern)

@@ -61,7 +61,7 @@ How search works is in [how-it-works.md](how-it-works.md).
 
 ## Work
 
-Work brings together Owed, project ledger boards, Waiting on you, Running now and Accounts. Open a project board to read or change its ledger. Settings > Work manages tracker imports and the summary files your runners report.
+Work brings together Owed, project ledger boards, Waiting on you, Running now and Accounts. Open a project board to read or change its ledger. Settings > Work manages the summary files your runners report.
 
 ### Owed
 
@@ -112,13 +112,13 @@ Settings has thirteen sections. Database is open first.
 | Capture & models | Choose how captures are stored, the summary models and the daily summariser budget. Keys includes Gemini, Claude API, OpenAI, OpenRouter, an optional local-endpoint key and an optional GLM Coding Plan key. |
 | Accounts and routing | Manage tracked accounts, inline plan usage and sign-in, priorities, your note, standing rules, holds, reset checks, what conversations are told, job runner folders and the lane map. Review recent changes. See [routing.md](routing.md). |
 | Owner actions | Review owner changes made in conversations, the app or terminal, with eligible Undo controls. Manage owner-direction settings. |
-| Work | Manage ledger projects, tracker import, runner summary-file sources, Owed items hidden from Waiting on you, and Work/ledger size, timing and retention limits. |
+| Work | Manage ledger projects, runner summary-file sources, Owed items hidden from Waiting on you, and Work/ledger size, timing and retention limits. |
 | Projects | Review canonical and older project names, same-project questions and kept-separate pairs. Owner actions can merge names, keep them separate or separate an older name again. |
 | Optional features | Switches for Search and memory, the Local recall service, Routing, and a group of options marked "Measured, not recommended". |
 | Embeddings | Embedding models (profiles) with an Add a model action, libraries (folders of .txt and .md files that become a search space), and the progress of indexing jobs. |
-| Data & backups | The data folder, older file locations (path overrides), the graph backup destination, Backup and Restore. |
+| Data & backups | The data folder, older file locations (path overrides), Backup and Restore. |
 | Another Mac | The gateway address, and Set up another Mac (Save join kit). |
-| Components | App and CLI version, the database and graph builder components, and What feeds the graph. |
+| Components | App and CLI version, the database component, and Memory sources. |
 | Updates | Installed version and Check for updates. |
 | Advanced | Run setup again, Conflicting edits, Send feedback, background jobs, Health checks and storage controls, and the raw configuration. |
 
@@ -156,11 +156,9 @@ Save is disabled when the database lives only on this Mac, because another Mac c
 
 Backup zips the Mac-local data folder. Restore reads a zip or folder back into it: files with the same name are overwritten, and other files already there are kept. These are the app forms of `khipu backup-local` and `khipu import-local --replace`. (On the command line, `khipu import-local` without `--replace` skips files that already exist.) Database backups and health checks are covered in [operations.md](operations.md).
 
-**Graph backup destination** sets where the weekly off-site copy of the graph snapshot goes (the `graph_backup_remote` setting, an rclone `remote:path`, default `r2:khipu-backups/khipu-graph`). It shows the current value and whether it comes from the default, this Mac's settings or the `KHIPU_GRAPH_BACKUP_REMOTE` environment variable, which locks the field. Save checks the value first; **Use the default** removes a saved one.
-
 ### Components
 
-The database and the graph builder upgrade on their own, apart from the app. **What feeds the graph** lists the local folders the graph builder reads on its next run. Turning one off skips it next time and deletes nothing. Each folder with a path can opt in to **Embed images** (PNG and JPEG). You can add or remove a code folder. On a Mac that does not build the graph, the list is read-only.
+The database upgrades on its own, apart from the app. **Memory sources** lists the sources Khipu reads. Turning one off skips it next time and deletes nothing.
 
 ### Advanced
 
@@ -168,7 +166,7 @@ Background jobs shows the scheduled jobs and lets you install or remove each one
 
 ## First-run setup (Welcome)
 
-Welcome has seven steps: Welcome, Database, Model, Graph, Agents, Accounts and Finish. Each step checks itself, so setup can be resumed.
+Welcome has six steps: Welcome, Database, Model, Agents, Accounts and Finish. Each step checks itself, so setup can be resumed.
 
 - **Database.** Choose one:
   - Join a Khipu I already have (import a join kit with its passphrase, or use a nearby PIN; a kit saved unencrypted needs none)
@@ -177,7 +175,6 @@ Welcome has seven steps: Welcome, Database, Model, Graph, Agents, Accounts and F
 
   A progress list shows each stage (reach, version, privileges, schema, graph, store, upkeep, and a memory round trip) as Working, Needs you, Skipped, Waiting or Checking.
 - **Model.** Choose the summary provider, or Skip for now.
-- **Graph.** Installs the graph builder. You can skip it and do it later in Settings > Components.
 - **Agents.** Lists the harnesses found on this Mac and a button, Open Harnesses to install and verify.
 - **Accounts.** Optionally selects tracked accounts, sets priority and enables telling conversations about routing. Next applies the choices; Skip for now writes nothing.
 - **Finish.** Runs a health check and lists any unresolved item with one fix each. Continue anyway is always available.

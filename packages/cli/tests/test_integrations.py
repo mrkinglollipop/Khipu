@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Tests for khipu.integrations — per-harness native packs (P3 step 4).
 
 Every test runs against a TEMP home directory (HOME is patched and the module's
@@ -1372,8 +1369,6 @@ def _green_doctor_patches():
         mock.patch("khipu.hub_snapshot.snapshot_health", return_value={"ok": True}),
         mock.patch("khipu.keychain.secrets_status", return_value={"dsn_file": {"ok": True}, "gemini_in_keychain": True}),
         mock.patch("khipu.drift.backup_health", return_value={"ok": True}),
-        mock.patch("khipu.graph_backup.local_health", return_value={"ok": True}),
-        mock.patch("khipu.graph_backup.offsite_health", return_value={"ok": True}),
         mock.patch("khipu.config.path_setting", return_value=None),
         mock.patch("khipu.outbox.status", return_value={"pending": 0}),
         mock.patch("khipu.outbox.drain", return_value={"failed": 0}),

@@ -265,7 +265,6 @@ class UpgradeRecoveryTest(unittest.TestCase):
     def _failed_upgrade(self, *, preserve_fails: bool, restore_fails: bool, old_start_fails: bool):
         versions = {
             "postgres": {"mode": "local_docker", "image": "registry/old:19-pgvector", "port": 54329},
-            "graphify": {"semver": "1.0.0"},
         }
         row = {
             "postgres_image": "registry/new:19-pgvector",
@@ -365,7 +364,7 @@ class DbMoveAliasIdentityTest(unittest.TestCase):
         self.assertFalse(any(sql.startswith("TRUNCATE") for sql in target.sql))
 
     def test_upgrade_prepares_image_before_stopping_original_container(self):
-        versions = {"postgres": {"mode": "local_docker", "image": "registry/old:19-pgvector", "port": 54329}, "graphify": {"semver": "1.0.0"}}
+        versions = {"postgres": {"mode": "local_docker", "image": "registry/old:19-pgvector", "port": 54329}}
         row = {"postgres_image": "registry/new:19-pgvector", "graphify_semver": "1.0.0", "graphify_tarball_url": "https://example.invalid/g", "pgvector_min": "0"}
         class Cursor:
             def __enter__(self): return self

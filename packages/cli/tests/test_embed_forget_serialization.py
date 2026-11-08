@@ -147,26 +147,3 @@ def test_episode_catchup_serializes_with_forget(tmp_path, timing):
         embed.embed_recent_missing()
     assert conn.forget_result["complete"]
     assert conn.inserts == [], "catch-up recreated forgotten chunks"
-
-
-def test_media_asset_lock_spans_chunk_insertion_and_commit(tmp_path):
-    class MediaConnection(RaceConnection):
-        def execute(self, sql, params=None):
-            if "SELECT id, sha256 FROM media_assets" in sql:
-                self.locked = "FOR UPDATE" in sql or "FOR SHARE" in sql
-                self.result = [("media-id", "old-hash")]
-            else:
-                super().execute(sql, params)
-
-    conn = MediaConnection(tmp_path, kind="media")
-    with mock.patch.object(embed, "embed_batch_images", return_value=[[1.0, 0.0]]), \
-            mock.patch.object(embed._profiles, "cached_spec", return_value=None):
-        embed._flush_media_batch(conn, "test-profile", [
-            ("source", tmp_path / "image.png", "image.png", "image/png", "new-hash", b"image")
-        ], {"embedded": 0, "batches": 0})
-    assert conn.locked
-    assert conn.pending, "deletion must wait while the vector transaction holds the asset"
-    assert conn.inserts
-    conn.commit()
-    assert conn.deleted
-    assert conn.inserts == []

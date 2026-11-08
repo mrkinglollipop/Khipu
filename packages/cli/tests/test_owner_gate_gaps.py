@@ -1,9 +1,8 @@
 """Regression coverage derived from the owner-gate review probes. No live state."""
-import hashlib
 import json
 import time
 
-from khipu import ledger_import, owner_act, owner_direction, owner_turns, routing
+from khipu import owner_act, owner_direction, owner_turns, routing
 from tests.test_t3_owner_confirm import (
     THREAD, T3_SESSION, _be, _confirm_id, _hold_in_t3, _t3_hook_turn, world,
 )
@@ -12,7 +11,8 @@ from tests.test_owner_priority_pending import _ask_in_t3, _owner_says_yes, _pend
 
 def test_a_typed_turn_can_direct_more_than_one_routing_change(world):
     _hold_in_t3(world)
-    ok, sensitive = owner_act.act('direction.set', {'key':'latest_window_h', 'value':'1000'})
+    ok, sensitive = owner_act.act('direction.request', {'action': 'direction.set',
+                                                        'args': {'key':'latest_window_h', 'value':'1000'}})
     assert ok and sensitive['pending'], sensitive
     mid = world['t3'].message(THREAD, time.time()+1, text='thanks')
     _t3_hook_turn(prompt='thanks')
@@ -42,34 +42,6 @@ def test_priority_confirm_discloses_and_pins_underlying_change(world):
     assert secret_change in json.dumps(priority)
 
 
-def test_ledger_import_replays_reviewed_bytes(world, monkeypatch):
-    path=world['tmp'] / 'tracker.json'
-    original={'rows': {'ok': {'title':'Reviewed task', 'kind':'task', 'state':'todo'}}}
-    swapped={'rows': {'unshown': {'title':'Unreviewed replacement', 'kind':'task', 'state':'done'}}}
-    path.write_text(json.dumps(original))
-    original_digest=hashlib.sha256(path.read_bytes()).hexdigest()
-    ok, held = _ask_in_t3(world, 'ledger.import', {'project':'p','file':str(path)})
-    assert ok and held['pending'], held
-    request=owner_direction._read_requests(owner_direction.requests_path())[0]
-    assert request['args'] == {'project':'p','file':str(path)}
-    path.write_text(json.dumps(swapped))
-    seen=[]
-    monkeypatch.setattr(ledger_import, 'done_imports', lambda *a: [])
-    def fake_import_sink(file, project, **kw):
-        src=owner_direction.import_source(file,project)
-        assert src is not None
-        seen.append(src)
-        return {'ok':True,'project':project,'file':src['name'],'digest':src['digest'],
-                'counts_in_file':ledger_import.tracker_counts(src['rows']),
-                'masked':src['masked'],'other_keys':src['other_keys'],'result':'done'}
-    monkeypatch.setattr(ledger_import, 'run_import', fake_import_sink)
-    _owner_says_yes(world)
-    ok, out=_confirm_id(held['request'])
-    assert ok, out
-    assert seen[0]['digest'] == original_digest
-    assert seen[0]['rows'] == original['rows']
-
-
 def test_config_confirm_cannot_retarget_new_request(world):
     key='routing_summary_chars'
     routing.set_setting(key, '100', request={'request':'100 characters','by':{'kind':'conversation','session':'a'}})
@@ -87,7 +59,8 @@ def test_config_confirm_cannot_retarget_new_request(world):
 
 def test_t3_confirmation_does_not_compare_transport_text(world):
     _hold_in_t3(world)
-    ok, held = owner_act.act('direction.set', {'key':'latest_window_h', 'value':'1000'})
+    ok, held = owner_act.act('direction.request', {'action': 'direction.set',
+                                                   'args': {'key':'latest_window_h', 'value':'1000'}})
     assert ok and held['pending']
     world['t3'].message(THREAD, time.time()+1, text='a real owner message')
     _t3_hook_turn(prompt='a synthetic different prompt')
@@ -113,7 +86,8 @@ def test_terminal_pty_from_harness_is_refused_but_owner_terminal_works(monkeypat
 
 def test_each_asked_request_applies_once_without_a_message_quota(world):
     first = _hold_in_t3(world)
-    ok, second = owner_act.act('direction.set', {'key': 'latest_window_h', 'value': '1000'})
+    ok, second = owner_act.act('direction.request', {'action': 'direction.set',
+                                                     'args': {'key': 'latest_window_h', 'value': '1000'}})
     assert ok and second['pending']
     _owner_says_yes(world)
     ok, out = _confirm_id(first)
@@ -155,7 +129,8 @@ def test_owed_tidy_hold_replays_the_full_reviewed_plan(world, monkeypatch):
     path = world['tmp'] / 'plan.json'
     original = {'project': 'p', 'items': [{'id': 4, 'owner': 'assistant'}]}
     path.write_text(json.dumps(original))
-    ok, held = _ask_in_t3(world, 'owed.tidy', {'project': 'p', 'plan': str(path)})
+    ok, held = _ask_in_t3(world, 'direction.request', {'action': 'owed.tidy',
+                                                      'args': {'project': 'p', 'plan': str(path)}})
     assert ok and held['pending'] and 'assistant' in held['ask'], held
     path.write_text(json.dumps({'project': 'p', 'items': [{'id': 99, 'owner': 'user'}]}))
     seen = []

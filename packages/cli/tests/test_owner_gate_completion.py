@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from khipu import accounts, ledger_import, needs_you, owed_tidy, owner_act, owner_direction, routing
+from khipu import accounts, needs_you, owed_tidy, owner_act, owner_direction, routing
 from tests.test_owner_needs_you import (
     _accounts_request, _cap_request, _earlier_ask, _owner_types, _priority_request,
     _rule_added, _rule_changed, _setting_request, _tier_request,
@@ -13,7 +13,7 @@ from tests.test_t3_owner_confirm import world
 assert world
 
 KINDS = ('priority', 'priority_undo', 'rule', 'rule_undo', 'proposal', 'setting', 'tier',
-         'seeded_rule_undo', 'tracker', 'owed_plan', 'cap_proposal')
+         'seeded_rule_undo', 'owed_plan', 'cap_proposal')
 
 
 def _legacy(world, monkeypatch, kind):
@@ -45,11 +45,8 @@ def _legacy(world, monkeypatch, kind):
                                          'revision': 'conv1', 'purpose': 'job'}
     else:
         path = world['tmp'] / (kind + '.json')
-        path.write_text(json.dumps({'rows': {'reviewed': {'title': 'Reviewed', 'kind': 'task', 'state': 'todo'}}}
-                                   if kind == 'tracker' else {'project': 'p', 'items': []}))
-        action, args = ('ledger.import', {'file': str(path), 'project': 'p'}) if kind == 'tracker' else (
-            'owed.tidy', {'project': 'p', 'plan': str(path)})
-        monkeypatch.setattr(ledger_import, 'done_imports', lambda *a: [])
+        path.write_text(json.dumps({'project': 'p', 'items': []}))
+        action, args = 'owed.tidy', {'project': 'p', 'plan': str(path)}
     _owner_types(world, 'prepare the old change')
     # Produce the old persisted shape: no content pins, review seal or disclosure metadata.
     row = owner_direction.hold(action, args, ask=owner_direction.ask_line(action, args))
@@ -62,18 +59,10 @@ def _legacy(world, monkeypatch, kind):
     return row
 
 
-@pytest.mark.parametrize('kind', ['tracker','owed_plan'])
+@pytest.mark.parametrize('kind', ['owed_plan'])
 def test_legacy_hold_never_applies_after_a_full_read_and_later_yes(world, monkeypatch, kind):
     row = _legacy(world, monkeypatch, kind)
     seen = []
-    if kind == 'tracker':
-        def run_import(file, project, **kw):
-            seen.append(owner_direction.import_source(file, project))
-            return {'ok': True}
-        monkeypatch.setattr(ledger_import, 'run_import', run_import)
-        # The path now contains data the old ask never showed.
-        from pathlib import Path
-        Path(row['args']['file']).write_text(json.dumps({'rows': {'hidden': {'title': 'Hidden', 'kind': 'task', 'state': 'done'}}}))
     if kind == 'owed_plan':
         monkeypatch.setattr(owed_tidy, 'apply', lambda doc, **kw: seen.append(doc) or {'ok': True})
     before_events = routing.read_events()[0]
@@ -104,26 +93,6 @@ def test_own_request_on_first_proven_t3_turn_needs_no_question(world):
     out = _own_request('rule')
     done = owner_act.apply_request('rule', out)
     assert done.get('applied') is True and not done.get('pending'), done
-
-
-def test_legacy_refusal_can_be_replaced_only_by_a_freshly_shown_hold_and_reply(world, monkeypatch):
-    row = _legacy(world, monkeypatch, 'tracker')
-    def imported(file,project,**kw):
-        src=owner_direction.import_source(file,project)
-        return {'ok':True,'project':project,'file':src['name'],'digest':src['digest'],
-                'counts_in_file':ledger_import.tracker_counts(src['rows']),
-                'masked':src['masked'],'other_keys':src['other_keys'],'result':'done'}
-    monkeypatch.setattr(ledger_import,'run_import',imported)
-    _owner_types(world, 'yes to the old question')
-    ok, out = owner_act.act('direction.confirm', {'request': row['id']})
-    assert not ok and out['code'] == 'legacy_hold', out
-    ok, fresh = owner_act.act('direction.request', {'action': row['action'], 'args': row['args']})
-    assert ok and fresh['pending'] and 'Reviewed file contents' in fresh['ask'], fresh
-    ok, out = owner_act.act('direction.confirm', {'request': fresh['request']})
-    assert not ok and out['code'] == 'not_confirmed', out
-    _owner_types(world, 'yes to the full new request')
-    ok, out = owner_act.act('direction.confirm', {'request': fresh['request']})
-    assert ok, out
 
 
 def test_same_turn_read_does_not_turn_own_direction_into_an_answer(world):

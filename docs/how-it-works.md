@@ -183,9 +183,7 @@ The schema migrations extend through `0044`, including ledger, episode origin, f
 |---|---|
 | Commitments | Things you still owe on a project (see section 4) |
 | Decisions | A registry with a lifecycle and links between decisions (see section 4) |
-| Briefs | Source-backed summaries of a topic (see section 4) |
 | Library sources | Folders of text and Markdown files, indexed as a search space (see section 3) |
-| Media assets | PNG and JPEG files embedded for search |
 | Embedding profiles | Which model and size produce vectors, and which profile is active |
 | Episode sources | Where each episode came from (capture identity, above) |
 | Ledger | Project work rows, their vocabulary and change history |
@@ -214,7 +212,7 @@ Hooks put prior work in front of the agent before it acts.
 - **Aegis** gets no push. Its hooks run as observers and their output is discarded. Aegis agents pull with `khipu_status` and `khipu_owed`.
 - **Cursor** gets the session-start push and a project rule file, but no per-prompt hook.
 
-With `routing_push` enabled, routing updates can arrive at session start, before prompts and at delegation. `routing_push_start`, `routing_push_prompt` and `routing_push_delegation` each default on within that feature; the master feature defaults off. Recall can also label imported topic text whose routing claims may have been superseded.
+With `routing_push` enabled, routing updates can arrive at session start, before prompts and at delegation. `routing_push_start`, `routing_push_prompt` and `routing_push_delegation` each default on within that feature; the master feature defaults off.
 
 A warm local recall service (`khipu recall serve`) answers the per-prompt hook over a socket so each prompt skips a cold Python start. It is an optional launch job. Without it the hook uses a one-shot path.
 
@@ -280,7 +278,7 @@ Use `khipu owed` (list, `--close`, `--reopen`, `--snooze`), Owed within the Work
 
 ### Work and project names
 
-The project ledger tracks work rows and their history. The Work screen includes Owed, project ledger boards, Waiting on you, Running now and Accounts. Use `khipu ledger` or `khipu_ledger` to read and update rows. Project-name groups keep renamed projects together and expose merge and keep-separate questions to the owner; `khipu_project` shows their names, evidence and counts.
+The project ledger tracks work rows and their history. The Work screen includes Owed, project ledger boards, Waiting on you, Running now and Accounts. Use `khipu ledger` or `khipu_ledger` to read and update rows. Project-name groups keep renamed projects together and expose merge and keep-separate questions to the owner; `khipu project show` shows their names, evidence and counts.
 
 ### Decisions
 
@@ -288,19 +286,9 @@ Decisions are a registry with a lifecycle: supersede, restore, retract. Possible
 
 One validity module gives each result a state: current, mixed, superseded, retracted or unknown. Topics marked superseded, retired or abandoned rank lower. They are not excluded. Use `khipu decisions` or the `khipu_decisions` tools. Automatic supersession (`auto_supersede`) and validity ranking (`validity_ranking`) are feature switches and default off.
 
-### Briefs
-
-A brief is a source-backed summary of a topic. Every claim cites episode ids. Citations to episodes that were not offered are removed, and a claim left with no valid citation is dropped. A failed build never replaces the current brief. A brief goes stale when its sources change or a cited episode is forgotten.
-
-Briefs are off by default. Turn on the `briefs` switch, then use `khipu briefs plan|build|show` or `khipu_brief`.
-
-### Reflect
-
-`khipu reflect "question"` answers from memory with citations. It abstains rather than answer without sources. It writes no memory and has a 20 second deadline. It is off by default and needs the `reflect` switch. The agent tool is `khipu_reflect`.
-
 ### Forget
 
-`khipu episode forget ID` tombstones one episode. It does not erase the row: it sets `deleted_at`, and the summary and its provenance stay in the `episodes` table. Search, `khipu_get`, the episode detail view and recent-capture readers exclude it, including Activity, doctor, status, the full `khipu_status` and the session-start fallback. It also removes the episode's vectors, closes the commitments it opened (reason `forgotten`; the closed rows stay), retracts its decisions, deletes its deliverables, removes its lines from the legacy file and Khipu's own forget backups, updates the local replica, and marks briefs that cited it stale. Graph topic nodes are shared across episodes and are left alone, and database backups made before the forget still contain it. The legacy file and local replica steps can fail. Forget removes queued jobs that exactly match the episode’s sources under the outbox lock; unreadable, loosely matching or shared jobs remain and are reported with reasons and locations. If anything is left, the result says `complete: false` and lists it under `partial`.
+`khipu episode forget ID` tombstones one episode. It does not erase the row: it sets `deleted_at`, and the summary and its provenance stay in the `episodes` table. Search, `khipu_get`, the episode detail view and recent-capture readers exclude it, including Activity, doctor, status, the full `khipu_status` and the session-start fallback. It also removes the episode's vectors, closes the commitments it opened (reason `forgotten`; the closed rows stay), retracts its decisions, deletes its deliverables, removes its lines from the legacy file and Khipu's own forget backups, and updates the local replica. Graph topic nodes are shared across episodes and are left alone, and database backups made before the forget still contain it. The legacy file and local replica steps can fail. Forget removes queued jobs that exactly match the episode’s sources under the outbox lock; unreadable, loosely matching or shared jobs remain and are reported with reasons and locations. If anything is left, the result says `complete: false` and lists it under `partial`.
 
 Forget publishes durable source identities to prevent later replay from resurrecting the episode. The tombstoned row and text remain, with no episode purge or restore command. Independent routing words remain until removed using their routing commands.
 
@@ -371,7 +359,7 @@ Khipu never opens the database to the internet itself; keep it on a private netw
 
 Install and check a harness with `khipu integrations install <harness>` and `khipu integrations verify <harness>`. Verify exercises the integration. It does not just check that a file exists.
 
-Scheduled jobs on the Mac: a nightly memory run, a graph build, a monthly run, a notes watcher and the five-minute queue drain. The warm recall service is opt-in. See [operations.md](operations.md).
+Scheduled jobs on the Mac: a nightly memory run, a monthly run, a notes watcher and the five-minute queue drain. The warm recall service is opt-in. See [operations.md](operations.md).
 
 ## 6. Nothing is cut over irreversibly
 
@@ -412,7 +400,7 @@ During the migration, memory exists as files and as database rows, so they can d
 | `khipu reconcile` | Sweeps files into PostgreSQL. Idempotent: it upserts on `(ts, md5(summary))`, so re-running never duplicates. It tombstones topics whose files were deleted (with a circuit breaker) and restores ones that reappear. |
 | `khipu doctor` | The single health command. It checks drift in one direction: every file episode must exist in PostgreSQL. It also covers many more checks. |
 | `khipu revisions` | Shows conflicting topic edits across machines. The newest edit wins and the older version is kept. |
-| `khipu sources` | Lists, enables, disables, adds and removes graph roots. `sources export` writes the file graphify reads. |
+| `khipu sources` | Lists, enables and disables memory sources, and sets which of them embed images. |
 
 `khipu doctor --quick` runs all the local health checks (imports, config, outbox, capture liveness, jobs, backups, launchers and more) and omits hub reachability, network and probe checks; reads the hub only for the pending-migration check. `khipu doctor --probe` runs a fresh end-to-end recall test.
 

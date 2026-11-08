@@ -9,7 +9,6 @@ Memory goes to your own PostgreSQL server, and text goes to the model providers 
 
 - Summaries: transcript windows go to the summariser provider you pick, in parts of at most 14,000 characters. The default is Google Gemini. You can switch to Anthropic, OpenAI, OpenRouter, or a local OpenAI-compatible endpoint. You can also use the `claude` or `codex` CLI on your own login, in which case Khipu holds no credential. By default, if a provider other than Gemini or local fails a window and a Gemini key is configured, that window is retried once on Gemini Flash. Set `synth_fallback` to `none` to turn that off.
 - Embeddings: memory chunks and search queries go to the embedding provider of the active profile. That can be Google Gemini, Voyage, or an OpenAI-compatible endpoint. A provider of type `local` accepts plain HTTP only on this Mac (loopback) but also accepts any HTTPS address, so it keeps text on your Mac only if you point it at one.
-- Graph backups: if `rclone` is installed and a remote named `r2` is configured, the graph job copies the newest graph snapshot to that remote about once a week. Without an `r2` remote nothing is uploaded.
 
 There is no telemetry. The app checks GitHub Releases for updates. Something reaches the maintainer only when you send it from the app's feedback form: your message, reply-to email, app version, macOS version and any files you attach.
 
@@ -37,7 +36,6 @@ Yes, for both jobs.
 
 - Summaries: choose Gemini (the default, `gemini-2.5-flash`), Anthropic, OpenAI, OpenRouter, a local OpenAI-compatible endpoint, or the `claude` or `codex` CLI on your own login. Settings > Capture & models and `khipu models set --role synth` support all these choices. First-run setup offers Gemini, Anthropic, Claude or Codex on your own login, a local endpoint, or Skip for now.
 - Embeddings (search vectors): the first-run setup offers Gemini Embedding 2 at 768 dimensions. You can add Voyage or OpenAI-compatible profiles with `khipu embed profiles add`, or in Settings > Embeddings. You can also skip embeddings until you set one up. Switching later creates a new profile and a re-embed job. A profile becomes active only when its coverage is complete, unless you force it.
-- Images: PNG and JPEG vectors are opt-in per source (`khipu sources set-embed-media`, then `khipu embed-media-backfill`). Captioning images is not built.
 
 **How much does capture cost?**
 A capture is due after five user turns or twenty minutes, and always at compaction or session end. Each uncached part normally needs one summariser call. Provider retries and Gemini fallback can add calls, and every API or subscription-CLI attempt counts against the daily synth ceiling. Most captures are a single part. A window longer than 14,000 characters is split into several parts, and each part is summarised on its own. A window under 200 characters is never sent. Embeddings are keyed by content hash, so unchanged text is not re-embedded.
@@ -81,7 +79,7 @@ Only for some agents.
 If you use neither Aegis nor a cloud agent, skip the gateway. See [operations.md](operations.md).
 
 **What do the MCP tools cover?**
-The local MCP server exposes 22 tools, including route advice, project identity, owner actions, what is waiting on you and the work ledger. Owner actions and what is waiting on you are not advertised through the gateway. Brief and reflect are off by default and answer `available: false` until you turn them on with `khipu features`. Usage and routing write/advice tools remain unavailable through the gateway, but `khipu_route` serves the owner-enabled published cloud routing copy, with a hub timestamp, stale status and persistent pull receipts. See [mcp-tools.md](mcp-tools.md).
+The local MCP server exposes 19 tools, including route advice, owner actions, what is waiting on you and the work ledger. Owner actions and what is waiting on you are not advertised through the gateway. Usage and routing write/advice tools remain unavailable through the gateway, but `khipu_route` serves the owner-enabled published cloud routing copy, with a hub timestamp, stale status and persistent pull receipts. See [mcp-tools.md](mcp-tools.md).
 
 **Does Khipu route my work between accounts?**
 No. It reports each account's state and plan headroom, and the choice stays with you. See [routing.md](routing.md).

@@ -25,8 +25,7 @@ Red when any of:
     check people learn to ignore (audit 2026-08-17).
 
 Only the Mac that runs the nightly is judged (``is_sync_host``); everywhere
-else this is *not applicable* and green, exactly like ``graph_sync``'s producer
-check.
+else this is *not applicable* and green.
 """
 
 from __future__ import annotations

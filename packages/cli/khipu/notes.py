@@ -258,9 +258,6 @@ def _note_topic_dict(path: Path, *, project: str | None) -> dict[str, Any] | Non
     parent = flat.get("parent")
     if parent:
         frontmatter["parent"] = parent
-    from khipu.routing_scanner import has_routing_claim
-
-    frontmatter["_routing_state_claim"] = has_routing_claim(str(path), body)
     return {
         "slug": slug,
         "title": name,
@@ -287,10 +284,11 @@ def _claude_project_dirs(root: Path) -> list[Path]:
     if not root.is_dir():
         return []
     # Old summariser calls used state/synth-cli/work-<tempfile suffix> as
-    # cwd. Claude encoded that path as a project slug. Reject by name before
-    # even stat-ing it: tens of thousands of these can outlive the temp cwd.
+    # cwd; current ones use the fixed state/synth-cli/work. Claude encoded
+    # that path as a project slug. Reject by name before even stat-ing it:
+    # tens of thousands of the old ones can outlive the temp cwd.
     return sorted(p for p in root.iterdir()
-                  if not re.search(r"-state-synth-cli-work-[a-z0-9_-]{8}$", p.name)
+                  if not re.search(r"-state-synth-cli-work(-[a-z0-9_-]{8})?$", p.name)
                   and p.is_dir())
 
 
@@ -676,12 +674,8 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
                 "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
                 "files": dict((state or {}).get("files", {})),
             })
-        _refresh_scan_report()
         return out
 
-    # The scan report refreshes before the hub write, not after it, so a
-    # reconcile with no hub reachable still refreshes it.
-    _refresh_scan_report()
     from khipu import offline
     from khipu.db import connect
     from khipu.mirror import _upsert_topic
@@ -773,7 +767,6 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
         "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
         "files": new_files_state,
     })
-    _refresh_scan_report()
     try:
         from khipu import organise
 
@@ -784,17 +777,6 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
         out["organise"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         _log(f"organise.after_reconcile failed: {exc}")
     return out
-
-
-def _refresh_scan_report() -> None:
-    """Refresh the owner-local routing scan report; never fatal, and the
-    log line carries only the exception type, never file words."""
-    try:
-        from khipu import routing_scan_report
-
-        routing_scan_report.refresh()
-    except Exception as exc:  # noqa: BLE001 — the scan report must never break reconcile
-        _log(f"routing scan report failed: {type(exc).__name__}")
 
 
 def notes_freshness(cur) -> dict[str, Any]:

@@ -49,18 +49,6 @@ export const RECOMMENDED_FEATURES: ReadonlyArray<FeatureRow> = [
     what: "A model reads the top search results and puts the best match first.",
     cost: "Adds about 0.8 s to a search and makes one model call per search.",
   },
-  {
-    name: "reflect",
-    label: "Answer questions from memory, with sources",
-    what: "Ask a question and get an answer in which every claim points to a memory it came from.",
-    cost: "One model call per question, and only when you ask.",
-  },
-  {
-    name: "briefs",
-    label: "Build a sourced summary page per topic",
-    what: "The nightly job writes a short brief for each topic, and each claim in it cites its source.",
-    cost: "Model calls in the nightly job, up to 40 topics a night.",
-  },
 ];
 
 export const REJECTED_FEATURES: ReadonlyArray<FeatureRow> = [

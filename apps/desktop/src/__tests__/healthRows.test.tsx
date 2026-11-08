@@ -20,10 +20,7 @@ afterEach(() => {
 
 const ALL_OK_KEYS = [
   "hub_ok",
-  "graph_backup_ok",
-  "graph_offsite_ok",
   "drift_ok",
-  "graph_drift_ok",
   "outbox_ok",
   "capture_liveness_ok",
   "git_sync_ok",
@@ -72,7 +69,7 @@ describe("the offline-copy row's icon matches its sentence", () => {
 describe("healthRows (pure)", () => {
   it("returns one row per _ok key, all green, when everything passes", () => {
     const rows = healthRows(fixture());
-    expect(rows).toHaveLength(19);
+    expect(rows).toHaveLength(16);
     expect(rows.every((r) => r.status === "ok")).toBe(true);
   });
 
@@ -146,11 +143,11 @@ describe("healthRows (pure)", () => {
     const rows = healthRows(
       fixture({
         recall_probe_ok: false,
-        not_configured: ["graph_sqlite"],
+        not_configured: ["memory_root"],
       }),
     );
     expect(rows[0]).toMatchObject({ key: "recall_probe_ok", status: "err" });
-    expect(rows[1]).toMatchObject({ key: "graph_drift_ok", status: "skipped" });
+    expect(rows[1]).toMatchObject({ key: "drift_ok", status: "skipped" });
     expect(rows[rows.length - 1].status).toBe("ok");
   });
 
@@ -166,12 +163,12 @@ describe("healthRows (pure)", () => {
 });
 
 describe("HealthReportRows", () => {
-  it("(a) renders 19 rows with a check mark and no raw JSON", () => {
+  it("(a) renders 16 rows with a check mark and no raw JSON", () => {
     const { container } = render(
       <HealthReportRows parsed={fixture()} attention={[]} />,
     );
-    expect(container.querySelectorAll(".row-item")).toHaveLength(19);
-    expect(container.querySelectorAll("svg.ok")).toHaveLength(19);
+    expect(container.querySelectorAll(".row-item")).toHaveLength(16);
+    expect(container.querySelectorAll("svg.ok")).toHaveLength(16);
     expect(container.querySelector("pre")).toBeNull();
   });
 

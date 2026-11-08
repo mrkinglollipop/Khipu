@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """Real-SQL integration tests against a separately provisioned disposable database.
 
 Require KHIPU_LIVE_TESTS=1, a 32-character lowercase hexadecimal
@@ -929,6 +926,76 @@ class GraphCandidatesScratchTest(unittest.TestCase):
         candidates, missed = gc.hub_candidates(self.cur, fused, deadline=time.monotonic() - 1)
         self.assertTrue(missed)
         self.assertEqual(candidates, [])
+
+
+    def test_forgotten_episodes_are_neither_seeds_nor_mentions(self):
+        from khipu import graph_candidates as gc
+
+        self._seed_topic("scratch-gc-forgot", "Forgot", "forgot body")
+        kept = self._seed_episode("kept mention", ["Scratch GC Forgot"], days_ago=1)
+        gone = self._seed_episode("forgotten mention", ["Scratch GC Forgot"], days_ago=0)
+        self.cur.execute("UPDATE episodes SET deleted_at = now() WHERE id = %s", (gone,))
+        self.conn.commit()
+
+        import time
+
+        cands, missed = gc.hub_candidates(
+            self.cur, [{"kind": "topic", "id": "scratch-gc-forgot"}],
+            deadline=time.monotonic() + gc.HUB_LEG_DEADLINE_S)
+        self.assertFalse(missed)
+        self.assertEqual([c["id"] for c in cands if c["kind"] == "episode"], [str(kept)])
+        cands, missed = gc.hub_candidates(
+            self.cur, [{"kind": "episode", "id": str(gone)}],
+            deadline=time.monotonic() + gc.HUB_LEG_DEADLINE_S)
+        self.assertEqual((cands, missed), ([], False))
+
+    def test_mixed_seeds_in_one_pipelined_statement_restore_the_timeout(self):
+        from khipu import graph_candidates as gc
+
+        self._seed_topic("scratch-gc-mix-a", "Mix A", "a body")
+        self._seed_topic("scratch-gc-mix-b", "Mix B", "b body")
+        self.cur.execute(
+            "INSERT INTO nodes (id, type, name) VALUES (%s, 'topic', %s), (%s, 'topic', %s) "
+            "ON CONFLICT (id) DO NOTHING",
+            ("topic:scratch-gc-mix-a", "scratch-gc-mix-a",
+             "topic:scratch-gc-mix-b", "scratch-gc-mix-b"),
+        )
+        self.cur.execute(
+            "INSERT INTO edges (src, dst, type, weight) VALUES (%s, %s, 'wiki_link', 1.0)",
+            ("topic:scratch-gc-mix-a", "topic:scratch-gc-mix-b"),
+        )
+        eid = self._seed_episode("names mix b", ["Scratch-GC-Mix-B"])
+        self.cur.execute("SET statement_timeout = '7s'")
+
+        import time
+
+        fused = [{"kind": "topic", "id": "scratch-gc-mix-a"}, {"kind": "episode", "id": str(eid)},
+                 {"kind": "topic", "id": "note:scratch-not-a-slug"}]
+        cands, missed = gc.hub_candidates(
+            self.cur, fused, deadline=time.monotonic() + gc.HUB_LEG_DEADLINE_S)
+        self.assertFalse(missed)
+        got = {(c["kind"], c["id"], c["via"]["seed"], c["via"]["relation"]) for c in cands}
+        self.assertIn(("topic", "scratch-gc-mix-b", "topic:scratch-gc-mix-a", "wiki_link"), got)
+        self.cur.execute("SELECT current_setting('statement_timeout')")
+        self.assertEqual(self.cur.fetchone()[0], "7s")
+
+    def test_a_statement_past_the_deadline_is_cancelled_and_reported_missed(self):
+        from khipu import graph_candidates as gc
+
+        self._seed_topic("scratch-gc-slow", "Slow", "slow body")
+        import time
+
+        sql, params = gc._hub_candidates_sql(
+            gc._seeds([{"kind": "topic", "id": "scratch-gc-slow"}]), set(), live_episodes=True)
+        slow = sql.replace("WITH ", "WITH slow AS MATERIALIZED (SELECT pg_sleep(1)), ", 1) + \
+            " UNION ALL SELECT 0, 'topic', 'x', 'wiki_link', 'topic', 'y', NULL, NULL, 0 FROM slow"
+        with mock.patch.object(gc, "_hub_candidates_sql", return_value=(slow, params)):
+            cands, missed = gc.hub_candidates(
+                self.cur, [{"kind": "topic", "id": "scratch-gc-slow"}],
+                deadline=time.monotonic() + 0.2)
+        self.assertEqual((cands, missed), ([], True))
+        self.cur.execute("SELECT 1")
+        self.assertEqual(self.cur.fetchone()[0], 1)
 
 
 class EmbedHybridSearchGraphCandidatesScratchTest(unittest.TestCase):

@@ -437,9 +437,9 @@ describe("review round 2", () => {
 
   it("a tile's rows are rendered and marked", async () => {
     const { HealthReportRows, markHealthRows } = await import("../healthRows");
-    render(<HealthReportRows parsed={{ backup_ok: false, graph_backup_ok: true, graph_offsite_ok: true }} attention={[]} />);
+    render(<HealthReportRows parsed={{ backup_ok: false }} attention={[]} />);
     const marked = markHealthRows(document, TILE_HEALTH_KEYS.backups);
-    expect(marked.map((el) => el.getAttribute("data-health-key")).sort()).toEqual(["backup_ok", "graph_backup_ok", "graph_offsite_ok"]);
+    expect(marked.map((el) => el.getAttribute("data-health-key")).sort()).toEqual(["backup_ok"]);
   });
 });
 
@@ -454,7 +454,7 @@ describe("health tiles and callouts", () => {
   });
 
   it("maps every tile and callout to the health rows it is about", () => {
-    expect(TILE_HEALTH_KEYS.backups).toEqual(["backup_ok", "graph_backup_ok", "graph_offsite_ok"]);
+    expect(TILE_HEALTH_KEYS.backups).toEqual(["backup_ok"]);
     expect(TILE_HEALTH_KEYS.recording).toContain("capture_liveness_ok");
     expect(healthKeysForAttention("liveness:claude_code")).toEqual(["capture_liveness_ok"]);
     expect(healthKeysForAttention("backup")).toEqual(["backup_ok"]);

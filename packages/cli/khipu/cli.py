@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """khipu CLI entry — status / search / graph / doctor / regen-memory / reconcile."""
 
 from __future__ import annotations
@@ -28,7 +25,7 @@ def _env(*names: str, default: str = "") -> str:
 # was an unconditional NameError on every `khipu jobs install/refresh/
 # uninstall <name>` call with explicit names — a different function's scope
 # does not see a parser-builder's locals. Module level so both see it.
-_JOBS_CHOICES = ("nightly", "monthly", "graph_build", "notes_watch", "queue_drain", "recall_daemon", "replica_refresh")
+_JOBS_CHOICES = ("nightly", "monthly", "notes_watch", "queue_drain", "recall_daemon", "replica_refresh")
 
 
 def _memory_root_default() -> str | None:
@@ -173,6 +170,14 @@ def _synth_provider_block(secrets: dict) -> tuple[dict, bool]:
                       "model": _synth["model_id"] if _provider == "local" else cloud_model_id(_synth),
                       "key_present": bool(_key_present)}
     synth_provider_ok = _provider == "local" or bool(_key_present)
+    if not _key_present and _provider not in CLI_PROVIDERS:
+        # A locked login Keychain (ssh, a fresh boot) hides a key it still lists.
+        # That is not a missing key: say it cannot be read right now, do not fail.
+        from khipu.keychain import held_but_unreadable
+
+        if held_but_unreadable(f"{_provider}_api_key"):
+            synth_provider.update(key_present=None, note="can't read the keychain right now")
+            synth_provider_ok = True
     if _provider in CLI_PROVIDERS:
         from khipu.synth_cli import binary
 
@@ -209,7 +214,7 @@ _QUICK_IMPORTS = (
 # on every one; --quick leaves out only the hub, network and probe checks.
 LOCAL_GATES = (
     "outbox_ok", "capture_liveness_ok", "git_sync_ok", "dsn_file_ok", "synth_provider_ok",
-    "jobs_ok", "index_freshness_ok", "synth_budget_ok", "graph_backup_ok", "bundle_seal_ok",
+    "jobs_ok", "index_freshness_ok", "synth_budget_ok", "bundle_seal_ok",
     "prompt_recall_snapshot_ok", "prompt_recall_outcomes_ok", "recall_daemon_ok", "forget_list_ok",
     "nightly_steps_ok", "degraded_rate_ok", "launchers_ok", "ledger_outbox_ok", "disk_space_ok",
     "recall_eval_ok",
@@ -220,9 +225,9 @@ LOCAL_GATES = (
 # `*_ok` keys in the report that do not: routing_delivery_ok (evidence), and the nightly step flags
 # that `nightly_steps_ok` already folds in.
 OK_GATES = (
-    "hub_ok", "drift_ok", "graph_drift_ok", "outbox_ok", "backup_ok", "capture_liveness_ok", "git_sync_ok",
+    "hub_ok", "drift_ok", "outbox_ok", "backup_ok", "capture_liveness_ok", "git_sync_ok",
     "dsn_file_ok", "index_freshness_ok", "jobs_ok", "embed_coverage_ok", "synth_budget_ok", "synth_provider_ok",
-    "graph_backup_ok", "graph_offsite_ok", "hub_snapshot_ok", "ledger_copy_ok", "recall_probe_ok", "bundle_seal_ok",
+    "hub_snapshot_ok", "ledger_copy_ok", "recall_probe_ok", "bundle_seal_ok",
     "literal_trgm_ok", "prompt_recall_snapshot_ok", "prompt_recall_outcomes_ok", "recall_daemon_ok", "forget_list_ok",
     "nightly_steps_ok", "topics_embed_lag_ok", "degraded_rate_ok", "launchers_ok", "ledger_outbox_ok",
     "disk_space_ok", "recall_eval_ok", "schema_migrations_ok",
@@ -367,12 +372,6 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         synth_budget["tokens_today"] = None
         synth_budget["estimated_usd_today"] = None
         synth_budget["usage_error"] = f"{type(e).__name__}: {e}"
-    try:
-        from khipu import graph_backup
-
-        graph_backup_block = graph_backup.local_health()
-    except Exception as e:  # noqa: BLE001
-        graph_backup_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # Bundle seal: red the moment a signed .app has gained a file it shouldn't
     # have — this is the tripwire the 0.3.15 "Khipu is damaged" incident
     # needed (see khipu.bundle_seal). `na` (maintainer checkout, no codesign)
@@ -440,7 +439,7 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     # install or a Mac that just updated has nothing in nightly-last.json
     # yet, which is not evidence of a failure (maintainer, 2026-09-14:
     # "especially after they update"). Reuses the same not_configured /
-    # grey-row convention memory_root and graph_sqlite already use.
+    # grey-row convention memory_root already uses.
     from khipu.jobs import skipped_step_names
 
     not_configured.extend(skipped_step_names(nightly_steps))
@@ -501,7 +500,6 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         "jobs": jobs, "job_failures": known_job_failures, "jobs_ok": jobs_ok,
         "index_freshness": index_fresh, "index_freshness_ok": index_freshness_ok,
         "synth_budget": synth_budget, "synth_budget_ok": synth_budget_ok,
-        "graph_backup": graph_backup_block, "graph_backup_ok": bool(graph_backup_block.get("ok")),
         "bundle_seal": bundle_seal_block, "bundle_seal_ok": bool(bundle_seal_block.get("ok")),
         "prompt_recall_snapshot": prompt_recall_snapshot,
         "prompt_recall_snapshot_ok": bool(prompt_recall_snapshot.get("ok")),
@@ -658,8 +656,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     from khipu.drift import backup_health, sample_drift, status_payload
 
     mem = Path(args.memory_root) if args.memory_root else None
-    # The three checks that wait longest on the hub (file-vs-hub drift, the
-    # graph mirror's drift, embedding coverage with its topic lag) and the
+    # The checks that wait longest on the hub (file-vs-hub drift,
+    # embedding coverage with its topic lag) and the
     # checks that read only this Mac run in worker threads, the hub ones on
     # their own connections, while the rest of doctor goes on; each answer is
     # what it was when they ran one after another (58 s end to end on
@@ -687,15 +685,6 @@ def _doctor_sample_drift(sample_drift, mem: Path, sample) -> dict:
             "topic_mismatches": [],
             "topic_files_unreadable": [],
         }
-
-
-def _doctor_graph_drift() -> dict:
-    try:
-        from khipu.graph_sync import graph_drift
-
-        return graph_drift()
-    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 def _doctor_embed_checks() -> tuple[dict, bool, dict]:
@@ -734,18 +723,7 @@ def _doctor_start_workers(pool, args, mem, sample_drift) -> dict:
     workers: dict = {
         "drift": pool.submit(_doctor_sample_drift, sample_drift, mem, args.sample)
         if mem is not None else None,
-        "graph": None,
-        "graph_configured": None,
-        "graph_error": None,
     }
-    try:
-        from khipu.config import path_setting
-
-        workers["graph_configured"] = path_setting("graph_sqlite") is not None
-    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
-        workers["graph_error"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    if workers["graph_configured"]:
-        workers["graph"] = pool.submit(_doctor_graph_drift)
     workers["embed"] = pool.submit(_doctor_embed_checks)
     # Every check that reads only this Mac; `doctor --quick` gates on the same
     # set (khipu.promote's first gate step).
@@ -766,9 +744,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         status_payload_snapshot,
     )
 
-    drift_future, graph_future, embed_future, local_future = (
-        workers["drift"], workers["graph"], workers["embed"], workers["local"])
-    graph_configured, graph_error = workers["graph_configured"], workers["graph_error"]
+    drift_future, embed_future, local_future = (
+        workers["drift"], workers["embed"], workers["local"])
     hub_ok = True
     try:
         status = status_payload(None)
@@ -808,17 +785,11 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
             "topic_files_unreadable": [],
         }
     backup = backup_health()
-    try:
-        from khipu import graph_backup
-
-        _graph_offsite = graph_backup.offsite_health()
-    except Exception as e:  # noqa: BLE001
-        _graph_offsite = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # --probe captures to the hub and then searches for it, so the hub checks
     # finish first, as they did when everything ran in order: a probe row
     # must never show up in their answers.
     if getattr(args, "probe", False):
-        for fut in (drift_future, graph_future, embed_future):
+        for fut in (drift_future, embed_future):
             if fut is not None:
                 fut.exception()
     # Informational: per-library coverage and profile, beside embed coverage.
@@ -973,7 +944,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     # names and liveness rows used to be added.
     local = local_future.result()
     not_configured.extend(local.pop("not_configured"))
-    _graph_backup = local["graph_backup"]
     liveness = local["capture_liveness"]
     (outbox, outbox_ok, git_sync, secrets, dsn_file_ok, synth_provider, synth_provider_ok, jobs,
      known_job_failures, jobs_ok, index_fresh, index_freshness_ok, synth_budget, synth_budget_ok,
@@ -998,19 +968,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         and not drift.get("topic_files_unreadable")
         and not drift.get("error")
     )
-    # Graph: graphify's graph.sqlite vs PG's graphify-owned rows, both
-    # directions (audit 2026-08-17 — PG had silently diverged for two weeks
-    # while doctor stayed green because it only looked at episodes/topics).
-    # A CONFIGURED-but-missing graph.sqlite is a red result, not a skip: that
-    # machine is supposed to be able to see the graph's source. An UNCONFIGURED
-    # one is skipped and named.
-    if graph_configured is False:
-        not_configured.append("graph_sqlite")
-        graph = {"ok": True, "skipped": "graph_sqlite not configured"}
-    elif graph_future is not None:
-        graph = graph_future.result()
-    else:
-        graph = graph_error
     embed_coverage, embed_coverage_ok, topics_lag = embed_future.result()
     # Pending migrations: red. With the hub down the read fails too; hub_ok
     # is already red for that, so the schema row says why it was not checked.
@@ -1081,7 +1038,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "ledger_copy": ledger_copy,
         "ledger_copy_ok": bool(ledger_copy.get("ok")),
         "drift": drift,
-        "graph_drift": graph,
         "outbox": outbox,
         "ledger_outbox": local["ledger_outbox"],
         "disk_space": local["disk_space"],
@@ -1144,12 +1100,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
                      + _replica_schema_warnings(local) + _recall_outcomes_warnings(local)
                      + _storage_warnings(local) + _owner_writes_warnings()),
         "not_configured": not_configured,
-        "graph_backup": _graph_backup,
-        "graph_backup_ok": bool(_graph_backup.get("ok")),
-        "graph_offsite": _graph_offsite,
-        "graph_offsite_ok": bool(_graph_offsite.get("ok")),
         "drift_ok": drift_ok,
-        "graph_drift_ok": bool(graph.get("ok")),
         "outbox_ok": outbox_ok,
         "capture_liveness_ok": bool(liveness.get("ok")),
         "git_sync_ok": bool(git_sync.get("ok")),
@@ -1899,7 +1850,6 @@ def _cmd_embed_index(args: argparse.Namespace) -> int:
     return 0
 
 
-# --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
 def _cmd_embed_profile_delete(args: argparse.Namespace) -> int:
     """`khipu embed profiles delete ID --yes`: delete a profile nothing uses and
     every vector it owns. Refuses (naming the users) when it is the active
@@ -2023,7 +1973,6 @@ def cmd_library(args: argparse.Namespace) -> int:
     from khipu import library
 
     cmd = args.library_cmd
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     if cmd == "backfill" and (getattr(args, "job", False) or getattr(args, "job_id", None)):
         return cmd_library_backfill_job(args)
     try:
@@ -2049,7 +1998,6 @@ def cmd_library(args: argparse.Namespace) -> int:
             elif cmd == "scan":
                 out = library.scan(conn, args.name, allow_rebuild=bool(getattr(args, "allow_rebuild", False)))
             elif cmd == "backfill":
-                # --bypass-harness (sonnet lane): dispatched agent, no delegation.
                 out = library.backfill(
                     conn, args.name, limit=args.limit, stale=bool(args.stale),
                     profile=getattr(args, "profile", None),
@@ -2068,37 +2016,6 @@ def cmd_library(args: argparse.Namespace) -> int:
         return _backfill_exit_code(out)
     if cmd == "import" and out.get("ok") is False:
         return 1
-    return 0
-
-
-def cmd_embed_media_backfill(args: argparse.Namespace) -> int:
-    """Top-level hyphenated job: native PNG/JPEG into gemini-embedding-2@768."""
-    from khipu.embed import backfill_media
-    from khipu.jobs import _write_job_state
-
-    dry_run = bool(getattr(args, "dry_run", False))
-    yes = bool(getattr(args, "yes", False))
-    try:
-        stats = backfill_media(
-            dry_run=dry_run,
-            yes=yes,
-            limit=getattr(args, "limit", None),
-            source_id=getattr(args, "source_id", None),
-            profile=getattr(args, "profile", None),
-        )
-    except Exception as e:  # noqa: BLE001
-        if not dry_run:
-            _write_job_state("embed_media_backfill", 1)
-        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
-        return 1
-    if stats.get("needs_yes"):
-        if not dry_run:
-            _write_job_state("embed_media_backfill", 2)
-        print(json.dumps({"ok": False, **stats}, indent=2))
-        return 2
-    if not dry_run:
-        _write_job_state("embed_media_backfill", 0)
-    print(json.dumps({"ok": True, **stats}, indent=2))
     return 0
 
 
@@ -2295,17 +2212,6 @@ def cmd_graph(args: argparse.Namespace) -> int:
         out = graph_neighbors_snapshot(args.id, args.hops, args.limit)
         out.update(stale_fields())
     print(json.dumps(out, indent=2, default=str))
-    return 0
-
-
-def cmd_topic_graph_backfill(args: argparse.Namespace) -> int:
-    from khipu.mirror import backfill_topic_graph
-
-    mem = _require_memory_root(args)
-    if mem is None:
-        return 2
-    stats = backfill_topic_graph(mem, dry_run=bool(getattr(args, "dry_run", False)))
-    print(json.dumps(stats, indent=2, default=str))
     return 0
 
 
@@ -3677,10 +3583,9 @@ def cmd_get(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
-        wiki = bool(getattr(args, "wiki", False))
         if getattr(args, "all", False):
-            return _get_topic_all(ident, offset, max_bytes, wiki=wiki)
-        row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
+            return _get_topic_all(ident, offset, max_bytes)
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
     if row is None:
         print(json.dumps({"ok": False, "error": f"{kind} not found: {ident}"}))
         return 1
@@ -3696,8 +3601,7 @@ def cmd_get(args: argparse.Namespace) -> int:
     return 0
 
 
-def _get_topic_all(ident: str, offset: int, max_bytes: int, *,
-                   wiki: bool = False) -> int:
+def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
     """`khipu get <topic> --all`: follow body_next_offset and write the body
     from ``offset`` to the end on stdout, raw, one page at a time. Stops with
     an error if the topic changes between pages (content_hash or updated_at),
@@ -3706,7 +3610,7 @@ def _get_topic_all(ident: str, offset: int, max_bytes: int, *,
 
     first = None
     while True:
-        row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
         if row is None:
             print(json.dumps({"ok": False, "error": f"topic not found: {ident}"}),
                   file=sys.stderr)
@@ -3925,19 +3829,6 @@ def cmd_config(args: argparse.Namespace) -> int:
             print(json.dumps({"ok": False, "error": str(err).strip("'\""), "key": key}))
             return 2
         print(json.dumps({"ok": True, "cli_settings": cli_settings_status(), "config_file": str(path)}))
-        return 0
-    if (args.set and args.set[0] == "graph_backup_remote") or args.unset == "graph_backup_remote":
-        # Where `graph-backup offsite` copies the graph snapshot (rclone
-        # remote:path); `--unset` goes back to the default.
-        from khipu.config import graph_backup_remote_status, set_graph_backup_remote
-
-        try:
-            path = set_graph_backup_remote(args.set[1] if args.set else None)
-        except ValueError as err:
-            print(json.dumps({"ok": False, "error": str(err)}))
-            return 2
-        print(json.dumps({"ok": True, "graph_backup_remote": graph_backup_remote_status(),
-                          "config_file": str(path)}))
         return 0
     from khipu import replica_heal
 
@@ -4168,7 +4059,6 @@ def cmd_config(args: argparse.Namespace) -> int:
     from khipu.config import (
         cli_settings_status,
         float_settings_status,
-        graph_backup_remote_status,
         list_setting,
         count_settings_status,
         minute_settings_status,
@@ -4203,7 +4093,6 @@ def cmd_config(args: argparse.Namespace) -> int:
         "work": _work.settings_status(),
         "work_suggested": _work.suggested_files(),
         "offline": _offline.settings_status(),
-        "graph_backup_remote": graph_backup_remote_status(),
         "config_file": str(config_file()),
         "config": load_config(),
     }
@@ -4598,147 +4487,10 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     if args.outbox_cmd == "retry-dead":
         print(json.dumps(outbox.retry_dead(), indent=2))
         return 0
-    if args.outbox_cmd == "merge-line-preferences":
-        return _outbox_merge_preferences(args)
-    if args.outbox_cmd == "span-covered":
-        return _outbox_span_covered(args)
     out = outbox.drain(limit=args.limit)
     out["remaining"] = outbox.status()["pending"]
     print(json.dumps(out, indent=2))
     return 0 if not out.get("failed") else 1
-
-
-def _outbox_merge_preferences(args: argparse.Namespace) -> int:
-    """``khipu outbox merge-line-preferences``: a dry run by default (counts
-    and redacted samples). ``--apply`` and ``--undo ID`` change the hub, so
-    each is the owner's: the app (``--from-app``), a yes typed on a terminal,
-    or ``--owner-direction``, as ``routing._owner_via`` checks them; logged
-    with its Undo either way."""
-    from khipu import outbox_preferences, owner_direction, routing
-
-    if args.apply and args.undo:
-        print(json.dumps({"ok": False, "error": "give --apply or --undo, not both"}))
-        return 2
-    if getattr(args, "include_unproven", False) and not args.undo:
-        print(json.dumps({"ok": False, "error": "--include-unproven goes with --undo"}))
-        return 2
-    if getattr(args, "include_unproven", False) and not getattr(args, "by_direction", False):
-        print(json.dumps({"ok": False, "code": "owner_only",
-                          "error": "--include-unproven needs --owner-direction (a conversation the owner typed "
-                                   "in); it is logged. Nothing was changed."}))
-        return 2
-    with_decisions = bool(getattr(args, "include_decisions", False))
-    content = bool(getattr(args, "include_content", False)) or with_decisions
-    if content and args.undo:
-        print(json.dumps({"ok": False, "error": "--include-content and --include-decisions go with a dry run or "
-                                                "--apply; --undo reads what the merge recorded"}))
-        return 2
-    if not (args.apply or args.undo):
-        print(json.dumps(outbox_preferences.dry_run(include_content=content, include_decisions=with_decisions),
-                         indent=2))
-        return 0
-    if args.undo:
-        line = owner_direction._find(args.undo)
-        if line is not None and line.get("action") != outbox_preferences.ACTION:
-            print(json.dumps({"ok": False, "code": "refused",
-                              "error": f"owner action {args.undo} is not a preference merge; nothing was changed"}))
-            return 2
-        why = owner_direction._undo_refusal(line, args.undo)
-        if why:
-            print(json.dumps({"ok": False, "code": "refused", "error": why + "; nothing was changed"}))
-            return 2
-        unproven = bool(getattr(args, "include_unproven", False))
-        want = owner_direction.intent("direction.undo", args.undo,
-                                      facts={"include_unproven": True} if unproven else None)
-    else:
-        facts = {"include_content": True} if content else {}
-        if with_decisions:
-            facts["include_decisions"] = True
-        want = owner_direction.intent(outbox_preferences.ACTION, "outbox", facts=facts or None)
-    refused = {"ok": False, "code": "owner_only",
-               "error": "Merging into the hub (or undoing a merge) is the owner's change: make it in the Khipu "
-                        "app, type yes on a terminal, or pass --owner-direction from a conversation the owner "
-                        "typed in. Nothing was changed."}
-    via = None
-    if getattr(args, "from_app", False):
-        caller = routing._caller()
-        if caller["app"]:
-            owner_direction.noted(want, {"auth": "app",
-                                         "auth_chain": " < ".join(caller["chain"] + [caller["where"]])})
-            via = "app"
-    elif getattr(args, "by_direction", False):
-        try:
-            owner_direction.gate(want)
-        except owner_direction.DirectionRefused as err:
-            print(json.dumps({**err.refusal(), "error": err.message + " Nothing was changed."}))
-            return 2
-        via = "direction"
-    elif routing.typed_yes(f"This changes preferences{' and topics' if content else ''}"
-                           f"{' and adds decision rows' if with_decisions else ''} on hub episodes "
-                           "(Undo puts them back). Type yes to confirm: "):
-        owner_direction.noted(want, {"auth": "terminal", "auth_chain": " < ".join(routing._caller()["chain"])})
-        via = "cli"
-    if via is None:
-        refused["error"] = routing.terminal_refusal(refused.get("error"))
-        print(json.dumps(refused))
-        return 2
-    try:
-        if args.undo:
-            res = owner_direction.undo(args.undo, via, include_unproven=unproven)
-        else:
-            res = outbox_preferences.apply(record=owner_direction.record_preference_merges,
-                                           record_resolutions=owner_direction.record_preference_resolutions,
-                                           record_committed=owner_direction.record_preference_commits,
-                                           include_content=content, include_decisions=with_decisions)
-    except BaseException:
-        owner_direction._abandon()
-        raise
-    res = owner_direction.finish(res, **({"state": "partial"} if res.get("unproven") else {})) or res
-    print(json.dumps(res, indent=2, default=str))
-    return 0 if res.get("ok") else 1
-
-
-def _outbox_span_covered(args: argparse.Namespace) -> int:
-    """``khipu outbox span-covered``: a dry run by default, in plain words.
-    ``--apply`` is the owner's: a yes typed on a terminal, or ``--owner-direction``
-    only in the replay of a request his answer confirmed (``owner_direction.CONFIRM_ONLY``),
-    logged with its Undo either way. The drain never reaches this."""
-    from khipu import outbox_span_covered, owner_direction, routing
-
-    def show(out: dict) -> int:
-        print(json.dumps(out, indent=2, default=str) if args.json else outbox_span_covered.words(out))
-        return 0 if out.get("ok") else 1
-
-    if not args.apply:
-        return show(outbox_span_covered.dry_run())
-    want = owner_direction.intent(outbox_span_covered.ACTION, "outbox")
-    if getattr(args, "by_direction", False):
-        try:
-            if not owner_direction.replaying(outbox_span_covered.ACTION):
-                raise owner_direction.DirectionRefused(
-                    "confirm_needed", "This needs the owner's own yes: ask for it through khipu_owner_act, which "
-                                      "holds it until he answers.")
-            owner_direction.gate(want)
-        except owner_direction.DirectionRefused as err:
-            show({**err.refusal(), "error": err.message + " Nothing was changed."})
-            return 2
-    elif routing.typed_yes("This moves the dead jobs a dry run would retire to the outbox's resolved folder. Each "
-                           "job's own summary then stays only in that local record; nothing is written to the hub "
-                           "(Undo puts them back). Type yes to confirm: "):
-        from khipu import owner_act
-        _ok, started = owner_act.settle_terminal(outbox_span_covered.ACTION, {})
-        return show(started)
-    else:
-        show({"ok": False, "code": "owner_only",
-              "error": "Retiring dead jobs is the owner's change: type yes on a terminal, or ask for it through "
-                       "khipu_owner_act in a conversation the owner typed in. Nothing was changed."})
-        return 2
-    try:
-        res = outbox_span_covered.apply(record_resolutions=owner_direction.record_preference_resolutions)
-    except BaseException:
-        owner_direction._abandon()
-        raise
-    return show(owner_direction.finish(res) or res)
 
 
 def cmd_promote(args: argparse.Namespace) -> int:
@@ -5050,20 +4802,6 @@ def cmd_recall(args: argparse.Namespace) -> int:
     return 2
 
 
-def cmd_graph_sync(args: argparse.Namespace) -> int:
-    """Mirror graphify's graph.sqlite into PG (idempotent) or report drift."""
-    from khipu.graph_sync import graph_drift, sync_from_sqlite
-
-    sqlite = Path(args.sqlite) if args.sqlite else None
-    if args.check:
-        d = graph_drift(sqlite)
-        print(json.dumps(d, indent=2))
-        return 0 if d.get("ok") else 2
-    out = sync_from_sqlite(sqlite, dry_run=args.dry_run)
-    print(json.dumps(out, indent=2))
-    return 0 if args.dry_run or out.get("drift", {}).get("ok") else 2
-
-
 def cmd_sessions(args: argparse.Namespace) -> int:
     """Native session capture across every harness: the shared queue, per-harness
     heartbeat + liveness, and the drain (model extraction + capture) that turns
@@ -5264,20 +5002,6 @@ def cmd_features(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_briefs(args: argparse.Namespace) -> int:
-    """`khipu briefs plan | build [--topic SLUG] [--limit N] | show SLUG`."""
-    from khipu import briefs
-
-    return briefs.cli_main(args)
-
-
-def cmd_reflect(args: argparse.Namespace) -> int:
-    """`khipu reflect "question" [--project P]`."""
-    from khipu import reflect
-
-    return reflect.cli_main(args)
-
-
 def cmd_paths(args: argparse.Namespace) -> int:
     from khipu.paths import paths_status, set_data_dir
 
@@ -5316,12 +5040,6 @@ def cmd_monthly(args: argparse.Namespace) -> int:
     from khipu.jobs import run_monthly
 
     return run_monthly(dry_run=bool(args.dry_run))
-
-
-def cmd_graph_build(_args: argparse.Namespace) -> int:
-    from khipu.jobs import run_graph_build
-
-    return run_graph_build()
 
 
 def cmd_models(args: argparse.Namespace) -> int:
@@ -5443,10 +5161,6 @@ def cmd_sources(args: argparse.Namespace) -> int:
         if action == "list":
             out = {
                 "sources": sources.load_sources().get("sources", []),
-                "resolved": sources.resolve_for_graphify(),
-                "graph_producer": __import__(
-                    "khipu.graph_sync", fromlist=["is_graph_producer"]
-                ).is_graph_producer(),
             }
             print(json.dumps(out, indent=2, default=str))
             return 0
@@ -5458,77 +5172,15 @@ def cmd_sources(args: argparse.Namespace) -> int:
             sources.set_enabled(args.source_id, False)
             print(json.dumps({"ok": True, "id": args.source_id, "enabled": False}))
             return 0
-        if action == "set-embed-media":
-            raw = str(getattr(args, "embed_media_value", "")).strip().lower()
-            if raw not in ("on", "off"):
-                print(
-                    json.dumps(
-                        {
-                            "ok": False,
-                            "error": "set-embed-media expects on|off",
-                        }
-                    )
-                )
-                return 2
-            on = raw == "on"
-            sources.set_embed_media(args.source_id, on)
-            print(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "id": args.source_id,
-                        "embed_media": on,
-                    }
-                )
-            )
-            return 0
-        if action == "add":
-            sources.add_code_root(Path(args.root))
-            print(json.dumps({"ok": True, "root": args.root}))
-            return 0
         if action == "remove":
             sources.remove_user_source(args.source_id)
             print(json.dumps({"ok": True, "id": args.source_id}))
-            return 0
-        if action == "export":
-            out = sources.export_resolved()
-            print(
-                json.dumps(
-                    {"ok": True, "path": str(sources.resolved_path()), "resolved": out}
-                )
-            )
             return 0
         print(json.dumps({"ok": False, "error": f"unknown sources action: {action}"}))
         return 2
     except ValueError as e:
         print(json.dumps({"ok": False, "error": str(e)}))
         return 2
-
-
-@guard_output
-def cmd_graph_backup(args: argparse.Namespace) -> int:
-    from khipu import graph_backup
-    from khipu.join_errors import redact_connection_text
-
-    action = getattr(args, "graph_backup_cmd", None)
-    actions = {
-        "record-local": graph_backup.record_local,
-        "offsite": graph_backup.run_offsite,
-        "drill": graph_backup.scratch_drill,
-        "status": graph_backup.status_payload,
-    }
-    if action not in actions:
-        print(
-            json.dumps({"ok": False, "error": f"unknown graph-backup action: {action}"})
-        )
-        return 2
-    try:
-        out = actions[action]()
-    except Exception:  # noqa: BLE001 — backup failures can quote credentials
-        print(json.dumps({"ok": False, "error": f"graph backup {action} failed"}))
-        return 2
-    print(redact_connection_text(json.dumps(out, indent=2, default=str)))
-    return 0 if action == "status" or out.get("ok", False) else 2
 
 
 def cmd_import_local(args: argparse.Namespace) -> int:
@@ -5566,10 +5218,6 @@ def cmd_components(args: argparse.Namespace) -> int:
         from khipu.components_backup import bootstrap_local_backup
 
         return _print_component_result(bootstrap_local_backup())
-    if action == "install-graphify":
-        from khipu.components_graphify import install_graphify
-
-        return _print_component_result(install_graphify(first_run=True))
     if action == "status-json":
         from khipu.components_postgres import components_status
 
@@ -5578,10 +5226,6 @@ def cmd_components(args: argparse.Namespace) -> int:
         from khipu.components_postgres import upgrade_postgres
 
         return _print_component_result(upgrade_postgres())
-    if action == "upgrade-graphify":
-        from khipu.components_graphify import upgrade_graphify
-
-        return _print_component_result(upgrade_graphify())
     if action == "check-remote":
         from khipu.components_postgres import check_remote_postgres
 
@@ -5594,10 +5238,6 @@ def cmd_components(args: argparse.Namespace) -> int:
             from khipu.components_postgres import install_local_postgres
 
             return _print_component_result(install_local_postgres())
-        if target == "graphify":
-            from khipu.components_graphify import install_graphify
-
-            return _print_component_result(install_graphify(first_run=False))
         print(json.dumps({"ok": False, "error": f"unknown install target: {target}"}))
         return 1
     if action == "status":
@@ -5610,10 +5250,6 @@ def cmd_components(args: argparse.Namespace) -> int:
             from khipu.components_postgres import upgrade_postgres
 
             return _print_component_result(upgrade_postgres())
-        if target == "graphify":
-            from khipu.components_graphify import upgrade_graphify
-
-            return _print_component_result(upgrade_graphify())
         print(json.dumps({"ok": False, "error": f"unknown upgrade target: {target}"}))
         return 1
     print(json.dumps({"ok": False, "error": "missing components subcommand"}))
@@ -5845,7 +5481,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile",
         help="Target profile id (default: active). e.g. gemini-embedding-2@768",
     )
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     bf.add_argument(
         "--stale", action="store_true",
         help="Accepted for symmetry with `library backfill`: memory backfill always "
@@ -5903,7 +5538,6 @@ def build_parser() -> argparse.ArgumentParser:
         "profiles", help="List embedding profiles or add one (provider adapter + record)"
     )
     pr_sub = pr.add_subparsers(dest="profiles_cmd", required=True)
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     pr_sub.add_parser(
         "list",
         help="Every profile: provider, model, dim, endpoint, rows per space, where it is used, "
@@ -5968,7 +5602,6 @@ def build_parser() -> argparse.ArgumentParser:
     lb = lib_sub.add_parser("backfill", help="Embed chunks that have no vector under the library's profile")
     lb.add_argument("name")
     lb.add_argument("--limit", type=int, default=None, help="Embed at most N chunks this run")
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     lb.add_argument(
         "--stale", action="store_true",
         help="Also re-embed chunks whose text changed since they were embedded",
@@ -6044,36 +5677,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mo.set_defaults(func=cmd_monthly)
 
-    gb = sub.add_parser(
-        "graph-build", help="Run graphify_nightly.py once (graph.sqlite)"
-    )
-    gb.set_defaults(func=cmd_graph_build)
-
-    emb = sub.add_parser(
-        "embed-media-backfill",
-        help="Embed PNG/JPEG under sources with embed_media (active Gemini Embedding 2)",
-    )
-    emb.add_argument("--dry-run", action="store_true", help="Count only; no API calls")
-    emb.add_argument(
-        "--yes",
-        action="store_true",
-        help=f"Required when more than {1000} images would be scanned",
-    )
-    emb.add_argument("--limit", type=int, default=None, help="Cap files this run")
-    emb.add_argument(
-        "--source-id",
-        dest="source_id",
-        default=None,
-        help="Only walk this source id (must have embed_media on + root)",
-    )
-    emb.add_argument(
-        "--profile",
-        default=None,
-        help="Profile id (default gemini-embedding-2@768)",
-    )
-    emb.set_defaults(func=cmd_embed_media_backfill)
-
-    # --bypass-harness (sonnet lane): dispatched agent, brief says do not delegate.
     # Detached-spawn wrappers (the desktop app's job pattern: one hyphenated
     # subcommand, output goes to a log, progress goes to <data_dir>/jobs/<id>.json).
     ebj = sub.add_parser(
@@ -6145,61 +5748,20 @@ def build_parser() -> argparse.ArgumentParser:
     md.set_defaults(func=cmd_models, models_cmd="show")
 
     src = sub.add_parser(
-        "sources", help="Graph membership: list / enable / disable / add / export"
+        "sources", help="Memory sources: list / enable / disable / add"
     )
     src_sub = src.add_subparsers(dest="sources_cmd", required=True)
-    src_sub.add_parser(
-        "list", help="JSON: sources + resolve_for_graphify"
-    ).set_defaults(func=cmd_sources)
+    src_sub.add_parser("list", help="JSON: the sources").set_defaults(func=cmd_sources)
     en = src_sub.add_parser("enable", help="Enable a seeded or user source")
     en.add_argument("source_id")
     en.set_defaults(func=cmd_sources)
     dis = src_sub.add_parser("disable", help="Disable a source (does not purge PG)")
     dis.add_argument("source_id")
     dis.set_defaults(func=cmd_sources)
-    sem = src_sub.add_parser(
-        "set-embed-media",
-        help="Opt a source into native image embed (on|off; default off)",
-    )
-    sem.add_argument("source_id")
-    sem.add_argument(
-        "embed_media_value",
-        choices=("on", "off"),
-        help="on = walk PNG/JPEG under this source's root on embed-media-backfill",
-    )
-    sem.set_defaults(func=cmd_sources)
-    add = src_sub.add_parser("add", help="Add a code_ast root (absolute path)")
-    add.add_argument("--root", required=True, dest="root", help="Absolute code root")
-    add.set_defaults(func=cmd_sources)
     rem = src_sub.add_parser("remove", help="Remove a user-added source row")
     rem.add_argument("source_id")
     rem.set_defaults(func=cmd_sources)
-    src_sub.add_parser("export", help="Write graph_sources.resolved.json").set_defaults(
-        func=cmd_sources
-    )
     src.set_defaults(func=cmd_sources)
-
-    gbu = sub.add_parser(
-        "graph-backup",
-        help="Graph.sqlite snapshot record / offsite / drill / status (producer Mac)",
-    )
-    gbu_sub = gbu.add_subparsers(dest="graph_backup_cmd", required=True)
-    gbu_sub.add_parser(
-        "record-local",
-        help="Integrity-check latest snapshot and record graph_snapshot ops_event",
-    ).set_defaults(func=cmd_graph_backup)
-    gbu_sub.add_parser(
-        "offsite",
-        help="rclone copyto latest snapshot to graph_backup_remote (default r2:khipu-backups/khipu-graph)",
-    ).set_defaults(func=cmd_graph_backup)
-    gbu_sub.add_parser(
-        "status", help="Local + offsite health and last ops_events"
-    ).set_defaults(func=cmd_graph_backup)
-    gbu_sub.add_parser(
-        "drill",
-        help="Scratch restore drill on latest snapshot (never touches live graph.sqlite)",
-    ).set_defaults(func=cmd_graph_backup)
-    gbu.set_defaults(func=cmd_graph_backup)
 
     rc = sub.add_parser("reconcile", help="Full file→PG episodes/topics sync")
     rc.add_argument("--memory-root", default=_memory_root_default())
@@ -6852,10 +6414,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--all", action="store_true",
         help="Topics: write the whole body (from --offset) to stdout, page by page",
     )
-    gt.add_argument(
-        "--wiki", action="store_true",
-        help="Topics: return the raw wiki page even when a current brief exists",
-    )
     gt.set_defaults(func=cmd_get)
 
     mg = sub.add_parser(
@@ -7022,7 +6580,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=2,
         metavar=("KEY", "VALUE"),
         help="Persist a machine-specific path (memory_root, memory_repo, "
-        "capture_v2, graph_sqlite, gemini_key_file), a 0-1 similarity knob "
+        "capture_v2, gemini_key_file), a 0-1 similarity knob "
         "(dedup_similarity, commitment_close_similarity), the relevance "
         "floor (relevance.cosine_floor, above 0 up to 1; per embedding profile "
         "relevance.cosine_floor_by_profile.<profile>), a daily call "
@@ -7031,8 +6589,7 @@ def build_parser() -> argparse.ArgumentParser:
         "summariser fallback (synth_fallback gemini|none: what a failed "
         "window does on a provider other than Gemini), the comma-"
         'separated user_aliases list (e.g. --set user_aliases "matt,matthew") '
-        "the graph backup destination (graph_backup_remote, an rclone "
-        "remote:path, default r2:khipu-backups/khipu-graph), how far back "
+        "how far back "
         "doctor's rate checks look (doctor_rate_window_minutes, default 60), "
         "how long the promotion gate waits for an unreachable hub "
         "(promote_hub_wait_minutes, default 10), the red doctor checks the "
@@ -7044,7 +6601,7 @@ def build_parser() -> argparse.ArgumentParser:
         "are also supported. Run khipu config for current names, defaults and sources",
     )
     cfg.add_argument("--unset", metavar="KEY",
-                     help="Remove a path setting, a daily call ceiling, a minutes setting, synth_fallback, graph_backup_remote or usage_accounts, or "
+                     help="Remove a path setting, a daily call ceiling, a minutes setting, synth_fallback or usage_accounts, or "
                      "relevance.cosine_floor / "
                      "relevance.cosine_floor_by_profile.<profile> to restore its default; also supports CLI-path, "
                      "replica, storage, ledger, work, offline and routing settings")
@@ -7227,25 +6784,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gsy.set_defaults(func=cmd_git_sync)
 
-    gs = sub.add_parser(
-        "graph-sync",
-        help="Mirror graphify's graph.sqlite into PG (nodes/edges); --check reports drift only",
-    )
-    gs.add_argument(
-        "--sqlite",
-        help="Path to graph.sqlite; otherwise use configured graph_sqlite (environment overrides config.json); "
-        "fail if no path is configured",
-    )
-    gs.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Run the sync in a transaction and roll back",
-    )
-    gs.add_argument(
-        "--check", action="store_true", help="Drift only; exit 2 when not zero"
-    )
-    gs.set_defaults(func=cmd_graph_sync)
-
     ob = sub.add_parser(
         "outbox", help="Offline outbox: drain (replay into PG) / status"
     )
@@ -7257,46 +6795,8 @@ def build_parser() -> argparse.ArgumentParser:
         "retry-dead",
         help="Move captures buried after KHIPU_OUTBOX_MAX_ATTEMPTS failures back into the queue. Jobs refused for "
              "not announcing their source identities stay held and are counted, since a retry may land them as "
-             "duplicates: `span-covered` counts them",
+             "duplicates",
     )
-    obs = ob_sub.add_parser(
-        "span-covered",
-        help="Dead jobs refused for not announcing their source identities, whose range sits inside another episode "
-             "of the session that holds their evidence fields: count them (default) or retire them with a record "
-             "(--apply), where a job's own summary then stays. Summaries are not compared. Writes nothing to the hub",
-    )
-    obs.add_argument("--apply", action="store_true",
-                     help="Retire them (the owner's: a typed yes, or his confirmed answer through khipu_owner_act)")
-    obs.add_argument("--json", action="store_true", help="Print the counts as JSON")
-    from khipu.owner_direction import add_owner_flags as _span_owner_flags
-
-    _span_owner_flags(obs)
-    obm = ob_sub.add_parser(
-        "merge-line-preferences",
-        help="Held memory-file lines that differ from the hub only by preferences it lacks: "
-             "count them (default), merge them (--apply) or undo a merge (--undo ID)",
-    )
-    obm.add_argument("--apply", action="store_true",
-                     help="Append the missing preferences to their hub episodes (the owner's: the app, a typed yes "
-                          "or --owner-direction)")
-    obm.add_argument("--undo", metavar="OWNER_ACTION", default=None,
-                     help="Put back the exact prior preferences of one merge (the owner's, as --apply)")
-    obm.add_argument("--include-content", action="store_true",
-                     help="Also append the topic items a held line carries that its hub episode lacks (where the "
-                          "hub's writer would put them), and archive lines that differ only by a kept hub scope; "
-                          "decisions are appended only with --include-decisions")
-    obm.add_argument("--include-decisions", action="store_true",
-                     help="Also store the decisions a held line carries that its hub episode lacks, through the "
-                          "capture's decision writer (own rows, dedup, reversal detection, fact claims), and "
-                          "append them to the episode (implies --include-content; Undo retracts the rows it "
-                          "created)")
-    obm.add_argument("--include-unproven", action="store_true",
-                     help="With --undo: also revert episodes whose commit Khipu could not prove (owner direction, "
-                          "logged)")
-    obm.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
-    from khipu.owner_direction import add_owner_flags as _merge_owner_flags
-
-    _merge_owner_flags(obm)
     ob.set_defaults(func=cmd_outbox)
 
     jb = sub.add_parser(
@@ -7306,14 +6806,14 @@ def build_parser() -> argparse.ArgumentParser:
     jb_sub = jb.add_subparsers(dest="jobs_cmd", required=True)
     jb_sub.add_parser("status", help="Print khipu.jobs.job_status() as JSON")
     jbi = jb_sub.add_parser("install", help="Render and load the named jobs; with no names, install the six default jobs, excluding opt-in recall_daemon")
-    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon,replica_refresh}")
+    jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,notes_watch,queue_drain,recall_daemon,replica_refresh}")
     jbr = jb_sub.add_parser(
         "refresh",
         help="Re-render + reload installed jobs whose plist is stale (default: all installed)",
     )
-    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon,replica_refresh}")
+    jbr.add_argument("names", nargs="*", metavar="{nightly,monthly,notes_watch,queue_drain,recall_daemon,replica_refresh}")
     jbu = jb_sub.add_parser("uninstall", help="Unload + remove the named jobs (default: all)")
-    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon,replica_refresh}")
+    jbu.add_argument("names", nargs="*", metavar="{nightly,monthly,notes_watch,queue_drain,recall_daemon,replica_refresh}")
     jb.set_defaults(func=cmd_jobs)
 
     pmt = sub.add_parser(
@@ -7430,41 +6930,6 @@ def build_parser() -> argparse.ArgumentParser:
     reval.add_argument("--seed", type=int, default=0, help="With --replay --sample: deterministic sampling seed")
     rc.set_defaults(func=cmd_recall)
 
-    tg = sub.add_parser(
-        "topic-graph",
-        help="Persist topic wiki/path graph (topics.links + Khipu-owned nodes/edges)",
-    )
-    tg_sub = tg.add_subparsers(dest="topic_graph_cmd", required=True)
-    tgb = tg_sub.add_parser(
-        "backfill",
-        help="Walk all topic .md files: UPDATE topics.links/frontmatter and mint topic:/path: edges",
-    )
-    tgb.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Report column updates + graph upserts; roll back writes",
-    )
-    tgb.add_argument("--memory-root", default=_memory_root_default())
-    tg.set_defaults(func=cmd_topic_graph_backfill)
-
-    gb = sub.add_parser(
-        "grok-bot-config",
-        help="Print the account-level Cursor cloud config (covers every repo) + the secret to add",
-    )
-    gb.set_defaults(
-        func=lambda a: (
-            print(
-                json.dumps(
-                    __import__(
-                        "khipu.integrations", fromlist=["x"]
-                    ).grok_bot_account_config(),
-                    indent=2,
-                )
-            )
-            or 0
-        )
-    )
-
     gw = sub.add_parser(
         "gateway",
         help="Khipu gateway bearer token: set / status (never prints the token)",
@@ -7499,26 +6964,9 @@ def build_parser() -> argparse.ArgumentParser:
     feat.add_argument("--set", nargs=2, metavar=("NAME", "VALUE"), default=None)
     feat.set_defaults(func=cmd_features)
 
-    br = sub.add_parser("briefs", help="Source-backed topic briefs: plan / build / show")
-    br_sub = br.add_subparsers(dest="briefs_cmd", required=True)
-    br_sub.add_parser("plan", help="Topics whose brief is missing or stale")
-    br_build = br_sub.add_parser(
-        "build", help="Build briefs for planned topics (needs the briefs switch on)"
-    )
-    br_build.add_argument("--topic", default=None, help="Build only this planned topic")
-    br_build.add_argument("--limit", type=int, default=5, help="Most topics to build (default 5)")
-    br_show = br_sub.add_parser("show", help="Print a topic's current brief")
-    br_show.add_argument("slug")
-    br.set_defaults(func=cmd_briefs)
-
-    rf = sub.add_parser("reflect", help="Answer a question from memory with cited evidence (needs the reflect switch on)")
-    rf.add_argument("question")
-    rf.add_argument("--project", default=None, help="Prefer sources from this project")
-    rf.set_defaults(func=cmd_reflect)
-
     comp = sub.add_parser(
         "components",
-        help="Postgres / Graphify component install, status, and upgrades",
+        help="Postgres component install, status, and upgrades",
     )
     comp_sub = comp.add_subparsers(dest="components_cmd", required=True)
 
@@ -7552,11 +7000,6 @@ def build_parser() -> argparse.ArgumentParser:
     ).set_defaults(func=cmd_components, components_cmd="bootstrap-local-backup")
 
     comp_sub.add_parser(
-        "install-graphify",
-        help="Install pending graphify tarball (Task 5)",
-    ).set_defaults(func=cmd_components, components_cmd="install-graphify")
-
-    comp_sub.add_parser(
         "status-json",
         help="JSON component versions for the desktop shell",
     ).set_defaults(func=cmd_components, components_cmd="status-json")
@@ -7565,11 +7008,6 @@ def build_parser() -> argparse.ArgumentParser:
         "upgrade-postgres",
         help="Dump/restore Postgres upgrade runbook",
     ).set_defaults(func=cmd_components, components_cmd="upgrade-postgres")
-
-    comp_sub.add_parser(
-        "upgrade-graphify",
-        help="Upgrade installed graphify semver",
-    ).set_defaults(func=cmd_components, components_cmd="upgrade-graphify")
 
     cr = comp_sub.add_parser(
         "check-remote",
@@ -7586,11 +7024,11 @@ def build_parser() -> argparse.ArgumentParser:
     cst.set_defaults(func=cmd_components, components_cmd="status")
 
     cins = comp_sub.add_parser("install", help="Install a named component")
-    cins.add_argument("install_target", choices=("postgres", "graphify"))
+    cins.add_argument("install_target", choices=("postgres",))
     cins.set_defaults(func=cmd_components, components_cmd="install")
 
     cup = comp_sub.add_parser("upgrade", help="Upgrade a named component")
-    cup.add_argument("upgrade_target", choices=("postgres", "graphify"))
+    cup.add_argument("upgrade_target", choices=("postgres",))
     cup.set_defaults(func=cmd_components, components_cmd="upgrade")
 
     comp.set_defaults(func=cmd_components)
@@ -7611,7 +7049,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_paths()
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.func in (cmd_join, cmd_graph_backup):
+    if args.func in (cmd_join,):
         return _dispatch_guarded_command(args)
     try:
         return int(args.func(args))

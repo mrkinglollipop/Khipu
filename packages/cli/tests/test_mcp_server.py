@@ -108,8 +108,6 @@ class ProtocolTest(unittest.TestCase):
                 "khipu_owed",
                 "khipu_decisions",
                 "khipu_decisions_update",
-                "khipu_brief",
-                "khipu_reflect",
                 "khipu_usage",
                 "khipu_route",
                 "khipu_route_advise",
@@ -119,7 +117,6 @@ class ProtocolTest(unittest.TestCase):
                 "khipu_ledger",
                 "khipu_owner_act",
                 "khipu_needs_you",
-                "khipu_project",
             },
         )
         for tool in out["result"]["tools"]:
@@ -366,7 +363,7 @@ class GetKindOmittedFallbackTest(unittest.TestCase):
         self.assertEqual(out["kind"], "topic")
         self.assertEqual(out["slug"], "42")
         ep.assert_called_once_with(42)
-        tp.assert_called_once_with("42", offset=0, max_bytes=65536, wiki=False)
+        tp.assert_called_once_with("42", offset=0, max_bytes=65536)
         md.assert_not_called()
 
     def test_explicit_kind_episode_does_not_fall_through(self):

@@ -1,6 +1,3 @@
-# --bypass-harness (sonnet lane) — authored directly by the dispatched
-# on-sub Sonnet build agent for this phase (brief: "do not delegate to other
-# agents"); there is no further agent to route this to.
 """The one absolute relevance gate, behind the ``relevance_floor`` switch.
 
 ``recall_prompt._apply_score_floor`` is relative to the top row, so a prompt
@@ -11,6 +8,9 @@ when it has none.
 
 A row is evidence when
 
+- it is an exact-phrase hit (``exact_phrase`` is ``True``: the query appears
+  verbatim in the row, or the row matched it through an identity index such as
+  a session id or owner words), or
 - its raw cosine similarity is a number at or above the floor, or
 - it names at least ``need`` of the query's content tokens as whole words,
   where ``need = min(n, max(2, ceil(n / 2)))`` for ``n`` content tokens: one
@@ -195,9 +195,13 @@ def is_evidence(
     row: dict[str, Any], floor: float, needed: int,
     by_profile: dict[str, float] | None = None,
 ) -> bool:
-    """The evidence test for one row. A row that names the embedding profile
+    """The evidence test for one row. An exact-phrase hit is always evidence: a
+    session-id or owner-words query has no cosine and its identifier is not in
+    the row's text as tokens, so neither other test could pass it. A row that names the embedding profile
     its cosine came from (a library row) is held to that profile's floor in
     ``by_profile`` when it has one, else to ``floor``."""
+    if row.get("exact_phrase") is True:
+        return True
     cosine = _number(row.get("cosine"))
     if by_profile:
         floor = by_profile.get(row.get("profile") or "", floor)
