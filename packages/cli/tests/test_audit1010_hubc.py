@@ -453,183 +453,131 @@ class CandidateDeadlineTest(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertEqual(con.execute("SELECT 1").fetchone()[0], 1)
 
-    def test_hub_applies_remaining_statement_timeout_and_restores_it(self):
+    def _hub_cur(self, *, fail=None, rows=()):
+        class Cur:
+            def __init__(self):
+                self.calls = []
+            def execute(self, sql, params=None):
+                flat = " ".join(sql.split())
+                self.calls.append((flat, params))
+                if fail is not None and flat.startswith("WITH "):
+                    raise fail
+            def fetchone(self): return None
+            def fetchall(self): return list(rows)
+        return Cur()
+
+    def test_hub_leg_is_two_round_trips_whatever_the_seeds(self):
+        """The hub is across the network (2026-11-07: ~45 ms a round trip),
+        and the per-query timeout plus per-seed queries missed the 400 ms
+        deadline on every live search. Five mixed seeds: savepoint, timeout
+        and ONE statement (pipelined on a real connection), then cleanup."""
         from khipu import graph_candidates as gc
-        cur = mock.Mock()
-        cur.fetchone.side_effect = lambda: ("9s",)
-        cur.fetchall.return_value = []
-        with mock.patch.object(gc, "_hub_episode_slug_map", return_value={}):
-            rows, missed = gc.hub_candidates(cur, [{"kind":"topic", "id":"x"}], deadline=time.monotonic() + 1)
+
+        cur = self._hub_cur()
+        fused = [{"kind": "topic", "id": "a"}, {"kind": "episode", "id": "1"},
+                 {"kind": "topic", "id": "b"}, {"kind": "episode", "id": "2"},
+                 {"kind": "topic", "id": "c"}]
+        with mock.patch("khipu.db.has_columns", return_value=True):
+            rows, missed = gc.hub_candidates(cur, fused, deadline=time.monotonic() + 0.4)
         self.assertFalse(missed)
         self.assertEqual(rows, [])
-        calls = [(" ".join(c.args[0].split()), c.args[1] if len(c.args)>1 else None) for c in cur.execute.call_args_list]
-        settings = [p for sql,p in calls if "set_config('statement_timeout'" in sql]
-        self.assertTrue(settings)
-        self.assertEqual(settings[-1], ("9s",))
+        sql = [c[0] for c in cur.calls]
+        self.assertEqual(len(sql), 4, sql)
+        self.assertEqual(sql[0], "SAVEPOINT khipu_graph_candidates_deadline")
+        self.assertIn("set_config('statement_timeout'", sql[1])
+        timeout = cur.calls[1][1][0]
+        self.assertTrue(timeout.endswith("ms") and 0 < int(timeout[:-2]) <= 400, timeout)
+        self.assertTrue(sql[2].startswith("WITH "))
+        self.assertEqual(sql[3], "ROLLBACK TO SAVEPOINT khipu_graph_candidates_deadline; "
+                                 "RELEASE SAVEPOINT khipu_graph_candidates_deadline")
 
-    def test_hub_query_timeout_rolls_back_savepoint_and_restores_policy(self):
+    def test_hub_query_timeout_reports_missed_and_rolls_back(self):
         from khipu import graph_candidates as gc
 
         class QueryCanceled(Exception):
             pass
-        class Cur:
-            def __init__(self):
-                self.calls = []
-                self.rows = []
-            def execute(self, sql, params=None):
-                flat = " ".join(sql.split())
-                self.calls.append((flat, params))
-                if "current_setting" in flat:
-                    self.rows = [("9s",)]
-                elif flat.startswith("SELECT dst FROM edges"):
-                    raise QueryCanceled("statement timeout")
-                else:
-                    self.rows = []
-            def fetchone(self): return self.rows[0] if self.rows else None
-            def fetchall(self): return list(self.rows)
-        cur = Cur()
-        rows, missed = gc.hub_candidates(
-            cur, [{"kind":"topic", "id":"x"}], deadline=time.monotonic() + 1
-        )
+        cur = self._hub_cur(fail=QueryCanceled("canceling statement due to statement timeout"))
+        with mock.patch("khipu.db.has_columns", return_value=True):
+            rows, missed = gc.hub_candidates(
+                cur, [{"kind": "topic", "id": "x"}], deadline=time.monotonic() + 1)
         self.assertTrue(missed)
         self.assertEqual(rows, [])
-        sql = [c[0] for c in cur.calls]
-        self.assertIn("ROLLBACK TO SAVEPOINT khipu_graph_candidates_deadline", sql)
-        self.assertIn("RELEASE SAVEPOINT khipu_graph_candidates_deadline", sql)
-        self.assertEqual(cur.calls[-2][1], ("9s",))
+        self.assertTrue(cur.calls[-1][0].startswith("ROLLBACK TO SAVEPOINT khipu_graph_candidates_deadline"))
 
-    def test_hub_keeps_finished_wiki_hits_when_a_later_expansion_misses(self):
+    def test_hub_other_error_still_rolls_back_and_raises(self):
         from khipu import graph_candidates as gc
 
-        class Cur:
-            def __init__(self):
-                self.calls = []
-                self.rows = []
-            def execute(self, sql, params=None):
-                flat = " ".join(sql.split())
-                self.calls.append(flat)
-                if "current_setting" in flat:
-                    self.rows = [("9s",)]
-                else:
-                    self.rows = []
-            def fetchone(self): return self.rows[0] if self.rows else None
-            def fetchall(self): return list(self.rows)
+        cur = self._hub_cur(fail=RuntimeError("relation does not exist"))
+        with mock.patch("khipu.db.has_columns", return_value=True), \
+                self.assertRaises(RuntimeError):
+            gc.hub_candidates(cur, [{"kind": "topic", "id": "x"}], deadline=time.monotonic() + 1)
+        self.assertTrue(cur.calls[-1][0].startswith("ROLLBACK TO SAVEPOINT"))
 
-        wiki_hit = [{
-            "kind": "topic", "id": "kept-neighbor", "label": "kept",
-            "snippet": "kept", "_seed_rank": 0, "_seed_key": "topic:seed",
-            "_relation": "wiki_link", "_recency": 1.0,
-        }]
-        def boom(*_a, **_k):
-            raise gc.DeadlineMissed()
-
-        cur = Cur()
-        with mock.patch.object(gc, "_hub_topic_wiki", return_value=wiki_hit), \
-             mock.patch.object(gc, "_hub_topic_recent_episodes", side_effect=boom):
-            rows, missed = gc.hub_candidates(
-                cur, [{"kind": "topic", "id": "seed"}], deadline=time.monotonic() + 1
-            )
-        self.assertTrue(missed)
-        self.assertEqual([r["id"] for r in rows], ["kept-neighbor"])
-
-    def test_hub_slug_map_serves_recent_episodes_without_per_seed_json_scan(self):
+    def test_an_expired_hub_deadline_sends_nothing(self):
         from khipu import graph_candidates as gc
 
-        gc._HUB_SLUG_CACHE.clear()
-        class Cur:
-            def __init__(self):
-                self.sql = []
-            def execute(self, sql, params=None):
-                self.sql.append(" ".join(sql.split()))
-            def fetchone(self):
-                last = self.sql[-1] if self.sql else ""
-                if "max(ts)" in last:
-                    return ("2026-10-30T00:00:00Z",)
-                return None
-            def fetchall(self):
-                last = self.sql[-1] if self.sql else ""
-                if "ORDER BY ts DESC" in last:
-                    return [(7, "2026-10-30T00:00:00Z", "named", ["Billing Service"])]
-                return []
-        cur = Cur()
-        with mock.patch("khipu.db.has_columns", return_value=False):
-            rows = gc._hub_topic_recent_episodes(
-                cur, "billing-service", seed_rank=0, seed_key="topic:billing-service")
-            self.assertEqual([r["id"] for r in rows], ["7"])
-            self.assertFalse(any("jsonb_array_elements_text" in s for s in cur.sql))
-            self.assertTrue(any("ORDER BY ts DESC" in s for s in cur.sql))
-            builds = sum(1 for s in cur.sql if "ORDER BY ts DESC" in s)
-            again = gc._hub_topic_recent_episodes(
-                cur, "billing-service", seed_rank=0, seed_key="topic:billing-service")
-            self.assertEqual([r["id"] for r in again], ["7"])
-            # Cache hit inside the TTL: no second full build.
-            self.assertEqual(sum(1 for s in cur.sql if "ORDER BY ts DESC" in s), builds)
+        cur = self._hub_cur()
+        rows, missed = gc.hub_candidates(cur, [{"kind": "topic", "id": "x"}], deadline=time.monotonic() - 1)
+        self.assertEqual((rows, missed), ([], True))
+        self.assertEqual(cur.calls, [])
 
-    def test_hub_slug_build_is_bounded_and_cheap_stamped(self):
+    def test_hub_rows_become_candidates_with_their_seed_and_relation(self):
         from khipu import graph_candidates as gc
 
-        gc._HUB_SLUG_CACHE.clear()
+        rows = [
+            (0, "topic", "seed", "wiki_link", "topic", "nb", "Neighbour", "nb body", 20.0),
+            (0, "topic", "seed", "capture_topic", "episode", "7", None, "named it", 30.0),
+            (1, "episode", "9", "capture_topic", "topic", "named", None, "named body", 10.0),
+        ]
+        cur = self._hub_cur(rows=rows)
+        with mock.patch("khipu.db.has_columns", return_value=True):
+            out, missed = gc.hub_candidates(
+                cur, [{"kind": "topic", "id": "seed"}, {"kind": "episode", "id": "9"}],
+                deadline=time.monotonic() + 1)
+        self.assertFalse(missed)
+        self.assertEqual(
+            [(r["kind"], r["id"], r["label"], r["via"]) for r in out],
+            [("topic", "nb", "Neighbour", {"seed": "topic:seed", "relation": "wiki_link"}),
+             ("episode", "7", "named it", {"seed": "topic:seed", "relation": "capture_topic"}),
+             ("topic", "named", "named", {"seed": "episode:9", "relation": "capture_topic"})])
 
-        class Cur:
-            def __init__(self):
-                self.sql = []
-            def execute(self, sql, params=None):
-                self.sql.append(" ".join(sql.split()))
-            def fetchone(self):
-                return ("2026-10-30T00:00:00Z",)
-            def fetchall(self):
-                return []
-        cur = Cur()
-        with mock.patch("khipu.db.has_columns", return_value=False):
-            gc._hub_episode_slug_map(cur)
-        joined = " ".join(cur.sql)
-        self.assertNotIn("count(*)", joined)
-        self.assertIn("SELECT max(ts) FROM episodes", joined)
-        self.assertIn("left(summary, 200)", joined)
-        self.assertIn("LIMIT", joined)
-        # Within the TTL a second call issues no query at all.
-        before = len(cur.sql)
-        gc._hub_episode_slug_map(cur)
-        self.assertEqual(len(cur.sql), before)
-
-    def test_hub_slug_build_failure_reports_missed_and_keeps_wiki_hits(self):
+    def test_hub_statement_bounds_every_seed_and_skips_what_cannot_match(self):
         from khipu import graph_candidates as gc
 
-        gc._HUB_SLUG_CACHE.clear()
+        seeds = gc._seeds([{"kind": "topic", "id": "billing-service"},
+                           {"kind": "topic", "id": "note:not-a-slug"},
+                           {"kind": "episode", "id": "3"}])
+        sql, params = gc._hub_candidates_sql(
+            seeds, {("topic", "billing-service"), ("episode", "3")}, live_episodes=True)
+        self.assertEqual(sql.count("LIMIT %(cap)s"), 3)
+        self.assertEqual(params["cap"], gc.TOTAL_CAP + gc.PER_SEED_CAP)
+        # Only a seed id that is a slug can be named by an episode label.
+        self.assertEqual(params["c_sid"], ["billing-service"])
+        self.assertEqual(params["c_like"], ["%billing%"])
+        self.assertEqual(params["ex_topics"], ["billing-service"])
+        self.assertEqual(params["ex_episodes"], ["3"])
+        self.assertIn("ep.deleted_at IS NULL", sql)
+        self.assertIn("FROM episodes WHERE deleted_at IS NULL ORDER BY ts DESC LIMIT %(recent)s", sql)
+        older, _ = gc._hub_candidates_sql(seeds, set(), live_episodes=False)
+        self.assertNotIn("deleted_at IS NULL ORDER BY", older)
+        self.assertNotIn("ep.deleted_at", older)
+        only_notes, p2 = gc._hub_candidates_sql(
+            gc._seeds([{"kind": "topic", "id": "note:x"}]), set(), live_episodes=True)
+        self.assertNotIn("recent AS", only_notes)
+        self.assertEqual(p2["c_sid"], [])
 
-        class Cur:
-            def __init__(self):
-                self.sql = []
-                self.rows = []
-            def execute(self, sql, params=None):
-                flat = " ".join(sql.split())
-                self.sql.append(flat)
-                if "current_setting" in flat:
-                    self.rows = [("9s",)]
-                elif "max(ts)" in flat:
-                    self.rows = [("2026-10-30T00:00:00Z",)]
-                elif "ORDER BY ts DESC" in flat:
-                    raise RuntimeError("canceling statement due to statement timeout")
-                else:
-                    self.rows = []
-            def fetchone(self): return self.rows[0] if self.rows else None
-            def fetchall(self): return list(self.rows)
+    def test_hub_sql_slug_matches_the_python_slug(self):
+        """Pin the SQL mirror of topic_graph.topic_slug_from_label and the
+        Python cases it must agree with; real Postgres proves the join in
+        test_pg_scratch."""
+        from khipu import graph_candidates as gc, topic_graph
 
-        wiki_hit = [{
-            "kind": "topic", "id": "kept-neighbor", "label": "kept",
-            "snippet": "kept", "_seed_rank": 0, "_seed_key": "topic:seed",
-            "_relation": "wiki_link", "_recency": 1.0,
-        }]
-        cur = Cur()
-        with mock.patch("khipu.db.has_columns", return_value=False), \
-             mock.patch.object(gc, "_hub_topic_wiki", return_value=wiki_hit):
-            rows, missed = gc.hub_candidates(
-                cur, [{"kind": "topic", "id": "seed"}], deadline=time.monotonic() + 1)
-        self.assertTrue(missed)
-        self.assertEqual([r["id"] for r in rows], ["kept-neighbor"])
-        self.assertIn("ROLLBACK TO SAVEPOINT khipu_graph_candidates_deadline", cur.sql)
-        self.assertTrue(cur.sql[-1].startswith("RELEASE SAVEPOINT"))
-        self.assertEqual(gc._HUB_SLUG_CACHE, {})
+        self.assertEqual(
+            gc._PG_SLUG.format(x="l"),
+            "left(btrim(regexp_replace(lower(l), '[^a-z0-9]+', '-', 'g'), '-'), 80)")
+        for label, slug in (("Scratch GC Webhook!!", "scratch-gc-webhook"),
+                            ("  OpenBot ", "openbot"), ("café_menu", "caf-menu")):
+            self.assertEqual(topic_graph.topic_slug_from_label(label), slug)
 
 
 class EpisodeCollapseTest(unittest.TestCase):
