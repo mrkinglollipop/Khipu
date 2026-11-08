@@ -1822,12 +1822,12 @@ def _observed_base(entity: str, *, base=None, expect=None) -> str:
     if base not in revisions:
         if not conversation_author().get("session"):
             raise RouteError("this connection has not read that owner revision through this MCP server; "
-                             "read khipu_route on this connection before proposing")
-        raise RouteError("this conversation was not shown that revision; read khipu_route again")
+                             "read khipu_route full=true on this connection before proposing")
+        raise RouteError("this conversation was not shown that revision; read khipu_route full=true again")
     if expect is not None:
         observed = (data.get("priority_versions") or {}).get(str(expect).strip())
         if observed != base:
-            raise RouteError("this conversation was not shown that revision; read khipu_route again")
+            raise RouteError("this conversation was not shown that revision; read khipu_route full=true again")
     return base
 
 
@@ -5857,6 +5857,13 @@ def _save_view(view: dict) -> None:
             with contextlib.suppress(OSError):
                 tmp.unlink()
         raise
+    # Slice 6: every saved fold writes the page the prompt hook reads
+    # (``routing_page_file``). Under the same lock as this save, so a page
+    # never lands after a newer view's. It never fails the save.
+    from khipu import routing_page_file
+
+    if routing_page_file.enabled():
+        routing_page_file.write(view)
 
 
 def _captures_unchanged(view: dict, fingerprint: dict, now: datetime) -> bool:
@@ -11884,10 +11891,12 @@ def start_push(budget: float | None = None, moment: str = "start", *,
     budget = start_budget() if budget is None else budget
     out = light_status(lock_wait=budget / 2, start=True,
                        session_id=None if child_component else session_id)
-    from khipu import routing_delivery
+    from khipu import routing_delivery, routing_page_file
 
     now = _now()
     view = out.view
+    if routing_page_file.enabled() and not child_component:
+        return _start_page(view, now)
     if child_component:
         # A subagent receives a snapshot, not its parent conversation's
         # notices: the plan is built with no session, and the bounded
@@ -11943,7 +11952,7 @@ def prompt_imports() -> None:
     interpreter's imports (tens of milliseconds on the one-shot path); the
     recall daemon calls it at start, so its children have nothing to import."""
     from khipu import (  # noqa: F401
-        agent_view, claude_homes, config, discover, features, identity, keychain, paths, redact, routing_advice, routing_advisory, routing_delivery, routing_pace, routing_providers, routing_sources,
+        agent_view, claude_homes, config, discover, features, identity, keychain, paths, redact, routing_advice, routing_advisory, routing_delivery, routing_pace, routing_page, routing_page_file, routing_providers, routing_sources,
         session_capture, usage)
 
 
@@ -12645,11 +12654,118 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
     ``fold_wait``, ``kick``: as for ``_prompt_push``. Provider-key lookups
     inside it are the minute-old yes or no of ``keychain.prompt_scope``, never
     a ``security`` process per prompt."""
-    from khipu import keychain
+    from khipu import keychain, routing_page_file
 
+    if routing_page_file.enabled():
+        return page_push(marker, budget=budget, now=now, session_id=session_id, kick=kick)
     with keychain.prompt_scope():
         return _prompt_push_scoped(marker, budget=budget, now=now, on_fold=on_fold, session_id=session_id,
                                    fold_wait=fold_wait, kick=kick)
+
+
+# ---- the page as what routing delivers (slice 6) ------------------------------------------
+#
+# A prompt reads page.txt (``routing_page_file``), never the view or the log,
+# and offers it to the delivery ledger as one entity, ``page``, whose
+# revision is the page's signature (``routing_page.signature``). The ledger
+# sends it when that revision is not yet acknowledged by this conversation,
+# pages it when the hook has no room, and leases it until the hook prints it;
+# a percentage moving on its own leaves the revision, so nothing is sent.
+# Session start sends it whole again whatever was acknowledged before.
+
+
+def _refresh_page(view: dict, now: datetime) -> bool:
+    """Write ``view``'s page at ``now`` when page.txt is missing, of another
+    version, or older than ``routing_page_file.OLD_AFTER_S``, so its time
+    says when the record was last found current. Only under the routing
+    lock, never waiting for it, and only while view.json is still the one
+    ``view`` was read from: a page never lands after a newer view's."""
+    from khipu import routing_page_file
+
+    if not routing_page_file.enabled() or not view.get("record") or view.get("saved", True) is False:
+        return False
+    seen = getattr(_view_seen, "stat", None)
+    current = routing_page_file.read()
+    if current is not None and current["version"] == view.get("version") and current.get("epoch") == view.get("epoch"):
+        rendered = _parse(current.get("rendered_at"))
+        if rendered is not None and (now - rendered).total_seconds() <= routing_page_file.OLD_AFTER_S:
+            return False
+    try:
+        with lock_budget(0.0), _lock():
+            if seen is None or _stat(view_file()) != seen:
+                return False
+            return routing_page_file.write(view, now)
+    except (LockBusy, OSError):
+        return False
+
+
+def _page_answer(page: dict, now: datetime, cfg: dict) -> dict:
+    from khipu import routing_page_file
+
+    line = routing_page_file.age_line(page, now, cfg["routing_not_refreshed_after"])
+    text = page["text"] + ("\n" + line if line else "")
+    return {"kind": "full", "text": text, "page": page["text"], "sig": page["sig"], "version": page["version"],
+            "epoch": page.get("epoch"), "generation": [], "count": 0, "why": "page", "notices": []}
+
+
+def page_push(marker: dict | None, *, budget: float, now: datetime | None = None,
+              session_id: str | None = None, kick=None) -> dict:
+    """What the per-prompt hook adds (``prompt_push``'s answer) with the page
+    as what routing delivers: the page whole when this conversation has not
+    yet acknowledged its current signature, else ``kind: none``. Reads
+    page.txt and the conversation's ledger, nothing else. Only when there is
+    no page yet does it read the saved view (as ``_prompt_view`` does, never
+    folding when one exists) and write the page from it. ``kick(reason)``
+    is called when the record may have moved past the page, so the caller
+    refolds off the prompt path (``refold_in_background``)."""
+    from khipu import routing_delivery, routing_page_file
+
+    now = now or _now()
+    cfg = settings()
+    page = routing_page_file.read()
+    if page is None:
+        with lock_budget(budget / 2, fold=budget / 2):
+            _view_seen.stat = None
+            view = _prompt_view(now, kick=kick)
+        text, meta = routing_page_file.render(view, now)
+        _refresh_page(view, now)
+        page = dict(meta, text=text)
+    else:
+        why = routing_page_file.behind(page, now)
+        if why and kick is not None:
+            kick(why)
+    out = _page_answer(page, now, cfg)
+    session = getattr(marker, "session", None) or session_id
+    if not session:
+        return {k: v for k, v in out.items() if k not in ("page", "sig")}
+    component = getattr(marker, "component", "main")
+    planned = routing_delivery.page_plan(out, now, cfg)
+    answer = routing_delivery.offer(planned, session=session, component=component, deferred=True)
+    if not answer.get("routing_changes"):
+        return {"kind": "none", "text": None, "version": out["version"], "epoch": out["epoch"],
+                "generation": [], "count": 0}
+    # The ledger keeps what is owed; the session marker gets no entity list
+    # (an earlier Khipu reading it back would not know a ``page`` entity).
+    return dict({k: v for k, v in answer.items() if k not in ("page", "sig")}, owed_entities=[], shown_entities=[])
+
+
+def _start_page(view: dict, now: datetime) -> dict:
+    """``start_push``'s answer with the page as what routing delivers: the
+    page rendered from the view the start just read (and written to
+    page.txt when that view is saved), planned for the ledger so that it is
+    owed again whatever this conversation acknowledged before. The session
+    is attached by the hook (``recall_rule._RoutingAtStart``)."""
+    from khipu import recall_rule, routing_delivery, routing_page_file
+
+    cfg = settings()
+    text, meta = routing_page_file.render(view, now)
+    _refresh_page(view, now)
+    out = _page_answer(dict(meta, text=text), now, cfg)
+    planned = routing_delivery.page_plan(out, now, cfg, restate=True)
+    planned["delivery_plan"]["max_chars"] = min(9000, recall_rule._HOOK_CONTEXT_BUDGET -
+        recall_rule._utf16_len(recall_rule.RULE_MD.strip()) - recall_rule._utf16_len(recall_rule._START_SEP))
+    answer = routing_delivery.offer(planned)
+    return {k: v for k, v in answer.items() if k not in ("page", "sig")}
 
 
 def _prompt_push_scoped(marker: dict | None, *, budget: float, now: datetime | None = None,
@@ -12743,6 +12859,7 @@ def _poll_refold(now: datetime | None = None, *, on_fold=None) -> dict:
                                "valid_until": None, "interval": poll_interval(cfg)}
         prev = _load_view()
         if _fresh(prev, fingerprint, now):
+            _refresh_page(prev, now)  # the record is current: the page's time says so
             return dict(out, version=prev["version"], valid_until=prev.get("valid_until"))
         try:
             view = _prompt_view(now, on_fold=on_fold)
@@ -12771,7 +12888,9 @@ def refold_in_background(now: datetime | None = None, *, on_fold=None) -> str:
         with lock_budget(BACKGROUND_LOCK_BUDGET, fold=0):
             now = now or _now()
             fingerprint, _cfg = _light_inputs()
-            if _fresh(_load_view(), fingerprint, now):
+            prev = _load_view()
+            if _fresh(prev, fingerprint, now):
+                _refresh_page(prev, now)  # the record is current: the page's time says so
                 return "fresh"
             with _fold_turn():
                 if on_fold is not None:
@@ -13622,6 +13741,13 @@ def run_cli(args) -> int:
                 if session and text["notices"]:
                     from khipu import recall_prompt
                     recall_prompt.mark_routing_notices(session, text["notices"])
+                return 0
+            from khipu import routing_page_file
+
+            if not (args.json or mode or account or getattr(args, "full", False)) and routing_page_file.enabled():
+                # Slice 6: the page by default; --full (or --json) for the record.
+                conversation, readings = _page_inputs(view, now)
+                print(page(view, now, conversation, readings))
                 return 0
             if args.json or mode:
                 out = public_view(view, now, account)

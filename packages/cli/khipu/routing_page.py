@@ -275,9 +275,9 @@ def _rules(view: dict) -> list[tuple[str, str]]:
     return [(name, text) for name, texts in found.items() for text in texts]
 
 
-def _render(view: dict, now: datetime, conversation: dict, readings: dict, rules: list, keep: int, widths,
-            account_width: int, r) -> str:
-    providers = (view.get("definitions") or {}).get("providers") or {}
+def _ordered(view: dict, now: datetime) -> tuple[list, list]:
+    """(the accounts in the owner's order, the accounts outside it), each as
+    (account entry, priority item or None), ended accounts left out."""
     held = (view.get("priority") or {}).get("entries") or []
     by_key = {a["key"]: a for a in view.get("accounts") or []}
     ordered, seen = [], set()
@@ -290,6 +290,13 @@ def _render(view: dict, now: datetime, conversation: dict, readings: dict, rules
              if a["key"] not in seen and (a.get("note") or [None])[0] != "untracked"]
     ordered = [(e, i) for e, i in ordered if not _ended(e, now)]
     extra = [(e, i) for e, i in extra if not _ended(e, now)]
+    return ordered, extra
+
+
+def _render(view: dict, now: datetime, conversation: dict, readings: dict, rules: list, keep: int, widths,
+            account_width: int, r) -> str:
+    providers = (view.get("definitions") or {}).get("providers") or {}
+    ordered, extra = _ordered(view, now)
     holds = [h for h in view.get("holds") or []]
     lines = [f"ROUTING {r._clock(now, now)}. The owner's record. Guidance, not a gate: route differently if you "
              "know better, and say why.", ""]
@@ -330,7 +337,7 @@ def _render(view: dict, now: datetime, conversation: dict, readings: dict, rules
             last_head = name
         lines.append(text)
     if keep < len(rules):
-        lines += ["", f"{len(rules) - keep} more rule lines: run `khipu route`."]
+        lines += ["", f"{len(rules) - keep} more rule lines: run `khipu route --full`."]
     return "\n".join(lines)
 
 
@@ -367,3 +374,60 @@ def page(view: dict, now: datetime, conversation: dict | None = None, readings: 
                 return text
     # Last resort: a page never leaves the limit.
     return text[: LIMIT - 1].rstrip() + "…"
+
+
+# ---- what makes the page worth sending again (routing slice 6) -------------------------
+#
+# The page goes to a conversation at its start and again only when one of
+# these changed: an account's status word, the owner's order, or the owner's
+# words (his rules, and the roles, exceptions, holds, caps and plan terms he
+# set). A percentage, a reset time or a measured spend moving on its own
+# changes none of them, so it never resends the page.
+
+WORDS = ("PAUSED", "NO JOBS", "LIMIT REACHED", "DOWN", "UNKNOWN", "NEARLY OUT", "SECOND OPINIONS ONLY",
+         "LAST RESORT", "HOLD BACK", "PROBABLY OPEN", "OK")
+
+
+def _word(status: str) -> str:
+    """The status word that opens ``_status``'s text, without its clock or words."""
+    return next((w for w in WORDS if status.startswith(w)), status.split(":", 1)[0].split(",", 1)[0])
+
+
+def facts(view: dict, now: datetime) -> dict:
+    """The parts of the page whose change resends it: the order (account
+    keys, in the owner's order then the rest), each account's status word,
+    the owner's confirmed rules whole, and the owner's words and settings
+    on each account (role, exceptions, holds, caps as set, plan terms,
+    provider facts). Readings are not in it."""
+    from khipu import routing as r
+
+    now = now.astimezone(timezone.utc)
+    if not view.get("record"):
+        return {"record": False}
+    providers = (view.get("definitions") or {}).get("providers") or {}
+    ordered, extra = _ordered(view, now)
+    holds = view.get("holds") or []
+    accounts = []
+    for n, (entry, item) in enumerate([*ordered, *extra]):
+        mine = [h for h in holds if (h.get("scope") or {}).get("kind") == "account"
+                and (h.get("scope") or {}).get("account") == entry["key"]]
+        provider = providers.get(entry.get("harness")) or providers.get(entry["key"].partition(":")[0]) or {}
+        last = n == len(ordered) - 1 and not extra
+        status = _status(entry, provider, _windows(entry, now, r), mine, last, (0, 0), now, r)
+        exceptions = [{k: x.get(k) for k in ("id", "text", "until")} for x in (item or {}).get("exceptions") or []
+                      if (r._parse(x.get("until")) or now) > now]
+        accounts.append({"key": entry["key"], "ordered": item is not None, "word": _word(status),
+                         "role": (item or {}).get("role"), "exceptions": exceptions,
+                         "caps": entry.get("caps") or [], "terms": entry.get("terms") or {},
+                         "provider": {k: provider.get(k) for k in ("use", "models_allowed")}})
+    return {"record": True, "accounts": accounts, "rules": [list(x) for x in _rules(view)],
+            "holds": [{k: h.get(k) for k in ("id", "text", "until", "scope")} for h in holds]}
+
+
+def signature(view: dict, now: datetime) -> str:
+    """A short hash of ``facts``: equal while nothing that resends the page changed."""
+    import hashlib
+    import json
+
+    blob = json.dumps(facts(view, now), sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]

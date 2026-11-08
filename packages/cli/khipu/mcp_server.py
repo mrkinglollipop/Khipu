@@ -717,7 +717,9 @@ TOOLS: list[dict] = [
             "`khipu_route_report action=end_hold hold_id=...`; an owner hold "
             "is ended only by the owner); provider facts (models_allowed, models_never and use); "
             "and job runner lanes not matched to an account, with candidates. "
-            "Locally this is the full record; through the HTTPS gateway it is "
+            "By default it answers the routing page (the accounts in the owner's order with their status "
+            "words, then his rules); pass `full: true` for the full record. "
+            "Locally `full` is the full record; through the HTTPS gateway it is "
             "the closed published cloud copy when enabled (otherwise "
             "`{available: false}`). Read it before you hand work to another "
             "account or model. "
@@ -755,6 +757,9 @@ TOOLS: list[dict] = [
                 "summary": {"type": "boolean",
                             "description": "true: the same compact read as view=summary (bounded; its `omitted` "
                                            "list names the sections to page in with view=<section>)"},
+                "full": {"type": "boolean",
+                         "description": "true: the full record (revisions, proposals, hold ids, lanes, pull delivery) "
+                                        "instead of the page; read it before proposing a change"},
                 "session_id": {"type": "string",
                                "description": "This conversation's own session id when its environment names none; "
                                               "a descendant uses the canonical root as its prefix (claude:<id>/child, codex:<id>/child)"},
@@ -2598,6 +2603,19 @@ def _tool_route_projected(args: dict) -> dict:
     for key in ("session_id", "ack"):
         if args.get(key) is not None and not isinstance(args[key], str):
             raise ValueError(f"{key} must be text")
+    want_full = args.get("full")
+    if want_full is not None:
+        if isinstance(want_full, str) and want_full.strip().lower() in ("true", "false", "1", "0"):
+            want_full = want_full.strip().lower() in ("true", "1")
+        elif type(want_full) is int and want_full in (0, 1):
+            want_full = bool(want_full)
+        if not isinstance(want_full, bool):
+            raise ValueError("full must be true or false")
+    from khipu import routing_page_file
+
+    if routing_page_file.enabled() and not want_full and since is None and not (mode and str(mode).strip()) \
+            and not account and not (args.get("ack") or "").strip():
+        return _route_page(routing)
     identity = routing_delivery.canonical_identity(os.environ, explicit=args.get("session_id"))
     if args.get("session_id") and identity is None and routing_delivery.canonical_identity(os.environ):
         raise _ToolFailure({"ok": False, "code": "session_not_yours",
@@ -2640,6 +2658,24 @@ def _tool_route_projected(args: dict) -> dict:
         out["routing_changes"] = changes
     out["delivery"] = delivery
     return out
+
+
+ROUTE_FULL_POINTER = ("This is the routing page. Pass full=true for the full record: revisions to propose "
+                      "against, proposals, hold ids, provider facts, lanes and pull delivery.")
+
+
+def _route_page(routing) -> dict:
+    """khipu_route's default answer (slice 6): the routing page, rendered
+    from the current view with this conversation's own overrides. It shows
+    no revisions, so it records no read receipt and reserves nothing in the
+    delivery ledger: a conversation proposing a change reads ``full``."""
+    now = routing._now()
+    with routing._for_a_conversation(), routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
+        view = routing.read_view(now)
+    conversation, readings = routing._page_inputs(view, now)
+    text = routing.page(view, now, conversation, readings)
+    return {"page": text, "chars": len(text), "version": view.get("version"), "epoch": view.get("epoch"),
+            "full_record": ROUTE_FULL_POINTER}
 
 
 def _tool_route_advise(args: dict) -> dict:

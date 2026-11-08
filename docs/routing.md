@@ -599,7 +599,9 @@ A background helper in the warm recall service polls the sources every 10 second
 
 ### Command line
 
-`khipu route` prints the record. Useful flags: `--json`, `--summary` (the text a session gets at start), `--brief` (text for a job runner brief), `--account A`, and `--since V` (only what changed after version V).
+`khipu route` prints the routing page: the accounts in the owner's order with their status words, then his rules. `--full` prints the whole record. Useful flags: `--json` (always the whole record, as the app reads it), `--summary` (the earlier session-start summary), `--brief` (text for a job runner brief), `--account A`, and `--since V` (only what changed after version V).
+
+The page is also what the hooks deliver. Every saved fold writes it to `page.txt` beside the view, atomically, with the time it was rendered. Session start sends it whole. The per-prompt hook reads that file, never the view or the log, and sends the page again only when an account's status word, the owner's order or his words (rules, roles, exceptions, holds, caps, plan terms) change. A percentage, a reset time or measured spend moving on its own does not resend it. A page older than `routing_not_refreshed_after` goes out with a line giving its time.
 
 Agents can also record what they learned:
 

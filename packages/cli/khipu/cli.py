@@ -5589,6 +5589,8 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("--brief", action="store_true", help="The text a job runner puts into a brief")
     rt.add_argument("--page", action="store_true",
                     help="The routing page: the accounts in the owner's order, then the owner's rules (at most 4,500 characters)")
+    rt.add_argument("--full", action="store_true",
+                    help="The full record (plain `khipu route` prints the routing page; --json is always the full record)")
     rt.add_argument("--account", dest="view_account", default=None, metavar="A", help="One account only")
     rt.add_argument(
         "--view", default=None, metavar="NAME",
