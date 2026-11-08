@@ -813,7 +813,6 @@ const USAGE_ACCOUNTS_KEY: &str = "usage_accounts";
 /// Owed's limits (`khipu.config.COUNT_SETTINGS`): whole numbers of 0 or
 /// more, 0 for no limit, each `config --set KEY N` or `config --unset=KEY`.
 const OWED_COUNT_KEYS: &[&str] = &["owed_page_max", "owed_bulk_max"];
-/// Whether Owed's close rules ask GitHub, read-only, if a pull request merged.
 
 /// Settings -> Data, "This Mac's copy": how old the copy may get before the
 /// background job updates it, how often the job looks, and how long a failed
