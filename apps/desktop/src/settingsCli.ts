@@ -125,7 +125,6 @@ export type ConfigShape = {
   float_settings?: Record<string, { value: number; source: string; default: number }>;
   relevance_cosine_floor?: { value: number; source: string; default: number };
   replica?: Record<string, { value: number; default: number; source: string }>;
-  graph_backup_remote?: { value: string; source: "env" | "config" | "default"; default: string; error?: string };
   minute_settings?: Record<string, { value: number; source: "file" | "default"; default: number; min: number; max: number }>;
   /** `config.count_settings_status()`: whole numbers of 0 or more, 0 for no limit. */
   count_settings?: Record<string, { value: number; source: "file" | "default"; default: number; no_limit?: number }>;

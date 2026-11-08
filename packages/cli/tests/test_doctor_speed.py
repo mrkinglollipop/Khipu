@@ -2,28 +2,23 @@
 as before and fails here in its old form.
 
   * episodes_missing_in_pg asks in one statement, not one per 500 keys.
-  * a passing snapshot integrity check is remembered for that exact file.
   * doctor plans the memory space once (coverage keeps the gaps, the topic
     lag reuses them) and from the fingerprint cache.
   * the slow hub checks run at the same time, and --probe waits for them.
-  * graph_drift reads nodes and edges on two connections at once.
 """
 
 from __future__ import annotations
 
 import io
 import json
-import sqlite3
 import tempfile
 import threading
 import time
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from unittest import mock
 
-from khipu import cli, drift, embed, graph_backup
+from khipu import cli, drift, embed
 
 
 class _RecordingCursor:
@@ -58,87 +53,6 @@ class EpisodesMissingOneStatementTest(unittest.TestCase):
         self.assertEqual(drift.episodes_missing_in_pg(cur, []), [])
         self.assertEqual(cur.calls, [])
 
-
-class IntegrityVerdictIsRememberedTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
-        self.snap = self.root / "graph-20261015T000000Z.sqlite"
-        con = sqlite3.connect(self.snap)
-        con.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY)")
-        con.execute("CREATE TABLE edges (src TEXT, dst TEXT, type TEXT)")
-        con.commit()
-        con.close()
-        cache = self.root / "cache" / "integrity.json"
-        p = mock.patch.object(graph_backup, "_integrity_cache_file", return_value=cache)
-        p.start()
-        self.addCleanup(p.stop)
-
-    def _health(self):
-        return graph_backup.local_health(
-            producer=True, snapshot_dir=self.root, now=datetime.now(timezone.utc)
-        )
-
-    def test_unchanged_snapshot_is_checked_once(self):
-        with mock.patch.object(graph_backup, "_integrity_check", return_value="ok") as check:
-            first, second = self._health(), self._health()
-        self.assertEqual(check.call_count, 1)
-        self.assertTrue(first["ok"] and second["ok"], (first, second))
-        self.assertEqual(first["integrity_checked_at"], second["integrity_checked_at"])
-
-    def test_a_changed_snapshot_is_checked_again(self):
-        with mock.patch.object(graph_backup, "_integrity_check", return_value="ok") as check:
-            self._health()
-            time.sleep(0.01)
-            con = sqlite3.connect(self.snap)
-            con.execute("INSERT INTO nodes VALUES ('x')")
-            con.commit()
-            con.close()
-            self._health()
-        self.assertEqual(check.call_count, 2)
-
-    def test_a_failing_verdict_is_never_remembered(self):
-        with mock.patch.object(graph_backup, "_integrity_check", return_value="error: malformed") as check:
-            first, second = self._health(), self._health()
-        self.assertEqual(check.call_count, 2)
-        self.assertFalse(first["ok"] or second["ok"])
-
-    def test_a_day_old_verdict_is_checked_again(self):
-        with mock.patch.object(graph_backup, "_integrity_check", return_value="ok") as check:
-            self._health()
-            later = datetime.now(timezone.utc) + timedelta(hours=25)
-            with mock.patch.object(graph_backup, "_utcnow", return_value=later):
-                self._health()
-        self.assertEqual(check.call_count, 2)
-
-
-    def test_a_write_during_the_check_is_not_remembered_as_checked(self):
-        # Cross-family review: the identity was read after the check, so a
-        # file changed while it was checked kept the old pass.
-        writes = []
-
-        def check_then_write(path):
-            writes.append(1)
-            con = sqlite3.connect(path)
-            con.execute("INSERT INTO nodes VALUES (?)", (f"written during check {len(writes)}",))
-            con.commit()
-            con.close()
-            return "ok"
-
-        with mock.patch.object(graph_backup, "_integrity_check", side_effect=check_then_write) as check:
-            self._health()
-            self._health()
-        self.assertEqual(check.call_count, 2)
-
-    def test_a_snapshot_with_a_wal_beside_it_is_never_remembered(self):
-        # Committed WAL pages change the database without touching the main
-        # file's size or times, so a verdict for it cannot be remembered.
-        Path(f"{self.snap}-wal").write_bytes(b"x")
-        with mock.patch.object(graph_backup, "_integrity_check", return_value="ok") as check:
-            self._health()
-            self._health()
-        self.assertEqual(check.call_count, 2)
 
 class MemoryPlannedOnceTest(unittest.TestCase):
     def test_memory_gaps_can_use_the_fingerprint_cache(self):
@@ -202,10 +116,8 @@ class DoctorHubChecksRunTogetherTest(unittest.TestCase):
 
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        patches = [p for p in _green_doctor_patches() if p.attribute != "path_setting"]
+        patches = list(_green_doctor_patches())
         patches += [
-            mock.patch("khipu.config.path_setting",
-                       side_effect=lambda key, *a, **k: Path("/x/graph.sqlite") if key == "graph_sqlite" else None),
             mock.patch("khipu.probe.status", return_value={"ok": True, "reason": None}),
             mock.patch("khipu.drift.recall_quality", return_value={}),
         ]
@@ -219,8 +131,8 @@ class DoctorHubChecksRunTogetherTest(unittest.TestCase):
             cli.cmd_doctor(args)
         return json.loads(out.getvalue())
 
-    def test_drift_graph_and_coverage_are_waited_on_together(self):
-        together = threading.Barrier(3, timeout=5)
+    def test_drift_and_coverage_are_waited_on_together(self):
+        together = threading.Barrier(2, timeout=5)
 
         def meet(result):
             def run(*_a, **_k):
@@ -231,15 +143,13 @@ class DoctorHubChecksRunTogetherTest(unittest.TestCase):
         clean_drift = {"episodes_missing_in_pg": 0, "topic_mismatches": [], "topic_files_unreadable": []}
         coverage = {"episodes": {"missing": 0}, "topics": {"missing": 0}}
         with mock.patch("khipu.drift.sample_drift", side_effect=meet(clean_drift)), \
-                mock.patch("khipu.graph_sync.graph_drift", side_effect=meet({"ok": True})), \
                 mock.patch("khipu.embed.coverage", side_effect=meet(coverage)):
             out = self._doctor([])
         # Run one after another, the first to arrive waits out the barrier and
-        # every one of the three comes back as an error.
+        # both come back as an error.
         self.assertEqual(out["drift"], clean_drift)
-        self.assertEqual(out["graph_drift"], {"ok": True})
         self.assertEqual(out["embed_coverage"], coverage)
-        self.assertTrue(out["drift_ok"] and out["graph_drift_ok"] and out["embed_coverage_ok"])
+        self.assertTrue(out["drift_ok"] and out["embed_coverage_ok"])
 
     def test_probe_waits_for_the_hub_checks(self):
         done = {}
@@ -259,83 +169,13 @@ class DoctorHubChecksRunTogetherTest(unittest.TestCase):
 
         with mock.patch("khipu.drift.sample_drift", side_effect=slow("drift", {
                     "episodes_missing_in_pg": 0, "topic_mismatches": [], "topic_files_unreadable": []})), \
-                mock.patch("khipu.graph_sync.graph_drift", side_effect=slow("graph", {"ok": True})), \
                 mock.patch("khipu.embed.coverage", side_effect=slow("coverage", {
                     "episodes": {"missing": 0}, "topics": {"missing": 0}})), \
                 mock.patch("khipu.probe.run_probe", side_effect=probe), \
                 mock.patch("khipu.probe.harness_results", return_value={}):
             self._doctor(["--probe"])
-        self.assertEqual(set(done), {"drift", "graph", "coverage"})
+        self.assertEqual(set(done), {"drift", "coverage"})
         self.assertGreaterEqual(started["probe"], max(done.values()))
-
-
-class GraphDriftTwoConnectionsTest(unittest.TestCase):
-    def test_nodes_and_edges_are_read_at_the_same_time(self):
-        from khipu import graph_sync
-
-        together = threading.Barrier(2, timeout=5)
-
-        class Cur:
-            def __init__(self):
-                self.rows = []
-
-            def execute(self, sql, params=None):
-                flat = " ".join(sql.split())
-                if "SELECT n.id, n.type" in flat:
-                    together.wait()
-                    self.rows = [("n1", "concept", "code", "Name", {"a": 1}, "x.py",
-                                  datetime(2026, 1, 1, tzinfo=timezone.utc), False, None)]
-                elif "SELECT COUNT(*)" in flat:
-                    self.rows = [(0,)]
-                elif "SELECT e.src" in flat:
-                    together.wait()
-                    self.rows = [("n1", "n1", "uses", 1.0, {"z": 1}, None)]
-
-            def fetchall(self):
-                return list(self.rows)
-
-            def fetchone(self):
-                return self.rows[0]
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        class Conn:
-            def __init__(self):
-                self.cur = Cur()
-
-            def cursor(self):
-                return self.cur
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        with tempfile.TemporaryDirectory() as td:
-            p = Path(td) / "graph.sqlite"
-            con = sqlite3.connect(p)
-            con.executescript("""
-            CREATE TABLE nodes(id TEXT,type TEXT,bucket TEXT,name TEXT,payload TEXT,source_path TEXT,built_at TEXT,frozen INTEGER);
-            CREATE TABLE edges(src TEXT,dst TEXT,type TEXT,weight REAL,payload TEXT,built_at TEXT);
-            INSERT INTO nodes VALUES('n1','concept','code','Name','{"a":1}','x.py','2026-01-01T00:00:00Z',0);
-            INSERT INTO edges VALUES('n1','n1','uses',1,'{"z":1}',NULL);
-            """)
-            con.commit()
-            con.close()
-            with mock.patch.object(graph_sync, "is_graph_producer", return_value=True), \
-                    mock.patch.object(graph_sync, "disabled_or_unreachable_ids", return_value=set()), \
-                    mock.patch.object(graph_sync, "load_sources", return_value={"sources": []}), \
-                    mock.patch.object(graph_sync, "owned_source_ids", return_value=set()), \
-                    mock.patch.object(graph_sync, "_changed_since_last_mirror", return_value=False), \
-                    mock.patch("khipu.db.connect", side_effect=lambda **_k: Conn()):
-                out = graph_sync.graph_drift(p)
-        self.assertTrue(out["ok"], out)
-        self.assertEqual((out["pg_graphify_nodes"], out["pg_graphify_edges"]), (1, 1))
 
 
 class SecretsMigrationRunsOnceTest(unittest.TestCase):

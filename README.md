@@ -55,11 +55,10 @@ The app checks GitHub Releases at launch. Install an update from Settings, then 
 
 ## First run
 
-The first launch opens a seven-step setup: Welcome, Database, Model, Graph, Agents, Accounts, Finish. Each step checks itself, so you can stop and resume.
+The first launch opens a six-step setup: Welcome, Database, Model, Agents, Accounts, Finish. Each step checks itself, so you can stop and resume.
 
 - **Database.** Choose one: join a Khipu you already have, set up a new database on this Mac (needs Docker), or connect to a database you already run.
 - **Model.** Pick the summariser: cloud Gemini, Claude Haiku with an API key, Claude or ChatGPT on your own login, or a local OpenAI-compatible endpoint. You can skip this for now.
-- **Graph.** Installs the graph builder. You can skip it and do it later in Settings.
 - **Agents.** Lists the agents it found. Install and verify each one in Harnesses.
 - **Accounts.** Optionally choose tracked accounts, set their priority and enable telling conversations about routing. Skip for now writes nothing.
 - **Finish.** Runs a health check and lists anything unresolved, each with one fix.

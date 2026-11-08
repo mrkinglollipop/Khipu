@@ -2,9 +2,8 @@
 
 Search enrich and ``khipu graph`` union-expand live here so MCP and CLI cannot
 drift. Minted ids are only ``topic:{slug}`` and ``path:{rel}`` with
-``bucket=conversation-memory``. Never INSERT/UPDATE graphify ids
-(``memory_topic:…``) — ``graph_sync`` ``ON CONFLICT (id) DO UPDATE SET`` would
-overwrite type/bucket/payload on the next nightly.
+``bucket=conversation-memory``. Never INSERT/UPDATE the old code-graph ids
+(``memory_topic:…``); rows left from the removed code graph are not touched.
 """
 from __future__ import annotations
 

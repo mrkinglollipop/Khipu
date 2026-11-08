@@ -1,4 +1,4 @@
-"""Scheduled memory/graph jobs — thin wrappers around legacy consolidate/graphify scripts.
+"""Scheduled memory jobs — thin wrappers around legacy consolidate scripts.
 
 Khipu owns the launchd labels and CLI entrypoints; the engines stay unchanged.
 """
@@ -27,12 +27,6 @@ from khipu.paths import DEFAULT_DIR, ensure_data_dir
 DRIVER_TIMEOUT_SECONDS = 3600
 DRIVER_TERMINATE_GRACE_SECONDS = 2
 
-GRAPHIFY_NOT_INSTALLED = {
-    "ok": False,
-    "error": "graphify_not_installed",
-    "fix": "khipu components install graphify",
-}
-
 
 def _env_script_path(env_key: str) -> Path | None:
     raw = (os.environ.get(env_key) or "").strip()
@@ -43,55 +37,9 @@ def _application_support_dir() -> Path:
     return Path.home() / "Library" / "Application Support" / "Khipu"
 
 
-def _versions_file() -> Path:
-    return _application_support_dir() / "versions.json"
-
-
-def graphify_nightly_path() -> Path | None:
-    """Resolve graphify_nightly.py: versions.json, then env, then None."""
-    versions_path = _versions_file()
-    if versions_path.is_file():
-        try:
-            data = json.loads(versions_path.read_text(encoding="utf-8"))
-            graphify = data.get("graphify") if isinstance(data, dict) else None
-            if isinstance(graphify, dict):
-                root = str(graphify.get("path") or "").strip()
-                if root:
-                    script = Path(root) / "graphify_nightly.py"
-                    if script.is_file():
-                        return script
-        except (OSError, ValueError, TypeError):
-            pass
-
-    env_script = _env_script_path("KHIPU_GRAPHIFY_NIGHTLY")
-    if env_script is not None and env_script.is_file():
-        return env_script
-    # The desktop app and an interactive shell do not carry the launchd job's
-    # environment; the installed plist is the one place the maintainer path
-    # is recorded, so read it back from there.
-    plist_script = _plist_env_path(PLIST_GRAPH, "KHIPU_GRAPHIFY_NIGHTLY")
-    if plist_script is not None and plist_script.is_file():
-        return plist_script
-    return None
-
-
-def _plist_env_path(label: str, key: str) -> Path | None:
-    import plistlib
-
-    try:
-        with open(_plist_path(label), "rb") as fh:
-            data = plistlib.load(fh)
-    except (OSError, ValueError):
-        return None
-    env = data.get("EnvironmentVariables") if isinstance(data, dict) else None
-    raw = str((env or {}).get(key) or "").strip() if isinstance(env, dict) else ""
-    return Path(raw) if raw else None
-
-
 # Patchable module attrs (tests); no maintainer-path install defaults.
 CONSOLIDATE_NIGHTLY = _env_script_path("KHIPU_CONSOLIDATE_NIGHTLY")
 CONSOLIDATE_MONTHLY = _env_script_path("KHIPU_CONSOLIDATE_MONTHLY")
-GRAPHIFY_NIGHTLY: Path | None = None
 BUILD_INDEX = _env_script_path("KHIPU_BUILD_INDEX")
 
 LOG_DIR = Path.home() / "Library" / "Logs" / "Khipu"
@@ -107,7 +55,6 @@ LOG_DIR_CONFIG = DEFAULT_DIR / "logs"
 
 PLIST_NIGHTLY = "com.matt.khipu-nightly"
 PLIST_MONTHLY = "com.matt.khipu-monthly"
-PLIST_GRAPH = "com.matt.khipu-graph"
 # F1: the fourth LaunchAgent — WatchPaths on the memory dirs the notes
 # scanner knows, debounced (ThrottleInterval) rather than calendar-scheduled,
 # so a note edit is reconciled within the throttle window instead of waiting
@@ -129,7 +76,6 @@ PLIST_RECALL_DAEMON = "com.khipu.recall-daemon"
 PLIST_REPLICA_REFRESH = "com.khipu.replica-refresh"
 
 LEGACY_PLIST_NIGHTLY = "com.matt.conversation-memory-nightly"
-LEGACY_PLIST_GRAPH = "com.matt.graphify-nightly"
 
 INDEX_SLACK_S = int(os.environ.get("KHIPU_INDEX_SLACK_S", "1800"))
 
@@ -143,11 +89,6 @@ _JOB_SPECS: dict[str, dict[str, str]] = {
         "plist": PLIST_MONTHLY,
         "log_stem": "khipu-monthly",
         "schedule": "monthly day 1 09:00",
-    },
-    "graph_build": {
-        "plist": PLIST_GRAPH,
-        "log_stem": "khipu-graph",
-        "schedule": "daily 02:17",
     },
     "notes_watch": {
         "plist": PLIST_NOTES_WATCH,
@@ -1183,7 +1124,7 @@ def _commitment_close_rules() -> dict[str, Any]:
 
 def _reconcile_notes_if_due() -> dict[str, Any]:
     """W4.3: piggyback `khipu.notes.reconcile` on the nightly cadence, the
-    same posture as `_offsite_if_due` on the graph job — additive,
+    additive,
     best-effort, and must never turn a good nightly run into a bad one on
     doctor/status (the external CONSOLIDATE_NIGHTLY driver's exit code above
     is the one that actually gates job_status/doctor)."""
@@ -1627,8 +1568,8 @@ def skipped_step_names(health: dict[str, dict[str, Any]]) -> list[str]:
     """The base name (``key`` minus its ``_ok`` suffix) of every
     `nightly_step_health()` entry marked `skipped` or `applicable: false` —
     doctor folds these into its `not_configured` list so healthRows.tsx
-    renders them with the same grey "not set up" row `memory_root`/
-    `graph_sqlite` already use, instead of a false green for a step that
+    renders them with the same grey "not set up" row `memory_root`
+    already uses, instead of a false green for a step that
     never runs on this Mac or has not run yet."""
     names: list[str] = []
     for key, v in health.items():
@@ -1667,49 +1608,6 @@ def _run_monthly_locked(*, dry_run: bool = False) -> int:
     )
 
 
-def run_graph_build() -> int:
-    script = GRAPHIFY_NIGHTLY or graphify_nightly_path()
-    if script is None:
-        _write_job_state("graph_build", 2)
-        print(json.dumps(GRAPHIFY_NOT_INSTALLED))
-        return 2
-    rc = _run_script(script, log_stem="khipu-graph", state_name="graph_build")
-    # Snapshot protection is independent of embedding progress or failures.
-    _offsite_if_due()
-    return rc
-
-
-def _offsite_if_due() -> None:
-    """Weekly offsite copy of the newest graph snapshot, piggybacked on the
-    graph job because nothing else schedules it — `khipu graph-backup offsite`
-    had run exactly once, by hand, before this (2026-08-25). Failures are
-    recorded by run_offsite as ops_events (doctor's graph_offsite reads them)
-    and must never fail the build whose snapshot they copy."""
-    from khipu import graph_backup
-
-    try:
-        last_ok = graph_backup._last_ok_time(
-            "graph_snapshot_offsite",
-            statement_timeout_s=graph_backup.OFFSITE_RECEIPT_STATEMENT_TIMEOUT_SECONDS,
-            connect_timeout=graph_backup.OFFSITE_RECEIPT_CONNECT_TIMEOUT_SECONDS,
-            raise_on_error=True,
-        )
-        now = datetime.now(timezone.utc)
-        if not graph_backup.offsite_due(last_ok=last_ok, now=now):
-            return
-        out = graph_backup.run_offsite()
-    except graph_backup.OffsiteReceiptReadError as exc:
-        out = {"ok": False, "reason": str(exc)}
-    except Exception as exc:  # noqa: BLE001
-        out = {"ok": False, "reason": str(exc)}
-    try:
-        out_log, _ = _log_paths("khipu-graph")
-        with open(out_log, "ab") as f:
-            f.write(f"offsite: {json.dumps(out, default=str)[:600]}\n".encode())
-    except OSError:
-        pass
-
-
 def run_build_index() -> int:
     return _run_script(
         BUILD_INDEX, log_stem="khipu-build-index", state_name="build_index"
@@ -1740,14 +1638,6 @@ def nightly_log_path() -> Path:
     if legacy is not None and legacy.is_file():
         return legacy
     return khipu
-
-
-def graph_plist_path() -> Path:
-    khipu = _plist_path(PLIST_GRAPH)
-    legacy = _plist_path(LEGACY_PLIST_GRAPH)
-    if khipu.is_file():
-        return khipu
-    return legacy
 
 
 def _installed_log_paths(plist: Path, stem: str) -> tuple[Path, Path]:
@@ -1822,7 +1712,7 @@ def _job_entry(name: str) -> dict[str, Any]:
 
         scheduled = read_versions().get("scheduled_jobs", {})
         expected = isinstance(scheduled, dict) and bool(
-            scheduled.get(name) or (name == "graph_build" and scheduled.get("graph"))
+            scheduled.get(name)
         )
     except Exception:
         expected = False
@@ -1855,7 +1745,6 @@ def job_status() -> dict[str, Any]:
     return {
         "nightly": _job_entry("nightly"),
         "monthly": _job_entry("monthly"),
-        "graph_build": _job_entry("graph_build"),
         "notes_watch": _job_entry("notes_watch"),
         "queue_drain": _job_entry("queue_drain"),
         "recall_daemon": _job_entry("recall_daemon"),

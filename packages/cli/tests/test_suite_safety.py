@@ -17,12 +17,6 @@ def _load(name):
 
 
 class LiveResourceSafetyTest(unittest.TestCase):
-    def test_bundled_semantic_behavior_tests_are_not_skipped(self):
-        module = _load("test_code_semantic_extractor")
-        self.assertFalse(getattr(module.CodeRootsFromResolvedTest, "__unittest_skip__", False))
-        self.assertEqual(module.EXTRACTOR_PATH.resolve(),
-                         Path(__file__).resolve().parents[3] / "third_party" / "graphify" / "code_semantic_extractor.py")
-
     def test_pure_outbox_durability_tests_execute_without_a_database(self):
         with mock.patch("khipu.db.connect", side_effect=AssertionError("database consulted")) as connect:
             module = _load("test_outbox")

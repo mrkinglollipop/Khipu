@@ -359,7 +359,7 @@ Khipu never opens the database to the internet itself; keep it on a private netw
 
 Install and check a harness with `khipu integrations install <harness>` and `khipu integrations verify <harness>`. Verify exercises the integration. It does not just check that a file exists.
 
-Scheduled jobs on the Mac: a nightly memory run, a graph build, a monthly run, a notes watcher and the five-minute queue drain. The warm recall service is opt-in. See [operations.md](operations.md).
+Scheduled jobs on the Mac: a nightly memory run, a monthly run, a notes watcher and the five-minute queue drain. The warm recall service is opt-in. See [operations.md](operations.md).
 
 ## 6. Nothing is cut over irreversibly
 
@@ -400,7 +400,7 @@ During the migration, memory exists as files and as database rows, so they can d
 | `khipu reconcile` | Sweeps files into PostgreSQL. Idempotent: it upserts on `(ts, md5(summary))`, so re-running never duplicates. It tombstones topics whose files were deleted (with a circuit breaker) and restores ones that reappear. |
 | `khipu doctor` | The single health command. It checks drift in one direction: every file episode must exist in PostgreSQL. It also covers many more checks. |
 | `khipu revisions` | Shows conflicting topic edits across machines. The newest edit wins and the older version is kept. |
-| `khipu sources` | Lists, enables, disables, adds and removes graph roots. `sources export` writes the file graphify reads. |
+| `khipu sources` | Lists, enables and disables memory sources, and sets which of them embed images. |
 
 `khipu doctor --quick` runs all the local health checks (imports, config, outbox, capture liveness, jobs, backups, launchers and more) and omits hub reachability, network and probe checks; reads the hub only for the pending-migration check. `khipu doctor --probe` runs a fresh end-to-end recall test.
 

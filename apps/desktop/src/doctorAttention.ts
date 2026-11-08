@@ -139,17 +139,6 @@ export function buildAttention(parsed: Record<string, unknown>): {
     });
   }
 
-  if ((parsed as { graph_drift_ok?: boolean }).graph_drift_ok === false) {
-    issues.push("Graph mirror drift");
-    items.push({
-      key: "graph_drift",
-      tone: "warn",
-      title: "The connections index is behind its source",
-      cause:
-        "The graph builder's own copy and the database disagree. The next graph build reconciles them; run it from the health report below.",
-    });
-  }
-
   if ((parsed as { outbox_ok?: boolean }).outbox_ok === false) {
     issues.push("Captures waiting to sync");
     const box = (parsed as { outbox?: OutboxFields }).outbox;
@@ -169,26 +158,6 @@ export function buildAttention(parsed: Record<string, unknown>): {
       tone: "err",
       title: "The newest backup is older than it should be",
       cause: "Backups run on a schedule off this Mac. Until one lands, a restore would lose recent sessions.",
-    });
-  }
-
-  if ((parsed as { graph_backup_ok?: boolean }).graph_backup_ok === false) {
-    issues.push("Graph snapshot");
-    items.push({
-      key: "graph_backup",
-      tone: "warn",
-      title: "The connections snapshot is stale",
-      cause: "The last saved copy of the connections index is older than its limit.",
-    });
-  }
-
-  if ((parsed as { graph_offsite_ok?: boolean }).graph_offsite_ok === false) {
-    issues.push("Graph offsite");
-    items.push({
-      key: "graph_offsite",
-      tone: "warn",
-      title: "The off-site copy of the connections index is stale",
-      cause: "The most recent copy sent off this Mac is older than its limit.",
     });
   }
 

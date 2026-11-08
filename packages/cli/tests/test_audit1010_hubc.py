@@ -12,48 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from khipu import graph_backup, git_sync_health
-
-
-class GraphSnapshotHealthTest(unittest.TestCase):
-    def test_unrelated_healthy_sqlite_is_not_a_graph_snapshot(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            snap = root / "graph-20261010T000000Z.sqlite"
-            con = sqlite3.connect(snap)
-            try:
-                con.execute("CREATE TABLE unrelated (id INTEGER)")
-                con.commit()
-            finally:
-                con.close()
-            out = graph_backup.local_health(
-                now=datetime.now(timezone.utc), snapshot_dir=root, producer=True
-            )
-        self.assertFalse(out["ok"], out)
-        self.assertIn("nodes", out["reason"])
-
-    def test_invalid_fresh_snapshot_is_red_and_never_uploaded(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            snap = root / "graph-20261010T000000Z.sqlite"
-            snap.write_bytes(b"this is not sqlite")
-            live = root / "graph.sqlite"
-            live.write_bytes(b"live")
-            now = datetime.now(timezone.utc)
-            health = graph_backup.local_health(now=now, snapshot_dir=root, producer=True)
-            self.assertFalse(health["ok"], health)
-            self.assertIn("integrity", health["reason"])
-            with (
-                mock.patch.object(graph_backup, "latest_snapshot", return_value=snap),
-                mock.patch.object(graph_backup, "_live_graph", return_value=live),
-                mock.patch.object(graph_backup, "resolve_rclone", return_value="rclone"),
-                mock.patch.object(graph_backup, "has_r2_remote", return_value=True),
-                mock.patch.object(graph_backup, "_integrity_check", return_value="error: malformed database"),
-                mock.patch("khipu.graph_backup.subprocess.run", side_effect=AssertionError("must not upload")),
-            ):
-                out = graph_backup.run_offsite()
-            self.assertFalse(out["ok"], out)
-            self.assertIn("integrity", out["reason"])
+from khipu import git_sync_health
 
 
 class GitSyncHealthEvidenceTest(unittest.TestCase):
@@ -364,81 +323,6 @@ class TopicPathContainmentTest(unittest.TestCase):
             with mock.patch("khipu.config.path_setting", return_value=root), mock.patch.object(Path, "read_text", side_effect=AssertionError("outside read")):
                 self.assertIsNone(mirror.parse_topic_file(topics / ".." / "outside.md"))
                 self.assertIsNone(mirror.parse_topic_file(link))
-
-
-class GraphDriftContentTest(unittest.TestCase):
-    class _Cur:
-        def __init__(self, *, payload='{"a":2}', weight=2.0, source_id="code:test"):
-            self.payload, self.weight, self.source_id, self.rows = payload, weight, source_id, []
-        def execute(self, sql, params=None):
-            flat = " ".join(sql.split())
-            if "SELECT n.id, n.type" in flat:
-                self.rows = [("n1", "concept", "code", "Name", self.payload, "x.py", "2026-01-01T00:00:00Z", False, self.source_id)]
-            elif "SELECT COUNT(*)" in flat:
-                self.rows = [(0,)]
-            elif "SELECT e.src" in flat:
-                self.rows = [("n1", "n1", "uses", self.weight, '{"z":1}', "2026-01-01T00:00:00+00:00")]
-        def fetchall(self): return list(self.rows)
-        def fetchone(self): return self.rows[0]
-        def __enter__(self): return self
-        def __exit__(self, *args): return False
-    class _Conn:
-        def __init__(self, cur): self.cur = cur
-        def cursor(self): return self.cur
-        def __enter__(self): return self
-        def __exit__(self, *args): return False
-
-    def _sqlite(self, root):
-        p = root / "graph.sqlite"
-        con = sqlite3.connect(p)
-        con.executescript("""
-        CREATE TABLE nodes(id TEXT,type TEXT,bucket TEXT,name TEXT,payload TEXT,source_path TEXT,built_at TEXT,frozen INTEGER);
-        CREATE TABLE edges(src TEXT,dst TEXT,type TEXT,weight REAL,payload TEXT,built_at TEXT);
-        INSERT INTO nodes VALUES('n1','concept','code','Name','{"a":1}','x.py','2026-01-01T00:00:00+00:00',0);
-        INSERT INTO edges VALUES('n1','n1','uses',1.0,'{"z":1}','2026-01-01T00:00:00Z');
-        """)
-        con.commit()
-        con.close()
-        return p
-
-    def test_equal_ids_with_changed_content_are_red_and_normalized_values_are_clean(self):
-        from khipu import graph_sync
-        with tempfile.TemporaryDirectory() as td:
-            p = self._sqlite(Path(td))
-            common = [mock.patch.object(graph_sync, "is_graph_producer", return_value=True), mock.patch.object(graph_sync, "disabled_or_unreachable_ids", return_value=set()), mock.patch.object(graph_sync, "load_sources", return_value={"sources": [{"id":"code:test", "enabled":True}]}), mock.patch.object(graph_sync, "owned_source_ids", return_value={"code:test"}), mock.patch.object(graph_sync, "_changed_since_last_mirror", return_value=False)]
-            with common[0], common[1], common[2], common[3], common[4], mock.patch("khipu.db.connect", side_effect=lambda **_kw: self._Conn(self._Cur())):
-                drifted = graph_sync.graph_drift(p)
-            self.assertFalse(drifted["ok"], drifted)
-            self.assertEqual(drifted["nodes_content_drift"], 1)
-            self.assertEqual(drifted["edges_content_drift"], 1)
-            with mock.patch.object(graph_sync, "is_graph_producer", return_value=True), mock.patch.object(graph_sync, "disabled_or_unreachable_ids", return_value=set()), mock.patch.object(graph_sync, "load_sources", return_value={"sources": []}), mock.patch.object(graph_sync, "owned_source_ids", return_value=set()), mock.patch.object(graph_sync, "_changed_since_last_mirror", return_value=False), mock.patch("khipu.db.connect", side_effect=lambda **_kw: self._Conn(self._Cur(payload='{"a": 1}', weight=1.0, source_id=None))):
-                clean = graph_sync.graph_drift(p)
-            self.assertTrue(clean["ok"], clean)
-
-    def test_pending_excuse_is_doctors_default_and_the_sync_can_turn_it_off(self):
-        from khipu import graph_sync
-        with tempfile.TemporaryDirectory() as td:
-            p = self._sqlite(Path(td))
-            with mock.patch.object(graph_sync, "is_graph_producer", return_value=True), mock.patch.object(graph_sync, "disabled_or_unreachable_ids", return_value=set()), mock.patch.object(graph_sync, "load_sources", return_value={"sources": [{"id": "code:test", "enabled": True}]}), mock.patch.object(graph_sync, "owned_source_ids", return_value={"code:test"}), mock.patch.object(graph_sync, "_changed_since_last_mirror", return_value=True), mock.patch("khipu.db.connect", side_effect=lambda **_kw: self._Conn(self._Cur())):
-                doctor_view = graph_sync.graph_drift(p)
-                sync_view = graph_sync.graph_drift(p, excuse_pending=False)
-        self.assertTrue(doctor_view["ok"], doctor_view)
-        self.assertIn("pending", doctor_view)
-        self.assertFalse(sync_view["ok"], sync_view)
-        self.assertNotIn("pending", sync_view)
-        self.assertEqual(sync_view["nodes_content_drift"], 1)
-
-    def test_corrupt_source_registry_is_explicitly_red(self):
-        from khipu import graph_sync, sources
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            p = self._sqlite(root)
-            registry = root / "sources.json"
-            registry.write_text("{broken", encoding="utf-8")
-            with mock.patch.object(graph_sync, "is_graph_producer", return_value=True), mock.patch.object(sources, "sources_file", return_value=registry):
-                out = graph_sync.graph_drift(p)
-        self.assertFalse(out["ok"])
-        self.assertIn("source registry", out["error"])
 
 
 class CandidateDeadlineTest(unittest.TestCase):

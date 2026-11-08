@@ -1808,7 +1808,7 @@ function ImportDialog({
       <div className="kit-dialog-body">
         <h2 id="import-emb-title">Import an index into {library?.name ?? ""}</h2>
         <p>
-          Bring in vectors that were already computed elsewhere, so nothing is embedded again. Use a graphify SQLite
+          Bring in vectors that were already computed elsewhere, so nothing is embedded again. Use an embeddings SQLite
           file or a .jsonl file.
         </p>
         <div className="field-grid">

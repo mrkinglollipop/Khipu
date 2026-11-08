@@ -50,12 +50,12 @@ To point Khipu at a legacy file wiki, use `python3 -m khipu config --set memory_
 |---|---|
 | Health and data | `doctor`, `status`, `activity`, `revisions`, `reconcile`, `migrate`, `snapshot`, `outbox` |
 | Search and records | `search`, `get`, `graph`, `episode`, `topic`, `notes`, `owed`, `decisions`, `recall` |
-| Maintenance | `regen-memory`, `backfill`, `project`, `hygiene`, `graph-sync`, `git-sync` |
+| Maintenance | `regen-memory`, `backfill`, `project`, `hygiene`, `git-sync` |
 | Embeddings and libraries | `embed`, `embed-backfill`, `library`, `library-backfill`, `sources` |
 | Models and limits | `models`, `budget`, `features`, `secrets`, `config` |
-| Setup and moving | `db`, `join`, `components`, `paths`, `backup-local`, `import-local`, `graph-backup` |
+| Setup and moving | `db`, `join`, `components`, `paths`, `backup-local`, `import-local` |
 | Harnesses and capture | `integrations`, `sessions` (older name `aegis`), `capture`, `gateway` |
-| Jobs and deploy | `jobs`, `nightly`, `monthly`, `graph-build`, `promote` |
+| Jobs and deploy | `jobs`, `nightly`, `monthly`, `promote` |
 | Routing and plans | `route`, `usage` |
 
 ## Environment

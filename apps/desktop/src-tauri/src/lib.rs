@@ -494,7 +494,7 @@ fn app_cli_timeout_secs() -> u64 {
 fn cli_has_no_time_limit(args: &[String]) -> bool {
     let first = args.first().map(String::as_str).unwrap_or("");
     match first {
-        "backup-local" | "import-local" | "doctor" | "nightly" | "graph-build" | "monthly" | "embed-backfill"
+        "backup-local" | "import-local" | "doctor" | "nightly" | "monthly" | "embed-backfill"
         | "library-backfill" | "join" => true,
         "db" => matches!(args.get(1).map(String::as_str), Some("move" | "preflight" | "connect")),
         // The Owed clean-up: a plan may make its capped model calls, and an
@@ -738,7 +738,6 @@ const FEATURE_NAMES: &[&str] = &[
 const JOB_NAMES: &[&str] = &[
     "nightly",
     "monthly",
-    "graph_build",
     "notes_watch",
     "queue_drain",
     "recall_daemon",
@@ -753,7 +752,6 @@ const PATH_KEYS: &[&str] = &[
     "memory_root",
     "memory_repo",
     "capture_v2",
-    "graph_sqlite",
     "gemini_key_file",
 ];
 const COSINE_FLOOR_KEY: &str = "relevance.cosine_floor";
@@ -815,30 +813,12 @@ const SYNTH_FALLBACKS: &[&str] = &["gemini", "none"];
 /// `config --set usage_accounts JSON` / `config --unset usage_accounts`: the
 /// accounts Home -> Plans reads (Settings -> Capture & models -> Plans).
 const USAGE_ACCOUNTS_KEY: &str = "usage_accounts";
-const GRAPH_BACKUP_REMOTE_KEY: &str = "graph_backup_remote";
 /// Owed's limits (`khipu.config.COUNT_SETTINGS`): whole numbers of 0 or
 /// more, 0 for no limit, each `config --set KEY N` or `config --unset=KEY`.
 const OWED_COUNT_KEYS: &[&str] = &["owed_orchestrator_slice_max", "owed_page_max", "owed_bulk_max", "owed_tidy_calls"];
 /// Whether Owed's close rules ask GitHub, read-only, if a pull request merged.
 const OWED_GITHUB_KEY: &str = "owed_pr_check_github";
 
-/// An rclone `remote:path` (the CLI checks it again): one token, the remote
-/// name first, so it can never read as a flag.
-fn checked_backup_remote(value: &str) -> Result<String, String> {
-    let v = value.trim().trim_end_matches('/');
-    let (remote, path) = v.split_once(':').unwrap_or(("", ""));
-    let ok = v.len() <= 512
-        && !remote.is_empty()
-        && !path.is_empty()
-        && remote.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && remote.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
-        && !v.chars().any(|c| c.is_control() || c.is_whitespace());
-    if ok {
-        Ok(v.to_string())
-    } else {
-        Err(format!("graph_backup_remote must look like r2:bucket/folder, got {value:?}"))
-    }
-}
 /// Settings -> Data, "This Mac's copy": how old the copy may get before the
 /// background job updates it, how often the job looks, and how long a failed
 /// database connection is remembered. Lengths of time in
@@ -1495,7 +1475,6 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
             }
             Ok(set("synth_fallback", v.to_string()))
         }
-        GRAPH_BACKUP_REMOTE_KEY => Ok(set(GRAPH_BACKUP_REMOTE_KEY, checked_backup_remote(value)?)),
         k if OWED_COUNT_KEYS.contains(&k) => Ok(set(k, parse_daily_calls(k, value)?)),
         OWED_GITHUB_KEY => {
             let v = value.trim();
@@ -1535,7 +1514,6 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
     if !PATH_KEYS.contains(&key)
         && key != COSINE_FLOOR_KEY
         && key != USAGE_ACCOUNTS_KEY
-        && key != GRAPH_BACKUP_REMOTE_KEY
         && !OWED_COUNT_KEYS.contains(&key)
         && key != OWED_GITHUB_KEY
         && minute_key(key).is_none()
@@ -4528,11 +4506,6 @@ async fn bootstrap_local_backup() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn install_graphify() -> Result<String, String> {
-    run_khipu_cli_async(vec!["components".into(), "install-graphify".into()]).await
-}
-
-#[tauri::command]
 async fn components_status() -> Result<String, String> {
     run_khipu_cli_async(vec!["components".into(), "status-json".into()]).await
 }
@@ -4540,11 +4513,6 @@ async fn components_status() -> Result<String, String> {
 #[tauri::command]
 async fn upgrade_postgres() -> Result<String, String> {
     run_khipu_cli_async(vec!["components".into(), "upgrade-postgres".into()]).await
-}
-
-#[tauri::command]
-async fn upgrade_graphify() -> Result<String, String> {
-    run_khipu_cli_async(vec!["components".into(), "upgrade-graphify".into()]).await
 }
 
 #[tauri::command]
@@ -4880,7 +4848,7 @@ fn join_receive_sync(passphrase: String, pin: String, out_path: Option<String>) 
 /// This list is exactly what the front end invokes, enumerated from every
 /// `runKhipu([...])` call site in `App.tsx`, `Welcome.tsx`, and
 /// `IntegrationsPanel.tsx` rather than assumed. The first pass kept five more
-/// — `sessions`, `git-sync`, `outbox`, `embed`, `graph-sync` — that no pane
+/// — `sessions`, `git-sync`, `outbox`, `embed` — that no pane
 /// should call through `run_khipu`. Welcome first-run activates cloud embed
 /// via `models welcome` (in-process), not the `embed` subcommand. The
 /// boundary must not hand a compromised webview paid Gemini calls
@@ -4909,10 +4877,10 @@ const ALLOWED_SUBCOMMANDS: &[&str] = &[
     "episode", "owed", "storage",
 ];
 
-/// Fire-and-forget job runners — long-running consolidate/graphify passes.
+/// Fire-and-forget job runners — long-running consolidate passes.
 /// Deliberately separate from `ALLOWED_SUBCOMMANDS`: these spawn detached and
 /// return immediately; the UI must not block on `.output()`.
-const SPAWN_ALLOWED_SUBCOMMANDS: &[&str] = &["nightly", "graph-build", "monthly"];
+const SPAWN_ALLOWED_SUBCOMMANDS: &[&str] = &["nightly", "monthly"];
 
 /// Env the desktop runner adds for selected CLI verbs. Search from Recall must
 /// not look like an agent in the query log (guides "Ask your agent" tick).
@@ -5008,7 +4976,7 @@ fn spawn_detached_cli(args: &[String], label: &str) -> Result<(u32, PathBuf), St
 }
 
 /// Engine stdout for spawnable jobs — same stems as `jobs.py` `_JOB_SPECS`
-/// (`khipu-nightly` / `khipu-monthly` / `khipu-graph`) under
+/// (`khipu-nightly` / `khipu-monthly`) under
 /// `~/Library/Logs/Khipu/`, falling back to `~/Library/Logs/<KHIPU_LEGACY_LOG_DIR>`
 /// when that env var is set and the Khipu dir does not exist yet (an upgrade
 /// whose launchd jobs still write to the product's pre-rename log directory).
@@ -5017,7 +4985,6 @@ fn engine_job_log_path(subcommand: &str) -> PathBuf {
     let stem = match subcommand {
         "nightly" => "khipu-nightly",
         "monthly" => "khipu-monthly",
-        "graph-build" => "khipu-graph",
         other => other,
     };
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -5597,10 +5564,8 @@ pub fn run() {
             select_compat_row,
             install_local_postgres,
             bootstrap_local_backup,
-            install_graphify,
             components_status,
             upgrade_postgres,
-            upgrade_graphify,
             check_remote_postgres,
             dsn_configured,
             health_snapshot,
@@ -6029,7 +5994,7 @@ mod run_khipu_guard_tests {
         // calls and vector deletes, model extraction, PG writes, and a git
         // push that opens and merges PRs. Welcome first-run uses
         // `models welcome` (in-process activate), not `embed`.
-        for s in ["sessions", "git-sync", "outbox", "embed", "graph-sync"] {
+        for s in ["sessions", "git-sync", "outbox", "embed"] {
             assert!(!ALLOWED_SUBCOMMANDS.contains(&s),
                     "`{s}` is not called by any pane and must not be reachable");
         }
@@ -6649,18 +6614,6 @@ mod settings_command_tests {
     }
 
     #[test]
-    fn the_graph_backup_remote_is_one_remote_path() {
-        assert_eq!(
-            config_set_argv("graph_backup_remote", " r2:my-bucket/graph/ ").unwrap(),
-            v(&["config", "--set", "graph_backup_remote", "r2:my-bucket/graph"])
-        );
-        for bad in ["", "bucket", "r2:", ":path", "--set:x", "r2:a b", "r2:a\n--x"] {
-            assert!(config_set_argv("graph_backup_remote", bad).is_err(), "accepted {bad:?}");
-        }
-        assert_eq!(config_unset_argv("graph_backup_remote").unwrap(), v(&["config", "--unset=graph_backup_remote"]));
-    }
-
-    #[test]
     fn the_summariser_fallback_is_gemini_or_none() {
         assert_eq!(config_set_argv("synth_fallback", "gemini").unwrap(), v(&["config", "--set", "synth_fallback", "gemini"]));
         assert_eq!(config_set_argv("synth_fallback", " none ").unwrap(), v(&["config", "--set", "synth_fallback", "none"]));
@@ -6768,7 +6721,7 @@ mod settings_command_tests {
         for n in JOB_NAMES {
             assert!(job_argv("install", n).is_ok());
         }
-        assert_eq!(JOB_NAMES.len(), 7);
+        assert_eq!(JOB_NAMES.len(), 6);
     }
 
     #[test]
@@ -6836,7 +6789,7 @@ mod settings_command_tests {
     fn user_aliases_and_paths_refuse_flags_and_control_characters() {
         assert_eq!(config_set_argv("user_aliases", "matt, matthew").unwrap(), v(&["config", "--set", "user_aliases", "matt, matthew"]));
         assert_eq!(config_set_argv("user_aliases", "").unwrap(), v(&["config", "--set", "user_aliases", ""]));
-        for key in ["user_aliases", "memory_root", "memory_repo", "capture_v2", "graph_sqlite", "gemini_key_file"] {
+        for key in ["user_aliases", "memory_root", "memory_repo", "capture_v2", "gemini_key_file"] {
             for bad in ["-x", "--unset", "--set-gateway-url=https://x", "a\nb", "a\0b", "a\tb"] {
                 assert!(config_set_argv(key, bad).is_err(), "{key} accepted {bad:?}");
             }
@@ -7158,7 +7111,7 @@ mod embeddings_command_tests {
             assert!(!SPAWN_ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of SPAWN_ALLOWED_SUBCOMMANDS");
         }
         assert_eq!(ALLOWED_SUBCOMMANDS.len(), 15);
-        assert_eq!(SPAWN_ALLOWED_SUBCOMMANDS, &["nightly", "graph-build", "monthly"]);
+        assert_eq!(SPAWN_ALLOWED_SUBCOMMANDS, &["nightly", "monthly"]);
         assert_eq!(JOB_SPAWN_VERBS, &["embed-backfill", "library-backfill"]);
     }
 

@@ -13,7 +13,7 @@ python3 -m khipu <command>
 
 Most commands need the Python dependencies on `PYTHONPATH` first; [packages/cli/README.md](../packages/cli/README.md) shows the one-time setup. To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
 
-There are 60 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
+There are 57 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
 
 ## Health and status
 
@@ -125,7 +125,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | `embed-backfill` | Job-mode alias for `embed backfill --job`. |
 | `library-backfill NAME` | Job-mode alias for `library backfill NAME --job`. |
 | `models` | Per-role model settings: `show`, `set`, `welcome`. |
-| `sources` | Graph membership: `list`, `enable`, `disable`, `add`, `remove`, `export`. |
+| `sources` | Memory sources: `list`, `enable`, `disable`, `remove`. |
 
 ### embed
 
@@ -144,7 +144,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 - `enable`, `disable`, `set-profile NAME PROFILE`.
 - `scan NAME [--allow-rebuild]`: pick up file changes.
 - `backfill NAME`: embed documents. `--limit`, `--stale`, `--profile`, `--job`, `--job-id`.
-- `import NAME PATH`: load vectors computed elsewhere (a graphify SQLite file or `.jsonl`). `--strip-prefix`, `--profile`, `--batch`.
+- `import NAME PATH`: load vectors computed elsewhere (an embeddings SQLite file or `.jsonl`). `--strip-prefix`, `--profile`, `--batch`.
 
 ### models
 
@@ -205,9 +205,7 @@ With `--at-owner-request`, a conversation can record `priority set`, `rule add`,
 | `backup-local` | Zip the Mac-local data folder. `--out PATH`. |
 | `import-local` | Restore it. `--source ZIP|DIR`. Merges and skips existing files by default; `--replace` overwrites. |
 | `snapshot` | Offline read replica: `refresh` (hub must be up), `status`, and `heal` (background recovery stages and refresh of an old copy). |
-| `graph-backup` | Graph snapshot backup, on the Mac that builds the graph: `record-local`, `offsite`, `status`, `drill`. |
-| `graph-sync` | Mirror the graph file into Postgres. `--dry-run`, `--check` (exits 2 on drift). |
-| `components` | Postgres and Graphify install, status and upgrades: `status`, `install {postgres,graphify}`, `upgrade {postgres,graphify}`, `check-remote [--full]`, `bootstrap-local-backup`, the single-purpose forms `install-local-postgres`, `install-graphify`, `upgrade-postgres` and `upgrade-graphify`, plus helpers for the app (`status-json`, `select-compat-row`). |
+| `components` | Postgres install, status and upgrades: `status`, `install postgres`, `upgrade postgres`, `check-remote [--full]`, `bootstrap-local-backup`, the single-purpose forms `install-local-postgres` and `upgrade-postgres`, plus helpers for the app (`status-json`, `select-compat-row`). |
 
 - `db move`: `--to DSN` or `--new-local`, `--dry-run`, `--into-nonempty`. It copies and verifies before switching and never writes to the source.
 - `db connect`: `--dsn`, `--use-stored`, `--root-crt`, `--no-jobs`, `--no-prove`.
@@ -255,14 +253,13 @@ Zero is setting-specific: `replica_refresh_after=0` refreshes at every check; `h
 | `promote` | Gate a ref in the inactive live slot and make it live on a pass. |
 | `nightly` | Run the nightly memory wiki job once. |
 | `monthly` | Run the monthly wiki classification once. |
-| `graph-build` | Run the graph build once. |
 | `backfill` | `backfill identity` derives repo and project for episodes. `--dry-run`, `--apply`, `--limit`. |
 | `project` | Project identity: backfill, alias add/list/remove, show NAME, list, merge A B --show-as NAME, keep-separate A B, separate NAME, and renames check. Grouped names read as one project; owner merge/separation decisions control grouping. |
 | `hygiene` | `hygiene paths` finds and purges bad path graph nodes. `hygiene commitments` re-judges open commitments. |
 
 ### jobs
 
-Job names: `nightly`, `monthly`, `graph_build`, `notes_watch`, `queue_drain`, `recall_daemon`, `replica_refresh`. `install` with no name schedules the six jobs other than `recall_daemon` (the default set). `refresh` with no name re-renders every installed job whose plist is stale and never installs a new one. `uninstall` with no name removes all seven, including `recall_daemon`. `recall_daemon` is opt-in: `khipu jobs install recall_daemon`.
+Job names: `nightly`, `monthly`, `notes_watch`, `queue_drain`, `recall_daemon`, `replica_refresh`. `install` with no name schedules the five jobs other than `recall_daemon` (the default set). `refresh` with no name re-renders every installed job whose plist is stale and never installs a new one. `uninstall` with no name removes all six, including `recall_daemon`. `recall_daemon` is opt-in: `khipu jobs install recall_daemon`.
 
 ### promote
 
