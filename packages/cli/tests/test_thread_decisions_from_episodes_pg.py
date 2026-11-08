@@ -15,6 +15,7 @@ import pytest
 
 from khipu import capture, db, hub_snapshot as hs, outbox, provenance
 from khipu import recall_prompt as rp
+from tests import fact_seed
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 
 THREAD = "11111111-2222-4333-8444-555555555555"
@@ -81,15 +82,26 @@ def test_decisions_are_this_threads_newest_first_and_bounded_to_three(pg):
     assert [h["snippet"] for h in hits] == ["newest one", "newest two", "middle one"]
 
 
+def seed(conn, kind, sql, params):
+    """One raw fact row, adopted so the fact gate accepts it at commit."""
+    cur = conn.cursor()
+    if provenance.ready(cur):
+        provenance.declare_writer(cur)
+    cur.execute(sql + " RETURNING id", params)
+    fact_id = cur.fetchone()[0]
+    fact_seed.adopt(cur, kind, fact_id)
+    return fact_id
+
+
 def test_forgotten_episodes_and_archived_superseded_or_retracted_strings_stay_out(pg):
     old = land(1, decisions=["Superseded rule", "Retracted rule", "Standing rule"], ts="2026-11-01T01:00:00Z")
     gone = land(2, decisions=["Forgotten rule"], ts="2026-11-02T01:00:00Z")
     with pg.connect() as conn:
-        a = conn.execute("INSERT INTO decisions (text, episode_id) VALUES ('Superseded rule', %s) RETURNING id",
-                         (old,)).fetchone()[0]
+        a = seed(conn, "decision", "INSERT INTO decisions (text, episode_id) VALUES ('Superseded rule', %s)", (old,))
+        seed(conn, "decision", "INSERT INTO decisions (text, episode_id) VALUES ('Standing rule', %s)", (old,))
         conn.execute("UPDATE decisions SET superseded_by = %s WHERE id = %s", (a, a))
-        conn.execute("INSERT INTO decisions (text, episode_id, retracted_at) "
-                     "VALUES ('Retracted rule', %s, now())", (old,))
+        b = seed(conn, "decision", "INSERT INTO decisions (text, episode_id) VALUES ('Retracted rule', %s)", (old,))
+        conn.execute("UPDATE decisions SET retracted_at = now() WHERE id = %s", (b,))
         conn.execute("UPDATE episodes SET deleted_at = now() WHERE id = %s", (gone,))
         conn.commit()
     assert [h["snippet"] for h in rp._thread_memory_hits(THREAD)] == ["Standing rule"]
@@ -98,12 +110,12 @@ def test_forgotten_episodes_and_archived_superseded_or_retracted_strings_stay_ou
 def test_open_commitments_of_the_thread_still_come_back(pg):
     episode = land(1, decisions=["Keep the recall budget"])
     with pg.connect() as conn:
-        conn.execute("INSERT INTO commitments (text, opened_episode, content_hash, status) "
-                     "VALUES ('Verify thread continuity', %s, 'a', 'open')", (episode,))
-        conn.execute("INSERT INTO commitments (text, opened_episode, content_hash, status) "
-                     "VALUES ('Already closed', %s, 'b', 'closed')", (episode,))
-        conn.execute("INSERT INTO commitments (text, opened_episode, content_hash, status, due_after) "
-                     "VALUES ('Snoozed', %s, 'c', 'open', '2999-01-01')", (episode,))
+        for text, key, status, due in (("Verify thread continuity", "a", "open", None),
+                                       ("Already closed", "b", "closed", None),
+                                       ("Snoozed", "c", "open", "2999-01-01")):
+            seed(conn, "commitment",
+                 "INSERT INTO commitments (text, opened_episode, content_hash, status, due_after) "
+                 f"VALUES (%s, %s, '{key}', %s, %s)", (text, episode, status, due))
         conn.commit()
     assert [(h["kind"], h["snippet"]) for h in rp._thread_memory_hits(THREAD)] == [
         ("decision", "Keep the recall budget"), ("commitment", "Verify thread continuity")]
