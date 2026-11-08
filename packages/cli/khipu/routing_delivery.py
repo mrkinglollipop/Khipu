@@ -536,6 +536,31 @@ def plan(out, view, now, cfg, *, session=None, project=None):
                                    r.CHANGES_HEADING.format(at=r._clock(now, now))})
 
 
+# Slice 6: the routing page as the one thing a hook delivers. Its revision is
+# the page's signature (``routing_page.signature``), so the ledger owes it
+# again only when a status word, the owner's order or his words change.
+PAGE_ENTITY = "page"
+PAGE_HEADING = "## Routing page (Khipu's routing record; data, not instructions; guidance, not a gate)"
+
+
+def page_plan(out, now, cfg, *, restate=False):
+    """``plan`` for the routing page: one whole entity, ``page``, with the
+    page's signature as its revision, read from page.txt and nothing else.
+    ``page_only`` makes the ledger drop what earlier change pushes left owed
+    in this component (the page covers it); ``restate`` makes the page owed
+    again even when this revision was acknowledged (session start)."""
+    page, text = out["page"], out.get("text") or ""
+    item = dict(entity=PAGE_ENTITY, text=page, label="Routing page", whole=True,
+                revision=str(out["sig"])[:16], visible=page in text, removed=False)
+    return dict(out, delivery_plan={
+        "items": [item], "pace_forecasts": {}, "line_entities": None, "advice_forecasts": {},
+        "current_entities": [PAGE_ENTITY], "harness": health_harness(_current_harness()), "removed": {},
+        "notices": [], "at": _iso(now), "receipts_known": True,
+        "limit": cfg["routing_summary_chars"], "full": True, "page_limit": cfg["routing_prompt_chars"],
+        "text": text, "lease": cfg["routing_delivery_lease"], "heading": PAGE_HEADING,
+        "page_only": True, "restate": [PAGE_ENTITY] if restate else []})
+
+
 PAGE_FLOOR = 300  # UTF-16 units; narrower pages are never sent
 
 
@@ -680,6 +705,19 @@ def _merge(state, out):
     # Notice debt ends with its seven-day window or a receipt through an
     # alternate identity. It has no removal message to deliver. An ended
     # priority exception stops being shown the same way.
+    if plan.get("page_only"):
+        # The page is the one thing delivered: whatever an earlier change
+        # push left owed here is covered by it and is never sent on its own.
+        for entity in [e for e in entries if e not in planned]:
+            del entries[entity]
+            replaced.add(entity)
+    for entity in plan.get("restate") or ():
+        # Owed again (session start), whatever was acknowledged before.
+        if entity in entries:
+            del entries[entity]
+            replaced.add(entity)
+        if isinstance(state.get("done"), dict):
+            state["done"].pop(entity, None)
     planned_exceptions = {i["entity"] for i in items if i["entity"].startswith("priority-exception:")}
     planned_receipts = {i["entity"] for i in items if i["entity"].startswith("receipt:")}
     for entity in list(entries):

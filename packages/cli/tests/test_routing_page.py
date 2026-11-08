@@ -155,7 +155,7 @@ def test_a_record_with_todays_long_roles_and_rules_still_fits_and_keeps_every_ac
     assert "HOLD BACK" in _line(text, "Codex") and "ceiling 95%" in _line(text, "Codex")
     assert "NO JOBS until" in _line(text, "Grok") and "up to 90%" in _line(text, "Grok")
     assert "NEARLY OUT" in _line(text, "Kimi") and "SECOND OPINIONS ONLY" in _line(text, "Muse")
-    assert re.search(r"\d+ more rule lines: run `khipu route`", text)
+    assert re.search(r"\d+ more rule lines: run `khipu route --full`", text)
 
 
 def test_the_limit_holds_even_when_the_accounts_alone_would_not_fit():

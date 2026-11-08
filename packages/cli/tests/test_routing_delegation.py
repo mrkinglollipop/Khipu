@@ -343,7 +343,8 @@ def test_the_launcher_refuses_inside_aegis_by_every_route():
     assert out["ok"], out
 
 
-def test_the_launcher_delivers_and_never_fails_the_call(tmp_path):
+@pytest.mark.parametrize("page", ["0", "1"])
+def test_the_launcher_delivers_and_never_fails_the_call(tmp_path, page):
     data = tmp_path / "data"
     data.mkdir()
     (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS, "routing_prompt_budget_ms": 1000,
@@ -354,12 +355,14 @@ def test_the_launcher_delivers_and_never_fails_the_call(tmp_path):
            if not k.startswith(("KHIPU_", "ROUTING_", "GROK_", "CLAUDE_"))}
     env.update(HOME=str(tmp_path), KHIPU_DATA_DIR=str(data), KHIPU_CAPTURE_HOME=str(capture),
                KHIPU_FEATURE_ROUTING_PUSH="1", KHIPU_PYTHON=sys.executable,
-               PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+               PYTHONPATH=os.pathsep.join(p for p in sys.path if p),
+               # Slice 6: the page (1) or the earlier summary (0) the suite's switch selects.
+               KHIPU_ROUTING_PAGE=page)
     try:
         subprocess.run([sys.executable, "-c", "from khipu import routing; routing.report(account='Codex', "
                         "state='limited', until='1h', author={'kind': 'owner'})"], env=env, check=True,
                        capture_output=True, timeout=60)
-        for payload, want in ((_call("Agent"), FULL), (_call("Read", {"file_path": "/a"}), None),
+        for payload, want in ((_call("Agent"), "ROUTING " if page == "1" else FULL), (_call("Read", {"file_path": "/a"}), None),
                               ("not json", None)):
             p = subprocess.run([str(LAUNCHER)], input=payload if isinstance(payload, str) else json.dumps(payload),
                                capture_output=True, text=True, env=env, timeout=60)

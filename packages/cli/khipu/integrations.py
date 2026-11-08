@@ -3285,7 +3285,9 @@ def _probe_recall(command: str, payload: str = "{}") -> dict:
 # recall_prompt.ROUTING_TOO_LONG's pointer). recall_prompt appends the block
 # after whatever recall printed, never before it, so a context that starts
 # with one of these holds no recall output.
-_ROUTING_HEADINGS = ("## Routing at ", "## Routing changes at ", "## Routing\nKhipu's routing update")
+_ROUTING_HEADINGS = ("## Routing at ", "## Routing changes at ", "## Routing\nKhipu's routing update",
+                     # Slice 6: the routing page (``routing_page``), whole or paged.
+                     "ROUTING ", "## Routing page (")
 _RECALL_HEADING = "## Prior work on this topic"
 
 

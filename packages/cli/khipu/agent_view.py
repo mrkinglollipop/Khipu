@@ -499,6 +499,25 @@ _PROJECTION = threading.local()
 
 
 @contextlib.contextmanager
+def pinned(extra_keys):
+    """One table for every scrub of one rendered answer (the routing page
+    scrubs each account label and each fitting attempt): built once, by the
+    usual checks, when the render starts, instead of the inventory
+    signature being taken again for each piece. Inside a projection that is
+    already pinned (a hook's or a pull's) it changes nothing."""
+    keys = tuple(extra_keys)
+    if getattr(_PROJECTION, "current", None) is not None:
+        yield
+        return
+    table = _table(keys)
+    _PROJECTION.current = (keys, table)
+    try:
+        yield
+    finally:
+        _PROJECTION.current = None
+
+
+@contextlib.contextmanager
 def routing_projection(extra_keys):
     """Bound discovery before projecting a hook's routing output."""
     keys = tuple(extra_keys)
