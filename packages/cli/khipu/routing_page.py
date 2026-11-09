@@ -17,8 +17,15 @@ from datetime import datetime, timezone
 
 LIMIT = 4500  # characters, the whole page
 NEARLY_OUT_PCT = 10.0
-# Role and exception widths tried, widest first, before any rule line is dropped.
-_WIDTHS = ((220, 140), (140, 100), (90, 60), (0, 0))
+# Role, exception and hold widths tried, widest first, before any rule line is
+# dropped. An exception width of 0 is the shortest form: no quote, only a
+# count. The owner's standing rules outrank exceptions for space, so the
+# exception text gives way first (the second number shrinks before a rule line
+# is touched). A hold's words say why an account takes no jobs, so they keep
+# their width until the very last step (the third number).
+_WIDTHS = ((220, 140, 140), (140, 100, 100), (90, 60, 60), (90, 30, 60), (90, 0, 60), (0, 0, 0))
+# Newest exceptions shown on an account's line; older ones collapse to a count.
+EXCEPTIONS_SHOWN = 2
 # A rule that opens with one of these names (``WHICH MODEL: Opus: ...``) goes
 # under that heading; every other rule goes under RULES.
 SECTIONS = ("WHICH MODEL", "NEVER", "CHECKS", "MACS")
@@ -185,7 +192,7 @@ def _status(entry: dict, provider: dict, windows: list[dict], holds: list[dict],
     if state == r.PAUSED:
         return "PAUSED " + (f"until {r._clock(until, now)}" if until else "until lifted")
     if holds:
-        return "NO JOBS " + _hold_words(holds[0], widths[1], now, r)
+        return "NO JOBS " + _hold_words(holds[0], widths[2], now, r)
     if state == r.LIMITED:
         text = "LIMIT REACHED" + (f", back {'about ' if entry.get('basis') == 'estimated' else ''}"
                                   f"{r._clock(until, now)}" if until else "")
@@ -203,6 +210,16 @@ def _status(entry: dict, provider: dict, windows: list[dict], holds: list[dict],
     if _held_back(entry, window):
         return "HOLD BACK"
     return "PROBABLY OPEN" if state == r.PROBABLY_OPEN else "OK"
+
+
+def _live_exceptions(item: dict | None, now: datetime, r) -> list[dict]:
+    """The account's exceptions that have not ended, newest first (by their
+    ``at`` time; one without a time counts as oldest, and a tie keeps the
+    later-written one first)."""
+    live = [x for x in (item or {}).get("exceptions") or [] if (r._parse(x.get("until")) or now) > now]
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    ranked = sorted(enumerate(live), key=lambda p: (r._parse(p[1].get("at")) or floor, p[0]), reverse=True)
+    return [x for _i, x in ranked]
 
 
 def _account_text(label: str, entry: dict, item: dict | None, *, number, holds: list[dict], last: bool,
@@ -248,12 +265,16 @@ def _account_text(label: str, entry: dict, item: dict | None, *, number, holds: 
                      (f" on {_term_day(change['on'], now, r)}" if change.get("on") else ", date not set"))
     if terms.get("ends"):
         parts.append(f"Ends {_term_day(terms['ends'], now, r)}")
-    live = [x for x in (item or {}).get("exceptions") or [] if (r._parse(x.get("until")) or now) > now]
-    if widths[1] > 0:
-        for x in live:
+    live = _live_exceptions(item, now, r)
+    if live and widths[1] > 0:
+        for x in live[:EXCEPTIONS_SHOWN]:
             ends = r._parse(x.get("until"))
             parts.append("Exception" + (f" until {r._clock(ends, now)}" if ends else "") +
                          f": “{_cut(x.get('text'), widths[1])}”")
+        if len(live) > EXCEPTIONS_SHOWN:
+            parts.append(f"+{len(live) - EXCEPTIONS_SHOWN} older: khipu route --full")
+    elif live:  # the shortest form: the count alone
+        parts.append(f"{len(live)} exception{'s' if len(live) != 1 else ''}: khipu route --full")
     role = _cut((item or {}).get("role"), widths[0])
     if role:
         parts.append(role)
@@ -293,6 +314,11 @@ def _ordered(view: dict, now: datetime) -> tuple[list, list]:
     return ordered, extra
 
 
+def _headings(cut: list[tuple[str, str]]) -> str:
+    """The headings that lost lines, in the page's order, each once."""
+    return ", ".join(dict.fromkeys(name for name, _text in cut))
+
+
 def _render(view: dict, now: datetime, conversation: dict, readings: dict, rules: list, keep: int, widths,
             account_width: int, r) -> str:
     providers = (view.get("definitions") or {}).get("providers") or {}
@@ -321,7 +347,7 @@ def _render(view: dict, now: datetime, conversation: dict, readings: dict, rules
         lines += [line(entry, item, None, False) for entry, item in extra]
     for hold in holds:
         if (hold.get("scope") or {}).get("kind") != "account":
-            lines.append(f"Hold on {hold.get('scope_label') or 'everything'}: " + _hold_words(hold, widths[1], now, r)
+            lines.append(f"Hold on {hold.get('scope_label') or 'everything'}: " + _hold_words(hold, widths[2], now, r)
                          + ".")
     resets = [f"{r._account_label(e['label'], e.get('key'), view=view)} {e['terms']['resets_held']}"
               for e, _i in (*ordered, *extra) if (e.get("terms") or {}).get("resets_held")]
@@ -337,7 +363,8 @@ def _render(view: dict, now: datetime, conversation: dict, readings: dict, rules
             last_head = name
         lines.append(text)
     if keep < len(rules):
-        lines += ["", f"{len(rules) - keep} more rule lines: run `khipu route --full`."]
+        lines += ["", f"{len(rules) - keep} more rule lines (cut from {_headings(rules[keep:])}): "
+                  "run `khipu route --full`."]
     return "\n".join(lines)
 
 
@@ -350,9 +377,11 @@ def page(view: dict, now: datetime, conversation: dict | None = None, readings: 
     account key and cap kind, for a caller that already read them; absent, a
     cap prints as set. Both are inputs because this function reads nothing.
 
-    To fit, the roles and exceptions are shortened in steps, then whole rule
-    lines are dropped from the bottom with a count; accounts, status words
-    and caps are never dropped."""
+    To fit, the exceptions then the roles are shortened in steps (an exception
+    ends as a bare count), and only then are whole rule lines dropped from the
+    bottom, with a count and the headings that lost lines; accounts, status
+    words and caps are never dropped. At most the two newest exceptions of an
+    account print; older ones collapse to a count."""
     from khipu import agent_view, routing as r
 
     now = now.astimezone(timezone.utc)
@@ -360,14 +389,33 @@ def page(view: dict, now: datetime, conversation: dict | None = None, readings: 
         return "ROUTING: no routing record on this Mac."
     # Every scrub below is of this one view: one table for the whole render.
     with agent_view.pinned(a.get("key") for a in view.get("accounts") or [] if isinstance(a, dict)):
-        return _fitted(view, now, conversation or {}, readings or {}, r)
+        return _fitted(view, now, conversation or {}, readings or {}, r)[0]
 
 
-def _fitted(view: dict, now: datetime, conversation: dict, readings: dict, r) -> str:
-    """``page``'s fitting loop (see there)."""
+def left_out(view: dict, now: datetime) -> list[tuple[str, int]]:
+    """(heading, lines) for each heading of the owner's rules the page has to
+    leave out to fit, in the page's order; empty when every rule line is on
+    it. A page cut at the limit as a last resort counts as leaving out
+    every rule."""
+    from khipu import agent_view, routing as r
+
+    now = now.astimezone(timezone.utc)
+    if not view.get("record"):
+        return []
+    with agent_view.pinned(a.get("key") for a in view.get("accounts") or [] if isinstance(a, dict)):
+        _text, keep = _fitted(view, now, {}, {}, r)
+    cut: dict[str, int] = {}
+    for name, _text in _rules(view)[keep:]:
+        cut[name] = cut.get(name, 0) + 1
+    return list(cut.items())
+
+
+def _fitted(view: dict, now: datetime, conversation: dict, readings: dict, r) -> tuple[str, int]:
+    """``page``'s fitting loop (see there): (the page, how many of the
+    owner's rule lines it keeps)."""
     rules = _rules(view)
     text = ""
-    # Roles and exceptions shorten first (all rules kept), then whole rule
+    # Exceptions, then roles, shorten first (all rules kept), then whole rule
     # lines go from the bottom, then roles and exceptions go, then the
     # account lines themselves tighten.
     tries = ([(len(rules), w) for w in _WIDTHS[:-1]]
@@ -377,9 +425,9 @@ def _fitted(view: dict, now: datetime, conversation: dict, readings: dict, r) ->
             text = r._for_agents(_render(view, now, conversation, readings, rules, keep, widths, account_width, r),
                                  view)
             if len(text) <= LIMIT:
-                return text
+                return text, keep
     # Last resort: a page never leaves the limit.
-    return text[: LIMIT - 1].rstrip() + "…"
+    return text[: LIMIT - 1].rstrip() + "…", 0
 
 
 # ---- what makes the page worth sending again (routing slice 6) -------------------------
@@ -419,7 +467,7 @@ def facts(view: dict, now: datetime) -> dict:
                 and (h.get("scope") or {}).get("account") == entry["key"]]
         provider = providers.get(entry.get("harness")) or providers.get(entry["key"].partition(":")[0]) or {}
         last = n == len(ordered) - 1 and not extra
-        status = _status(entry, provider, _windows(entry, now, r), mine, last, (0, 0), now, r)
+        status = _status(entry, provider, _windows(entry, now, r), mine, last, (0, 0, 0), now, r)
         exceptions = [{k: x.get(k) for k in ("id", "text", "until")} for x in (item or {}).get("exceptions") or []
                       if (r._parse(x.get("until")) or now) > now]
         accounts.append({"key": entry["key"], "ordered": item is not None, "word": _word(status),

@@ -490,3 +490,39 @@ def test_the_routing_imports_cover_everything_the_page_read_imports(home):
     proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, timeout=30)
     assert proc.returncode == 0, proc.stderr.decode()[-2000:]
     assert proc.stdout.decode().strip() == "[]"
+
+
+# ---- doctor speaks of the page, not the old summary --------------------------------------------
+
+
+def _long_rules(n=12, size=450):
+    for i in range(n):
+        routing.add_rule(f"RULES: rule {i} " + "x" * size, via="app")
+
+
+def test_doctor_names_the_headings_the_page_left_out_and_not_the_old_summary_as_a_conversations(home):
+    _set(home, routing_rule_chars=0, routing_rules_max=0, routing_rules_chars=900)
+    _record()
+    _long_rules()
+    block = routing.doctor_block()
+    page_words = [w for w in block["warnings"] if w.startswith("The routing page left out")]
+    assert len(page_words) == 1 and "RULES" in page_words[0] and "4,500" in page_words[0]
+    assert not any("at the start of a conversation shows only part" in w for w in block["warnings"])
+    assert not any(w.startswith("The summary had to leave out") for w in block["warnings"])
+    assert any(w.startswith("The summary subagents get shows only part of your words") for w in block["warnings"])
+
+
+def test_doctor_says_nothing_about_the_page_when_every_rule_fits_on_it(home):
+    _record()
+    routing.add_rule("NEVER: a short rule.", via="app")
+    assert not any("routing page" in w for w in routing.doctor_block()["warnings"])
+
+
+def test_doctor_keeps_the_old_wording_when_the_page_is_off(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_ROUTING_PAGE", "0")
+    _set(home, routing_rule_chars=0, routing_rules_max=0, routing_rules_chars=900)
+    _record()
+    _long_rules()
+    warnings = routing.doctor_block()["warnings"]
+    assert any(w.startswith("The summary at the start of a conversation shows only part") for w in warnings)
+    assert not any("routing page" in w for w in warnings)
