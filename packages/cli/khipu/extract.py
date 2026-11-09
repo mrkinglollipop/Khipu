@@ -300,9 +300,12 @@ def _generate_api(prompt: str, *, provider: str, model_id: str, timeout: int,
                   retries: int, caller: str) -> str:
     key = _provider_key(provider)
     headers = {"Content-Type": "application/json"}
-    payload = {"model": model_id, "max_tokens": 4096, "temperature": 0.2,
+    payload = {"model": model_id, "max_tokens": 4096,
                "messages": [{"role": "user", "content": prompt}]}
     if provider == "anthropic":
+        # No sampling settings: Claude Haiku 5.5 (the default here) and the
+        # other current Claude models answer a non-default temperature with a
+        # 400, which would fail every summary while the key check stays green.
         url = "https://api.anthropic.com/v1/messages"
         headers.update({"x-api-key": key, "anthropic-version": "2023-06-01"})
     elif provider == "openrouter":
@@ -314,6 +317,8 @@ def _generate_api(prompt: str, *, provider: str, model_id: str, timeout: int,
     else:
         url = "https://api.openai.com/v1/chat/completions"
         headers["Authorization"] = f"Bearer {key}"
+    if provider != "anthropic":
+        payload["temperature"] = 0.2
     body = json.dumps(payload).encode("utf-8")
     last: Exception | None = None
     for attempt in range(retries + 1):
