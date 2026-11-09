@@ -71,6 +71,10 @@ _ROUTING_LOOK_S = 2.0
 # kept even with this service's push off (that prompt's environment had it
 # on); one still starting is never stopped. Its poll follows its own switches.
 _ROUTING_IDLE_STOP_S = 60.0
+# The replica changes in bursts (each capture writes to it, about once a
+# minute on a busy day, 2026-11-09). Once it has been still this long and no
+# prompt is being answered, the service reloads what the change made stale.
+REPLICA_QUIET_S = 1.5
 # sockaddr_un.sun_path is 104 bytes on macOS, 108 on Linux; stay under both.
 _SUN_PATH_MAX = 100
 _SHAPES = ("claude", "cursor", "antigravity")
@@ -247,6 +251,12 @@ class RecallService:
         self._listener: socket.socket | None = None
         self._ino: int | None = None
         self._threads: list[threading.Thread] = []
+        # Recall requests being answered now, and the replica's identity as
+        # last seen and as last warmed (keep_caches_warm).
+        self._in_flight = 0
+        self._replica_seen: tuple[Any, ...] | None = None
+        self._replica_moved_at = 0.0
+        self._replica_warmed: tuple[Any, ...] | None = None
 
     # -- socket ownership --
 
@@ -339,6 +349,38 @@ class RecallService:
             self.routing_forkserver.stop(idle_for=_ROUTING_IDLE_STOP_S)
             return False
         return self.routing_forkserver.keep_alive()
+
+    def keep_caches_warm(self) -> bool:
+        """Between prompts, reload what a replica write made stale (the
+        vector matrix, the topic slug map, the word-rarity counts), so the
+        next prompt does not. Each of those is keyed by the replica file, and
+        nearly every write is followed by a prompt: the first prompt after it
+        paid for all three, the reloads holding the interpreter while its own
+        keyword search ran, and on a busy Mac that pushed it past its
+        deadline (2026-11-09). Runs once per change, after the file has been
+        still ``REPLICA_QUIET_S`` and while no prompt is being answered; True
+        when it reloaded."""
+        if self._stopping.is_set():
+            return False
+        try:
+            from khipu import hub_snapshot
+
+            st = os.stat(hub_snapshot.snapshot_path())
+            key = (st.st_ino, st.st_mtime_ns, st.st_size)
+        except Exception:  # noqa: BLE001 — no replica: nothing to keep warm
+            return False
+        now = self._clock()
+        if key != self._replica_seen:
+            self._replica_seen, self._replica_moved_at = key, now
+            return False
+        if key == self._replica_warmed or now - self._replica_moved_at < REPLICA_QUIET_S:
+            return False
+        with self._lock:
+            if self._in_flight:
+                return False
+        self._replica_warmed = key
+        _warm_caches()
+        return True
 
     def close(self) -> None:
         if self.routing_forkserver is not None:
@@ -466,6 +508,8 @@ class RecallService:
             from khipu import recall_prompt
             recall_prompt.log_terminal_outcome(raw, "error: daemon restarting")
             return {"ok": False, "error": "restarting"}
+        with self._lock:
+            self._in_flight += 1
         try:
             answer = self.dispatch(req, delivery)
             if answer.get("ok") is False and not (delivery or {}).get("result"):
@@ -481,6 +525,8 @@ class RecallService:
             recall_prompt.log_terminal_outcome(raw, f"error: dispatch crashed: {type(exc).__name__}")
             return {"ok": False, "error": "dispatch failed"}
         finally:
+            with self._lock:
+                self._in_flight -= 1
             if last:
                 self._wake()
 
@@ -557,6 +603,7 @@ class RecallService:
                 while not self._stopping.wait(_ACCEPT_TICK_S):
                     self._detect_stale()
                     self.keep_routing()
+                    self.keep_caches_warm()
             threading.Thread(target=watch_code, daemon=True).start()
         while not self._stopping.is_set():
             try:
@@ -593,10 +640,13 @@ def _warm_imports() -> None:
 
 
 def _warm_caches() -> None:
-    """Load the replica's vector matrix and the topic slug map now, on a thread.
-    The service restarts on every code change, and a cold matrix load (about a
-    second, competing with the lexical scan for the same process) cost the
-    first prompts after each restart their whole budget (2026-10-12)."""
+    """Load the replica's vector matrix, the topic slug map and the word-rarity
+    counts now, on a thread: at start, and after each replica change
+    (``RecallService.keep_caches_warm``). The service restarts on every code
+    change, and a cold matrix load (about a second, competing with the lexical
+    scan for the same process) cost the first prompts after each restart their
+    whole budget (2026-10-12). A changed replica's matrix and slug map reload
+    on threads of their own; the counts are made here."""
     try:
         from khipu import graph_candidates, hub_snapshot
 
@@ -604,6 +654,7 @@ def _warm_caches() -> None:
         if profile:
             hub_snapshot._matrix_rows(hub_snapshot.snapshot_path(), profile, None)
         graph_candidates._episode_slug_map()
+        hub_snapshot.term_document_frequency()
     except Exception as exc:  # noqa: BLE001 — the first prompt loads them instead
         _log(f"warm caches skipped: {type(exc).__name__}: {exc}")
 
