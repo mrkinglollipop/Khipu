@@ -19,9 +19,12 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(routing, "_entry_definitions", lambda: ({}, {}))
 
 
+NOW = 1792756800 + 3600
+
+
 def row(**updates):
     return dict(id="rd-audit", session="synthetic", prompt_sha256="sha", occurrence=1,
-                words="Use GLM only one job at a time.", status="open", at=1792756800,
+                words="Use GLM only one job at a time.", status="open", at=1792756800, join="joined", typed=True,
                 target={"entity": "GLM", "kind": "concurrency", "value": 1}, **updates)
 
 
@@ -108,13 +111,17 @@ def test_each_direction_uses_its_own_project(world, monkeypatch):
     first.update(id="rd-first", project="project-a")
     second.update(id="rd-second", project="project-b", occurrence=2)
     d._save({"directions": {first["id"]: first, second["id"]: second}})
-    assert d.pushed_slice_ids("project-a") == ["rd-first"]
-    assert d.pushed_slice_ids("project-b") == ["rd-second"]
-    assert d.pushed_slice_ids("project-a", job=True) == []
+    assert d.pushed_slice_ids("project-a", session="synthetic", now=NOW) == ["rd-first"]
+    assert d.pushed_slice_ids("project-b", session="synthetic", now=NOW) == ["rd-second"]
+    assert d.pushed_slice_ids("project-a", job=True, session="synthetic", now=NOW) == []
     first.pop("project")
     second.pop("project")
     second["prompt_sha256"] = "other-sha"
     monkeypatch.setattr(d, "_project_for", lambda session, sha: "project-a" if sha == "sha" else "project-b")
     d._save({"directions": {first["id"]: first, second["id"]: second}})
-    assert d.pushed_slice_ids("project-a") == ["rd-first"]
-    assert d.pushed_slice_ids("project-b") == ["rd-second"]
+    assert d.pushed_slice_ids("project-a", session="synthetic", now=NOW) == ["rd-first"]
+    assert d.pushed_slice_ids("project-b", session="synthetic", now=NOW) == ["rd-second"]
+    # Only the starting conversation hears of its own, and only while the row is fresh.
+    assert d.pushed_slice_ids("project-a", session="another") == [] and d.pushed_slice_ids("project-a") == []
+    assert d.pushed_slice_ids("project-a", session="claude_code:synthetic", now=NOW) == ["rd-first"]
+    assert d.pushed_slice_ids("project-a", session="synthetic", now=NOW + 8 * 86400) == []

@@ -3,6 +3,8 @@ review in /tmp/khipu-routing-s19a/fix1/review.md, as a test. Hermetic:
 a temp capture home and data dir, fake data only, no hub, no model."""
 from __future__ import annotations
 
+import contextvars
+
 import json
 import time
 import types
@@ -150,6 +152,7 @@ def test_the_pushed_session_slice_names_no_direction_words(world, monkeypatch):
                         lambda cwd: {"repo_root": "/work", "project": "proj"})
     monkeypatch.setattr(activity, "project_slice",
                         lambda **kw: {"commitments": [], "episodes": [], "topics": [], "decisions": []})
+    monkeypatch.setattr(recall_rule, "_START_SESSION", contextvars.ContextVar("s", default=SESSION))
     text = recall_rule._pushed_memory_slice("/work")
     assert GLM not in text and "Routing said here" not in text
     assert f"1 routing direction not yet in Khipu: {row['id']}; khipu owed shows them" in text

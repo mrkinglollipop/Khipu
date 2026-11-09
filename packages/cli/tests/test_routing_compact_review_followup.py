@@ -19,7 +19,8 @@ def test_owner_only_growth_is_yellow_with_nothing_to_do(world, monkeypatch):
             assert rc.compact(END)['result'] == 'skipped'
         health = rc.health()
         assert health['level'] == 'yellow'
-        assert "own history" in health['warning'] and "nothing is broken" in health['warning'] and "nothing to do" in health['warning']
+        assert "own history" in health['note'] and "nothing is broken" in health['note'] and "nothing to do" in health['note']
+        assert 'warning' not in health
 
 
 def test_red_byte_bound_is_reachable_below_red_line_bound(world, monkeypatch):

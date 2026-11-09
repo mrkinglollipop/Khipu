@@ -114,6 +114,10 @@ _UNNAMED_MODEL = "one model (its name is in khipu_route)"
 # still be taken over the clock (another writer's clock read a moment ago).
 # A time further ahead is not trusted: the clock is used, and doctor warns.
 CLOCK_TOLERANCE = 300
+# Doctor names a line dated well off its neighbours only while it was written this recently.
+OFF_CLOCK_WARN_DAYS = 7
+# A job runner silent longer than this is no longer a warning: one quiet note names how to remove it.
+SILENT_SOURCE_QUIET_DAYS = 7
 # Display order of account lines: what closes work first.
 _STATE_ORDER = {LIMITED: 0, PAUSED: 1, DOWN: 2, UNKNOWN: 3, PROBABLY_OPEN: 4, OPEN: 5}
 
@@ -10372,12 +10376,27 @@ def doctor_block(now: datetime | None = None) -> dict:
     if _crowded(numbers):
         warnings.append("The routing record holds a line numbered at the most a line can hold (edited by hand or "
                         "merged); Khipu numbers new lines below it, so that line may sort out of order.")
-    _fixed, behind, ahead = _record_times(events)
+    fixed, behind, ahead = _record_times(events)
+    # Only lines written in the last week are news: the record cannot be
+    # rewritten, so an old stray line would warn forever with nothing to do.
+    # A stray line counts from the lines around it (``fixed``), which is
+    # where it was really written.
+    recent = now - timedelta(days=OFF_CLOCK_WARN_DAYS)
+    behind, ahead = [], []
+    for event, settled in zip(events, fixed):
+        raw = _parse(event.get("written_at"))
+        if raw is None or settled is None or _copied(event) or event.get("type") == COMPACTION_GENERATION_TYPE:
+            continue
+        if settled >= recent:
+            if (settled - raw).total_seconds() > CLOCK_TOLERANCE:
+                behind.append(raw)
+            elif (raw - settled).total_seconds() > CLOCK_TOLERANCE:
+                ahead.append(raw)
     # Lines that took the record's time because their Mac's clock read before
     # the whole record (``_stamp_locked``) are named by that reading.
     for event in events:
         written, clock = _parse(event.get("written_at")), _parse(event.get("clock_at"))
-        if written and clock and (written - clock).total_seconds() > CLOCK_TOLERANCE:
+        if written and clock and (written - clock).total_seconds() > CLOCK_TOLERANCE and written >= recent:
             behind.append(clock)
     for found, side, edge, which in ((behind, "before", "early", min), (ahead, "after", "late", max)):
         if found:
@@ -10387,8 +10406,15 @@ def doctor_block(now: datetime | None = None) -> dict:
                             f"Khipu counts each from the line {side} it. Check the date and time on the Mac "
                             f"that wrote {them}.")
     sources = view.get("sources") or {}
-    warnings += [runner_line(r, now) + "." for r in sources.get("runners") or []
-                 if r.get("silent") or r.get("unreadable")]
+    notes: list[str] = []
+    for r in sources.get("runners") or []:
+        if not (r.get("silent") or r.get("unreadable")):
+            continue
+        quiet = _long_silent(r, now)
+        if quiet is None:
+            warnings.append(runner_line(r, now) + ".")
+        else:
+            notes.append(_silent_source_note(r, quiet))
     if sources.get("refused"):
         warnings.append("A job runner folder was refused because it is inside a private folder.")
     if sources.get("invalid"):
@@ -10439,9 +10465,41 @@ def doctor_block(now: datetime | None = None) -> dict:
             "unchecked": view.get("unchecked") or [],
             "seed_error": view.get("seed_error"), "bad_lines": view.get("bad_lines", 0),
             "sources": _sources_brief(sources), "rule_checks": checks, "runner_caps": runner_caps,
-            "warnings": warnings,
+            "warnings": warnings, "notes": notes,
             "contradictions": list(view.get("contradictions") or []),
             "rule_hygiene": list(view.get("rule_hygiene") or [])}
+
+
+def _long_silent(runner: dict, now: datetime) -> datetime | None:
+    """When a job runner last reported, if it has been silent longer than
+    ``SILENT_SOURCE_QUIET_DAYS`` (and its files are not the trouble); else
+    None. A runner with no heartbeat on record has no date to age, so it
+    keeps warning."""
+    if not runner.get("silent") or runner.get("unreadable"):
+        return None
+    beat = _parse(runner.get("heartbeat_at"))
+    if beat is None or (now - beat) <= timedelta(days=SILENT_SOURCE_QUIET_DAYS):
+        return None
+    return beat
+
+
+def _silent_source_note(runner: dict, beat: datetime) -> str:
+    """The one quiet line for a job runner silent past a week, with the
+    exact way to stop reading it: the app, or the checked command with the
+    folder list that is left."""
+    import shlex
+
+    from khipu.config import load_config
+
+    name = runner["name"]
+    stored = load_config().get("routing_sources")
+    kept = [e for e in stored if isinstance(e, dict) and str(e.get("name")).casefold() != str(name).casefold()
+            ] if isinstance(stored, list) else []
+    command = ("khipu config --unset routing_sources" if not kept else
+               "khipu config --set routing_sources " + shlex.quote(json.dumps(kept, separators=(",", ":"))))
+    return (f"Your {name} job runner has not reported since {_iso(beat)}, more than {SILENT_SOURCE_QUIET_DAYS} days. "
+            f"If it is gone for good, stop reading it: Settings \u2192 Routing \u2192 Job runner folders \u2192 "
+            f"Remove {name}, or run `{command}` (it asks you to type yes).")
 
 
 def _priority_warnings(view: dict, now: datetime, cfg: dict) -> list[str]:
@@ -11206,17 +11264,75 @@ def project_route_view(answer: dict, view: str) -> dict:
     return body
 
 
+# What stays when a read is narrowed to one account (``only_account_part``): the
+# record's own header, the account's row, and the holds, proposals and lanes that
+# name it. Everything else is listed under ``omitted`` for a ``view=`` read.
+_ONE_ACCOUNT_KEEP = (*_VIEW_FIELDS, "generated_at", "accounts", "holds", "priority", "proposals", "unmatched",
+                     "override_line", "about", "runner_caps", "plan_facts")
+
+
+def only_account_part(out: dict, key: str) -> dict:
+    """``out`` (a full ``khipu_route`` answer, or ``khipu route --json``) cut
+    down to one account's part: its entry, its entry in the priority with its
+    exceptions, and the holds, proposals and unmatched job runner lanes that
+    name it. The sections left out are named in ``omitted`` so a caller knows
+    to ask for them with ``view=`` (or without ``account``)."""
+    ids = {key, account_id(key)}
+    part = {k: v for k, v in out.items() if k in _ONE_ACCOUNT_KEEP}
+
+    def mine(entry) -> bool:
+        return isinstance(entry, dict) and (entry.get("account") in ids or entry.get("id") in ids)
+
+    priority = part.get("priority")
+    named = False
+    if isinstance(priority, dict):
+        priority = {k: v for k, v in priority.items() if k != "line"}
+        priority["entries"] = [e for e in priority.get("entries") or [] if mine(e)]
+        replaced = priority.get("replaced")
+        if isinstance(replaced, dict):
+            replaced = dict(replaced, entries=[e for e in replaced.get("entries") or [] if mine(e)])
+            priority["replaced"] = replaced if replaced["entries"] else None
+        named = bool(priority["entries"]) or bool((priority.get("replaced") or {}).get("entries"))
+        part["priority"] = priority
+
+    def names(item) -> bool:
+        entity = str(item.get("entity") or "") if isinstance(item, dict) else ""
+        return any(i in entity for i in ids) or (isinstance(item, dict) and item.get("kind") == "priority" and named)
+
+    proposals = part.get("proposals")
+    if isinstance(proposals, dict):
+        part["proposals"] = {k: v for k, v in proposals.items() if names(v)}
+    elif isinstance(proposals, list):
+        part["proposals"] = [p for p in proposals if names(p)]
+    part["holds"] = [h for h in part.get("holds") or [] if isinstance(h, dict)
+                     and ((h.get("scope") or {}).get("kind") == "all"
+                          or (h.get("scope") or {}).get("account") in ids)]
+    if "unmatched" in part:
+        part["unmatched"] = [u for u in part["unmatched"] or [] if isinstance(u, dict)
+                             and ids & set(u.get("candidates") or [])]
+    if isinstance(part.get("plan_facts"), dict):
+        part["plan_facts"] = {k: v for k, v in part["plan_facts"].items() if k in ids}
+    rows = part.get("accounts") or []
+    part["narrowed_to"] = (rows[0].get("label") if rows and isinstance(rows[0], dict) else None) or account_id(key)
+    part["omitted"] = sorted(k for k in out if k not in part)
+    part["omitted_note"] = ("Only this account's part. Omit `account` for the whole record, or pass "
+                            "view=<section> (rules, note, accounts, priority, holds, proposals) for one section in full.")
+    return part
+
+
 def conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
-                      lock_wait: float | None = CONVERSATION_LOCK_BUDGET, view: dict | None = None) -> dict:
+                      lock_wait: float | None = CONVERSATION_LOCK_BUDGET, view: dict | None = None,
+                      only_account: bool = False) -> dict:
     """What MCP ``khipu_route`` answers (``_conversation_view``), read
     waiting at most ``lock_wait`` seconds for the routing lock (an unsaved
     fold after that)."""
     with _for_a_conversation(), lock_budget(lock_wait):
-        return _conversation_view(since_version=since_version, account=account, now=now, view=view)
+        return _conversation_view(since_version=since_version, account=account, now=now, view=view,
+                                  only_account=only_account)
 
 
 def _conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
-                       view: dict | None = None) -> dict:
+                       view: dict | None = None, only_account: bool = False) -> dict:
     """What MCP ``khipu_route`` answers, built field by field from the view
     (see the note above ``account_id``). With ``since_version`` (V or
     EPOCH:V) the current state of everything that changed after it, as
@@ -11296,8 +11412,13 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
         out["tier_table"] = view["tier_table"]
     out["contradictions"] = list(view.get("contradictions") or [])
     out["rule_hygiene"] = list(view.get("rule_hygiene") or [])
+    narrowed = key is not None and only_account
+    if narrowed:
+        out = only_account_part(out, key)
     result = _for_agents(out, view)
-    _record_read(view, rules=True, priority=True)
+    # A narrowed answer did not carry the rules or the whole priority, so it
+    # is no receipt for either: a proposal against them needs a full read.
+    _record_read(view, rules=not narrowed, priority=not narrowed)
     session = conversation_author().get("session")
     if session:
         from khipu import recall_prompt
@@ -13763,14 +13884,18 @@ def run_cli(args) -> int:
                 conversation, readings = _page_inputs(view, now)
                 print(page(view, now, conversation, readings))
                 return 0
+            narrowed = bool(args.json and account and not mode)
             if args.json or mode:
                 out = public_view(view, now, account)
                 if mode:
                     out = project_route_view(out, mode)
+                elif narrowed:
+                    out = only_account_part(out, account)
                 _print_json(out)
             else:
                 _print_view(view, now, account)
-            _record_read(view, rules=True, priority=True)
+            # A narrowed answer is no receipt for the rules or the whole priority.
+            _record_read(view, rules=not narrowed, priority=not narrowed)
             return 0
         if cmd == "sources":
             out = _sources_brief(read_view(now).get("sources") or {})

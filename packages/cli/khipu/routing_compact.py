@@ -84,6 +84,12 @@ LINES_TRIGGER, BYTES_TRIGGER = 2000, 1 << 20
 # failing for days.
 LINES_YELLOW, BYTES_YELLOW = 3000, 2 << 20
 LINES_RED, BYTES_RED = 4000, 3 << 20
+# Where a log that compaction cannot shrink (the owner's history, kept by design)
+# becomes a doctor warning: five times the red bound. A fold of 3,000 lines is
+# about 50 ms and reading is linear, so 20,000 lines is about a third of a
+# second on every fold, and 15 MB is read in full each time. Below this the
+# size is a fact for an agent (``note``), not something the owner can act on.
+LINES_HURT, BYTES_HURT = 20_000, 15 << 20
 # Under this a log is never over the bound (a line is ~250 bytes): not even counted.
 SMALL_BYTES = 32 * 1024
 # A compaction aims below this, so the next one is not at once due.
@@ -199,12 +205,20 @@ def health(now: datetime | None = None) -> dict:
             out["level"] = "yellow"
             out["kept_lines"] = total - gone
             if owners == total or owner_bound:
-                out["warning"] = (f"Your own history accounts for {owners:,} of the routing record's {lines:,} lines ({nbytes:,} bytes); "
-                                  "nothing is broken and there is nothing to do.")
+                words = (f"Your own history accounts for {owners:,} of the routing record's {lines:,} lines ({nbytes:,} bytes); "
+                         "nothing is broken and there is nothing to do.")
             else:
-                out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes) and can't shrink "
-                                  f"further: {total - gone:,} of its lines are protected history, readings and "
-                                  "observations still counted, or the newest of their kind.")
+                words = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes) and can't shrink "
+                         f"further: {total - gone:,} of its lines are protected history, readings and "
+                         "observations still counted, or the newest of their kind.")
+            # By design the record keeps the owner's history, so "can't shrink"
+            # is a fact for an agent (the routing block), not a fault. It
+            # warns only once the size would slow every read of the record.
+            out["note"] = words
+            if lines > LINES_HURT or nbytes > BYTES_HURT:
+                out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes), more than "
+                                  f"{LINES_HURT:,} lines or {BYTES_HURT >> 20} MB, and compaction can't shrink it "
+                                  "further, so reading it is getting slow. Tell a conversation to look at it.")
         else:
             result = str(last.get("result") or "")
             attempted_here = last.get("attempt_generation") == ATTEMPT_GENERATION

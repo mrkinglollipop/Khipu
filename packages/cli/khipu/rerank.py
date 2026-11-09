@@ -280,8 +280,9 @@ def stage(
     ``payload`` is the ``rerank`` block (``applied``, ``model``, ``ms``,
     ``candidates``, ``reason``); ``degraded`` is True only when the stage
     failed and must be named in ``degraded_legs`` (a stage that simply does
-    not apply — literal mode, id-shaped query, fewer than two candidates — is
-    not a degradation). ``rows`` is ``fused`` unchanged unless applied."""
+    not apply — literal mode, id-shaped query, fewer than two candidates, or
+    a switch that is on with no model to run on — is not a degradation: the
+    search ran as designed, and ``khipu doctor`` tells the owner once). ``rows`` is ``fused`` unchanged unless applied."""
     from khipu.cli import _id_shaped
 
     skip = None
@@ -300,6 +301,6 @@ def stage(
         # candidate count and a duration is never read as a rerank that ran.
         payload.update(skipped=True, detail=result.get("detail"))
     if result["order"] is None:
-        return fused, payload, result["reason"] != "too-few-candidates"
+        return fused, payload, result["reason"] not in ("too-few-candidates", "no-provider")
     payload["applied"] = True
     return fuse(fused, result["order"], token_count=token_count), payload, False

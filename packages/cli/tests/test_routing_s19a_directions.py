@@ -178,7 +178,8 @@ def test_a_missed_recorder_turn_leaves_the_direction_unjoined(world):
     say("a different prompt entirely")
     (row,) = scan([GLM])  # the hook never recorded this turn
     assert row["status"] == "open" and row["join"] == "unjoined"
-    assert routing_directions.owed_items()[0]["join"] == "unjoined"
+    # Stored and open, but not shown: a prompt the recorder never saw is not known to be his.
+    assert routing_directions.owed_items() == []
 
 
 def test_a_deleted_counter_file_leaves_earlier_directions_unjoined(world):
