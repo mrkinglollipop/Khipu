@@ -216,10 +216,13 @@ def test_an_unreadable_store_is_left_byte_identical_by_sweep_forget_and_writers(
 
 def test_a_valid_row_next_to_a_malformed_one_is_still_owed_and_delivered(store):
     bad = {"id": "rd-bad", "session": 4, "words": "fake"}
-    good = {**_row("rd-good", "codex:live", "fake route words"), "project": "fake-proj", "join": "joined"}
+    # Listed means joined, typed by the owner himself and recent (``rd.listable``).
+    good = {**_row("rd-good", "codex:live", "fake route words"), "project": "fake-proj", "join": "joined",
+            "typed": True, "at": time.time()}
     _write({"rd-good": good, "rd-bad": bad})
     assert [i["id"] for i in rd.owed_items()] == ["rd-good"]
-    assert rd.pushed_slice_ids("fake-proj") == ["rd-good"]
+    assert rd.pushed_slice_ids("fake-proj", session="codex:live") == ["rd-good"]
+    assert rd.pushed_slice_ids("fake-proj") == []  # only the starting conversation hears of its own
     assert rd.dismiss("rd-good")["status"] == "dismissed"
     raw = _rows()
     assert raw["rd-bad"] == bad and raw["rd-good"]["status"] == "dismissed"
