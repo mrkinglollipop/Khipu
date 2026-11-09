@@ -562,9 +562,9 @@ TOOLS: list[dict] = [
         "name": "khipu_owed",
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
         "description": (
-            "List open (or closed/stale) commitments — followups, blockers, "
-            "questions, promises captured as open_loops and not yet closed by "
-            "a matching closed_loop/decision. Call this at session start for "
+            "List open (or closed/stale) commitments: explicit asks filed with khipu_owed_update "
+            "and archived followups, blockers, questions and promises. Captures no longer add "
+            "to this list. Call this at session start for "
             "a harness with no pushed slice (Aegis), or whenever 'what do I "
             "still owe on this project' would change the answer. Pages "
             "newest first: pass the reply's next_cursor as cursor for the "
@@ -572,8 +572,8 @@ TOOLS: list[dict] = [
             "matching item, not just this page. The user's own items never "
             "go stale: one unmentioned for weeks lists after the active ones "
             "with quiet_weeks and group 'Quiet for N weeks'. Nothing "
-            "automatic ever closes the user's own items: one a rule would have "
-            "closed (its pull requests merged, a decision settled it) has "
+            "automatic closes the user's own items: an archived one that was "
+            "already marked done has "
             "group 'Looks done' and looks_done (rule, reason, evidence); "
             "looks_done=true lists only those and counts.looks_done counts "
             "them. When the user says to close them, close them with "
@@ -1017,7 +1017,7 @@ TOOLS: list[dict] = [
             "Call this when the owner asks what needs confirming or approving, or what is waiting on them. One list "
             "of what waits for the owner's answer: a conversation's change to the priority, a standing rule, a "
             "routing setting, the account list or the tier table; requests held from any conversation; forgets the "
-            "hub lacks; job-origin corrections; same-project questions; the owner-actions alarm; holds to review; "
+            "hub lacks; same-project questions; holds to review; "
             "and accounts to sign in. Owed items that need the owner are a separate list: khipu_owed. "
             "Each item has `words`, `asked_by`, `confirm_does`, `undo_does` and `settle` (the khipu_owner_act action "
             "and args for confirm and for undo; null with `do` where there is none). "
@@ -1482,7 +1482,8 @@ def _routing_light() -> dict:
         # Status is optional and may finish after its caller has returned.
         # Notices belong to the delivery-aware route and hook responses.
         return routing.light_status(session_id="")
-    except Exception:  # noqa: BLE001 - an optional field must never break khipu_status
+    except Exception as exc:  # noqa: BLE001 - an optional field must never break khipu_status
+        print(f"[khipu-mcp] khipu_status routing field left out: {type(exc).__name__}", file=sys.stderr, flush=True)
         return {}
 
 

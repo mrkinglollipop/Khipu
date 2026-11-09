@@ -161,6 +161,7 @@ NOT_CAPTURE = {
                      "routing._save_view", "routing_replay._routing_quiet", "routing_replay._seed",
                      "routing_replay.replay", "conversation_overrides._append", "priority_cleanup._save",
                      "routing_page_file.write"), _ROUTING),
+    "notes.hook_reconcile": "a one-line timestamp that throttles the Stop hook's notes step; no note text",
     **dict.fromkeys(("memory_md.regen_memory_md", "notes._write_state", "organise._backup_index",
                      "organise._write_evidence", "organise.rewrite_index", "organise.split_note"),
                     _NOTES),

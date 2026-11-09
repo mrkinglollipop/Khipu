@@ -85,6 +85,17 @@ def render(view: dict, now: datetime | None = None) -> tuple[str, dict]:
     return text, meta
 
 
+def _log_failure(exc: BaseException) -> None:
+    """One line in prompt-recall.log naming the exception class, nothing from
+    the page or the view. Never raises."""
+    try:
+        from khipu import recall_prompt
+
+        recall_prompt._log(f"routing page not written: {type(exc).__name__}", tag="khipu-routing-page")
+    except Exception:  # noqa: BLE001 - logging never fails the save
+        pass
+
+
 def write(view: dict, now: datetime | None = None) -> bool:
     """Render ``view``'s page and replace ``page.txt`` with it atomically
     (a temp file in the same folder, fsynced, then renamed). Never raises:
@@ -104,7 +115,8 @@ def write(view: dict, now: datetime | None = None) -> bool:
         os.replace(tmp, target)
         tmp = None
         return True
-    except Exception:  # noqa: BLE001 - a page that could not be written costs nothing: the next save writes it
+    except Exception as exc:  # noqa: BLE001 - a page that could not be written costs nothing: the next save writes it
+        _log_failure(exc)
         return False
     finally:
         if tmp is not None:

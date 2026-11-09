@@ -421,8 +421,8 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         recall_daemon_block = daemon_health()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         recall_daemon_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    # D1: per-step nightly evidence — notes reconcile, embed backfill,
-    # commitments hygiene and mark-stale each get their own red/green
+    # D1: per-step nightly evidence — notes reconcile, embed backfill
+    # and the other nightly steps each get their own red/green
     # instead of only the legacy driver's exit code (`jobs.ok` above).
     try:
         from khipu.jobs import nightly_step_health

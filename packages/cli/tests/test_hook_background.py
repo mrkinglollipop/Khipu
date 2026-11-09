@@ -25,6 +25,9 @@ HOOK = Path(__file__).resolve().parents[1] / "bin" / "khipu-stop-hook"
 @pytest.fixture(autouse=True)
 def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
+    # The notes step keeps a stamp in the data folder; one test's run must not
+    # throttle the next test's.
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
     for name in ("KHIPU_DRAIN_SLOTS", "KHIPU_CAPTURE_NO_DRAIN", "KHIPU_HOOK_INLINE"):
         monkeypatch.delenv(name, raising=False)
 
@@ -172,6 +175,22 @@ def test_run_never_raises_and_names_every_skipped_step(monkeypatch, capsys):
                  "notes-reconcile skipped", "embed catch-up skipped"):
         assert step in err, (step, err)
     assert "session=sid-9" in err
+
+
+def test_run_says_when_the_notes_step_was_not_needed(monkeypatch, capsys, tmp_path):
+    import khipu.embed
+    import khipu.mirror
+    import khipu.notes
+
+    monkeypatch.setattr(hb, "_drain", lambda *a, **k: None)
+    monkeypatch.setattr(khipu.mirror, "sync_recent_episodes", lambda *_a, **_k: {})
+    monkeypatch.setattr(khipu.embed, "embed_recent_missing", lambda **_k: {"embedded": 0})
+    monkeypatch.setattr(khipu.notes, "hook_reconcile", lambda: {"skipped": "recent", "age_s": 5.0})
+
+    hb.run(str(tmp_path), "claude_code", "sid-5")
+
+    err = capsys.readouterr().err
+    assert "notes-reconcile not needed (recent)" in err and "notes-reconcile skipped" not in err
 
 
 # --- the real hook script ----------------------------------------------------

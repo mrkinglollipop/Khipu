@@ -501,8 +501,8 @@ def _folder_bytes(path: Path) -> int:
 
 
 def _jsonl_log_bytes() -> tuple[int, list[str]]:
-    """The append-only ``*.jsonl`` logs: owner actions (every sealed segment
-    too), routing records, the summariser's token counts, owner turns."""
+    """The append-only ``*.jsonl`` logs: owner actions (every numbered
+    segment too), routing records, the summariser's token counts, owner turns."""
     from khipu import owner_turns, routing
     from khipu.paths import data_dir
 

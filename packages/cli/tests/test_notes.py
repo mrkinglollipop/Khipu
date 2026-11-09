@@ -509,6 +509,107 @@ class ChangedOnlyReconcileTest(unittest.TestCase):
         self.assertIsNotNone(state["last_reconcile_at"])
 
 
+class HookReconcileTest(unittest.TestCase):
+    """The Stop hook's notes step is throttled and stat-checked: at most one
+    pass per HOOK_MIN_INTERVAL_S, and none when no note is newer than the last
+    clean pass, yet a note written in a session is still picked up."""
+
+    def _run(self, body):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as data_td:
+            claude_root = Path(td) / "claude_projects"
+            memory = claude_root / "-repo-a" / "memory"
+            for name in ("one", "two", "three"):
+                note = _write(memory / f"{name}.md", _sample_note_text().replace("khipu-state-of-play", name))
+                old = note.stat().st_mtime - 3600  # written long before the first pass
+                os.utime(note, (old, old))
+            cur = _FakeTopicsCursor()
+            with mock.patch.object(notes, "claude_projects_root", return_value=claude_root), \
+                    mock.patch.object(notes, "codex_memories_root", return_value=Path(td) / "no-codex"), \
+                    mock.patch.object(notes, "_project_for_slug", return_value="acme/repo-a"), \
+                    mock.patch("khipu.paths.ensure_data_dir", return_value=Path(data_td)), \
+                    mock.patch("khipu.db.connect", return_value=_FakeConn(cur)) as connect, \
+                    mock.patch("khipu.mirror.persist_topic_graph", return_value={
+                        "nodes_minted": 0, "edges_minted": 0}):
+                body(memory, connect)
+
+    def test_a_second_stop_inside_the_interval_does_no_work(self):
+        def body(_memory, connect):
+            t0 = 1_000_000.0
+            first = notes.hook_reconcile(now=t0)
+            self.assertEqual(first["written"], 3)
+            connect.reset_mock()
+            with mock.patch.object(notes, "_build_plan", side_effect=AssertionError("parsed")), \
+                    mock.patch.object(notes, "_iter_note_file_candidates", side_effect=AssertionError("listed")):
+                second = notes.hook_reconcile(now=t0 + notes.HOOK_MIN_INTERVAL_S - 1)
+            self.assertEqual(second["skipped"], "recent")
+            connect.assert_not_called()
+
+        self._run(body)
+
+    def test_a_stop_after_the_interval_with_no_new_note_only_stats_the_files(self):
+        def body(_memory, connect):
+            t0 = 1_000_000.0
+            notes.hook_reconcile(now=t0)
+            connect.reset_mock()
+            with mock.patch.object(notes, "_build_plan", side_effect=AssertionError("parsed")):
+                again = notes.hook_reconcile(now=t0 + notes.HOOK_MIN_INTERVAL_S + 1)
+            self.assertEqual(again, {"skipped": "unchanged"})
+            connect.assert_not_called()
+
+        self._run(body)
+
+    def test_a_note_edited_in_a_session_is_picked_up_at_the_next_allowed_stop(self):
+        def body(memory, _connect):
+            t0 = 1_000_000.0
+            notes.hook_reconcile(now=t0)
+            two = memory / "two.md"
+            two.write_text(two.read_text(encoding="utf-8") + "\nedited this session.\n", encoding="utf-8")
+            early = notes.hook_reconcile(now=t0 + 60)  # too soon: left for the next stop
+            self.assertEqual(early["skipped"], "recent")
+            later = notes.hook_reconcile(now=t0 + notes.HOOK_MIN_INTERVAL_S + 1)
+            self.assertEqual((later["candidates"], later["written"]), (1, 1))
+            self.assertTrue(later["slugs"][0].startswith("note:two"))
+            # And the pass that picked it up closes the gap: nothing is written again.
+            final = notes.hook_reconcile(now=t0 + 2 * notes.HOOK_MIN_INTERVAL_S + 2)
+            self.assertEqual(final.get("written", 0), 0)
+
+        self._run(body)
+
+    def test_a_new_note_is_picked_up(self):
+        def body(memory, _connect):
+            t0 = 1_000_000.0
+            notes.hook_reconcile(now=t0)
+            _write(memory / "four.md", _sample_note_text().replace("khipu-state-of-play", "four"))
+            got = notes.hook_reconcile(now=t0 + notes.HOOK_MIN_INTERVAL_S + 1)
+            self.assertEqual((got["candidates"], got["written"]), (1, 1))
+
+        self._run(body)
+
+    def test_a_pass_with_an_error_leaves_the_files_pending_for_the_next_stop(self):
+        def body(memory, _connect):
+            t0 = 1_000_000.0
+            notes.hook_reconcile(now=t0)
+            before = notes._read_state()["scanned_at"]
+            two = memory / "two.md"
+            two.write_text(two.read_text(encoding="utf-8") + "\nedited.\n", encoding="utf-8")
+            with mock.patch("khipu.mirror._upsert_topic", side_effect=RuntimeError("hub said no")):
+                failed = notes.hook_reconcile(now=t0 + notes.HOOK_MIN_INTERVAL_S + 1)
+            self.assertEqual(len(failed["errors"]), 1)
+            self.assertEqual(notes._read_state()["scanned_at"], before)
+            retry = notes.hook_reconcile(now=t0 + 2 * notes.HOOK_MIN_INTERVAL_S + 2)
+            self.assertEqual((retry["candidates"], retry["written"]), (1, 1))
+
+        self._run(body)
+
+    def test_the_first_ever_call_runs_a_full_pass(self):
+        def body(_memory, connect):
+            got = notes.hook_reconcile(now=1_000_000.0)
+            self.assertEqual(got["written"], 3)
+            connect.assert_called()
+
+        self._run(body)
+
+
 class TombstoneMissingNotesTest(unittest.TestCase):
     """F5: a note: topic whose source file is gone gets deleted_at = now(),
     bounded so a mount blip cannot look like a bulk delete."""

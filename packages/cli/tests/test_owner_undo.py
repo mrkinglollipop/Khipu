@@ -110,6 +110,27 @@ def test_direction_never_reports_success_when_its_undo_log_cannot_be_written(wor
     assert rc == 2 and out["code"] == "log_unwritable" and _state("codex|") != "paused", out
 
 
+def test_undo_finds_an_action_that_sits_in_an_older_segment(world, monkeypatch):
+    rc, out = _pause_by_direction(world)
+    assert rc == 0 and _state("codex|") == "paused", out
+    # Every append from here rolls the log, so the action ends up in a numbered
+    # segment and the Undo's own lines land in newer ones.
+    monkeypatch.setattr(owner_direction, "LOG_ROLL_BYTES", 1)
+    owner_direction._append({"kind": "state", "id": "filler01", "at": "2026-11-09T00:00:00Z",
+                             "target": "no-such-line", "state": "applied"})
+    action = out["owner_action"]
+    older = [p for p in owner_direction._sealed_paths() if action in p.read_text(encoding="utf-8")]
+    assert older and action not in owner_direction.log_path().read_text(encoding="utf-8")
+    assert [a["id"] for a in owner_direction.actions()] == [action]
+    world.say("undo that pause please")
+    rc, undone = world.run(["owner-direction", "undo", action], True)
+    assert rc == 0 and _state("codex|") != "paused", undone
+    assert owner_direction.line_state(action) == "undone"
+    assert len(owner_direction._sealed_paths()) >= 3
+    # The list the app shows reads the same segments: the action, then its Undo.
+    assert action in [a["id"] for a in owner_direction.actions()]
+
+
 def test_clear_can_restore_the_report_it_replaced(world):
     routing.report(state="limited", account="Codex", until="2h", author=dict(REPORTER))
     words = "clear Codex report please"

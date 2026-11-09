@@ -160,12 +160,18 @@ def run(mem_root: str, harness: str, sid: str) -> None:
     try:
         # A note edited this session becomes a topic now, not after the nightly.
         t0 = time.monotonic()
-        from khipu.notes import reconcile
+        # Throttled and stat-checked (notes.hook_reconcile): a full pass parses
+        # every note on the Mac, and nearly every stop has nothing new.
+        from khipu.notes import hook_reconcile
 
-        r = reconcile(dry_run=False, changed_only=True)
-        _say(sid, harness, f"notes-reconcile changed_only candidates={r.get('candidates')} "
-                           f"written={r.get('written')} errors={len(r.get('errors') or [])} "
-                           f"{round((time.monotonic() - t0) * 1000, 1)}ms")
+        r = hook_reconcile()
+        if r.get("skipped"):
+            _say(sid, harness, f"notes-reconcile not needed ({r['skipped']}) "
+                               f"{round((time.monotonic() - t0) * 1000, 1)}ms")
+        else:
+            _say(sid, harness, f"notes-reconcile changed_only candidates={r.get('candidates')} "
+                               f"written={r.get('written')} errors={len(r.get('errors') or [])} "
+                               f"{round((time.monotonic() - t0) * 1000, 1)}ms")
     except Exception as e:  # noqa: BLE001
         _say(sid, harness, f"notes-reconcile skipped: {type(e).__name__}: {e}")
     try:
