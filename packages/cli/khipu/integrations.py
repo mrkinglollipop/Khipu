@@ -4115,6 +4115,216 @@ def status_all() -> list[dict]:
     return [status(h) for h in HARNESSES]
 
 
+# ---- keeping the wired hooks current ------------------------------------------
+#
+# `install` is the only thing that writes a harness's hook list, and nothing ran
+# it again after a promote or an app update, so a hook fixed in a later build
+# (fb707582 narrowed the delegation hook's matcher on 2026-11-07) kept running
+# the old way. The pieces below let a promote and a new app build refresh the
+# hooks the installer already wired, and let `khipu doctor` say when they lag.
+#
+# Both reuse the installer itself: the plan is `install(..., dry_run=True)` and
+# a refresh is a real `install` of the same harness, so there is one set of
+# rules for what a hook list should hold.
+
+# Harnesses whose changed hook file takes effect with no human approval.
+HOOK_REFRESH_HARNESSES = ("claude_code", "cursor")
+# Harnesses `khipu doctor` compares. Codex is here but never refreshed: it
+# stops running a hook it has not seen until the owner reviews it in Codex, so
+# a silent rewrite would stop capture there.
+HOOK_PLAN_HARNESSES = ("claude_code", "cursor", "codex")
+_HOOK_LABELS = {"claude_code": "Claude Code", "cursor": "Cursor", "codex": "Codex"}
+
+
+def _has_khipu_hook(hooks: Any, *, nested: bool) -> bool:
+    """Does a ``hooks`` block hold any Khipu hook command, however stale?
+    ``nested``: Claude and Codex wrap commands in ``{"hooks": [...]}``; Cursor
+    lists them directly."""
+    if not isinstance(hooks, dict):
+        return False
+    for entries in hooks.values():
+        for e in entries if isinstance(entries, list) else []:
+            if not isinstance(e, dict):
+                continue
+            cmds = [x.get("command") for x in e.get("hooks", []) if isinstance(x, dict)] if nested \
+                else [e.get("command")]
+            if any(_cursor_is_khipu(c) for c in cmds):
+                return True
+    return False
+
+
+def _hook_file_wired(path: Path, *, nested: bool) -> bool:
+    """True when ``path`` holds a Khipu hook. An unreadable file counts as yes,
+    so the plan reports the unreadable file instead of hiding it."""
+    try:
+        return _has_khipu_hook(_load_json(path).get("hooks"), nested=nested)
+    except ConfigUnreadable:
+        return True
+
+
+def _plan_targets(harness: str) -> tuple[bool, list[dict[str, Any]]]:
+    """(detected, [kwargs for install()]) for the wired parts of ``harness``.
+    A part that holds no Khipu hook at all is left out: a first install is the
+    owner's choice, never a refresh's."""
+    if harness == "claude_code":
+        found = [h for h in _claude_homes() if h.exists]
+        return bool(found), [{"home": str(h.path)} for h in found
+                             if _hook_file_wired(h.settings_path, nested=True)]
+    if harness == "cursor":
+        return _cursor_detected(), ([{}] if _cursor_detected() and _hook_file_wired(CURSOR_HOOKS, nested=False)
+                                    else [])
+    if harness == "codex":
+        return _codex_detected(), ([{}] if _codex_detected() and _hook_file_wired(CODEX_HOOKS, nested=True)
+                                   else [])
+    raise ValueError(f"no hook plan for {harness}")
+
+
+def hook_plan(harness: str) -> dict[str, Any]:
+    """What ``install`` would change in the hook files ``harness`` already has
+    Khipu in, from a dry run: nothing is written, not even a launcher link.
+
+    ``changes`` is the installer's own wording; empty means the wired hooks are
+    what this version would install. ``wired`` is False when the harness is
+    found but holds no Khipu hook (nothing to compare). ``error`` names an
+    unreadable file."""
+    detected, targets = _plan_targets(harness)
+    out: dict[str, Any] = {"harness": harness, "detected": detected, "wired": bool(targets), "changes": []}
+    errors = []
+    for kwargs in targets:
+        res = install(harness, dry_run=True, **kwargs)
+        for c in res.get("changes", []):
+            if c not in out["changes"]:
+                out["changes"].append(c)
+        if res.get("next_step"):
+            out["next_step"] = res["next_step"]
+        if res.get("error"):
+            errors.append(str(res["error"]))
+    if errors:
+        out["error"] = "; ".join(errors)
+    return out
+
+
+def refresh_hooks(*, dry_run: bool = False) -> dict[str, Any]:
+    """Bring the hooks of the harnesses Khipu is already wired into up to what
+    this version installs: Claude Code (every home) and Cursor. Codex is only
+    reported (see ``HOOK_PLAN_HARNESSES``); a harness with no Khipu hook is
+    left alone. Each entry's ``changes`` names the file and what changed, in
+    the installer's words. ``ok`` is False when any harness failed; the caller
+    reports it and carries on."""
+    out: dict[str, Any] = {"ok": True, "dry_run": dry_run, "harnesses": []}
+    live = _live_root()
+    if live is not None and live.resolve() != _root().resolve():
+        # This Mac runs promoted code and this is some other build (an older
+        # app, a checkout): its rules could undo what the promoted code wired.
+        out["skipped"] = ("this Mac runs promoted code from "
+                          f"{live.resolve()}; `khipu promote` refreshes the hooks with that code")
+        return out
+    for harness in HOOK_PLAN_HARNESSES:
+        entry: dict[str, Any] = {"harness": harness}
+        out["harnesses"].append(entry)
+        try:
+            plan = hook_plan(harness)
+            entry.update(detected=plan["detected"], wired=plan["wired"])
+            if plan.get("error"):
+                raise ConfigUnreadable(plan["error"])
+            if not plan["detected"]:
+                entry["state"] = "not found"
+            elif not plan["wired"]:
+                entry["state"] = "not installed; left alone"
+            elif not plan["changes"]:
+                entry["state"] = "current"
+            elif harness not in HOOK_REFRESH_HARNESSES:
+                entry.update(state="needs the owner", changes=plan["changes"],
+                             note=("Codex stops running a changed hook until you review it in Codex, so Khipu "
+                                   "does not rewrite it: run `khipu integrations install codex`, then "
+                                   "approve the hooks in Codex"))
+            elif dry_run:
+                entry.update(state="would change", changes=plan["changes"])
+            else:
+                _, targets = _plan_targets(harness)
+                changes: list[str] = []
+                backups: list[str] = []
+                failures: list[str] = []
+                for kwargs in targets:
+                    res = install(harness, **kwargs)
+                    changes.extend(c for c in res.get("changes", []) if c not in changes)
+                    backups.extend(b for b in res.get("backups", []) if b)
+                    if res.get("error"):
+                        failures.append(str(res["error"]))
+                entry.update(state="changed" if not failures else "failed", changes=changes)
+                if backups:
+                    entry["backups"] = backups
+                if failures:
+                    raise ConfigUnreadable("; ".join(failures))
+        except Exception as e:  # noqa: BLE001 — one harness failing must not stop the others
+            entry.update(state="failed", error=f"{type(e).__name__}: {e}")
+            out["ok"] = False
+    return out
+
+
+def format_hook_refresh(res: dict[str, Any]) -> list[str]:
+    """Plain lines for a refresh result: each file changed and what changed,
+    then anything that failed or waits on the owner."""
+    if not isinstance(res, dict):
+        return ["hooks: no result"]
+    if res.get("error") and not res.get("harnesses"):
+        return [f"hooks refresh failed: {res['error']}"]
+    if res.get("skipped"):
+        return [f"hooks: left alone; {res['skipped']}"]
+    lines = []
+    for e in res.get("harnesses") or []:
+        label = _HOOK_LABELS.get(e.get("harness"), e.get("harness"))
+        state = e.get("state")
+        if state in ("changed", "would change", "needs the owner", "failed"):
+            lines.append(f"hooks {label}: {state}" + (f" ({e['error']})" if e.get("error") else ""))
+            lines.extend(f"  {c}" for c in e.get("changes") or [])
+            if e.get("note"):
+                lines.append(f"  {e['note']}")
+    return lines or ["hooks: every wired harness is current"]
+
+
+def hook_wiring_report() -> dict[str, Any]:
+    """`khipu doctor`'s hook row: per detected harness, whether the hooks wired
+    now are what this version would install, from the same dry run an install
+    uses. ``warnings`` is plain text for each one that is not, with the fix. It
+    is warning-level by design: the promote gate runs doctor on the candidate,
+    and a stale hook list must not block the promote that refreshes it."""
+    rows, warnings = [], []
+    for harness in HOOK_PLAN_HARNESSES:
+        label = _HOOK_LABELS[harness]
+        try:
+            plan = hook_plan(harness)
+        except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+            rows.append({"harness": harness, "state": "unknown", "error": f"{type(e).__name__}: {e}"})
+            warnings.append(f"{label}: could not compare the wired hooks with this version "
+                            f"({type(e).__name__}: {e})")
+            continue
+        if not plan["detected"]:
+            continue
+        row: dict[str, Any] = {"harness": harness}
+        rows.append(row)
+        if plan.get("error"):
+            row.update(state="unknown", error=plan["error"])
+            warnings.append(f"{label}: could not read its hook files to compare them ({plan['error']})")
+        elif not plan["wired"]:
+            row["state"] = "not installed"
+        elif not plan["changes"]:
+            row["state"] = "current"
+        else:
+            row.update(state="stale", changes=plan["changes"])
+            shown = "; ".join(plan["changes"][:3]) + (f"; and {len(plan['changes']) - 3} more"
+                                                       if len(plan["changes"]) > 3 else "")
+            if harness == "codex":
+                fix = ("it needs you: run `khipu integrations install codex`"
+                       + (", then approve the hooks in Codex (Codex stops running a changed hook "
+                          "until you review it)" if plan.get("next_step") else ""))
+            else:
+                fix = (f"run `khipu integrations install {harness}` (a promote or an app update "
+                       "refreshes it by itself)")
+            warnings.append(f"{label}: the wired hooks are behind this version ({shown}); {fix}")
+    return {"harnesses": rows, "warnings": warnings, "ok": not warnings}
+
+
 def _launcher_health_body() -> dict:
     states = launcher_states()
     roots = {

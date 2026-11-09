@@ -517,6 +517,20 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     }
 
 
+def _hook_wiring_block() -> dict:
+    """The doctor row for the hooks each harness has wired: current, or behind
+    this version, with the fix. Warning-level only: it is never in `ok`, since
+    the promote gate runs doctor on the candidate and a stale hook list must
+    not block the promote that refreshes it."""
+    try:
+        from khipu import integrations as integ
+
+        return integ.hook_wiring_report()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        return {"harnesses": [], "ok": False, "error": f"{type(e).__name__}: {e}",
+                "warnings": [f"could not compare the wired hooks with this version ({type(e).__name__}: {e})"]}
+
+
 def _disk_space_warnings(local: dict) -> list[str]:
     """An amber disk is a warning; red is already its own failed check."""
     block = local.get("disk_space") or {}
@@ -621,11 +635,11 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
         config = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     mem = Path(args.memory_root) if getattr(args, "memory_root", None) else None
     local = _doctor_local_checks(mem)
-    from khipu import __version__
+    from khipu import build_info
 
     out = {
         "quick": True,
-        "version": __version__,
+        "version": build_info.stamp(),
         "imports": {"ok": not imports, "failed": imports, "checked": len(_QUICK_IMPORTS)},
         "config": config,
         **local,
@@ -640,9 +654,12 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
     schema = _schema_check()
     out["schema_migrations"] = schema
     out["schema_migrations_ok"] = not schema.get("pending")
+    hook_wiring = _hook_wiring_block()
+    out["hook_wiring"] = hook_wiring
     out["warnings"] = (list(schema.get("warnings") or []) + _disk_space_warnings(local)
                        + _replica_schema_warnings(local) + _recall_outcomes_warnings(local)
-                       + _storage_warnings(local) + _owner_writes_warnings())
+                       + _storage_warnings(local) + _owner_writes_warnings()
+                       + list(hook_wiring.get("warnings") or []))
     out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
                  and all(bool(local[k]) for k in LOCAL_GATES) and out["schema_migrations_ok"])
     print(_strict_json(out, indent=2, default=str))
@@ -901,6 +918,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         claude_homes_block = _integ.claude_homes_report()
     except Exception as e:  # noqa: BLE001
         claude_homes_block = {"homes": [], "error": f"{type(e).__name__}: {e}"}
+    hook_wiring_block = _hook_wiring_block()
     # T3's own files are read-only.  It is omitted entirely when no T3
     # settings file exists, so a normal non-T3 install never gets a phantom
     # provider card.  A malformed settings file still counts as detected: its
@@ -1021,7 +1039,10 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         work_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
     from khipu import routing_health
 
+    from khipu import build_info
+
     out = {
+        "version": build_info.stamp(),
         "status": status,
         "hub_ok": hub_ok,
         "hub_snapshot": hub_snapshot,
@@ -1062,6 +1083,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "degraded_rate": degraded_rate,
         "unknown_harness": unknown_harness,
         "launchers": launchers,
+        "hook_wiring": hook_wiring_block,
         "claude_homes": claude_homes_block,
         **({"t3": t3_health} if t3_health is not None else {}),
         **({"project_renames": project_renames_block} if project_renames_block is not None else {}),
@@ -1089,7 +1111,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
                      + list(schema.get("warnings") or [])
                      + list(fact_provenance.get("warnings") or []) + rerank_warnings + _disk_space_warnings(local)
                      + _replica_schema_warnings(local) + _recall_outcomes_warnings(local)
-                     + _storage_warnings(local) + _owner_writes_warnings()),
+                     + _storage_warnings(local) + _owner_writes_warnings()
+                     + list(hook_wiring_block.get("warnings") or [])),
         "not_configured": not_configured,
         "drift_ok": drift_ok,
         "outbox_ok": outbox_ok,
@@ -4576,6 +4599,10 @@ cmd_aegis = cmd_sessions
 def cmd_integrations(args: argparse.Namespace) -> int:
     from khipu import integrations as integ
 
+    if args.integ_cmd == "refresh":
+        res = integ.refresh_hooks(dry_run=args.dry_run)
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok"] else 1
     targets = list(integ.HARNESSES) if args.harness == "all" else [args.harness]
     project = getattr(args, "project", None)
     # --home narrows a Claude Code install/uninstall/verify to one of the homes
@@ -5005,8 +5032,23 @@ class _Parser(argparse.ArgumentParser):
         super().error(redact_secrets(message, force=True)[0])
 
 
+class _VersionAction(argparse.Action):
+    """`khipu --version`: the version and the commit this build is. Read when
+    asked, not when the parser is built (that reads git)."""
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, help=None):
+        super().__init__(option_strings=option_strings, dest=dest, default=default, nargs=0, help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        from khipu import build_info
+
+        print(f"khipu {build_info.stamp()}")
+        parser.exit()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = _Parser(prog="khipu", description="Khipu memory hub CLI")
+    p.add_argument("--version", action=_VersionAction, help="Show the version and the commit this build is")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("status", help="PG counts + optional drift")
@@ -6349,6 +6391,12 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if name == "install":
             sp.add_argument("--no-verify", action="store_true")
+    rf = ig_sub.add_parser(
+        "refresh",
+        help="Bring the hooks already wired into Claude Code and Cursor up to this version "
+             "(a promote and a new app build run it; Codex is only reported)",
+    )
+    rf.add_argument("--dry-run", action="store_true", help="Show what would change; write nothing")
     ig.set_defaults(func=cmd_integrations)
 
     t3p = sub.add_parser("t3", help="Khipu for providers inside T3 Code")
