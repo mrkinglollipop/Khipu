@@ -473,12 +473,15 @@ def test_a_search_timeout_on_the_daemon_path_still_delivers_the_routing_lines(ho
     _record()
     _push_on(monkeypatch)
     monkeypatch.setattr(recall_prompt, "TIMEOUT_S", 0.3)  # too late for the client to try the one-shot path
-    home["search"]["delay"] = 1.0
+    # The client waits 2.2 s instead of 1.6 s while this Mac's load is at its
+    # core count; the search then times out at 0.9 s, also too late for it.
+    monkeypatch.setattr(recall_prompt, "BUSY_TIMEOUT_S", 0.9)
+    home["search"]["delay"] = 1.5
     code, out = _client(home)
     assert code == 0
     assert _recall_part(out) == "" and _routing_part(out).startswith(FULL)
     line = _wait_log(1)
-    assert " reason=timeout>0.3s " in line and line.endswith(" routing=full")
+    assert (" reason=timeout>0.3s " in line or " reason=timeout>0.9s " in line) and line.endswith(" routing=full")
     assert _marker()["version"] == routing.read_view()["version"]
 
 
