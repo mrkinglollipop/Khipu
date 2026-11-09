@@ -45,7 +45,7 @@ PATTERNS: tuple[tuple[str, str, str], ...] = (
     ("temp", "data", ".owner-*.tmp"),
     ("lock", "data", ".owner-*.lock"),
     ("log", "data", "owner-actions.jsonl"),
-    # Numbered segments an earlier version sealed: still lines of the log, never removed.
+    # Numbered segments the log rolls into when it grows large: still lines of the log, never removed.
     ("log", "data", "owner-actions.[0-9][0-9][0-9][0-9][0-9][0-9].jsonl"),
     # Left by an earlier version; nothing reads it now.
     ("head", "data", "owner-actions.head.json"),

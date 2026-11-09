@@ -611,7 +611,7 @@ def _interrupted() -> list[dict]:
 
 
 def _hub_items() -> list[dict]:
-    """What waits on the hub: job-origin corrections and same-project pairs.
+    """What waits on the hub: explicit asks and same-project pairs.
     Raises when the hub can't be read, so the answer says so."""
     from khipu import project_group, explicit_asks
     from khipu.hub_snapshot import try_hub_connect
@@ -761,7 +761,7 @@ def _gather(now: datetime) -> tuple[list[dict], list[dict], dict | None]:
         try:
             items += _hub_items()
         except Exception:  # noqa: BLE001 - a hub down leaves the rest of the list standing
-            unread.append({"what": "explicit asks, job-origin corrections and same-project questions",
+            unread.append({"what": "explicit asks and same-project questions",
                            "why": "the hub can't be reached right now"})
     if view is not None:
         try:

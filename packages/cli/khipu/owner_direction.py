@@ -37,12 +37,16 @@ from khipu import owner_turns
 
 PURGE_DELAY_S = 24 * 3600
 LOG_NAME = "owner-actions.jsonl"
-# An earlier version kept the log in numbered segments beside the current one
-# (``owner-actions.<six digits>.jsonl``). Khipu no longer writes them, but any
-# that exist are still lines of the log: ``read_log`` and the owner-words scan
-# read them, oldest first. Lines from that time carry ``v``, ``prev`` and
-# ``hash`` fields; nothing reads those now.
+# The log lives in numbered segments beside the current file
+# (``owner-actions.<six digits>.jsonl``, oldest first). An earlier version
+# sealed them with ``v``, ``prev`` and ``hash`` fields; nothing reads those now.
+# The current log is rolled into the next segment when it passes LOG_ROLL_BYTES
+# (below). ``read_log`` and the owner-words scan read every segment, then the log.
 _SEGMENT = re.compile(r"^owner-actions\.(\d{6})\.jsonl$")
+# The live log is moved to the next numbered segment, and a new one started,
+# when an append finds it at least this big. No hashes, seals or checks: it is
+# a plain rename, and every reader already reads the segments before the log.
+LOG_ROLL_BYTES = 4 * 1024 * 1024
 _SESSION_VARS = ("KHIPU_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
 
 _clock = time.time
@@ -1299,6 +1303,12 @@ def _sealed_paths() -> list[Path]:
     return [folder / n for n in names]
 
 
+def _next_segment_path() -> Path:
+    """The name the live log takes when it rolls: one past the highest segment."""
+    highest = max((int(_SEGMENT.match(p.name).group(1)) for p in _sealed_paths()), default=0)
+    return log_path().with_name(f"owner-actions.{highest + 1:06d}.jsonl")
+
+
 def _log_files() -> list[Path]:
     """Every file that holds log lines, in order: older segments, then the log."""
     return [*_sealed_paths(), log_path()]
@@ -1309,6 +1319,13 @@ def _append(line: dict) -> dict:
     interleave, and on disk before it returns."""
     with _log_locked() as path:
         line = json.loads(json.dumps(line, ensure_ascii=False, default=str))
+        # A log that has grown past LOG_ROLL_BYTES becomes the next segment
+        # (one atomic rename, under the lock) and this line starts a new one.
+        try:
+            if os.stat(path).st_size >= LOG_ROLL_BYTES:
+                os.replace(path, _next_segment_path())
+        except OSError:  # no log yet
+            pass
         # A last line that was cut short (a crash mid-write) must not swallow this one.
         try:
             with open(path, "rb") as fh:
@@ -1360,19 +1377,25 @@ def scrub_words(sessions, *, protected_sessions=()) -> int:
 
 def read_log() -> list[dict]:
     """Every line, oldest first, through any segments an earlier version sealed."""
-    out = []
-    for path in _log_files():
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        for text in raw.splitlines():
+    for _attempt in range(3):
+        files = _log_files()
+        out = []
+        for path in files:
             try:
-                row = json.loads(text)
-            except ValueError:
+                raw = path.read_text(encoding="utf-8")
+            except OSError:
                 continue
-            if isinstance(row, dict):
-                out.append(row)
+            for text in raw.splitlines():
+                try:
+                    row = json.loads(text)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    out.append(row)
+        # A writer that rolled the log while this read ran moved lines from
+        # the live file into a segment this read had not listed: read again.
+        if _log_files() == files:
+            break
     return out
 
 

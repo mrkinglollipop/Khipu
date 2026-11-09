@@ -1,7 +1,8 @@
 """The owner-actions log is a plain append-only JSON-lines file: every owner
 action is a line with its receipt, Undo reads it, and nothing checks it for
-tampering. Segments an earlier version sealed beside it, and the ``v``,
-``prev`` and ``hash`` fields it wrote, are still read and otherwise ignored.
+tampering. It rolls into numbered segments beside it when it grows past a size
+bound (a plain rename); segments an earlier version sealed, and the ``v``,
+``prev`` and ``hash`` fields it wrote, are read the same way and otherwise ignored.
 Hermetic: temp data and capture folders."""
 from __future__ import annotations
 
@@ -39,12 +40,74 @@ def test_a_new_line_is_written_as_given_with_no_chain_fields(folders):
     assert not {"v", "prev", "hash", "words_sha"} & set(row)
 
 
-def test_the_log_never_seals_into_segments_however_long_it_grows(folders):
+def test_a_small_log_stays_one_file(folders):
     for n in range(2100):
         _add(n)
     assert od._sealed_paths() == [] and len(_rows(od.log_path())) == 2100 and len(od.read_log()) == 2100
     assert sorted(p.name for p in od.log_path().parent.iterdir() if p.name.startswith("owner-actions")) == [
         od.LOG_NAME]
+
+
+def test_a_log_past_the_size_bound_rolls_into_the_next_numbered_segment(folders, monkeypatch):
+    monkeypatch.setattr(od, "LOG_ROLL_BYTES", 2000)
+    for n in range(60):
+        _add(n, words="pause the model for a while please " * 3)
+    names = sorted(p.name for p in od.log_path().parent.iterdir() if p.name.startswith("owner-actions"))
+    segments = [n for n in names if n != od.LOG_NAME]
+    assert len(segments) >= 3 and segments == [f"owner-actions.{i:06d}.jsonl" for i in range(1, len(segments) + 1)]
+    # The live file is bounded (a line may carry it a little past the mark), and no line is lost or reordered.
+    assert od.log_path().stat().st_size < 2000 + 400
+    assert [r["id"] for r in od.read_log()] == [f"a{n}" for n in range(60)]
+    assert [a["id"] for a in od.actions()] == [f"a{n}" for n in range(60)]
+    # No chain fields, hashes or seals: the rolled lines are the lines as given.
+    assert not any({"v", "prev", "hash"} & set(r) for r in od.read_log())
+
+
+def test_a_roll_continues_the_numbering_of_segments_already_there(folders, monkeypatch):
+    old = od.log_path().with_name("owner-actions.000004.jsonl")
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text(json.dumps({"kind": "action", "id": "old", "action": "route.pause", "target": "codex|",
+                               "state": "applied", "at": "2026-11-01T00:00:00Z"}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(od, "LOG_ROLL_BYTES", 1)
+    _add(1)
+    _add(2)
+    assert [p.name for p in od._sealed_paths()] == ["owner-actions.000004.jsonl", "owner-actions.000005.jsonl"]
+    assert [r["id"] for r in od.read_log()] == ["old", "a1", "a2"]
+
+
+def test_a_state_line_after_a_roll_completes_an_action_in_an_older_segment(folders, monkeypatch):
+    od._append({"kind": "action", "id": "x1", "auth": "app", "action": "route.pause", "target": "codex|",
+                "state": "pending"})
+    monkeypatch.setattr(od, "LOG_ROLL_BYTES", 1)
+    od._append({"kind": "state", "id": "s1", "at": "2026-11-09T00:00:00Z", "target": "x1", "state": "applied"})
+    assert [p.name for p in od._sealed_paths()] == ["owner-actions.000001.jsonl"]
+    assert od.line_state("x1") == "applied" and [a["id"] for a in od.actions()] == ["x1"]
+
+
+def test_a_reader_that_races_a_roll_still_sees_every_line(folders, monkeypatch):
+    for n in range(3):
+        _add(n)
+    real = od._log_files
+    calls = []
+
+    def racing():
+        files = real()
+        if not calls:  # the first listing is taken, then a writer rolls the log under the reader
+            calls.append(1)
+            od.log_path().replace(od._next_segment_path())
+        return files
+
+    monkeypatch.setattr(od, "_log_files", racing)
+    assert [r["id"] for r in od.read_log()] == ["a0", "a1", "a2"]
+
+
+def test_forget_scrubs_words_in_a_segment_the_log_rolled_into(folders, monkeypatch):
+    monkeypatch.setattr(od, "LOG_ROLL_BYTES", 1)
+    for n in range(3):
+        _add(n, words="pause the model please", session="s-gone")
+    assert od._sealed_paths()
+    assert od.scrub_words(["s-gone"]) == 3
+    assert all(r.get("words") is None and r.get("scrubbed") for r in od.read_log())
 
 
 def test_lines_an_earlier_version_chained_and_sealed_are_still_read_in_order(folders):

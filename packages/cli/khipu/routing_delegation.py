@@ -345,7 +345,11 @@ def _agent_tool_use(payload: dict, environ, agent_id: str) -> tuple[dict, dict |
 
     try:
         page = routing.child_page_push(session_id, agent_id)
-    except Exception:  # noqa: BLE001 - routing never breaks the hook
+    except Exception as exc:  # noqa: BLE001 - routing never breaks the hook
+        # Only the three fields the log line reads, not the whole payload (a brief can be long).
+        slim = {"session_id": session_id, "hook_event_name": _event(payload),
+                "tool_name": payload.get("tool_name") or payload.get("toolName")}
+        _log_call(json.dumps(slim), f"error:child_page_push:{type(exc).__name__}", None, "", time.monotonic())
         return {}, None, None
     if not page or not page.get("routing_changes") or not isinstance(page.get("text"), str):
         return {}, None, None

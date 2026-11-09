@@ -33,3 +33,19 @@ def test_rule_tool_text_does_not_say_the_write_is_live_when_a_stale_base_is_not_
     for name in ("khipu_route_rule", "khipu_route_priority"):
         desc = _tool(name)["description"]
         assert "stale" in desc.lower(), name
+
+
+def test_tool_text_and_docs_do_not_advertise_removed_features():
+    # Removed: job-origin corrections, the owner-actions alarm, to-dos guessed from captures.
+    needs = _tool("khipu_needs_you")["description"].lower()
+    assert "job-origin" not in needs and "alarm" not in needs
+    owed = _tool("khipu_owed")["description"].lower()
+    assert "captured as open_loops" not in owed and "pull requests merged" not in owed
+    docs = (ROOT / "docs/mcp-tools.md").read_text(encoding="utf-8").lower()
+    assert "job-origin" not in docs and "owner-actions alarm" not in docs
+
+
+def test_every_kind_the_needs_you_tool_text_lists_is_one_needs_you_can_return():
+    from khipu import needs_you
+
+    assert "job_origin" not in needs_you.KINDS and "alarm" not in needs_you.KINDS

@@ -184,6 +184,7 @@ def test_a_hub_that_cannot_be_read_leaves_the_rest_of_the_list_and_says_so(world
     out = needs_you.waiting()
     assert [i["kind"] for i in out["items"]] == ["rule"]
     assert out["unread"][0]["why"] == "the hub can't be reached right now" and "hub.example" not in json.dumps(out)
+    assert out["unread"][0]["what"] == "explicit asks and same-project questions"
 
 
 def _override_due(monkeypatch) -> None:
