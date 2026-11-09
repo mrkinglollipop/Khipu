@@ -242,6 +242,8 @@ def test_exception_text_gives_way_before_any_rule_line_is_touched():
     # Every account line still says it has exceptions, as a count at the least.
     for label in ("Codex", "Grok", "Claude", "Muse"):
         assert "khipu route --full" in _line(text, label)
+    # A hold's words outlast the exception quotes: they say why Grok takes no jobs.
+    assert "overpaced" in _line(text, "Grok")
 
 
 def test_a_rule_line_goes_only_when_the_page_cannot_fit_even_with_bare_counts_and_the_page_names_the_headings():

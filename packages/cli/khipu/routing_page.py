@@ -17,11 +17,13 @@ from datetime import datetime, timezone
 
 LIMIT = 4500  # characters, the whole page
 NEARLY_OUT_PCT = 10.0
-# Role and exception widths tried, widest first, before any rule line is dropped.
-# An exception width of 0 is the shortest form: no quote, only a count. The
-# owner's standing rules outrank exceptions for space, so the exception text
-# gives way first (the second number shrinks before a rule line is touched).
-_WIDTHS = ((220, 140), (140, 100), (90, 60), (90, 0), (0, 0))
+# Role, exception and hold widths tried, widest first, before any rule line is
+# dropped. An exception width of 0 is the shortest form: no quote, only a
+# count. The owner's standing rules outrank exceptions for space, so the
+# exception text gives way first (the second number shrinks before a rule line
+# is touched). A hold's words say why an account takes no jobs, so they keep
+# their width until the very last step (the third number).
+_WIDTHS = ((220, 140, 140), (140, 100, 100), (90, 60, 60), (90, 30, 60), (90, 0, 60), (0, 0, 0))
 # Newest exceptions shown on an account's line; older ones collapse to a count.
 EXCEPTIONS_SHOWN = 2
 # A rule that opens with one of these names (``WHICH MODEL: Opus: ...``) goes
@@ -190,7 +192,7 @@ def _status(entry: dict, provider: dict, windows: list[dict], holds: list[dict],
     if state == r.PAUSED:
         return "PAUSED " + (f"until {r._clock(until, now)}" if until else "until lifted")
     if holds:
-        return "NO JOBS " + _hold_words(holds[0], widths[1], now, r)
+        return "NO JOBS " + _hold_words(holds[0], widths[2], now, r)
     if state == r.LIMITED:
         text = "LIMIT REACHED" + (f", back {'about ' if entry.get('basis') == 'estimated' else ''}"
                                   f"{r._clock(until, now)}" if until else "")
@@ -345,7 +347,7 @@ def _render(view: dict, now: datetime, conversation: dict, readings: dict, rules
         lines += [line(entry, item, None, False) for entry, item in extra]
     for hold in holds:
         if (hold.get("scope") or {}).get("kind") != "account":
-            lines.append(f"Hold on {hold.get('scope_label') or 'everything'}: " + _hold_words(hold, widths[1], now, r)
+            lines.append(f"Hold on {hold.get('scope_label') or 'everything'}: " + _hold_words(hold, widths[2], now, r)
                          + ".")
     resets = [f"{r._account_label(e['label'], e.get('key'), view=view)} {e['terms']['resets_held']}"
               for e, _i in (*ordered, *extra) if (e.get("terms") or {}).get("resets_held")]
@@ -465,7 +467,7 @@ def facts(view: dict, now: datetime) -> dict:
                 and (h.get("scope") or {}).get("account") == entry["key"]]
         provider = providers.get(entry.get("harness")) or providers.get(entry["key"].partition(":")[0]) or {}
         last = n == len(ordered) - 1 and not extra
-        status = _status(entry, provider, _windows(entry, now, r), mine, last, (0, 0), now, r)
+        status = _status(entry, provider, _windows(entry, now, r), mine, last, (0, 0, 0), now, r)
         exceptions = [{k: x.get(k) for k in ("id", "text", "until")} for x in (item or {}).get("exceptions") or []
                       if (r._parse(x.get("until")) or now) > now]
         accounts.append({"key": entry["key"], "ordered": item is not None, "word": _word(status),
