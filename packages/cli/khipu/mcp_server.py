@@ -2404,13 +2404,16 @@ def _tool_usage(args: dict) -> dict:
 def _route_pull_attachment(routing, routing_delivery, identity, now, *, view=None, delivery_point=True):
     """(routing_changes, delivery) for one pull caller, from the current view.
 
-    An identified caller reserves its `mcp` component's batch under the
-    delivery lock; an unidentified one is shown the same items with nothing
-    reserved or consumed."""
+    What is offered is the routing page, the same text the hooks hand every
+    conversation and subagent, as the one ledger entity ``page`` whose
+    revision is the page's signature: a pull client is owed it again exactly
+    when a hooked conversation would be. An identified caller reserves its
+    `mcp` component's batch under the delivery lock; an unidentified one is
+    shown the same item with nothing reserved or consumed."""
     if view is None:
         with routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
             view = routing.read_view(now)
-    from khipu import agent_view
+    from khipu import agent_view, routing_page_file
 
     keys = [a.get("key") for a in view.get("accounts") or [] if isinstance(a, dict)]
     table = agent_view._table(keys)
@@ -2419,12 +2422,9 @@ def _route_pull_attachment(routing, routing_delivery, identity, now, *, view=Non
     def project(value):
         return agent_view.scrub_strict(value, keep=table.owner, extra_keys=keys)
 
-    planned = routing_delivery.plan(
-        {"kind": "full", "text": routing.summary(view, now=now)["text"],
-         "version": view["version"], "epoch": view.get("epoch"),
-         "owed_entities": [], "shown_entities": []},
-        view, now, routing.settings(), project=project,
-        session=identity["session"] if identity else None)
+    cfg = routing.settings()
+    text, meta = routing_page_file.render(view, now)
+    planned = routing_delivery.page_plan(routing._page_answer(dict(meta, text=text), now, cfg), now, cfg)
     if identity and identity["session"].startswith("gateway\0"):
         # ``checked_at`` moves on every quiet local read.  A gateway copy is
         # stale only when it trails an actual folded revision.
@@ -2612,17 +2612,15 @@ def _tool_route_projected(args: dict) -> dict:
             want_full = bool(want_full)
         if not isinstance(want_full, bool):
             raise ValueError("full must be true or false")
-    from khipu import routing_page_file
-
-    if routing_page_file.enabled() and not want_full and since is None and not (mode and str(mode).strip()) \
-            and not account and not (args.get("ack") or "").strip():
-        return _route_page(routing)
     identity = routing_delivery.canonical_identity(os.environ, explicit=args.get("session_id"))
     if args.get("session_id") and identity is None and routing_delivery.canonical_identity(os.environ):
         raise _ToolFailure({"ok": False, "code": "session_not_yours",
                             "error": "session_id must name this conversation or a strict descendant of its "
                                      "canonical root (for example claude:<id>/child or codex:<id>/child, "
                                      "using the root exactly as your environment names it)."})
+    if not want_full and since is None and not (mode and str(mode).strip()) \
+            and not account and not (args.get("ack") or "").strip():
+        return _route_page(routing, identity)
     now = routing._now()
     # The body, reserved pages and final scrub share one folded view.
     with routing._for_a_conversation(), routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
@@ -2665,18 +2663,31 @@ ROUTE_FULL_POINTER = ("This is the routing page. Pass full=true for the full rec
                       "against, proposals, hold ids, provider facts, lanes and pull delivery.")
 
 
-def _route_page(routing) -> dict:
+def _route_page(routing, identity=None) -> dict:
     """khipu_route's default answer (slice 6): the routing page, rendered
     from the current view with this conversation's own overrides. It shows
     no revisions, so it records no read receipt and reserves nothing in the
-    delivery ledger: a conversation proposing a change reads ``full``."""
+    delivery ledger: a conversation proposing a change reads ``full``.
+
+    ``delivery``: whether this conversation, its pull component and each of
+    its subagents was handed the current page, and when not, why
+    (``routing_delivery.page_delivery``); read-only."""
+    from khipu import routing_delivery, routing_page_file
+
     now = routing._now()
     with routing._for_a_conversation(), routing.lock_budget(routing.CONVERSATION_LOCK_BUDGET):
         view = routing.read_view(now)
     conversation, readings = routing._page_inputs(view, now)
     text = routing.page(view, now, conversation, readings)
-    return {"page": text, "chars": len(text), "version": view.get("version"), "epoch": view.get("epoch"),
-            "full_record": ROUTE_FULL_POINTER}
+    out = {"page": text, "chars": len(text), "version": view.get("version"), "epoch": view.get("epoch"),
+           "full_record": ROUTE_FULL_POINTER}
+    try:
+        revision = routing_delivery.page_revision(routing_page_file.render(view, now)[1]["sig"])
+        out["delivery"] = (routing_delivery.page_delivery(identity["session"], revision, now) if identity
+                           else "untracked: pass session_id")
+    except Exception:  # noqa: BLE001 - the receipt is optional; the page is the answer
+        out["delivery"] = {"readable": False}
+    return out
 
 
 def _tool_route_advise(args: dict) -> dict:

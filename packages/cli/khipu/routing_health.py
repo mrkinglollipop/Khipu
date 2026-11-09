@@ -140,7 +140,7 @@ def prompt_health(now, warn_pct=1.0):
         raw = ""  # no prompt has been logged yet: idle
     except OSError:
         return _result([], ["hook outcome log unreadable"])
-    statuses, runs, longest, ahead = [], {}, 0, False
+    statuses, runs, longest, ahead, last = [], {}, 0, False, {}
     for line in raw.splitlines():
         match = recall_prompt._LOG_LINE_RE.match(line)
         stamp = _time(match.group("stamp")) if match else None
@@ -152,12 +152,13 @@ def prompt_health(now, warn_pct=1.0):
             found = _SESSION_RE.search(line)
             session = found.group("session") if found else "?"
             if session != "?":
+                last[session] = status
                 delayed = status.startswith("skipped:") and status not in _NOT_A_DELAY
                 runs[session] = runs.get(session, 0) + 1 if delayed else 0
                 longest = max(longest, runs[session])
     missing = ["hook outcome dated ahead of the clock"] if ahead else []
     if not statuses:
-        return _result([], missing + ["recent hook outcomes"])
+        return _result([], missing + ["recent hook outcomes"], last_status={})
     skipped = sum(s.startswith("skipped:") for s in statuses)
     late = sum(s in recall_prompt.ROUTING_OUT_OF_TIME for s in statuses)
     rate = 100 * late / len(statuses)
@@ -167,7 +168,22 @@ def prompt_health(now, warn_pct=1.0):
     if longest >= PROMPT_DELAY_RUN:
         reasons.append("prompt-delay")
     return _result(reasons, missing, count=len(statuses), skipped=skipped, out_of_time=late, rate_pct=rate,
-                   warn_pct=warn_pct, longest_skip_run=longest)
+                   warn_pct=warn_pct, longest_skip_run=longest, last_status=last)
+
+
+def _last_status_by_ledger(last):
+    """The last hour's latest ``routing=`` status of each session, keyed by
+    its delivery ledger's file name (the hash of its canonical identity), so
+    a row can say a page is owed because its last read ran out of time."""
+    from khipu import routing_delivery
+
+    out = {}
+    for session, status in (last or {}).items():
+        try:
+            out[routing_delivery._path(session).name] = status
+        except Exception:  # noqa: BLE001 - one unmappable session only loses its reason
+            continue
+    return out
 
 
 def _ledger_quiet(data, path, now, live_after):
@@ -213,7 +229,19 @@ def delivery_ok(block) -> bool:
 def doctor_block(view, now, cfg):
     from khipu import recall_prompt, routing, routing_delivery, routing_replication
 
+    from khipu import routing_page_file
+
     reasons, missing, rows, gateways = [], [], [], []
+    try:
+        warn_pct = float(cfg.get("routing_slow_read_pct", 1.0))
+    except (TypeError, ValueError):
+        warn_pct = 1.0
+    prompts = prompt_health(now, warn_pct)
+    last_status = _last_status_by_ledger(prompts.pop("last_status", None))
+    # The page every reader is handed now: each row says whether its
+    # component was handed this one, and when not, why.
+    page = routing_page_file.read()
+    revision = routing_delivery.page_revision(page.get("sig")) if page else None
     folder = recall_prompt._dedup_path("ledger").parent
     try:
         paths = list(folder.glob("*.routing.json"))
@@ -265,18 +293,17 @@ def doctor_block(view, now, cfg):
                 gateways.append(attachment)
             health = component_health(state, now, slack=cfg["routing_delivery_slack"],
                                       child=component.startswith("agent:"))
+            harness = routing_delivery.health_harness(
+                state.get("harness") if component.startswith("agent:") else attachment.get("harness"))
+            receipt = routing_delivery.page_receipt(
+                state, revision, now, harness=harness,
+                last_status=last_status.get(path.name) if component == "main" else None)
             rows.append(dict(identity=path.name.removesuffix(".routing.json").removeprefix("recall--"),
-                             component=component,
-                             harness=routing_delivery.health_harness(
-                                 state.get("harness") if component.startswith("agent:") else attachment.get("harness")),
-                             last_delivery_point=state["last_delivery_point"], **health))
+                             component=component, harness=harness,
+                             last_delivery_point=state["last_delivery_point"], **health,
+                             page=receipt["page"], page_why=receipt["why"]))
             reasons += health["reasons"]
             missing += health["missing"]
-    try:
-        warn_pct = float(cfg.get("routing_slow_read_pct", 1.0))
-    except (TypeError, ValueError):
-        warn_pct = 1.0
-    prompts = prompt_health(now, warn_pct)
     reasons += prompts["reasons"]
     missing += prompts["missing"]
     replication = {"status": "not_applicable"}
@@ -383,7 +410,10 @@ def doctor_block(view, now, cfg):
             reasons.append("gateway-cleanup-full")
     if not rows:
         missing.append("live delivery identities")
-    result = _result(reasons, missing, identities=rows, prompts=prompts,
+    if page is None and rows:
+        missing.append("routing page file")
+    pages = {word: sum(row.get("page") == word for row in rows) for word in routing_delivery.PAGE_STATES}
+    result = _result(reasons, missing, identities=rows, prompts=prompts, page=dict(revision=revision, **pages),
                      replication=replication, gateway=gateway)
     from khipu import features
 

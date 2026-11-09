@@ -5862,8 +5862,7 @@ def _save_view(view: dict) -> None:
     # never lands after a newer view's. It never fails the save.
     from khipu import routing_page_file
 
-    if routing_page_file.enabled():
-        routing_page_file.write(view)
+    routing_page_file.write(view)
 
 
 def _captures_unchanged(view: dict, fingerprint: dict, now: datetime) -> bool:
@@ -10245,12 +10244,12 @@ def _current_line(entity: str, view: dict, now: datetime) -> str:
 # ---- doctor ---------------------------------------------------------------------------
 
 
-def _rules_block(view: dict, text: dict | None, cfg: dict, *, paged: bool = False) -> dict:
+def _rules_block(view: dict, page_text: str | None, cut: list, cfg: dict) -> dict:
     """Doctor's row for the size of the owner's rules and note: stored words
-    past their write-time limits (they keep working), how many rules the
-    summary shows, and what a session start gets: ``full``, ``lean`` (the
-    account state with a pointer to the rules) or ``pointer`` (even the
-    account state alone is too long, so only a line telling the
+    past their write-time limits (they keep working), how many of his rule
+    lines the routing page leaves out (``cut``, ``routing_page.left_out``),
+    and what a session start gets: ``full`` (the page fits beside the recall
+    rule) or ``pointer`` (it does not, so only a line telling the
     conversation to call khipu_route)."""
     from khipu.recall_rule import start_context_fits
 
@@ -10270,32 +10269,21 @@ def _rules_block(view: dict, text: dict | None, cfg: dict, *, paged: bool = Fals
     if note_cap and note_chars > note_cap:
         warnings.append(f"Your note is {note_chars:,} characters; the limit is {note_cap:,} (routing_note_chars). "
                         "It keeps working; shorten it when you next set it.")
-    left_out = (text or {}).get("rules_left_out", 0)
-    covered = (text or {}).get("covered_entities") or []
-    if left_out or covered:
-        what = [f"{left_out} of {len(rules)} standing rules"] if left_out else []
-        what += ["your note"] if "note" in covered else []
-        who = "The summary subagents get shows" if paged else "The summary at the start of a conversation shows"
-        warnings.append(f"{who} only part of your words ({' and '.join(what)} "
-                        f"left to read with khipu_route) to keep within {cfg['routing_rules_chars']:,} characters "
-                        "(routing_rules_chars).")
+    left_out = sum(n for _head, n in cut)
+    if cut:
+        from khipu import routing_page
+
+        warnings.append(f"The routing page left out {left_out} of your rule line{'s' if left_out != 1 else ''} to fit "
+                        f"its {routing_page.LIMIT:,} characters (from {', '.join(h for h, _n in cut)}); "
+                        "conversations read them with khipu_route. Shorten your roles, exceptions or rules.")
     mode = "full"
-    if text:
-        if not start_context_fits(text["text"]):
-            lean = text.get("lean_text")
-            if lean and start_context_fits(lean):
-                mode = "lean"
-                warnings.append("Your rules, note and priority are too long to arrive at session start beside the "
-                                "account state; conversations get the account state and a line telling them to call "
-                                "khipu_route for the rest. Shorten them or lower routing_rules_chars.")
-            else:
-                mode = "pointer"
-                warnings.append("The routing summary is too long to arrive at session start even without your "
-                                "rules, note and priority; conversations get a line telling them to call "
-                                "khipu_route instead. Lower routing_summary_chars.")
+    if page_text and not start_context_fits(page_text):
+        mode = "pointer"
+        warnings.append("The routing page is too long to arrive at session start beside the recall rule; "
+                        "conversations get a line telling them to call khipu_route instead.")
     return {"rules": len(rules), "left_out": left_out, "over_rule_cap": over, "note_chars": note_chars,
             "rule_chars_cap": rule_cap, "rules_max": count_cap, "note_chars_cap": note_cap,
-            "rules_chars_budget": cfg["routing_rules_chars"], "start": mode, "warnings": warnings}
+            "start": mode, "warnings": warnings}
 
 
 def doctor_block(now: datetime | None = None) -> dict:
@@ -10320,24 +10308,12 @@ def doctor_block(now: datetime | None = None) -> dict:
             began = _parse(dis["since"]) if dis else None
             if began and after and (now - began).total_seconds() > after:
                 warnings.append(f"Sources have disagreed about {name} for more than {_span(after)}.")
-    text = summary(view, now=now) if view.get("record") else None
-    from khipu import routing_page, routing_page_file
+    from khipu import routing_page
 
-    # With the page on, a conversation gets the page; the older summary goes
-    # to subagents only, so its warnings say so and the page gets its own.
-    paged = routing_page_file.enabled()
-    if text and text["dropped"]:
-        warnings.append(f"The summary subagents get had to leave out {text['dropped']} lines." if paged
-                        else f"The summary had to leave out {text['dropped']} lines.")
-    rules_block = _rules_block(view, text, cfg, paged=paged)
+    page_text = routing_page.page(view, now) if view.get("record") else None
+    cut = routing_page.left_out(view, now) if view.get("record") else []
+    rules_block = _rules_block(view, page_text, cut, cfg)
     warnings += rules_block.pop("warnings")
-    if paged and view.get("record"):
-        cut = routing_page.left_out(view, now)
-        if cut:
-            total = sum(n for _head, n in cut)
-            warnings.append(f"The routing page left out {total} of your rule line{'s' if total != 1 else ''} to fit "
-                            f"its {routing_page.LIMIT:,} characters (from {', '.join(h for h, _n in cut)}); "
-                            "conversations read them with khipu_route. Shorten your roles, exceptions or rules.")
     if view.get("outside_app"):
         warnings.append("A rule, a pause, a clear, your note or your priority was written by something other than "
                         "the app.")
@@ -11645,49 +11621,39 @@ def conversation_priority_amend(account, *, append=None, role=None, until=None, 
 
 
 
-class _StartStatus(dict):
-    """Internal fold evidence stays off the public status projection."""
-
-    def __init__(self, value, view):
-        super().__init__(value)
-        self.view = view
-
 def light_status(now: datetime | None = None, *, lock_wait: float = LIGHT_LOCK_BUDGET,
-                 start: bool = False, session_id: str | None = None) -> dict:
-    """The ``routing`` field of ``khipu_status``'s light payload: the summary
-    a conversation gets at its start (``khipu route --summary``), for a
-    harness with no hooks, and the text the session-start hook pushes
-    (``start_push``). It waits for the routing lock only ``lock_wait``
+                 session_id: str | None = None) -> dict:
+    """The ``routing`` field of ``khipu_status``'s light payload: the routing
+    page, the same text every conversation and subagent is handed
+    (``routing_page``), with its age line when it is old. Read from
+    page.txt; only when there is none, or the record may have moved past
+    it, is the view read, waiting for the routing lock only ``lock_wait``
     (``LIGHT_LOCK_BUDGET``, well inside the time khipu_status gives it), so
-    a held lock still answers, from an unsaved fold. With ``start`` the
-    view is read as the session-start child reads it (``_start_view``)."""
-    with lock_budget(lock_wait):
-        now = now or _now()
-        _view_seen.stat = None
-        view = _start_view(now) if start else read_view(now)
-        owners: list = []
-        out = summary(view, now=now, session_id=session_id, owners=owners)
-    # The summary is the push: built from labels and names, with the
-    # owner's own words whole; it holds no key and no configured path.
-    status = {"text": out["text"], "version": out["version"], "epoch": out["epoch"], "dropped": out["dropped"],
-              "about": ABOUT}
-    if start:
-        # Only for the hook, which checks it and never prints it: it names files.
-        status["generation"] = _generation(view, settings())
-        status["owed_entities"] = out["owed_entities"]
-        status["shown_entities"] = out["shown_entities"]
-        status["covered_entities"] = out["covered_entities"]
-        status["lean_text"] = out["lean_text"]
-        status["notices"] = out["notices"]
-        status["line_entities"] = owners
-    return _StartStatus(status, view) if start else status
+    a held lock still answers, from an unsaved fold. Nothing is reserved or
+    acknowledged: delivery belongs to the hooks and ``khipu_route``.
+    ``session_id`` is accepted for older callers and not used."""
+    from khipu import routing_page_file
+
+    now = now or _now()
+    page = routing_page_file.read()
+    if page is None or routing_page_file.behind(page, now):
+        with lock_budget(lock_wait):
+            _view_seen.stat = None
+            view = read_view(now)
+        text, meta = routing_page_file.render(view, now)
+        _refresh_page(view, now)
+        page = dict(meta, text=text)
+    out = _page_answer(page, now, settings())
+    return {"text": out["text"], "version": out["version"], "epoch": out["epoch"],
+            "rendered_at": page.get("rendered_at"), "about": ABOUT}
 
 
 # ---- the push at session start (phase 3a) ------------------------------------------------
 #
-# The session-start hook (``recall_rule.session_start_main``) adds the full
-# summary to what it already prints. It is the same text as ``light_status``:
-# one projection, built from labels and names with the owner's words whole.
+# The session-start hook (``recall_rule.session_start_main``) adds the
+# routing page to what it already prints, and a subagent's start hook
+# (``routing_delegation``) hands it the same page. It is the same text as
+# ``light_status`` and the per-prompt push: one page for every reader.
 # Matt's old bypass for the routing table's hook turns this off too.
 ROUTING_NOW_DISABLE_FILE = "/tmp/.routing_now_disable"
 PUSH_MOMENTS = {"start": "routing_push_start", "prompt": "routing_push_prompt",
@@ -11761,33 +11727,39 @@ def start_budget() -> float:
     return min(max(0, ms), START_BUDGET_MOST_MS) / 1000.0
 
 
-def _child_page_push_inline(session_id: str, agent_id: str,
-                            now: datetime | None = None, *, lease: bool = True) -> dict | None:
-    """The leased page, as ``child_page`` builds it. ``lease=False`` only for
-    the forked read in ``child_page_push``: its page carries the lease for
-    the hook to take, and the hook pops it before anything is printed."""
+def _child_page_push_inline(session_id: str, agent_id: str, now: datetime | None = None, *,
+                            kick=None) -> dict | None:
+    """The routing page for a subagent's tool result, as the per-prompt push
+    builds it for its parent (``page_push``) but in the subagent's own
+    ``agent:<agent_id>`` component: offered only when that component has
+    not acknowledged the page's current signature, so it is sent again
+    exactly when it would be sent again to the parent. None when nothing is
+    owed."""
     if push_off("delegation"):
         return None
     from khipu import routing_delivery
 
-    now = now or _now()
-    out = light_status(now, start=True, session_id=None)
-    planned = routing_delivery.plan(dict(out, kind="full"), out.view, now, settings(), session=None)
     session = routing_delivery.hook_session(session_id)
-    page = routing_delivery.child_page(planned, session=session, component=f"agent:{agent_id}",
-                                       now=now, cfg=settings(), lease=lease)
-    return dict(page, session=session) if page else None
+    marker = routing_delivery.Marker({}, session=session, component=f"agent:{agent_id}")
+    out = page_push(marker, budget=prompt_budget(), now=now, kick=kick)
+    if not out.get("routing_changes"):
+        return None
+    return dict(out, session=session)
 
 
 def child_page_push(session_id: str | None, agent_id: str | None, *,
                     now: datetime | None = None) -> dict | None:
-    """The next deferred routing page for a subagent's own tool result
-    (slice 8a): one page from its ``agent:<agent_id>`` ledger, or None when
-    nothing is deferred. The parent's ledger is never touched.
+    """The routing page for a subagent's own tool result, when its
+    ``agent:<agent_id>`` component has not yet acknowledged the page's
+    current signature (``_child_page_push_inline``), or None. The parent's
+    component is never touched.
 
-    Like the parent's per-prompt push, the record read runs in a forked
-    child under ``routing_prompt_budget_ms``: a slow read returns nothing
-    on time instead of blocking the subagent's tool call."""
+    Like the parent's per-prompt push, the read runs in a forked child under
+    ``routing_prompt_budget_ms``: a slow read returns nothing on time instead
+    of blocking the subagent's tool call. The child reserves the page as the
+    parent's prompt child does; an answer that came back too late stays in
+    flight for the lease and is handed, byte for byte, to the next tool
+    call, so nothing is reserved for nobody for longer than the lease."""
     if not session_id or not agent_id or push_off("delegation"):
         return None
     budget = prompt_budget()
@@ -11799,11 +11771,6 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
     from khipu import agent_view
 
     agent_view.prepare_routing_table()
-    # The child's start-up reads the record's entries (``_start_view``):
-    # parse them here, bounded, so the forked child inherits them and its
-    # budget times the read, not the parse.
-    with contextlib.suppress(Exception):
-        agent_view._bounded_inventory(_entry_cache, agent_view.COLD_FOLD_BUDGET_S)
     deadline = time.monotonic() + budget
     read_fd = write_fd = None
     pid = None
@@ -11835,11 +11802,20 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
                 signal.signal(signal.SIGALRM, on_alarm)
                 signal.setitimer(signal.ITIMER_REAL,
                                  max(0.0, deadline - time.monotonic()) + 0.05)
-                page = _child_page_push_inline(session_id, agent_id, now, lease=False)
+                kicks: list = []
+                page = _child_page_push_inline(session_id, agent_id, now, kick=kicks.append)
                 if page:
                     data = memoryview(json.dumps(page).encode("utf-8"))
                     while data:
                         data = data[os.write(write_fd, data):]
+                os.close(write_fd)  # the hook has its answer; a refold below never delays it
+                write_fd = None
+                if kicks:
+                    # The page was older than the record: refold here, off the
+                    # tool call, as the parent's prompt child does, within a bound.
+                    signal.signal(signal.SIGALRM, lambda *_: os._exit(1))
+                    signal.setitimer(signal.ITIMER_REAL, 900.0)
+                    refold_in_background()
                 code = 0
             except BaseException:  # noqa: BLE001 - nothing for routing
                 code = 1
@@ -11862,14 +11838,7 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
                 break
             chunks.append(chunk)
         page = json.loads(b"".join(chunks).decode("utf-8")) if chunks else None
-        if not isinstance(page, dict) or not page:
-            return None
-        # Only the hook that prints the page leases it: a read that came
-        # back too late leaves nothing in flight for nobody to acknowledge.
-        from khipu import routing_delivery
-
-        lease = page.pop("lease", None)
-        if not lease or not routing_delivery.lease_page(page["session"], f"agent:{agent_id}", lease, now=now):
+        if not isinstance(page, dict) or not page.get("routing_changes"):
             return None
         return page
     except Exception:  # noqa: BLE001 - routing never breaks the hook
@@ -11894,39 +11863,24 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
 def start_push(budget: float | None = None, moment: str = "start", *,
                session_id: str | None = None, child_component: str | None = None,
                child_session: str | None = None) -> dict | None:
-    """The full summary for the session-start hook (or, with ``moment``
+    """The routing page for the session-start hook (or, with ``moment``
     "delegation", for a subagent at its start), or None when the push is
     off. Folds outside the routing lock and waits for it, to save the view,
-    at most half of ``budget`` (then answers from an unsaved fold, as
-    ``light_status`` does). The hook bounds the
-    whole call and treats any exception as nothing to push."""
+    at most half of ``budget`` (then answers from an unsaved fold). A
+    subagent's page is offered in its own ``child_component`` of
+    ``child_session``'s ledger; with no ``child_session`` (a Codex native
+    child, an unidentified agent) it is a snapshot reserved nowhere. The
+    hook bounds the whole call and treats any exception as nothing to push.
+    ``session_id`` is accepted for older callers: the parent's hook attaches
+    its session itself (``recall_rule._RoutingAtStart``)."""
     if push_off(moment):
         return None
     budget = start_budget() if budget is None else budget
-    out = light_status(lock_wait=budget / 2, start=True,
-                       session_id=None if child_component else session_id)
-    from khipu import routing_delivery, routing_page_file
-
-    now = _now()
-    view = out.view
-    if routing_page_file.enabled() and not child_component:
-        return _start_page(view, now)
-    if child_component:
-        # A subagent receives a snapshot, not its parent conversation's
-        # notices: the plan is built with no session, and the bounded
-        # block is reserved in the child's own per-agent ledger.
-        planned = routing_delivery.plan(dict(out, kind="full"), view, now, settings(), session=None)
-        answer = routing_delivery.child_offer(planned, session=child_session,
-                                              component=child_component, now=now, cfg=settings())
-        answer.update(kind="full", version=out["version"], epoch=out.get("epoch"),
-                      generation=out.get("generation"), notices=[])
-        return answer
-    out = routing_delivery.plan(dict(out, kind="full"), view, now, settings(), session=session_id)
-    from khipu import recall_rule
-
-    out["delivery_plan"]["max_chars"] = min(9000, recall_rule._HOOK_CONTEXT_BUDGET -
-        recall_rule._utf16_len(recall_rule.RULE_MD.strip()) - recall_rule._utf16_len(recall_rule._START_SEP))
-    return routing_delivery.offer(out)
+    with lock_budget(budget / 2):
+        now = _now()
+        _view_seen.stat = None
+        view = _start_view(now)
+    return _start_page(view, now, component=child_component, session=child_session)
 
 
 # ---- the push on every prompt (phase 3b) -------------------------------------------------
@@ -12664,17 +12618,12 @@ def _prompt_text(marker, view, now, cfg, *, session_id=None):
 def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None,
                 on_fold=None, session_id: str | None = None, fold_wait: float | None = None,
                 kick=None) -> dict:
-    """Offer a leased batch when the marker carries a hook delivery identity.
-    ``fold_wait``, ``kick``: as for ``_prompt_push``. Provider-key lookups
-    inside it are the minute-old yes or no of ``keychain.prompt_scope``, never
-    a ``security`` process per prompt."""
-    from khipu import keychain, routing_page_file
-
-    if routing_page_file.enabled():
-        return page_push(marker, budget=budget, now=now, session_id=session_id, kick=kick)
-    with keychain.prompt_scope():
-        return _prompt_push_scoped(marker, budget=budget, now=now, on_fold=on_fold, session_id=session_id,
-                                   fold_wait=fold_wait, kick=kick)
+    """What the per-prompt hook adds: the routing page (``page_push``),
+    offered as a leased batch when the marker carries a hook delivery
+    identity. ``kick(reason)``: as for ``page_push``. ``on_fold`` and
+    ``fold_wait`` are accepted for the prompt child and the recall daemon,
+    and unused: a prompt never folds when a page exists."""
+    return page_push(marker, budget=budget, now=now, session_id=session_id, kick=kick)
 
 
 # ---- the page as what routing delivers (slice 6) ------------------------------------------
@@ -12696,7 +12645,7 @@ def _refresh_page(view: dict, now: datetime) -> bool:
     ``view`` was read from: a page never lands after a newer view's."""
     from khipu import routing_page_file
 
-    if not routing_page_file.enabled() or not view.get("record") or view.get("saved", True) is False:
+    if not view.get("record") or view.get("saved", True) is False:
         return False
     seen = getattr(_view_seen, "stat", None)
     current = routing_page_file.read()
@@ -12763,12 +12712,18 @@ def page_push(marker: dict | None, *, budget: float, now: datetime | None = None
     return dict({k: v for k, v in answer.items() if k not in ("page", "sig")}, owed_entities=[], shown_entities=[])
 
 
-def _start_page(view: dict, now: datetime) -> dict:
-    """``start_push``'s answer with the page as what routing delivers: the
-    page rendered from the view the start just read (and written to
-    page.txt when that view is saved), planned for the ledger so that it is
-    owed again whatever this conversation acknowledged before. The session
-    is attached by the hook (``recall_rule._RoutingAtStart``)."""
+def _start_page(view: dict, now: datetime, *, component: str | None = None,
+                session: str | None = None) -> dict:
+    """``start_push``'s answer: the page rendered from the view the start
+    just read (and written to page.txt when that view is saved), planned for
+    the ledger so that it is owed again whatever was acknowledged before.
+
+    A parent conversation (no ``component``): its session is attached by
+    the hook (``recall_rule._RoutingAtStart``), and the page shares the
+    hook's room with the recall rule. A subagent: the page whole, bounded
+    only by the hook's own cap, offered in its ``component`` of
+    ``session``'s ledger for its hook to acknowledge once printed; with no
+    ``session`` it is a snapshot that reserves nothing."""
     from khipu import recall_rule, routing_delivery, routing_page_file
 
     cfg = settings()
@@ -12776,9 +12731,18 @@ def _start_page(view: dict, now: datetime) -> dict:
     _refresh_page(view, now)
     out = _page_answer(dict(meta, text=text), now, cfg)
     planned = routing_delivery.page_plan(out, now, cfg, restate=True)
-    planned["delivery_plan"]["max_chars"] = min(9000, recall_rule._HOOK_CONTEXT_BUDGET -
-        recall_rule._utf16_len(recall_rule.RULE_MD.strip()) - recall_rule._utf16_len(recall_rule._START_SEP))
-    answer = routing_delivery.offer(planned)
+    if component is None:
+        planned["delivery_plan"]["max_chars"] = min(9000, recall_rule._HOOK_CONTEXT_BUDGET -
+            recall_rule._utf16_len(recall_rule.RULE_MD.strip()) - recall_rule._utf16_len(recall_rule._START_SEP))
+        answer = routing_delivery.offer(planned)
+    else:
+        planned["delivery_plan"]["max_chars"] = recall_rule._HOOK_CONTEXT_BUDGET
+        if session:
+            answer = routing_delivery.offer(planned, session=session, component=component, deferred=True)
+        else:
+            answer = routing_delivery.offer(planned, component=component)
+            for key in ("routing_changes", "delivery_reservation", "delivery_plan"):
+                answer.pop(key, None)
     return {k: v for k, v in answer.items() if k not in ("page", "sig")}
 
 
@@ -13724,9 +13688,12 @@ def run_cli(args) -> int:
             mode = getattr(args, "view", None)
             if mode and (args.since is not None or args.summary or args.brief or getattr(args, "page", False)):
                 raise RouteError("--view cannot be combined with --summary, --brief, --page, or --since")
-            if getattr(args, "page", False):
-                if args.since is not None or args.summary or args.brief:
-                    raise RouteError("--page cannot be combined with --summary, --brief, or --since")
+            # --summary and --brief print the page: the one text every
+            # conversation, subagent and brief is handed. (--brief is what the
+            # delegation advisory tells a parent to paste into a brief.)
+            if getattr(args, "page", False) or args.summary or args.brief:
+                if args.since is not None:
+                    raise RouteError("--page, --summary and --brief cannot be combined with --since")
                 conversation, readings = _page_inputs(view, now)
                 text = page(view, now, conversation, readings)
                 if args.json:
@@ -13744,21 +13711,7 @@ def run_cli(args) -> int:
                         print(f"Khipu can't tell what changed since version {version}; this is everything.")
                     print("\n".join(out["lines"]) if out["lines"] else "Nothing changed.")
                 return 0
-            if args.summary or args.brief:
-                text = summary(view, now=now, brief=bool(args.brief))
-                if args.json:
-                    _print_json(text)
-                else:
-                    print(text["text"])
-                sys.stdout.flush()
-                session = conversation_author().get("session")
-                if session and text["notices"]:
-                    from khipu import recall_prompt
-                    recall_prompt.mark_routing_notices(session, text["notices"])
-                return 0
-            from khipu import routing_page_file
-
-            if not (args.json or mode or account or getattr(args, "full", False)) and routing_page_file.enabled():
+            if not (args.json or mode or account or getattr(args, "full", False)):
                 # Slice 6: the page by default; --full (or --json) for the record.
                 conversation, readings = _page_inputs(view, now)
                 print(page(view, now, conversation, readings))

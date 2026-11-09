@@ -11,7 +11,7 @@ an agent") and section 6 item 6.
    record on request.
 
 Hermetic: a data dir per test, a fake clock, the search and the memory slice
-stubbed. The page is switched on here (``page_delivery``)."""
+stubbed."""
 from __future__ import annotations
 
 import copy
@@ -58,7 +58,7 @@ class Clock:
 
 
 @pytest.fixture
-def home(tmp_path, monkeypatch, page_delivery):
+def home(tmp_path, monkeypatch):
     data = tmp_path / "data"
     data.mkdir()
     (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS, "routing_prompt_budget_ms": 1000,
@@ -353,15 +353,11 @@ def test_session_start_sends_the_whole_page_every_time_and_prompts_stay_quiet(ho
     assert "ROUTING" not in _prompt(monkeypatch)
 
 
-@pytest.mark.parametrize("page_on", [True, False])
-def test_a_slow_view_read_no_longer_skips_the_prompt(home, monkeypatch, page_on):
+def test_a_slow_view_read_no_longer_skips_the_prompt(home, monkeypatch):
     """The per-prompt child of the one-shot hook is forked from this
-    process, so a slow view read patched here is the child's. With the page
-    the prompt never reads the view and the routing lands; the earlier
-    change push reads it and is skipped as out of budget."""
+    process, so a slow view read patched here is the child's. The prompt
+    reads the page file, never the view, so the routing lands."""
     _record()
-    if not page_on:
-        monkeypatch.setenv("KHIPU_ROUTING_PAGE", "0")
     _set(home, routing_prompt_budget_ms=500)
     real = routing._load_view
 
@@ -371,12 +367,8 @@ def test_a_slow_view_read_no_longer_skips_the_prompt(home, monkeypatch, page_on)
 
     monkeypatch.setattr(routing, "_load_view", slow)
     ctx = _prompt(monkeypatch)
-    if page_on:
-        assert ctx.endswith(routing_page_file.read()["text"])
-        assert _log().endswith(" routing=full")
-    else:
-        assert "## Routing" not in ctx
-        assert _log().endswith(" routing=skipped:budget")
+    assert ctx.endswith(routing_page_file.read()["text"])
+    assert _log().endswith(" routing=full")
 
 
 # ---- 4. khipu_route and khipu route -------------------------------------------------------------
@@ -398,7 +390,7 @@ def test_khipu_route_answers_the_page_by_default_and_the_full_record_on_request(
     view = _record()
     error, body = _call("khipu_route")
     assert not error, body
-    assert set(body) == {"page", "chars", "version", "epoch", "full_record"}
+    assert set(body) == {"page", "chars", "version", "epoch", "full_record", "delivery"}
     assert body["page"].startswith("ROUTING ") and "Codex: LIMIT REACHED" in body["page"]
     assert body["chars"] == len(body["page"]) <= routing_page.LIMIT
     assert body["version"] == view["version"] and "full=true" in body["full_record"]
@@ -509,20 +501,12 @@ def test_doctor_names_the_headings_the_page_left_out_and_not_the_old_summary_as_
     assert len(page_words) == 1 and "RULES" in page_words[0] and "4,500" in page_words[0]
     assert not any("at the start of a conversation shows only part" in w for w in block["warnings"])
     assert not any(w.startswith("The summary had to leave out") for w in block["warnings"])
-    assert any(w.startswith("The summary subagents get shows only part of your words") for w in block["warnings"])
+    # One text for every reader: no warning about a second summary for subagents.
+    assert not any("summary subagents get" in w for w in block["warnings"])
+    assert block["rules_budget"]["left_out"] == int(page_words[0].split(" left out ")[1].split()[0])
 
 
 def test_doctor_says_nothing_about_the_page_when_every_rule_fits_on_it(home):
     _record()
     routing.add_rule("NEVER: a short rule.", via="app")
     assert not any("routing page" in w for w in routing.doctor_block()["warnings"])
-
-
-def test_doctor_keeps_the_old_wording_when_the_page_is_off(home, monkeypatch):
-    monkeypatch.setenv("KHIPU_ROUTING_PAGE", "0")
-    _set(home, routing_rule_chars=0, routing_rules_max=0, routing_rules_chars=900)
-    _record()
-    _long_rules()
-    warnings = routing.doctor_block()["warnings"]
-    assert any(w.startswith("The summary at the start of a conversation shows only part") for w in warnings)
-    assert not any("routing page" in w for w in warnings)

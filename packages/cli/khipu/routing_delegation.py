@@ -10,22 +10,23 @@ Two hooks, both behind ``routing_push`` and ``routing_push_delegation``:
   2026-11-07, since session-start routing already reaches those jobs. It
   sends what the per-prompt push would send at this moment:
   the same read (``recall_prompt._RoutingAtPrompt``), the same budget
-  (``routing_prompt_budget_ms``, ``routing_prompt_chars``) and the same
+  (``routing_prompt_budget_ms``) and the same
   seen marker, moved only once the block was written. So a block one push
   delivered is never repeated by the other. A call inside a subagent (its
-  payload carries ``agent_id``) is not a delegation: it gets the next
-  deferred page from the subagent's own ledger (slice 8a), and the
-  parent's marker is not the subagent's.
-- SubagentStart: the one bounded child block
-  (``routing_delivery.child_offer``, slice 8a), for the child alone. The
-  parent's marker does not move, since the parent never saw it. A Claude
-  Code child keeps what the block leaves out owed in its own
-  ``agent:<agent_id>`` ledger, arriving as pages on its own delegation
-  tool calls (its PreToolUse, below). A Codex native child records the same block
-  as a developer message before its first call; it is its own
-  conversation, so nothing is reserved in the parent's ledger and its
-  deferred routing reaches it only on its own Khipu tool calls, under
-  its own ``CODEX_THREAD_ID`` identity (slice 7 pull delivery). When
+  payload carries ``agent_id``) is not a delegation: it gets the routing
+  page when the subagent's own ``agent:<agent_id>`` component has not yet
+  acknowledged the page's current signature, the parent's resend rule in
+  the subagent's own ledger, and the parent's marker is not the subagent's.
+- SubagentStart: the routing page, the same text the parent conversation
+  gets (``routing.start_push``), for the child alone. The parent's marker
+  does not move, since the parent never saw it. A Claude Code child's page
+  is reserved in its own ``agent:<agent_id>`` component and acknowledged
+  once printed; a later change of the page reaches it on its own tool
+  calls (its PreToolUse, below). A Codex native child records the same
+  page as a developer message before its first call; it is its own
+  conversation, so nothing is reserved in the parent's ledger and a later
+  page reaches it only through its own Khipu tool calls, under its own
+  ``CODEX_THREAD_ID`` identity (slice 7 pull delivery). When
   Codex's SubagentStart hook is absent and a ``spawn_agent`` brief
   carries no routing, the parent's PreToolUse result carries one
   advisory line naming ``khipu route --brief``; nothing is added to the
@@ -41,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -205,16 +207,21 @@ def _dispatch_model_brief(payload: dict) -> tuple[str | None, str | None]:
 ADVISORY = CHILD_NO_ROUTING_ADVISORY
 
 
+# The routing page's first line (``routing_page._render``).
+_PAGE_FIRST_LINE = re.compile(r"^ROUTING \S.*\. The owner's record\. Guidance, not a gate")
+
+
 def _brief_has_routing(brief: str) -> bool:
     """Whether a brief already carries a routing block, as opposed to
-    merely mentioning routing in prose. Only the exact headings the
-    pushes and ``khipu route --brief`` print count: a line opening
-    ``## Routing at`` / ``## Routing changes at`` (the pushes), or
-    ``Routing at`` (the --brief form), each naming Khipu's routing
-    record in its parenthetical. This is also the T3 check's original
-    pair of markers (``## Routing at`` and the record's name), with the
-    record's name required in the heading rather than anywhere."""
+    merely mentioning routing in prose. Only the exact headings Khipu
+    prints count: the routing page's first line (what the pushes and
+    ``khipu route --brief`` print now), or, from an older Khipu, a line
+    opening ``## Routing at`` / ``## Routing changes at`` (the pushes) or
+    ``Routing at`` (the --brief form), each naming Khipu's routing record
+    in its parenthetical."""
     for line in brief.splitlines():
+        if _PAGE_FIRST_LINE.match(line):
+            return True
         if "(Khipu's routing record" not in line:
             continue
         if line.startswith(("## Routing at ", "## Routing changes at ", "Routing at ")):
@@ -325,11 +332,12 @@ def _is_codex_child(environ=None, payload=None) -> bool:
 
 
 def _agent_tool_use(payload: dict, environ, agent_id: str) -> tuple[dict, dict | None, str | None]:
-    """The next deferred routing page on a subagent's own tool result.
+    """The routing page on a subagent's own tool result, when it changed
+    since the subagent last got it.
 
-    The subagent's PreToolUse is its delivery point: the page comes from
-    its ``agent:<agent_id>`` ledger, reserved until this hook's caller
-    records it delivered, and the parent's ledger never moves. Context
+    The subagent's PreToolUse is its delivery point: the page is offered in
+    its ``agent:<agent_id>`` component, reserved until this hook's caller
+    records it delivered, and the parent's component never moves. Context
     only, never a permission decision."""
     if _switched_off(environ) or _helper(payload):
         return {}, None, None
@@ -412,21 +420,17 @@ def pre_tool_use(payload: dict, environ=None) -> tuple[dict, dict | None, str | 
 
 
 def _subagent_start(payload: dict, environ=None) -> tuple[dict, dict | None, str | None]:
-    """The bounded child block for a child at its start, plus what to
-    record once it is printed. One block for every harness, built by
-    ``routing_delivery.child_offer`` through ``routing.start_push``:
-    accounts and holds first, then each standing rule and the note whole
-    if they fit, otherwise their openings, bounded by
-    ``routing_child_chars`` and the hook-context cap. A child receives a
-    snapshot, not its parent conversation's notices, and the parent's
-    marker never moves.
+    """The routing page for a child at its start, plus what to record once
+    it is printed: the same page the parent conversation gets, through
+    ``routing.start_push``, bounded only by the hook-context cap. The
+    parent's marker never moves.
 
-    A Claude Code subagent's remainder is owed in its own
-    ``agent:<agent_id>`` ledger and arrives as pages on its own tool
-    results. A Codex native child is its own conversation: the block is
-    reserved nowhere in the parent, and its deferred routing reaches it
-    only on its own Khipu tool calls, under its own ``CODEX_THREAD_ID``
-    identity (slice 7 pull delivery)."""
+    A Claude Code subagent's page is reserved in its own
+    ``agent:<agent_id>`` component and acknowledged once printed; a later
+    page arrives on its own tool results. A Codex native child is its own
+    conversation: the page is reserved nowhere in the parent, and a later
+    one reaches it only on its own Khipu tool calls, under its own
+    ``CODEX_THREAD_ID`` identity (slice 7 pull delivery)."""
     from khipu import recall_rule
 
     session_id = hook_shape.session_id(payload)

@@ -549,19 +549,132 @@ def page_plan(out, now, cfg, *, restate=False):
     ``page_only`` makes the ledger drop what earlier change pushes left owed
     in this component (the page covers it); ``restate`` makes the page owed
     again even when this revision was acknowledged (session start)."""
+    from khipu import routing_page
+
     page, text = out["page"], out.get("text") or ""
     item = dict(entity=PAGE_ENTITY, text=page, label="Routing page", whole=True,
-                revision=str(out["sig"])[:16], visible=page in text, removed=False)
+                revision=page_revision(out["sig"]), visible=page in text, removed=False)
+    # The page is sent whole: its own limit, and its age line, bound it; a
+    # hook with less room pages it at what it has, never at a smaller limit.
+    room = routing_page.LIMIT + 500
     return dict(out, delivery_plan={
         "items": [item], "pace_forecasts": {}, "line_entities": None, "advice_forecasts": {},
         "current_entities": [PAGE_ENTITY], "harness": health_harness(_current_harness()), "removed": {},
         "notices": [], "at": _iso(now), "receipts_known": True,
-        "limit": cfg["routing_summary_chars"], "full": True, "page_limit": cfg["routing_prompt_chars"],
+        "limit": room, "full": True, "page_limit": room,
         "text": text, "lease": cfg["routing_delivery_lease"], "heading": PAGE_HEADING,
         "page_only": True, "restate": [PAGE_ENTITY] if restate else []})
 
 
 PAGE_FLOOR = 300  # UTF-16 units; narrower pages are never sent
+
+
+# ---- was the current page handed over? (owner, 2 Nov: "I need to be confident
+# that it's going across conversations") -----------------------------------
+#
+# Read-only: one component's ledger state against the page's current
+# revision (its signature's first 16 characters, ``page_plan``). Doctor's
+# delivery rows and ``khipu_route``'s ``delivery`` block both say it.
+
+PAGE_STATES = ("handed_over", "in_flight", "owed", "behind", "never")
+_LATE = ("skipped:budget", "skipped:fold-busy", "skipped:busy", "skipped:starting")
+
+
+def page_revision(sig):
+    """The ledger revision of a page with signature ``sig``."""
+    return str(sig)[:16] if sig else None
+
+
+def _when(value):
+    try:
+        stamp = _parse(value) if isinstance(value, str) else None
+    except ValueError:
+        return None
+    return stamp if stamp is not None and stamp.tzinfo else None
+
+
+def page_receipt(state, revision, now, *, harness=None, last_status=None):
+    """``{"page": one of PAGE_STATES, "why": words or None}`` for one
+    component, with ``revision`` the current page's (``page_revision``).
+
+    ``handed_over``: this component acknowledged the current page (the hook
+    printed it, or a pull client acked its batch). ``in_flight``: it is
+    reserved for a hook or a pull that has not confirmed it yet. ``owed``:
+    offered and not confirmed, and why: the hook that took it never
+    confirmed (killed or timed out), only part of it fitted, the last
+    prompt's read ran out of time (``last_status``, the prompt log's
+    ``routing=`` field), or a client with no hooks that must pull it.
+    ``behind``: an earlier page was handed over and nothing has asked since
+    this one. ``never``: no page was ever offered here."""
+    # Only a harness known to have no hooks must pull; an unidentified one
+    # may well be a hooked conversation whose hook did not say which it is.
+    pull = health_harness(harness) in _PULL_ONLY_HARNESSES - {"unknown"}
+    must_pull = ("this client has no hooks: it reads the page with khipu_route and is counted once it "
+                 "acknowledges the batch (khipu_route full=true, then ack)")
+    late = (f"the last prompt's routing read ran out of time ({last_status}); the next prompt sends it"
+            if isinstance(last_status, str) and last_status in _LATE else None)
+    if not isinstance(state, dict) or not revision:
+        return {"page": "never", "why": must_pull if pull else "nothing has asked for routing here yet"}
+    entries = state.get("entries") if isinstance(state.get("entries"), dict) else {}
+    entry = entries.get(PAGE_ENTITY) if isinstance(entries.get(PAGE_ENTITY), dict) else None
+    done = state.get("done") if isinstance(state.get("done"), dict) else {}
+    if (entry and entry.get("revision") == revision and entry.get("acked")) or done.get(PAGE_ENTITY) == revision:
+        return {"page": "handed_over", "why": None}
+    flight = state.get("flight") if isinstance(state.get("flight"), dict) else None
+    if flight:
+        until = _when(flight.get("until"))
+        items = (((flight.get("out") or {}).get("routing_changes") or {}).get("items") or [])
+        if until and until > now and any(isinstance(i, dict) and i.get("entity") == PAGE_ENTITY
+                                         and i.get("revision") == revision for i in items):
+            return {"page": "in_flight",
+                    "why": "reserved for the hook or pull that took it; counted once that one confirms it"}
+    if entry and entry.get("revision") == revision:
+        if entry.get("expired") or (flight and _when(flight.get("until")) and _when(flight["until"]) <= now):
+            why = ("the hook that took it never confirmed it (killed or out of time before it printed); "
+                   "the next prompt or tool call offers it again")
+        elif entry.get("offset"):
+            why = "only part of it fitted beside the hook's other text; the rest follows on the next prompt"
+        elif late:
+            why = late
+        elif pull:
+            why = must_pull
+        else:
+            why = "offered, and no prompt or tool call has taken it since"
+        return {"page": "owed", "why": why}
+    if (entry and entry.get("acked")) or done.get(PAGE_ENTITY):
+        return {"page": "behind", "why": late or (must_pull if pull else
+                "an earlier page was handed over; this one goes with the next prompt or tool call")}
+    return {"page": "never", "why": late or (must_pull if pull else
+            "no page has been offered here yet (an older Khipu sent the earlier summary, or nothing has asked)")}
+
+
+def page_delivery(session, revision, now):
+    """``khipu_route``'s ``delivery`` block for one conversation: the
+    current page's receipt for each component of its ledger (``main``, the
+    pull component ``mcp``, and each subagent's ``agent:...``), with no
+    session id or agent id in it (subagents are counted, not named). Never
+    writes or reserves anything."""
+    attachment, data = {}, {}
+    path = _path(session)
+    try:
+        if path.exists() and path.stat().st_size <= _SESSION_FILE_BUDGET:
+            data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"revision": revision, "readable": False}
+    if not isinstance(data, dict):
+        return {"revision": revision, "readable": False}
+    attachment = data.get("attachment") if isinstance(data.get("attachment"), dict) else {}
+    harness = attachment.get("harness")
+    out = {"revision": revision, "readable": True}
+    for component in ("main", "mcp"):
+        out[component] = page_receipt(data.get(component), revision, now,
+                                      harness=harness if component == "main" else "unknown")
+    agents = [page_receipt(state, revision, now, harness=(state or {}).get("harness"))
+              for name, state in data.items() if name.startswith("agent:") and isinstance(state, dict)]
+    out["subagents"] = {"count": len(agents),
+                        **{word: sum(a["page"] == word for a in agents) for word in PAGE_STATES},
+                        "why": sorted({a["why"] for a in agents if a["why"]})}
+    return out
 
 
 def _due_rank(entry):
