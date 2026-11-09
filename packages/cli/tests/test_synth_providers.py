@@ -78,8 +78,13 @@ def test_request_prompt_usage_and_cost(provider, model):
                                              'thinkingConfig': {'thinkingBudget': 0}}
         assert headers['x-goog-api-key'] == 'fake-secret'
     else:
-        expected = {'model': model, 'max_tokens': 4096, 'temperature': .2,
+        expected = {'model': model, 'max_tokens': 4096,
                     'messages': [{'role': 'user', 'content': prompt}]}
+        if provider == 'anthropic':
+            # Current Claude models reject a non-default temperature (400).
+            assert 'temperature' not in body
+        else:
+            expected['temperature'] = .2
         if provider == 'openrouter':
             expected['usage'] = {'include': True}
         assert body == expected
