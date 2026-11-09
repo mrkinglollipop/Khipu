@@ -443,8 +443,10 @@ def set_int_setting(key: str, value: "int | None") -> Path:
 # ---------------------------------------------------------------------------
 # Lengths of time in whole minutes, each with its default and its allowed
 # range. `doctor_rate_window_minutes` is how far back doctor's rate checks
-# (prompt-time recall outcomes, search fallbacks) look, so a past outage ages
-# out on its own (docs/plans/2026-10-16-offline-and-self-healing.md, D).
+# (search fallbacks, and the promotion gate's verdict on prompt-time recall)
+# look, so a past outage ages out on its own
+# (docs/plans/2026-10-16-offline-and-self-healing.md, D). What the owner is
+# shown for prompt-time recall judges the last 24 hours instead.
 # ---------------------------------------------------------------------------
 
 MINUTE_SETTINGS: dict[str, tuple[int, int, int]] = {

@@ -312,8 +312,8 @@ class DoctorOutcomesTest(unittest.TestCase):
         self.assertLess(out["timeout_rate"], 0.5)
 
     def test_unhealthy_log(self) -> None:
-        """Timeouts alone under load are yellow (not a hard red promote block);
-        a mix with real errors still refuses."""
+        """Timeouts alone are red for the owner and never refuse a promote
+        (the gate's own rule); a mix with real errors is red for both."""
         now = datetime(2026, 9, 28, tzinfo=timezone.utc)
         lines = []
         for i in range(25):
@@ -322,10 +322,12 @@ class DoctorOutcomesTest(unittest.TestCase):
             lines.append(_log_line(ts, reason, 1200.0))
         self._write(lines)
         out = rp.prompt_recall_outcomes(now=now)
-        self.assertTrue(out["ok"])
-        self.assertEqual(out.get("level"), "amber")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out.get("level"), "red")
         self.assertTrue(out.get("timeout_only"))
         self.assertGreaterEqual(out["timeout_rate"], 0.5)
+        self.assertTrue(out["gate_ok"])
+        self.assertTrue(out["gate"]["timeout_only"])
         # Real errors mixed in stay a hard red.
         err_lines = []
         for i in range(25):
@@ -336,6 +338,7 @@ class DoctorOutcomesTest(unittest.TestCase):
         bad = rp.prompt_recall_outcomes(now=now)
         self.assertFalse(bad["ok"])
         self.assertFalse(bad["insufficient"])
+        self.assertFalse(bad["gate_ok"])
 
     def test_short_log_is_insufficient(self) -> None:
         now = datetime(2026, 9, 28, tzinfo=timezone.utc)
@@ -450,23 +453,38 @@ class DoctorOutcomesTest(unittest.TestCase):
             out.append(_log_line(ts, "timeout>1.2s", 1200.0) + (" offline=1" if offline else ""))
         return out
 
-    def test_an_old_outage_ages_out_on_an_idle_mac(self) -> None:
+    def test_an_old_outage_ages_out_of_the_gate_on_an_idle_mac(self) -> None:
         now = datetime(2026, 10, 16, 14, 0, tzinfo=timezone.utc)
         self._write(self._timeouts(now, minutes_ago=120))
+        out = rp.prompt_recall_outcomes(now=now, window_s=3600)
+        # The gate judges the owner's rate window: nothing in it, quiet.
+        self.assertTrue(out["gate_ok"])
+        self.assertTrue(out["gate"]["quiet"])
+        self.assertEqual(out["gate"]["count"], 0)
+        self.assertEqual(out["gate"]["window_minutes"], 60)
+        # The owner is shown the last day, which these timeouts are in.
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["count"], 100)
+        self.assertEqual(out["window_minutes"], 24 * 60)
+
+    def test_the_owner_view_ages_out_after_a_day(self) -> None:
+        now = datetime(2026, 10, 16, 14, 0, tzinfo=timezone.utc)
+        self._write(self._timeouts(now, minutes_ago=25 * 60))
         out = rp.prompt_recall_outcomes(now=now, window_s=3600)
         self.assertTrue(out["ok"])
         self.assertTrue(out["quiet"])
         self.assertEqual(out["count"], 0)
-        self.assertEqual(out["window_minutes"], 60)
+        self.assertIn("not enough prompts yet: 0 prompt(s) searched memory in the last 24 hours", out["message"])
 
-    def test_recent_timeouts_stay_amber_not_a_hard_red(self) -> None:
+    def test_recent_timeouts_are_red_for_the_owner_and_pass_the_gate(self) -> None:
         now = datetime(2026, 10, 16, 14, 0, tzinfo=timezone.utc)
         self._write(self._timeouts(now, minutes_ago=5))
         out = rp.prompt_recall_outcomes(now=now, window_s=3600)
-        self.assertTrue(out["ok"])
-        self.assertEqual(out.get("level"), "amber")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out.get("level"), "red")
         self.assertEqual(out["count"], 100)
         self.assertEqual(out["timeout_rate"], 1.0)
+        self.assertTrue(out["gate_ok"])
 
     def test_offline_calls_are_not_failures(self) -> None:
         now = datetime(2026, 10, 16, 14, 0, tzinfo=timezone.utc)
@@ -492,10 +510,11 @@ class DoctorOutcomesTest(unittest.TestCase):
         with mock.patch("khipu.config.minute_setting", return_value=180) as setting:
             out = rp.prompt_recall_outcomes(now=now)
         setting.assert_called_with("doctor_rate_window_minutes")
-        # Timeouts alone under the widened window are yellow, not hard red.
-        self.assertTrue(out["ok"])
-        self.assertEqual(out.get("level"), "amber")
-        self.assertEqual(out["window_minutes"], 180)
+        # The setting is the gate's window; timeouts alone there never refuse.
+        self.assertTrue(out["gate_ok"])
+        self.assertEqual(out["gate"]["window_minutes"], 180)
+        self.assertEqual(out["gate"]["count"], 100)
+        self.assertEqual(out["window_minutes"], 24 * 60)
 
     def test_doctor_never_raises_on_an_unreadable_directory(self) -> None:
         # _log_path pointed at a path whose parent does not exist at all —
