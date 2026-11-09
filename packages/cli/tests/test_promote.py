@@ -521,9 +521,9 @@ def test_replay_reads_only_the_query_log_and_never_a_credential(home, monkeypatc
     assert "2 prompt(s) replayed" in out["detail"]
     # Live, and the candidate with routing off and on, for each of the two distinct queries
     # (the candidate's routing probe is not a hook run).
-    # Live off + candidate off + candidate on + live on, for each of two queries.
-    assert len(envs) == 8
-    assert sorted(env["KHIPU_FEATURE_ROUTING_PUSH"] for env in envs) == ["0"] * 4 + ["1"] * 4
+    # Live off + candidate off + live off + candidate on + live on, for each of two queries.
+    assert len(envs) == 10
+    assert sorted(env["KHIPU_FEATURE_ROUTING_PUSH"] for env in envs) == ["0"] * 6 + ["1"] * 4
     for env in envs:
         assert not [k for k in env if "KEY" in k or "TOKEN" in k], env
         assert env["KHIPU_RECALL_DAEMON"] == "0"
@@ -596,8 +596,9 @@ def test_replay_passes_an_empty_answer_whose_embedding_was_late_once(home, monke
     out = pm.gate_recall_replay(candidate)
     assert out["ok"], out
     assert "prompt 1: 1 hit(s), 1 shared with live" in out["detail"]
-    # Live and the candidate were both replayed once before the step went on.
-    assert runs[:4] == [("live", "off"), ("cand", "off"), ("live", "off"), ("cand", "off")]
+    # Live, the candidate and live again were replayed once before the step went on.
+    assert runs[:6] == [("live", "off"), ("cand", "off"), ("live", "off"),
+                        ("live", "off"), ("cand", "off"), ("live", "off")]
 
 
 def test_replay_notes_an_empty_answer_whose_legs_differ_from_live_twice(home, monkeypatch):
@@ -649,7 +650,7 @@ def test_replay_still_refuses_an_empty_answer_when_the_replay_ran_live_s_legs(ho
     monkeypatch.setattr(pm, "_run", fake_run)
     out = pm.gate_recall_replay(candidate)
     assert not out["ok"] and "prompt 1: empty answer where live had 1 hit(s)" in out["detail"]
-    assert seen == [False, True, False, True]
+    assert seen == [False, True, False, False, True, False]
 
 
 def _routing_hook(runs: list, *, on_status="full", on_hits=("episode:3",), off_hits=("episode:3",),
@@ -678,8 +679,12 @@ def _routing_hook(runs: list, *, on_status="full", on_hits=("episode:3",), off_h
             first = sum(1 for r in runs if r[0] == "on") == 1
             hits = list(first_on_hits if first_on_hits is not None and first else on_hits)
             status = first_on_status if first_on_status is not None and first else on_status
-            reason, ms = on_reason, on_ms
-        again = not on and again_off is not None and sum(1 for r in runs if r[:2] == ("off", True)) == 2
+            if "/candidate/packages/" in argv[0]:
+                # Live's routing-on run answers at the usual time: it is the
+                # reference the candidate's is judged against.
+                reason, ms = on_reason, on_ms
+        again = (not on and again_off is not None and "/candidate/packages/" in argv[0]
+                 and sum(1 for r in runs if r[:2] == ("off", True)) == 2)
         if again:
             reason, ms, hits = again_off[0], again_off[1], list(again_off[2])
         line = _summary(datetime.now(timezone.utc), reason, hits).replace("ms=300.0", f"ms={ms}")
@@ -706,10 +711,11 @@ def test_replay_fails_a_candidate_whose_routing_read_is_over_budget(home, monkey
     assert not out["ok"]
     assert "with routing on, its routing read ran out of its budget (routing=skipped:budget)" in out["detail"]
     # Run out twice: the failing pair was replayed once more before the step failed.
-    # Live's routing-on run is compared too (off-live, off-cand, on-cand, on-live, …).
+    # Every candidate run has a live run on either side of it (off-live,
+    # off-cand, off-live, on-cand, on-live; the replay goes on from there).
     assert [r[:2] for r in runs if r[0] != "prefold"] == [
-        ("off", False), ("off", True), ("on", True), ("on", False),
-        ("off", True), ("on", True), ("on", False),
+        ("off", False), ("off", True), ("off", False), ("on", True), ("on", False),
+        ("off", True), ("off", False), ("on", True), ("on", False),
     ]
 
 
@@ -775,8 +781,8 @@ def test_replay_fails_a_candidate_whose_search_answers_differ_with_routing_on(ho
     assert "the search answer changed with routing on" in out["detail"]
     # The differing pair was replayed once more before the step failed.
     assert [r[:2] for r in runs if r[0] != "prefold"] == [
-        ("off", False), ("off", True), ("on", True), ("on", False),
-        ("off", True), ("on", True), ("on", False),
+        ("off", False), ("off", True), ("off", False), ("on", True), ("on", False),
+        ("off", True), ("off", False), ("on", True), ("on", False),
     ]
 
 
@@ -798,7 +804,7 @@ def test_replay_fails_a_candidate_whose_search_with_routing_on_times_out_fails_o
     assert not out["ok"], out
     assert expect in out["detail"]
     # The failing pair was replayed once more before the step failed.
-    assert [r[0] for r in runs if r[0] != "prefold"] == ["off", "off", "on", "on", "off", "on", "on"]
+    assert [r[0] for r in runs if r[0] != "prefold"] == ["off", "off", "off", "on", "on", "off", "off", "on", "on"]
 
 
 @pytest.mark.parametrize(("again_off", "expect"), [
@@ -817,7 +823,7 @@ def test_replay_holds_the_replayed_run_with_routing_off_to_the_same_tests(home, 
     out = pm.gate_recall_replay(candidate)
     assert not out["ok"], out
     assert expect in out["detail"]
-    assert [r[0] for r in runs if r[0] != "prefold"] == ["off", "off", "on", "on", "off", "on", "on"]
+    assert [r[0] for r in runs if r[0] != "prefold"] == ["off", "off", "off", "on", "on", "off", "off", "on", "on"]
 
 
 def test_the_search_test_is_the_same_for_both_runs():
@@ -827,7 +833,8 @@ def test_the_search_test_is_the_same_for_both_runs():
     assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, timeout>1.2s"
     off["hits"] = ["episode:1"]
     on.update(reason="ok", ms=1900.0, hits=["episode:1"], routing="full")
-    assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, 1900 ms > 1200 ms, reference 300 ms"
+    assert pm._routing_problem("prompt 1", off, on) == (
+        "prompt 1: with routing on, 1900 ms > 1200 ms, 1600 ms slower than its own run with routing off (300 ms)")
     on.update(reason=None)
     assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, the hook wrote no summary line"
     on.update(reason="ok", ms=900.0)
@@ -836,13 +843,14 @@ def test_the_search_test_is_the_same_for_both_runs():
 
 def _timed_hook(live_ms: float, off_ms: float, on_ms: float):
     """A fake hook whose summary line carries a fixed time per kind of run:
-    live's, the candidate's with routing off, the candidate's with it on."""
+    live's (routing on or off), the candidate's with routing off, the
+    candidate's with it on."""
     def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
         if argv[1:2] == ["-c"]:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"push": True}) + "\n", "")
         on = env.get("KHIPU_FEATURE_ROUTING_PUSH") == "1"
         cand = "/candidate/packages/" in argv[0]
-        ms = on_ms if on else off_ms if cand else live_ms
+        ms = (on_ms if on else off_ms) if cand else live_ms
         line = _summary(datetime.now(timezone.utc), "ok", ["episode:3"]).replace("ms=300.0", f"ms={ms}")
         line += " routing=full" if on else ""
         log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
@@ -866,7 +874,7 @@ def test_replay_fails_a_prompt_the_candidate_runs_300_ms_slower_than_live(home, 
     monkeypatch.setattr(pm, "_run", _timed_hook(1000.0, 1300.0, 1300.0))
     out = pm.gate_recall_replay(candidate)
     assert not out["ok"]
-    assert "prompt 1: 1300 ms > 1200 ms, reference 1000 ms" in out["detail"]
+    assert "prompt 1: 1300 ms > 1200 ms, 300 ms slower than live's run just before it (1000 ms)" in out["detail"]
 
 
 def test_replay_fails_a_candidate_slower_than_live_at_the_median(home, monkeypatch):

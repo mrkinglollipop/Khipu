@@ -756,6 +756,17 @@ def _offline_only(out: dict[str, Any], okey: str) -> bool:
     return isinstance(block, dict) and block.get("offline_only") is True
 
 
+def _gate_passes(out: dict[str, Any], okey: str) -> bool:
+    """Whether a red check's own block says the promotion gate's rule passes
+    (``gate_ok: true``) although what the owner is shown is red. Prompt-time
+    recall (khipu.recall_prompt.prompt_recall_outcomes) is the one that does:
+    the owner sees half the last day's prompts timing out, the gate refuses
+    only on real errors in the rate window, because timeouts on a busy live
+    Mac say nothing about the candidate."""
+    block = out.get(okey[:-3])
+    return isinstance(block, dict) and block.get("gate_ok") is True
+
+
 @_step
 def gate_doctor(candidate: Path) -> tuple[bool, str] | tuple[bool, str, dict[str, Any]]:
     """1. ``khipu doctor --quick`` from the candidate under the environment a
@@ -764,8 +775,10 @@ def gate_doctor(candidate: Path) -> tuple[bool, str] | tuple[bool, str, dict[str
 
     A red check whose block says ``offline_only`` (its evidence is all from
     a time the hub could not be reached) does not refuse a candidate, and
-    nor does a check the owner's one-time override names (``gate_override``);
-    both are named in the step's record, with the override itself, so the
+    nor does a check the owner's one-time override names (``gate_override``),
+    nor one whose block says the gate's own rule passes (``gate_ok``:
+    prompt-time recall timing out on the busy live Mac, ``_gate_passes``);
+    each is named in the step's record, with the override itself, so the
     promotion can clear it after this one use."""
     from khipu import launchd_gen
 
@@ -794,6 +807,8 @@ def gate_doctor(candidate: Path) -> tuple[bool, str] | tuple[bool, str, dict[str
         problems.append(f"summariser provider: {out.get('synth_provider')}")
     reds = [key for key, value in out.items()
             if key.endswith("_ok") and value is False and key not in _DOCTOR_NOT_GATED]
+    owner_only = [k[:-3] for k in reds if _gate_passes(out, k)]
+    reds = [k for k in reds if k[:-3] not in owner_only]
     if jobs_red:
         reds.append("jobs_ok")
     offline = [k[:-3] for k in reds if _offline_only(out, k)]
@@ -807,13 +822,16 @@ def gate_doctor(candidate: Path) -> tuple[bool, str] | tuple[bool, str, dict[str
         problems.append("red: " + ", ".join(red))
     if not out:
         problems.append(f"exit {r.returncode}: {_tail(r.stderr or r.stdout)}")
-    if not problems and not hard and (offline or ignored):
+    if not problems and not hard and (offline or ignored or owner_only):
         notes = []
         if offline:
             notes.append("red only from a time the hub was out of reach: " + ", ".join(offline))
         if ignored:
             notes.append("skipped once, as the owner chose Update anyway: " + ", ".join(ignored))
-        extra = {k: v for k, v in (("offline_reds", offline), ("ignored_reds", ignored)) if v}
+        if owner_only:
+            notes.append("red for the owner but passing the gate's own rule: " + ", ".join(owner_only))
+        extra = {k: v for k, v in (("offline_reds", offline), ("ignored_reds", ignored),
+                                   ("owner_only_reds", owner_only)) if v}
         return True, "doctor --quick ok; " + "; ".join(notes), {**extra, **used}
     return False, "; ".join(problems) or f"exit {r.returncode}", {
         **({"red_checks": red} if red else {}), **({"other_problems": True} if other else {}), **used}
@@ -997,40 +1015,80 @@ def _routing_skip_problem(status: str) -> str | None:
     return "its routing read was skipped"
 
 
-def _slower_than(run: dict[str, Any], refs: tuple[Any, ...]) -> bool:
-    """Whether ``run`` is over ``RECALL_BUDGET_MS`` and also slower than every
-    reference time (in ms; None ones are ignored) by more than
-    ``SLOWNESS_SLACK_MS``. With no reference time, over the budget is enough.
-    The hook self-limits near the budget, so a cold process whose embedding
-    is late lands a little over it on live's own code too."""
+# A reference time is a number (ms, or None when that run logged none) or
+# ``(what the run was, ms)``, so a refusal can say which run it lost to.
+_Ref = Any
+
+
+def _given(refs: tuple[_Ref, ...]) -> list[tuple[str, float]]:
+    """The reference times that exist, each with the run it came from."""
+    out = []
+    for ref in refs:
+        what, ms = ref if isinstance(ref, tuple) else ("the reference run", ref)
+        if ms is not None:
+            out.append((what, float(ms)))
+    return out
+
+
+def _slowest(refs: tuple[_Ref, ...]) -> tuple[str, float] | None:
+    given = _given(refs)
+    return max(given, key=lambda ref: ref[1]) if given else None
+
+
+def _slower_than(run: dict[str, Any], refs: tuple[_Ref, ...]) -> bool:
+    """Whether ``run`` is over ``RECALL_BUDGET_MS`` and also slower than the
+    slowest reference time (None ones are ignored) by more than
+    ``SLOWNESS_SLACK_MS``. The references are the live runs taken just
+    before and just after it, so load that arrives or leaves between runs
+    lands on a live run beside the candidate too. Only with no reference
+    time at all (no live hook, or a live run that logged no time) is being
+    over the budget enough. The hook self-limits near the budget, so a cold
+    process whose embedding is late lands a little over it on live's own
+    code too."""
     ms = run.get("ms")
     if ms is None or ms <= RECALL_BUDGET_MS:
         return False
-    return all(ms > r + SLOWNESS_SLACK_MS for r in refs if r is not None)
+    slowest = _slowest(refs)
+    return slowest is None or ms > slowest[1] + SLOWNESS_SLACK_MS
 
 
-def _shared_slowness_note(run: dict[str, Any], refs: tuple[Any, ...]) -> str | None:
+def _shared_slowness_note(run: dict[str, Any], refs: tuple[_Ref, ...]) -> str | None:
     """The note for a run over the budget that is no slower than its
     references by the slack: slowness live shares, not the candidate's."""
     ms = run.get("ms")
     if ms is None or ms <= RECALL_BUDGET_MS or _slower_than(run, refs):
         return None
-    given = [r for r in refs if r is not None]
-    return f"{ms:.0f} ms, reference {max(given):.0f} ms: shared slowness, not the candidate"
+    what, ref = _slowest(refs)
+    return f"{ms:.0f} ms, {what} {ref:.0f} ms: shared slowness, not the candidate"
 
 
-def _search_problem(run: dict[str, Any], refs: tuple[Any, ...] = (),
-                    live: dict[str, Any] | None = None) -> str | None:
+def _loaded(live: dict[str, Any] | None) -> bool:
+    """Whether a live run shows the Mac was too loaded to answer in time:
+    it timed out, or answered within ``SLOWNESS_SLACK_MS`` of the budget."""
+    if not live:
+        return False
+    reason, ms = live.get("reason"), live.get("ms")
+    if isinstance(reason, str) and reason.startswith("timeout"):
+        return True
+    return (isinstance(reason, str) and reason.startswith(("ok", "dedup")) and ms is not None
+            and ms >= RECALL_BUDGET_MS - SLOWNESS_SLACK_MS)
+
+
+def _search_problem(run: dict[str, Any], refs: tuple[_Ref, ...] = (),
+                    live: dict[str, Any] | list[dict[str, Any] | None] | None = None) -> str | None:
     """Why one replayed run's own search fails the step, or None: the hook
     exited non-zero or wrote no JSON, wrote no summary line, timed out or
-    failed, or took longer than ``RECALL_BUDGET_MS`` and longer than every
-    reference time in ``refs`` plus ``SLOWNESS_SLACK_MS`` (``_slower_than``).
-    The same test for the run with routing off and the run with routing on.
+    failed, or took longer than ``RECALL_BUDGET_MS`` and longer than the
+    slowest reference time in ``refs`` plus ``SLOWNESS_SLACK_MS``
+    (``_slower_than``). The same test for the run with routing off and the
+    run with routing on.
 
-    A candidate ``timeout>…`` is forgiven only when ``live`` (the live
-    hook's own run on the same prompt) timed out too: shared load, not the
-    candidate. A live that answered, however slowly, makes the candidate's
-    timeout a refusal; so does no live run to compare with."""
+    ``live`` is the live hook's run (or runs) on the same prompt just
+    before and after this one. A candidate ``timeout>…`` is forgiven when
+    one of them timed out too or answered within the slack of the budget
+    (``_loaded``): shared load, not the candidate. Live runs that answered
+    well inside the budget make the candidate's timeout a refusal; so does
+    no live run to compare with."""
     if run["exit"] != 0 or not run["valid_json"]:
         return f"hook exit {run['exit']}, valid_json={run['valid_json']}"
     reason = run.get("reason")
@@ -1039,15 +1097,28 @@ def _search_problem(run: dict[str, Any], refs: tuple[Any, ...] = (),
     if reason.startswith(("error", "gate error")):
         return reason
     if isinstance(reason, str) and reason.startswith("timeout"):
-        live_reason = (live or {}).get("reason")
-        if isinstance(live_reason, str) and live_reason.startswith("timeout"):
+        lives = [live] if isinstance(live, dict) else list(live or ())
+        if any(_loaded(one) for one in lives):
             return None
         return reason
     if _slower_than(run, refs):
-        given = [r for r in refs if r is not None]
-        against = f", reference {max(given):.0f} ms" if given else ""
-        return f"{run['ms']:.0f} ms > {RECALL_BUDGET_MS:.0f} ms{against}"
+        slowest = _slowest(refs)
+        if slowest is None:
+            return f"{run['ms']:.0f} ms > {RECALL_BUDGET_MS:.0f} ms, with no live run to compare with"
+        what, ref = slowest
+        return (f"{run['ms']:.0f} ms > {RECALL_BUDGET_MS:.0f} ms, {run['ms'] - ref:.0f} ms slower than "
+                f"{what} ({ref:.0f} ms)")
     return None
+
+
+def _adjacent(live: Any, what: str) -> list[tuple[str, dict[str, Any]]]:
+    """Live runs beside a candidate run, each with what it was: ``live`` is
+    one run (named ``what``) or ``(what, run)`` pairs; None runs are left out."""
+    if live is None:
+        return []
+    if isinstance(live, dict):
+        return [(what, live)]
+    return [(name, run) for name, run in live if run is not None]
 
 
 def _empty_by_timing(live: dict[str, Any] | None, cand: dict[str, Any]) -> bool:
@@ -1080,14 +1151,18 @@ def _abstained(live: dict[str, Any] | None, cand: dict[str, Any]) -> bool:
     return bool((live or {}).get("hits")) and not cand["hits"] and cand.get("reason") == ABSTAINED_REASON
 
 
-def _off_problem(label: str, live: dict[str, Any] | None, cand: dict[str, Any]) -> str | None:
+def _off_problem(label: str, live: dict[str, Any] | None, cand: dict[str, Any],
+                 adjacent: Any = None) -> str | None:
     """Why the candidate's run with routing off fails the step, or None: its
-    own search fails (``_search_problem``), or it answered nothing where the
-    live code had hits, unless only its embedding was late
-    (``_empty_by_timing``) or the candidate's relevance gate abstained
+    own search fails (``_search_problem``, against the live runs just before
+    and after it in ``adjacent``, or ``live`` alone), or it answered nothing
+    where the live code (``live``) had hits, unless only its embedding was
+    late (``_empty_by_timing``) or the candidate's relevance gate abstained
     (``_abstained``). The same test for the first run and the replayed
     one."""
-    what = _search_problem(cand, ((live or {}).get("ms"),), live)
+    beside = _adjacent(live if adjacent is None else adjacent, "live's run just before it")
+    what = _search_problem(cand, tuple((name, run.get("ms")) for name, run in beside),
+                           [run for _name, run in beside])
     if what:
         return f"{label}: {what}"
     live_hits = (live or {}).get("hits") or []
@@ -1105,13 +1180,14 @@ def _comparable(off: dict[str, Any], on: dict[str, Any]) -> bool:
 
 
 def _routing_problem(label: str, off: dict[str, Any], on: dict[str, Any],
-                     live: dict[str, Any] | None = None) -> str | None:
+                     live: Any = None) -> str | None:
     """Why the candidate's run with routing on fails the step, or None: its
     routing read was skipped for any reason but a benign one
     (``ROUTING_SKIPS_OK``), its code said the push was on and the hook
     logged no routing status, its own search fails as a run with routing
-    off would (``_search_problem``), or its search answer is not the one it
-    gave with routing off when both ran the same legs with the same
+    off would (``_search_problem``, against its own run with routing off and
+    the live runs beside it in ``live``), or its search answer is not the
+    one it gave with routing off when both ran the same legs with the same
     degraded note (``_comparable``)."""
     status = on.get("routing") or ""
     what = _routing_skip_problem(status)
@@ -1119,13 +1195,23 @@ def _routing_problem(label: str, off: dict[str, Any], on: dict[str, Any],
         return f"{label}: with routing on, {what} (routing={status})"
     if on.get("push") is True and not status and on.get("reason") is not None:
         return f"{label}: with routing on, the candidate's push is on but its hook logged no routing status"
-    what = _search_problem(on, (off.get("ms"), (live or {}).get("ms")), live)
+    beside = _adjacent(live, "live's run")
+    refs = (("its own run with routing off", off.get("ms")), *((name, run.get("ms")) for name, run in beside))
+    what = _search_problem(on, refs, [run for _name, run in beside])
     if what:
         return f"{label}: with routing on, {what}"
     if _comparable(off, on) and on["hits"] != off["hits"]:
         return (f"{label}: the search answer changed with routing on ({len(on['hits'])} hit(s) against "
                 f"{len(off['hits'])} with it off)")
     return None
+
+
+def _live_run(hook: Path, sample: dict[str, Any], session: str, *, legacy: bool, routing: bool = False,
+              root: Path | None = None) -> dict[str, Any] | None:
+    """One run of the live hook (``_recall_once``), or None with no live hook."""
+    if not hook.exists():
+        return None
+    return _recall_once(hook, sample, session, legacy=legacy, routing=routing, root=root if routing else None)
 
 
 @_step
@@ -1142,11 +1228,19 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
     search with routing on times out, fails or runs past the 1.2 s budget
     (the same test as with routing off), or when its search answer differs
     with routing on while both runs ran the same legs with the same degraded
-    note. A run over the 1.2 s budget fails only when it is also more than
-    ``SLOWNESS_SLACK_MS`` slower than live's run of the same prompt (with
-    routing on: than both live's and its own routing-off run); otherwise it
-    is noted as slowness live shares. The candidate's median is also held to
-    live's median plus the slack. An empty answer where live had hits that came only from the
+    note.
+
+    Speed is judged paired and order-fair: for each prompt the runs go live,
+    candidate, live, candidate with routing on, live with routing on, so
+    every candidate run has a live run just before and just after it. A run
+    over the 1.2 s budget fails only when it is also more than
+    ``SLOWNESS_SLACK_MS`` slower than the slower of those live runs (with
+    routing on, also than its own routing-off run); otherwise it is noted as
+    slowness live shares. A candidate timeout is forgiven when a live run
+    beside it timed out too or answered within the slack of the budget. The
+    budget alone fails a run only when no live run gave a time (no live
+    hook, or live logged nothing). The candidate's median is also held to
+    the median of those slower live runs plus the slack. An empty answer where live had hits that came only from the
     candidate's embedding being late or failed (no cosine leg where live ran
     one) replays live and the candidate once more; if it is still that, it
     is noted, not failed (a query whose words match nothing finds its hits
@@ -1182,59 +1276,73 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
     cand_times: list[float] = []
     live_times: list[float] = []
     for i, sample in enumerate(samples):
-        live = (_recall_once(live_hook, sample, f"khipu-gate-{nonce}-live-{i}", legacy=live_legacy, routing=False)
-                if live_hook.exists() else None)
-        cand = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-cand-{i}", legacy=cand_legacy, routing=False)
         label = f"prompt {i + 1}"
-        problem = _off_problem(label, live, cand)
+        tag = f"khipu-gate-{nonce}"
+        # Live, candidate, live: the candidate's run is judged against the
+        # live runs on either side of it, so load that arrives or leaves
+        # between runs is on a live run beside it too (one extra run per
+        # prompt instead of a reference that finished before it started).
+        live = _live_run(live_hook, sample, f"{tag}-live-{i}", legacy=live_legacy)
+        cand = _recall_once(cand_hook, sample, f"{tag}-cand-{i}", legacy=cand_legacy, routing=False)
+        live_after = _live_run(live_hook, sample, f"{tag}-live-after-{i}", legacy=live_legacy)
+        beside = (("live's run just before it", live), ("live's run just after it", live_after))
+        problem = _off_problem(label, live, cand, beside)
         if problem is None and _empty_by_timing(live, cand):
-            # Once more, both live and the candidate, before an empty answer
-            # from a late embedding is set aside as timing.
-            live = _recall_once(live_hook, sample, f"khipu-gate-{nonce}-live-{i}-again", legacy=live_legacy,
-                                routing=False)
-            cand = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-cand-{i}-again", legacy=cand_legacy,
-                                routing=False)
-            problem = _off_problem(label, live, cand)
+            # Once more, live, the candidate and live again, before an empty
+            # answer from a late embedding is set aside as timing.
+            live = _live_run(live_hook, sample, f"{tag}-live-{i}-again", legacy=live_legacy)
+            cand = _recall_once(cand_hook, sample, f"{tag}-cand-{i}-again", legacy=cand_legacy, routing=False)
+            live_after = _live_run(live_hook, sample, f"{tag}-live-after-{i}-again", legacy=live_legacy)
+            beside = (("live's run just before it", live), ("live's run just after it", live_after))
+            problem = _off_problem(label, live, cand, beside)
         live_hits = (live or {}).get("hits") or []
         embed_failed[i] = _embedding_failed(live, cand)
         if problem:
             problems.append(problem)
             continue
-        on = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-route-{i}", legacy=cand_legacy, routing=True,
+        on = _recall_once(cand_hook, sample, f"{tag}-route-{i}", legacy=cand_legacy, routing=True,
                           root=Path(candidate))
-        live_on = (_recall_once(live_hook, sample, f"khipu-gate-{nonce}-live-route-{i}", legacy=live_legacy,
-                                routing=True, root=live_root)
-                   if live_hook.exists() else None)
-        problem = _routing_problem(label, cand, on, live)
+        live_on = _live_run(live_hook, sample, f"{tag}-live-route-{i}", legacy=live_legacy, routing=True,
+                            root=live_root)
+        on_beside = (("live's run just before it", live_after),
+                     ("live's run with routing on just after it", live_on))
+        problem = _routing_problem(label, cand, on, on_beside)
         if problem or not _comparable(cand, on):
-            # Once more, both ways, before the step fails or the answers go
-            # uncompared: a search late once (embedding late, a cold cache)
-            # is not routing, and nor is a read that refolded once because a
+            # Once more, both ways, each candidate run followed by a live
+            # one, before the step fails or the answers go uncompared: a
+            # search late once (embedding late, a cold cache) is not
+            # routing, and nor is a read that refolded once because a
             # runner's heartbeat was rewritten between the prefold and the
             # hook's read.
-            cand = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-cand-{i}-again", legacy=cand_legacy,
-                                routing=False)
-            on = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-route-{i}-again", legacy=cand_legacy,
-                              routing=True, root=Path(candidate))
-            if live_hook.exists():
-                live_on = _recall_once(live_hook, sample, f"khipu-gate-{nonce}-live-route-{i}-again",
-                                       legacy=live_legacy, routing=True, root=live_root)
+            before = live_on
+            cand = _recall_once(cand_hook, sample, f"{tag}-cand-{i}-replay", legacy=cand_legacy, routing=False)
+            live_after = _live_run(live_hook, sample, f"{tag}-live-after-{i}-replay", legacy=live_legacy)
+            on = _recall_once(cand_hook, sample, f"{tag}-route-{i}-replay", legacy=cand_legacy, routing=True,
+                              root=Path(candidate))
+            live_on = _live_run(live_hook, sample, f"{tag}-live-route-{i}-replay", legacy=live_legacy,
+                                routing=True, root=live_root)
+            beside = (("live's run just before it", before), ("live's run just after it", live_after))
+            on_beside = (("live's run just before it", live_after),
+                         ("live's run with routing on just after it", live_on))
             # Both replayed runs are tested: the one with routing off
             # replaces the first, so it is held to the first one's tests.
-            problem = _off_problem(label, live, cand) or _routing_problem(label, cand, on, live)
+            problem = _off_problem(label, live, cand, beside) or _routing_problem(label, cand, on, on_beside)
             embed_failed[i] = _embedding_failed(live, cand)
         if problem:
             problems.append(problem)
             continue
         overlap = len(set(live_hits) & set(cand["hits"]))
         note = f"{label}: {len(cand['hits'])} hit(s), {overlap} shared with live, {cand['ms']:.0f} ms"
-        live_ms = (live or {}).get("ms")
-        if cand.get("ms") is not None and live_ms is not None:
+        off_refs = tuple((name, (run or {}).get("ms")) for name, run in beside)
+        slowest_live = _slowest(off_refs)
+        if cand.get("ms") is not None and slowest_live is not None:
+            # The median test compares like the per-run one: with the slower
+            # of the live runs on either side of the candidate's.
             cand_times.append(cand["ms"])
-            live_times.append(live_ms)
-        shared = _shared_slowness_note(cand, (live_ms,))
+            live_times.append(slowest_live[1])
+        shared = _shared_slowness_note(cand, off_refs)
         if shared:
-            note += f" ({shared}; live {live_ms:.0f} ms)" if live_ms is not None else f" ({shared})"
+            note += f" ({shared})"
         live_hit_prompts += bool(live_hits)
         if _abstained(live, cand):
             abstentions += 1
@@ -1257,7 +1365,8 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
                 routed_runs += 1
             on_ms = f"{on['ms']:.0f} ms" if on.get("ms") is not None else "no time"
             note += f", {on_ms} with routing on (routing={on['routing']})"
-            shared = _shared_slowness_note(on, (cand.get("ms"), live_ms))
+            shared = _shared_slowness_note(on, (("its own run with routing off", cand.get("ms")),
+                                                *((name, (run or {}).get("ms")) for name, run in on_beside)))
             if shared:
                 note += f" ({shared})"
         if not _comparable(cand, on):
@@ -1287,7 +1396,8 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
         cand_median, live_median = statistics.median(cand_times), statistics.median(live_times)
         if cand_median - live_median > SLOWNESS_SLACK_MS:
             problems.append(f"the candidate is slower than live by {cand_median - live_median:.0f} ms at the median "
-                            f"({cand_median:.0f} ms against {live_median:.0f} ms)")
+                            f"({cand_median:.0f} ms against {live_median:.0f} ms, the slower live run beside "
+                            f"each of its runs)")
         medians = f"median {cand_median:.0f} ms, live {live_median:.0f} ms; "
     if problems:
         return False, "; ".join(problems)

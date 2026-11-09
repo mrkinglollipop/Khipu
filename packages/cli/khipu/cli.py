@@ -212,6 +212,9 @@ _QUICK_IMPORTS = (
 # The `*_ok` keys of the checks that read only this Mac. Plain `doctor` and
 # `doctor --quick` both compute them with `_doctor_local_checks` and both gate
 # on every one; --quick leaves out only the hub, network and probe checks.
+# One key differs by design: --quick's `prompt_recall_outcomes_ok` is the
+# promotion gate's rule (`_recall_outcomes_gate_ok`), plain doctor's is what
+# the owner is shown.
 LOCAL_GATES = (
     "outbox_ok", "capture_liveness_ok", "git_sync_ok", "dsn_file_ok", "synth_provider_ok",
     "jobs_ok", "index_freshness_ok", "synth_budget_ok", "bundle_seal_ok",
@@ -589,9 +592,26 @@ def _owner_writes_warnings() -> list[str]:
 
 
 def _recall_outcomes_warnings(local: dict) -> list[str]:
-    """A thin or timeouts-only recall sample is amber: visible, never gating."""
+    """Recall before each prompt failing on half or more of the last day's
+    prompts is told to the owner in plain words; a thin sample is amber."""
     block = local.get("prompt_recall_outcomes") or {}
+    if block.get("warning"):
+        return [block["warning"]]
     return [block["message"]] if block.get("level") == "amber" and block.get("message") else []
+
+
+def _recall_outcomes_gate_ok(local: dict) -> bool:
+    """The promotion gate's verdict on prompt-time recall, which `doctor
+    --quick` (the gate's doctor) reports as `prompt_recall_outcomes_ok`.
+    It is the block's `gate_ok` (khipu.recall_prompt._gate_verdict:
+    timeouts alone on the live Mac never refuse), not the owner's `ok`, so a
+    busy Mac does not hold back an unrelated candidate. A block without
+    `gate_ok` (the check itself failed) keeps the flag the local checks
+    set from its `ok`."""
+    block = local.get("prompt_recall_outcomes")
+    if isinstance(block, dict) and "gate_ok" in block:
+        return bool(block["gate_ok"])
+    return bool(local.get("prompt_recall_outcomes_ok"))
 
 
 def _replica_schema_warnings(local: dict) -> list[str]:
@@ -637,6 +657,7 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
     local = _doctor_local_checks(mem)
     from khipu import build_info
 
+    local = {**local, "prompt_recall_outcomes_ok": _recall_outcomes_gate_ok(local)}
     out = {
         "quick": True,
         "version": build_info.stamp(),
@@ -6259,7 +6280,8 @@ def build_parser() -> argparse.ArgumentParser:
         "window does on a provider other than Gemini), the comma-"
         'separated user_aliases list (e.g. --set user_aliases "matt,matthew") '
         "how far back "
-        "doctor's rate checks look (doctor_rate_window_minutes, default 60), "
+        "doctor's rate checks look (doctor_rate_window_minutes, default 60; "
+        "prompt-time recall's own row judges the last 24 hours), "
         "how long the promotion gate waits for an unreachable hub "
         "(promote_hub_wait_minutes, default 10), the red doctor checks the "
         "next promotion skips once (promote_gate_ignore, comma-separated "

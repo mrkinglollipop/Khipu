@@ -3729,6 +3729,10 @@ _OUTCOMES_MIN_CALLS = 20
 # keep it red for days after the cause is gone, nor a week of old successes
 # keep it green for days after the lane breaks.
 _OUTCOMES_MAX_CALLS = 100
+# What the owner is shown judges the last day (finding F, 2026-11-09: a
+# one-hour window with 20 calls needed read "quiet" while 45% of a day's
+# prompts timed out). The promotion gate keeps the owner's rate window.
+_OUTCOMES_OWNER_WINDOW_S = 24 * 60 * 60
 _OUTCOMES_TIMEOUT_RATE_RED = 0.5
 # Generous enough to comfortably span 7 days of hook-log lines (structured
 # summary lines plus free-form diagnostics from other _log calls in this
@@ -3749,6 +3753,8 @@ _LOG_LINE_RE = re.compile(
 # A call made while the hub could not be reached: reported apart, never as a
 # failure of the lane (the lane did its job if it answered from the replica).
 _OFFLINE_FIELD_RE = re.compile(r" offline=1(?= |$)")
+# The legs that answered: a call without "cosine" got keyword matches only.
+_LEGS_FIELD_RE = re.compile(r" legs=(?P<legs>\[.*?\]) degraded=")
 
 # The button the app shows beside this check (Home and the health report).
 OUTCOMES_FIX = (
@@ -3830,6 +3836,37 @@ def _rate_window_s() -> int:
         return 60 * 60
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _gate_verdict(calls: list[tuple[str, float, bool]], *, lookback: int, offline: int,
+                  window_minutes: int) -> dict[str, Any]:
+    """The promotion gate's rule for this lane, unchanged from before the
+    owner's view moved to 24 hours: the searched calls of the owner's rate
+    window (``doctor_rate_window_minutes``), at most 100, refuse only when at
+    least half of 20 or more failed AND real errors are among them. Timeouts
+    alone are the live Mac under load, which says nothing about a candidate,
+    so they never refuse a promote. Fewer than 20 in the window: ok when the
+    lane answered 20 in the last 7 days, not ok when nothing at all was
+    searched in that week and the week was thin."""
+    total = len(calls)
+    base: dict[str, Any] = {"count": total, "offline": offline, "window_minutes": window_minutes}
+    if total < _OUTCOMES_MIN_CALLS:
+        if lookback >= _OUTCOMES_MIN_CALLS:
+            return {**base, "ok": True, "insufficient": True, "quiet": True}
+        return {**base, "ok": total > 0, "insufficient": True}
+    timeouts = sum(1 for category, _ms, _sem in calls if category == "timeout")
+    errors = sum(1 for category, _ms, _sem in calls if category == "error")
+    failure_rate = (timeouts + errors) / total
+    timeout_only = timeouts > 0 and errors == 0 and failure_rate >= _OUTCOMES_TIMEOUT_RATE_RED
+    refuse = failure_rate >= _OUTCOMES_TIMEOUT_RATE_RED and not timeout_only
+    return {**base, "ok": not refuse, "insufficient": False, "timeouts": timeouts, "errors": errors,
+            "failure_rate": round(failure_rate, 4), "timeout_only": timeout_only}
+
+
 def prompt_recall_outcomes(*, now: datetime | None = None,
                            window_s: int | None = None) -> dict[str, Any]:
     """Doctor's real evidence for the per-prompt lane (finding B10): count,
@@ -3837,32 +3874,46 @@ def prompt_recall_outcomes(*, now: datetime | None = None,
     dedup, timeout or error — a gated call never reached a search leg and
     does not count), read from the hook's own log.
 
-    Only calls inside the rate window (``doctor_rate_window_minutes``,
-    default an hour) are judged, so a past outage ages out by itself on an
-    idle Mac. Calls tagged ``offline=1`` (the hub could not be reached) are
-    counted apart as ``offline`` and never as failures.
+    Two verdicts from one read, kept apart on purpose:
 
-    Not ok when at least half of 20 or more judged calls failed or timed
-    out. Fewer judged calls in the window is not a verdict: green with
-    ``quiet`` when the lane answered at least 20 calls in the last 7 days
-    (it runs, it has just been quiet), otherwise insufficient evidence.
-    Missing or unreadable telemetry reports available=False.
+    * ``ok`` is what the owner is shown (plain doctor, the app's row): the
+      most recent searched calls of the last 24 hours, at most 100. Not ok
+      when at least half of 20 or more timed out or errored, whatever the
+      cause; ``warning`` then says so with the numbers, including how many
+      of the answered calls had no meaning-based (cosine) leg.
+    * ``gate_ok`` (and the ``gate`` block) is the promotion gate's rule,
+      ``_gate_verdict``: the rate window only, and timeouts alone never
+      refuse. ``doctor --quick``, the gate's doctor, reports this one as
+      ``prompt_recall_outcomes_ok``.
+
+    Fewer than 20 searched calls in 24 hours is not a verdict ("not enough
+    prompts yet", with the count): green with ``quiet`` when the lane
+    answered at least 20 calls in the last 7 days, yellow when the week was
+    thin, not ok when nothing at all was searched. Calls tagged
+    ``offline=1`` (the hub could not be reached) are counted apart as
+    ``offline`` and never as failures. A prompt the harness killed before
+    the hook wrote its summary line leaves no line and is not counted
+    anywhere. Missing or unreadable telemetry reports available=False.
     """
     now = now or datetime.now(timezone.utc)
     window_s = _rate_window_s() if window_s is None else int(window_s)
     lookback_cutoff = now.timestamp() - _OUTCOMES_WINDOW_S
-    window_cutoff = now.timestamp() - window_s
-    window_minutes = round(window_s / 60)
+    owner_cutoff = now.timestamp() - _OUTCOMES_OWNER_WINDOW_S
+    gate_cutoff = now.timestamp() - window_s
+    gate_minutes = round(window_s / 60)
+    owner_minutes = round(_OUTCOMES_OWNER_WINDOW_S / 60)
     path = _log_path()
     try:
         if not path.is_file():
-            return {"ok": False, "available": False, "insufficient": True, "count": 0}
+            return {"ok": False, "gate_ok": False, "available": False, "insufficient": True, "count": 0}
         raw = _tail_text(path, max_bytes=_OUTCOMES_TAIL_BYTES)
     except OSError:
-        return {"ok": False, "available": False, "insufficient": True, "count": 0}
+        return {"ok": False, "gate_ok": False, "available": False, "insufficient": True, "count": 0}
 
-    calls: list[tuple[str, float]] = []
-    offline = 0
+    # (category, ms, answered without the meaning-based leg), oldest first.
+    owner_calls: list[tuple[str, float, bool]] = []
+    gate_calls: list[tuple[str, float, bool]] = []
+    owner_offline = gate_offline = 0
     lookback = 0
     for line in split_lines(raw):
         m = _LOG_LINE_RE.match(line)
@@ -3871,29 +3922,42 @@ def prompt_recall_outcomes(*, now: datetime | None = None,
         try:
             stamp = datetime.strptime(m.group("stamp"), "%Y-%m-%dT%H:%M:%SZ").replace(
                 tzinfo=timezone.utc
-            )
+            ).timestamp()
         except ValueError:
             continue
-        if stamp.timestamp() < lookback_cutoff:
+        if stamp < lookback_cutoff:
             continue
         category = _classify_call_reason(m.group("reason"))
         if category is None:
             continue
         lookback += 1
-        if stamp.timestamp() < window_cutoff:
-            continue
-        if _OFFLINE_FIELD_RE.search(line):
-            offline += 1
-            continue
-        calls.append((category, float(m.group("ms"))))
+        offline = bool(_OFFLINE_FIELD_RE.search(line))
+        legs = _LEGS_FIELD_RE.search(line)
+        no_semantic = category in ("ok", "dedup") and not (legs and "'cosine'" in legs.group("legs"))
+        call = (category, float(m.group("ms")), no_semantic)
+        if stamp >= owner_cutoff:
+            if offline:
+                owner_offline += 1
+            else:
+                owner_calls.append(call)
+        if stamp >= gate_cutoff:
+            if offline:
+                gate_offline += 1
+            else:
+                gate_calls.append(call)
 
-    # The log is append-only, so the end of the list is the most recent calls.
-    calls = calls[-_OUTCOMES_MAX_CALLS:]
-    total = len(calls)
-    base = {"available": True, "count": total, "offline": offline, "window_minutes": window_minutes}
+    # The log is append-only, so the end of each list is the most recent calls.
+    owner_calls = owner_calls[-_OUTCOMES_MAX_CALLS:]
+    gate = _gate_verdict(gate_calls[-_OUTCOMES_MAX_CALLS:], lookback=lookback,
+                         offline=gate_offline, window_minutes=gate_minutes)
+    total = len(owner_calls)
+    base = {"available": True, "count": total, "offline": owner_offline,
+            "window_minutes": owner_minutes, "gate_ok": gate["ok"], "gate": gate}
     if total < _OUTCOMES_MIN_CALLS:
+        enough = (f"not enough prompts yet: {total} prompt(s) searched memory in the last "
+                  f"{owner_minutes // 60} hours ({_OUTCOMES_MIN_CALLS} are needed to judge)")
         if lookback >= _OUTCOMES_MIN_CALLS:
-            return {**base, "ok": True, "insufficient": True, "quiet": True}
+            return {**base, "ok": True, "insufficient": True, "quiet": True, "message": enough}
         if total == 0:
             # Nothing was searched in the window and the week was not busy
             # enough to call the lane merely quiet: there is nothing to
@@ -3903,49 +3967,43 @@ def prompt_recall_outcomes(*, now: datetime | None = None,
                     "log": _log_facts(path),
                     "fix": "check the prompt-recall hook is installed and firing"}
         # A thin but nonzero sample (< 20 searched calls in seven days) is
-        # yellow, not a hard red that alone blocks a promote.
+        # yellow, not a hard red.
         return {**base, "ok": True, "insufficient": True, "level": "amber",
-                "message": f"only {total} recall call(s) to judge so far (fewer than "
-                           f"{_OUTCOMES_MIN_CALLS}); the lane has barely been exercised"}
+                "message": f"{enough}; the lane has barely been exercised"}
 
-    timeouts = sum(1 for category, _ms in calls if category == "timeout")
-    errors = sum(1 for category, _ms in calls if category == "error")
-    timeout_rate = timeouts / total
+    timeouts = sum(1 for category, _ms, _sem in owner_calls if category == "timeout")
+    errors = sum(1 for category, _ms, _sem in owner_calls if category == "error")
+    answered = total - timeouts - errors
+    no_semantic = sum(1 for _category, _ms, sem in owner_calls if sem)
     failure_rate = (timeouts + errors) / total
-    ms_values = sorted(ms for _category, ms in calls)
-    mid = len(ms_values) // 2
-    median_ms = (
-        ms_values[mid]
-        if len(ms_values) % 2
-        else (ms_values[mid - 1] + ms_values[mid]) / 2
-    )
-    # Timeouts alone under the budget wall are the live hook under load:
-    # yellow, not a hard red that blocks a promote of an unrelated candidate.
-    # Real errors (or a mix that is not timeout-only) still refuse.
-    timeout_only = timeouts > 0 and errors == 0 and failure_rate >= _OUTCOMES_TIMEOUT_RATE_RED
-    hard_red = failure_rate >= _OUTCOMES_TIMEOUT_RATE_RED and not timeout_only
+    failing = failure_rate >= _OUTCOMES_TIMEOUT_RATE_RED
     out: dict[str, Any] = {
         **base,
-        "ok": not hard_red,
+        "ok": not failing,
         "insufficient": False,
-        "timeout_rate": round(timeout_rate, 4),
+        "timeouts": timeouts,
+        "errors": errors,
+        "answered": answered,
+        "answered_no_semantic": no_semantic,
+        "timeout_rate": round(timeouts / total, 4),
         "error_rate": round(errors / total, 4),
         "failure_rate": round(failure_rate, 4),
-        "median_ms": round(median_ms, 1),
+        "median_ms": round(_median([ms for _category, ms, _sem in owner_calls]), 1),
     }
-    if timeout_only:
-        out["level"] = "amber"
-        out["timeout_only"] = True
-        out["message"] = (f"{timeouts} of the last {total} recall calls missed the deadline "
-                          f"(timeouts only, under load)")
-        out["reason"] = (
-            f"{timeouts} of the last {total} recall attempts in the last "
-            f"{window_minutes} minutes missed the deadline under load (timeouts only; not a hard red)"
-        )
-    elif not out["ok"]:
+    if failing:
+        out["level"] = "red"
+        if errors == 0:
+            out["timeout_only"] = True
+        semantic = (f"; of the {answered} that answered, {no_semantic} had no meaning-based "
+                    f"search (keyword matches only)" if answered else "")
         out["reason"] = (
             f"{timeouts + errors} of the last {total} recall attempts in the last "
-            f"{window_minutes} minutes failed: {errors} errors and {timeouts} missed the deadline"
+            f"{owner_minutes // 60} hours failed: {errors} errors and {timeouts} missed the deadline"
+        )
+        out["warning"] = (
+            f"Recall before each prompt is failing: {timeouts + errors} of the last {total} prompts "
+            f"that searched memory in the last {owner_minutes // 60} hours got nothing back in time "
+            f"({timeouts} timed out, {errors} errored){semantic}."
         )
         out["fix"] = OUTCOMES_FIX
     return out

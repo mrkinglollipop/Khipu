@@ -283,9 +283,15 @@ def test_search_problem_timeout_uses_live_slack():
     # Live succeeded well under budget: the candidate's timeout is a refusal.
     live_ok = {"exit": 0, "valid_json": True, "reason": "ok", "ms": 300.0, "hits": []}
     assert pm._search_problem(run, (300.0,), live_ok) == "timeout>1.2s"
-    # Live succeeded slowly (1250 ms, no timeout): still a refusal.
+    # Live answered within the slack of the budget (1250 ms, and 1000 ms):
+    # the Mac was as loaded for live, so the candidate's timeout is forgiven.
     live_slow = {"exit": 0, "valid_json": True, "reason": "ok", "ms": 1250.0, "hits": []}
-    assert pm._search_problem(run, (1250.0,), live_slow) == "timeout>1.2s"
+    assert pm._search_problem(run, (1250.0,), live_slow) is None
+    live_near = {"exit": 0, "valid_json": True, "reason": "ok", "ms": 1000.0, "hits": []}
+    assert pm._search_problem(run, (1000.0,), live_near) is None
+    # Either live run beside it is enough; both well inside the budget refuse.
+    assert pm._search_problem(run, (300.0, 1250.0), [live_ok, live_slow]) is None
+    assert pm._search_problem(run, (300.0, 999.0), [live_ok, {**live_ok, "ms": 999.0}]) == "timeout>1.2s"
     # No live run to compare with: refuse.
     assert pm._search_problem(run, (1300.0,)) == "timeout>1.2s"
 
@@ -436,10 +442,13 @@ def test_outcomes_does_not_hard_red_on_live_timeouts_alone_under_shared_load(tmp
         )
     log.write_text("\n".join(lines) + "\n")
     monkeypatch.setattr(rp, "_log_path", lambda: log)
-    out = rp.prompt_recall_outcomes(now=now)
-    # Either yellow, or still red only when failure_rate is structural —
-    # timeouts-only under the budget wall are not a hard promote block.
-    assert out.get("level") == "amber" or out["ok"] is True or out.get("timeout_only")
+    out = rp.prompt_recall_outcomes(now=now, window_s=3600)
+    # The promotion gate's rule passes: timeouts alone are the live Mac
+    # under load, never a refusal of a candidate.
+    assert out["gate_ok"] is True and out["gate"]["timeout_only"] is True
+    # The owner is told: every searched prompt of the last day timed out.
+    assert out["ok"] is False and out["level"] == "red" and out["timeout_only"] is True
+    assert "25 of the last 25 prompts" in out["warning"]
 
 
 # ---- helpers pulled from test_promote without importing its fixtures twice ----
@@ -465,8 +474,11 @@ def _many_queries(home, n):
     return real(home, n)
 
 
-def test_replay_refuses_candidate_timeout_where_live_succeeded_slowly(home, monkeypatch):
-    """Live ok at 1250 ms (slow, but an answer); the candidate times out."""
+def test_replay_forgives_candidate_timeout_where_live_answered_past_the_budget(home, monkeypatch):
+    """Live ok at 1250 ms on either side (the Mac is that loaded); the
+    candidate times out: shared load, not the candidate (2026-11-09: a
+    timeout was forgiven only when live also logged one, so a busy Mac
+    refused code exactly as fast as live)."""
     candidate = _one_query(home)
 
     def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
@@ -487,8 +499,7 @@ def test_replay_refuses_candidate_timeout_where_live_succeeded_slowly(home, monk
 
     monkeypatch.setattr(pm, "_run", fake_run)
     out = pm.gate_recall_replay(candidate)
-    assert not out["ok"], out
-    assert "timeout" in out["detail"]
+    assert out["ok"], out
 
 
 def test_outcomes_with_nothing_to_measure_is_not_ok(tmp_path, monkeypatch):
