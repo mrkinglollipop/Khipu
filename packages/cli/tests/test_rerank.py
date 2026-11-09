@@ -182,7 +182,8 @@ def test_no_configured_provider_drops_the_stage():
     with _stub_model(rerank._Unavailable("no key")):
         out, payload, degraded = rerank.stage("some query", fused, mode="hybrid", token_count=2)
     assert out is fused
-    assert (payload["reason"], degraded) == ("no-provider", True)
+    # Switched on with nothing to run on: skipped, said in the block, not a degraded search.
+    assert (payload["reason"], payload.get("skipped"), degraded) == ("no-provider", True, False)
 
 
 def test_fewer_than_two_candidates_is_not_a_degradation():

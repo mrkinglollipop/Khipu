@@ -558,10 +558,23 @@ def _fold_gateway_liveness(liveness: dict, gw_liveness: dict, aegis_gw: dict) ->
             liveness["ok"] = False
 
 
+def _without_repeated_limit(routing_warnings: list[str], plan_usage: dict) -> list[str]:
+    """The routing warnings, less "The first account in your priority, X, is
+    limited ..." when the plan warning "Plan nearly used up: X ..." already
+    says X is at its limit: the owner reads it once. Only the limit repeats
+    the plan warning; "paused by you" and "down" say something else and stay."""
+    from khipu import usage as _usage
+
+    full = {a.get("account") for a in plan_usage.get("accounts") or []
+            if isinstance(a, dict) and (a.get("used_pct") or 0) >= _usage.ALERT_PCT}
+    drop = tuple(f"The first account in your priority, {label}, is limited" for label in full if label)
+    return [w for w in routing_warnings if not (drop and w.startswith(drop))]
+
+
 def _doctor_rerank() -> tuple[dict, list[str]]:
     """The rerank switch and whether a model stands behind it. On with no
-    model, searches skip the stage (and say so in ``degraded_legs``); that is
-    a warning here, never a gate."""
+    model, searches skip the stage and say so in the ``rerank`` block (never in
+    ``degraded_legs``: nothing broke); that is one plain line here, never a gate."""
     try:
         from khipu import rerank
 
@@ -570,9 +583,9 @@ def _doctor_rerank() -> tuple[dict, list[str]]:
         return {"error": f"{type(e).__name__}: {e}"}, []
     if block["enabled"] and not block["usable"]:
         return block, [
-            f"rerank is switched on but there is no rerank model available ({block['reason']}); "
-            "searches skip it and list rerank in degraded_legs. Point the synth model at an API "
-            "provider with a key, or run `khipu features --set rerank off`."]
+            f"rerank is switched on but there is no rerank model to run it ({block['reason']}), so searches "
+            "skip it. To settle it, run `khipu features --set rerank off` (or point the synth model at an "
+            "API provider with a key)."]
     return block, []
 
 
@@ -1112,6 +1125,9 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "rerank": rerank_block,
         "plan_usage": plan_usage_block,
         "routing": routing_block,
+        # Things that are true but need nothing from the owner today (a job runner silent for
+        # more than a week and how to stop reading it). Never in `warnings`, never gating `ok`.
+        "quiet_notes": list(routing_block.get("notes") or []),
         # The routing log's size against its bound: green, yellow (compaction
         # starts) or red (a fresh fold nears the prompt's budget). Never gates `ok`.
         "routing_log": routing_block.get("log"),
@@ -1126,7 +1142,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "work": work_block,
         "promotion": _promotion_block(),
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
-        "warnings": (list(plan_usage_block.get("warnings") or []) + list(routing_block.get("warnings") or [])
+        "warnings": (list(plan_usage_block.get("warnings") or [])
+                     + _without_repeated_limit(routing_block.get("warnings") or [], plan_usage_block)
                      + list(owner_direction_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
                      + list(schema.get("warnings") or [])

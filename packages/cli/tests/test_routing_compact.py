@@ -249,8 +249,14 @@ def test_protected_history_is_yellow_without_action(world, monkeypatch):
     assert rc.health()["level"] == "yellow"  # protected history needs no attempt
     assert rc.compact(END)["result"] == "skipped"
     row = rc.health()
-    assert row["level"] == "yellow" and "own history" in row["warning"]
-    assert "nothing is broken" in row["warning"] and "nothing to do" in row["warning"]
+    assert row["level"] == "yellow" and "own history" in row["note"]
+    assert "nothing is broken" in row["note"] and "nothing to do" in row["note"]
+    # Kept history that can't shrink is a fact for an agent, not a warning, while the size is harmless.
+    assert "warning" not in row
+    # Once the size would slow every read it does warn, in words that say what to do.
+    monkeypatch.setattr(rc, "LINES_HURT", 100)
+    warn = rc.health()["warning"]
+    assert "reading it is getting slow" in warn and "Tell a conversation" in warn
 
 
 def test_protected_byte_growth_is_yellow_without_action(world, monkeypatch):
@@ -324,7 +330,8 @@ def test_doctor_row_is_green_then_yellow_then_red(world, monkeypatch):
     _install(rows[:80])
     block = routing.doctor_block(END)
     assert block["log"]["level"] == "yellow" and block["log"]["lines"] == 80 and block["log"]["bytes"] > 0
-    assert any("80 lines" in w for w in block["warnings"])
+    # A record compaction cannot shrink is a fact for an agent, not a warning, at a harmless size.
+    assert not any("80 lines" in w for w in block["warnings"]) and "80 lines" in block["log"]["note"]
     _install(rows)
     block = routing.doctor_block(END)
     assert block["log"]["level"] == "red" and block["log"]["lines"] == len(rows)

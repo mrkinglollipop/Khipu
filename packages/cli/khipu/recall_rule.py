@@ -127,6 +127,12 @@ def cwd_search_term(cwd: str | None) -> str:
 _START_IS_JOB: contextvars.ContextVar[bool] = contextvars.ContextVar("khipu_start_is_job", default=False)
 
 
+# The session being started (its hook payload's id), for the one call
+# session_start_main makes: the start line names only that conversation's own
+# routing directions, so a resume hears of its own and a new session hears of none.
+_START_SESSION: contextvars.ContextVar[str] = contextvars.ContextVar("khipu_start_session", default="")
+
+
 def session_start_context(cwd: str | None = None) -> str:
     """RULE_MD plus a fail-open pushed slice. Never raises."""
     body = RULE_MD.strip()
@@ -366,7 +372,7 @@ def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
             try:
                 from khipu import routing_directions
 
-                direction_ids = routing_directions.pushed_slice_ids(project)
+                direction_ids = routing_directions.pushed_slice_ids(project, session=_START_SESSION.get())
             except Exception:  # noqa: BLE001 - directions never break the pushed slice
                 direction_ids = []
         if slice_data and (slice_data.get("decisions") or slice_data.get("topics") or slice_data.get("episodes")
@@ -797,10 +803,12 @@ def session_start_main(*, shape: str | None = None) -> None:
             return
         routing = _RoutingAtStart(session_id=sid).begin()
         token = _START_IS_JOB.set(_session_is_job(payload))
+        session_token = _START_SESSION.set(sid or "")
         try:
             memory = session_start_context(cwd)
         finally:
             _START_IS_JOB.reset(token)
+            _START_SESSION.reset(session_token)
         room = hook_shape.budget(want)
         routing_text = routing.text()
         ctx, pushed = (fit_start_context(memory, routing_text) if room == _HOOK_CONTEXT_BUDGET

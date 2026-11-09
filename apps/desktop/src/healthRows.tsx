@@ -366,7 +366,7 @@ export function plansHealthRow(plans: UsageReport | null | undefined, now: Date 
 export function routingHealthRow(view: RouteView | null | undefined, now: Date = new Date()): HealthRow | null {
   if (!view || !Array.isArray(view.accounts)) return null;
   if (!view.record) return { key: "routing", status: "skipped", label: LABELS.routing };
-  const runners = quietRunners(view).map((r) => runnerWords(r, now));
+  const runners = quietRunners(view, now).map((r) => runnerWords(r, now));
   const broken = brokenChecks(view).map((c) => (/[.!?]$/.test(c.text) ? c.text : `${c.text}.`));
   const parts = [...runners];
   const last = lastChangeWords(view, now);

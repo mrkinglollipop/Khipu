@@ -154,9 +154,10 @@ export function HealthChecksCard({
           value={row ? String(row.value) : ""}
           help={
             <>
-              In minutes. The checks for recall before each prompt and for search falling back to keyword-only judge
-              only this window, so a red light from a past network outage clears by itself. Calls made while the
-              database was out of reach are never counted as failures.
+              In minutes. The check for search falling back to keyword-only, and the check that decides whether an
+              update may install, judge only this window, so a red light from a past network outage clears by itself.
+              The recall row in your health report always looks at the last 24 hours, whatever you set here. Calls made
+              while the database was out of reach are never counted as failures.
               {row ? ` Default ${row.default}.` : ""}
             </>
           }
