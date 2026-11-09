@@ -2021,8 +2021,10 @@ _TIME_SHAPE = re.compile(
     r"(?:Z|[+-]\d{2}:?\d{2})?)?\Z")
 _HOME_LIKE = re.compile(
     r"(?:^|[\s\"'(=])~(?:/|$)|/(?:Users|home|private|root)/|^[A-Za-z]:[\\/]")
+# ``unknown`` is the base of an owner's line with no ``via`` that the fold
+# reads as unchecked (``_mark_unchecked``), so that verdict can travel too.
 _VIA_CODES = frozenset({"cli", "app", "mcp", "direction", "check", "seed",
-                        "migration", "runner", "auto", "terminal"})
+                        "migration", "runner", "auto", "terminal", "unknown"})
 _STATE_CODES = frozenset({LIMITED, OPEN, DOWN})
 _KIND_CODES = frozenset({"observation", "owner_rule", "fact"})
 _DEFINITION_CODES = frozenset({"provider", "account", "lane_map"})
@@ -2046,6 +2048,10 @@ _COMMON_FIELDS: dict[str, Any] = {
     "base": "revision_id", "proposal": "id", "op": "id", "revision": "revision_id",
     "written_at": "time", "via": "via", "kind": _KIND_CODES,
     "expires_at": "time",
+    # How an owner's line was authorised where it was written (the app, a
+    # terminal's typed yes, the owner's direction): the other Macs read it
+    # as that Mac's own record says, exactly as they read its ``via``.
+    "auth": "owner_auth",
     # A restore's lines (``_write_batch``): counted only when all are present.
     "batch": "id", "batch_n": "int",
 }
@@ -2168,7 +2174,8 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
     Only the fields named in ``_REPLICATION_FIELDS`` for the event's kind
     are copied, each in its named shape; an unknown kind is dropped
     entirely. The local ``source_id``, evidence text, ``op_body``,
-    ``auth_chain``, seed file names and hashes, account-list digests
+    ``auth_chain`` (an owner's line's ``auth`` travels: a closed code),
+    seed file names and hashes, account-list digests
     (``list_before``/``list_after``) and login bindings never leave the
     Mac. ``written_by`` is reduced to ``{kind, harness, mac}``; project and
     session names are dropped, never hashed into the payload. Owner rule
@@ -3199,19 +3206,40 @@ def _mark_unchecked(events: list[dict]) -> None:
     """From the first owner's line in the file that says how it was
     authorised (written by a Khipu that checks), an owner's line without
     the check its ``via`` calls for (the app's for ``app``, a typed yes for
-    ``cli``; no other ``via`` writes an owner's line) is read with ``via``
-    ending ``-unchecked``: it did not come through the CLI's owner check, so
-    the app's history and doctor show it as odd. Lines before that one were
-    written before the check existed."""
+    ``cli``, the owner's direction for ``direction``; no other ``via``
+    writes an owner's line) is read with ``via`` ending ``-unchecked``: it
+    did not come through the CLI's owner check, so the app's history and
+    doctor show it as odd. Lines before that one were written before the
+    check existed.
+
+    A line from another Mac (``remote``) was judged there, by the record
+    that holds the owner's check, and arrives with that Mac's verdict: its
+    ``auth`` when it passed, its ``via`` ending ``-unchecked`` when it did
+    not (``unchecked_local``). It is read by that verdict, never by this
+    Mac's own record. One that carries neither came from a build that sent
+    no verdict: it is read as written, as lines from before the check are;
+    the Mac that wrote it still judges it."""
     start = next((i for i, e in enumerate(events) if e.get("auth")), None)
     if start is None:
         return
     for event in events[start:]:
         via = event.get("via")
         by = event.get("written_by") or (OWNER if event.get("type") in _OWNER_ONLY else {})
-        if (by.get("kind") == "owner"
-                and (via not in _AUTH_OF_VIA or event.get("auth") != _AUTH_OF_VIA[via])):
+        if by.get("kind") != "owner":
+            continue
+        if event.get("remote") and (not event.get("auth") or str(via).endswith("-unchecked")):
+            continue
+        if via not in _AUTH_OF_VIA or event.get("auth") != _AUTH_OF_VIA[via]:
             event["via"] = f"{via or 'unknown'}-unchecked"
+
+
+def unchecked_local() -> dict[str, str]:
+    """This Mac's own lines that the fold reads as unchecked
+    (``_mark_unchecked``), by id, with the ``via`` it reads them by. The copy
+    sends each so, and every other Mac reads the verdict this one holds."""
+    events, _bad = _read_all_events()
+    return {e["id"]: e["via"] for e in events
+            if not e.get("remote") and isinstance(e.get("id"), str) and str(e.get("via")).endswith("-unchecked")}
 
 
 def _stamp_locked(clock: datetime, count: int = 1, *, events: list[dict] | None = None) -> list[dict]:
