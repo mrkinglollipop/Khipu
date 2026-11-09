@@ -10245,7 +10245,7 @@ def _current_line(entity: str, view: dict, now: datetime) -> str:
 # ---- doctor ---------------------------------------------------------------------------
 
 
-def _rules_block(view: dict, text: dict | None, cfg: dict) -> dict:
+def _rules_block(view: dict, text: dict | None, cfg: dict, *, paged: bool = False) -> dict:
     """Doctor's row for the size of the owner's rules and note: stored words
     past their write-time limits (they keep working), how many rules the
     summary shows, and what a session start gets: ``full``, ``lean`` (the
@@ -10275,7 +10275,8 @@ def _rules_block(view: dict, text: dict | None, cfg: dict) -> dict:
     if left_out or covered:
         what = [f"{left_out} of {len(rules)} standing rules"] if left_out else []
         what += ["your note"] if "note" in covered else []
-        warnings.append(f"The summary at the start of a conversation shows only part of your words ({' and '.join(what)} "
+        who = "The summary subagents get shows" if paged else "The summary at the start of a conversation shows"
+        warnings.append(f"{who} only part of your words ({' and '.join(what)} "
                         f"left to read with khipu_route) to keep within {cfg['routing_rules_chars']:,} characters "
                         "(routing_rules_chars).")
     mode = "full"
@@ -10320,10 +10321,23 @@ def doctor_block(now: datetime | None = None) -> dict:
             if began and after and (now - began).total_seconds() > after:
                 warnings.append(f"Sources have disagreed about {name} for more than {_span(after)}.")
     text = summary(view, now=now) if view.get("record") else None
+    from khipu import routing_page, routing_page_file
+
+    # With the page on, a conversation gets the page; the older summary goes
+    # to subagents only, so its warnings say so and the page gets its own.
+    paged = routing_page_file.enabled()
     if text and text["dropped"]:
-        warnings.append(f"The summary had to leave out {text['dropped']} lines.")
-    rules_block = _rules_block(view, text, cfg)
+        warnings.append(f"The summary subagents get had to leave out {text['dropped']} lines." if paged
+                        else f"The summary had to leave out {text['dropped']} lines.")
+    rules_block = _rules_block(view, text, cfg, paged=paged)
     warnings += rules_block.pop("warnings")
+    if paged and view.get("record"):
+        cut = routing_page.left_out(view, now)
+        if cut:
+            total = sum(n for _head, n in cut)
+            warnings.append(f"The routing page left out {total} of your rule line{'s' if total != 1 else ''} to fit "
+                            f"its {routing_page.LIMIT:,} characters (from {', '.join(h for h, _n in cut)}); "
+                            "conversations read them with khipu_route. Shorten your roles, exceptions or rules.")
     if view.get("outside_app"):
         warnings.append("A rule, a pause, a clear, your note or your priority was written by something other than "
                         "the app.")

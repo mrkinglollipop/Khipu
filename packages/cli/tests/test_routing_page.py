@@ -155,7 +155,7 @@ def test_a_record_with_todays_long_roles_and_rules_still_fits_and_keeps_every_ac
     assert "HOLD BACK" in _line(text, "Codex") and "ceiling 95%" in _line(text, "Codex")
     assert "NO JOBS until" in _line(text, "Grok") and "up to 90%" in _line(text, "Grok")
     assert "NEARLY OUT" in _line(text, "Kimi") and "SECOND OPINIONS ONLY" in _line(text, "Muse")
-    assert re.search(r"\d+ more rule lines: run `khipu route --full`", text)
+    assert re.search(r"\d+ more rule lines \(cut from [A-Z ,]+\): run `khipu route --full`", text)
 
 
 def test_the_limit_holds_even_when_the_accounts_alone_would_not_fit():
@@ -163,6 +163,113 @@ def test_the_limit_holds_even_when_the_accounts_alone_would_not_fit():
     for entry in view["accounts"]:
         entry["caps"] = entry["caps"] * 12
     assert len(_page(view)) <= 4500
+
+
+# ---- standing rules outrank exceptions for space ----------------------------------------------
+
+RULES_10 = [
+    "WHICH MODEL: " + "Opus: scopes, designs, rulings and the hardest code; Sonnet: most coding. " * 3,
+    "WHICH MODEL: " + "Codex Sol: cross-family checks, narrow re-checks and a few builds. " * 3,
+    "NEVER: " + "Grok, GLM, DeepSeek or Kimi on privacy, safety, sign-in, permission or money code. " * 3,
+    "NEVER: " + "A key's value to any model; portfolio data to anyone but the finance model. " * 3,
+    "CHECKS: " + "Cursor Auto may build sensitive code; Claude or Codex checks each result. " * 3,
+    "CHECKS: " + "A lane never confirms its own verdict; the last check before merge is cross-family. " * 3,
+    "MACS: " + "Before a job, compare load per core and start on the lower; both high: queue it. " * 3,
+    "Resets: " + "A reset is never pressed to make room; plan around the real reset time. " * 3,
+    "Reviews: " + "Findings go back to a builder with the exact fix, never a paraphrase. " * 3,
+    "Cost: " + "Pick the cheapest model that does the job well; quality wins ties. " * 3,
+]
+
+
+def _exception(n, *, ago_hours, until_days=2, text=None):
+    return {"id": f"x{n:08x}", "text": text or f"Exception number {n}: " + "use it only when the work really needs it, "
+            "and say why in one line. " * 4, "until": _iso(NOW + timedelta(days=until_days)),
+            "at": _iso(NOW - timedelta(hours=ago_hours)), "by": "owner"}
+
+
+def _with_exceptions(view, counts):
+    for entry in view["priority"]["entries"]:
+        label = entry["label"]
+        for n in range(counts.get(label, 0)):
+            entry.setdefault("exceptions", []).append(_exception(n + 1, ago_hours=10 + n))
+    return view
+
+
+def _rules_of(view):
+    return [text for _head, text in routing_page._rules(view)]
+
+
+def test_six_exceptions_on_one_account_never_cost_the_page_a_rule_line():
+    view = _with_exceptions(_view(rules=RULES_10), {"Codex": 6, "Grok": 3})
+    assert 2000 < sum(len(t) for t in _rules_of(view)) < 3000
+    text = _page(view)
+    assert len(text) <= routing_page.LIMIT
+    for rule in _rules_of(view):
+        assert rule in text, rule[:40]
+    assert "more rule lines" not in text
+    assert routing_page.left_out(view, NOW) == []
+
+
+def test_only_the_two_newest_exceptions_show_and_older_ones_collapse_to_a_count():
+    view = _with_exceptions(_view(), {"Codex": 6})
+    # Written out of order: the newest is the one whose `at` is latest.
+    view["priority"]["entries"][0]["exceptions"].reverse()
+    codex = _line(_page(view), "Codex")
+    assert codex.count("Exception until") == 2
+    assert "Exception number 1:" in codex and "Exception number 2:" in codex  # newest (ago 10h, 11h)
+    for old in (3, 4, 5, 6):
+        assert f"Exception number {old}:" not in codex
+    assert "+4 older: khipu route --full" in codex
+    assert "older" not in _line(_page(_with_exceptions(_view(), {"Grok": 2})), "Grok")
+
+
+def test_an_ended_exception_is_never_shown_or_counted():
+    view = _with_exceptions(_view(), {"Codex": 3})
+    view["priority"]["entries"][0]["exceptions"][0]["until"] = _iso(NOW - timedelta(minutes=1))
+    codex = _line(_page(view), "Codex")
+    assert "Exception number 1:" not in codex and "Exception number 2:" in codex and "older" not in codex
+
+
+def test_exception_text_gives_way_before_any_rule_line_is_touched():
+    long = "an exception quote that goes on and on about one more temporary thing " * 3
+    view = _view(rules=RULES_10)
+    for entry in view["priority"]["entries"]:
+        entry["exceptions"] = [_exception(n, ago_hours=n, text=long) for n in range(1, 7)]
+    text = _page(view)
+    assert len(text) <= routing_page.LIMIT
+    for rule in _rules_of(view):
+        assert rule in text
+    # Every account line still says it has exceptions, as a count at the least.
+    for label in ("Codex", "Grok", "Claude", "Muse"):
+        assert "khipu route --full" in _line(text, label)
+
+
+def test_a_rule_line_goes_only_when_the_page_cannot_fit_even_with_bare_counts_and_the_page_names_the_headings():
+    rules = RULES_10 + [f"Rule {i}: " + "A standing rule that runs on in full sentences. " * 12 for i in range(8)]
+    view = _with_exceptions(_view(rules=rules), {"Codex": 6})
+    text = _page(view)
+    assert len(text) <= routing_page.LIMIT
+    cut = routing_page.left_out(view, NOW)
+    assert cut and sum(n for _h, n in cut) == len(rules) - sum(1 for t in _rules_of(view) if t in text)
+    assert cut[-1][0] == "RULES"
+    footer = next(ln for ln in text.splitlines() if "more rule lines" in ln)
+    assert "RULES" in footer and "khipu route --full" in footer
+    # The lines that stay are the top ones, whole.
+    kept = [t for t in _rules_of(view) if t in text]
+    assert kept == _rules_of(view)[: len(kept)]
+
+
+def test_the_signature_moves_when_an_exception_is_added_or_ends_even_one_collapsed_into_the_count():
+    base = _with_exceptions(_view(), {"Codex": 3})
+    sig = routing_page.signature(base, NOW)
+    older = copy.deepcopy(base)  # an older exception: collapsed on the page, still in the signature
+    older["priority"]["entries"][0]["exceptions"].append(_exception(9, ago_hours=500))
+    assert "+2 older" in _line(_page(older), "Codex") and "+1 older" in _line(_page(base), "Codex")
+    assert routing_page.signature(older, NOW) != sig
+    ended = copy.deepcopy(base)
+    ended["priority"]["entries"][0]["exceptions"][2]["until"] = _iso(NOW - timedelta(minutes=1))  # a collapsed one
+    assert routing_page.signature(ended, NOW) != sig
+    assert routing_page.signature(copy.deepcopy(base), NOW) == sig
 
 
 # ---- every fact prints on its own account's line --------------------------------------------
