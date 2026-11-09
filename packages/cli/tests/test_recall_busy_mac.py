@@ -74,6 +74,11 @@ class ClientAnswerTimeoutTest(unittest.TestCase):
         # shell, the interpreter's start and the output.
         self.assertLessEqual(client.BUSY_ANSWER_TIMEOUT_S + 0.4, integrations.PROMPT_RECALL_TIMEOUT)
 
+    def test_the_promotion_gate_still_measures_the_one_shot_limit(self) -> None:
+        from khipu import promote
+
+        self.assertEqual(promote.RECALL_BUDGET_MS, rp.TIMEOUT_S * 1000)
+
 
 class BusyDeadlineTest(unittest.TestCase):
     def test_a_usual_deadline_answers_keyword_only_as_before(self) -> None:

@@ -71,11 +71,11 @@ TIMEOUT_S = 1.2
 # BUSY_ANSWER_TIMEOUT_S 2.2 s against 1.6 s), and the search may use that
 # time up to BUSY_TIMEOUT_S, keeping ANSWER_MARGIN_S for the answer to reach
 # the client (1.6 - 0.4 is TIMEOUT_S). The owner would rather a prompt wait a
-# second longer and get its memory: on the M5 at load 60 to 400 a replica
-# write's commit or a reload of the vectors after one held the search past
-# 1.2 s on 72 of 100 prompts (2026-11-09). The harness stops the hook at 3 s,
-# so 0.8 s stays for the shell, the client's start and the output. The
-# one-shot path, which also pays for starting Python, keeps TIMEOUT_S.
+# second longer and get its memory: on the M5 at load 60 to 400, 72 of 100
+# searched prompts got nothing back by 1.2 s (2026-11-09). The harness stops
+# the hook at 3 s, so 0.8 s stays for the shell, the client's start and the
+# output. A search with no deadline from the client (the one-shot hook with
+# the service down, and so the promotion gate's replays) keeps TIMEOUT_S.
 BUSY_TIMEOUT_S = 1.8
 ANSWER_MARGIN_S = 0.4
 
