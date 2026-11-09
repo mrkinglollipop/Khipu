@@ -1818,6 +1818,10 @@ def _record_read(view: dict, *, rules: bool = False, priority: bool = False) -> 
         return
 
 
+# A read narrowed with `account` carries no rules and is no receipt for them.
+_READ_AGAIN = ("this conversation was not shown that revision; read khipu_route full=true again, "
+               "without `account`")
+
 def _observed_base(entity: str, *, base=None, expect=None) -> str:
     if not isinstance(base, str) or not base.strip():
         raise RouteError("base must be the owner revision the request was prepared against")
@@ -1826,12 +1830,12 @@ def _observed_base(entity: str, *, base=None, expect=None) -> str:
     if base not in revisions:
         if not conversation_author().get("session"):
             raise RouteError("this connection has not read that owner revision through this MCP server; "
-                             "read khipu_route full=true on this connection before proposing")
-        raise RouteError("this conversation was not shown that revision; read khipu_route full=true again")
+                             "read khipu_route full=true (without `account`) on this connection before proposing")
+        raise RouteError(_READ_AGAIN)
     if expect is not None:
         observed = (data.get("priority_versions") or {}).get(str(expect).strip())
         if observed != base:
-            raise RouteError("this conversation was not shown that revision; read khipu_route full=true again")
+            raise RouteError(_READ_AGAIN)
     return base
 
 
@@ -11304,8 +11308,10 @@ def only_account_part(out: dict, key: str) -> dict:
         part["proposals"] = {k: v for k, v in proposals.items() if names(v)}
     elif isinstance(proposals, list):
         part["proposals"] = [p for p in proposals if names(p)]
+    # A hold on all work or on the Mac binds this account too: only a hold
+    # that names another account is left out.
     part["holds"] = [h for h in part.get("holds") or [] if isinstance(h, dict)
-                     and ((h.get("scope") or {}).get("kind") == "all"
+                     and ((h.get("scope") or {}).get("kind") != "account"
                           or (h.get("scope") or {}).get("account") in ids)]
     if "unmatched" in part:
         part["unmatched"] = [u for u in part["unmatched"] or [] if isinstance(u, dict)
@@ -11389,8 +11395,9 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
     out["providers"] = list((view.get("definitions") or {}).get("providers", {}).values())
     out["sources"] = _public_sources(view.get("sources"))
     out["holds"] = [_public_hold(h, now) for h in view.get("holds") or []
-                    if key is None or h["scope"].get("kind") == "all"
-                    or (h["scope"].get("kind") == "account" and h["scope"].get("account") == key)]
+                    # A hold on all work or on the Mac binds every account here.
+                    if key is None or h["scope"].get("kind") != "account"
+                    or h["scope"].get("account") == key]
     if key is None:
         from khipu import agent_view
 

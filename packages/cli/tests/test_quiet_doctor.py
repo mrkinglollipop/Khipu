@@ -152,3 +152,10 @@ def test_the_priority_line_stays_when_the_plan_is_not_nearly_used_up():
 def test_the_priority_line_stays_for_another_account():
     plans = {"accounts": [{"account": "Claude", "used_pct": 99.0}]}
     assert cli._without_repeated_limit([FIRST], plans) == [FIRST]
+
+
+def test_a_paused_or_down_first_account_is_still_said_when_its_plan_is_nearly_used_up():
+    plans = {"accounts": [{"account": "Codex", "used_pct": 100.0}]}
+    paused = "The first account in your priority, Codex, is paused by you."
+    down = "The first account in your priority, Codex, is down: out of service."
+    assert cli._without_repeated_limit([paused, down, FIRST], plans) == [paused, down]

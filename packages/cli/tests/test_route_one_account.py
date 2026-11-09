@@ -67,3 +67,15 @@ def test_the_command_line_narrows_the_same_way(home, capsys):
     assert cli.main(["route", "--json"]) == 0
     whole = json.loads(capsys.readouterr().out)
     assert len(whole["accounts"]) > 1 and whole["rules"]
+
+
+def test_a_hold_on_the_mac_stays_in_one_accounts_answer(home):
+    _record()
+    routing.add_hold("no jobs on this Mac tonight", reason="other", scope="machine", owner=True, via="app")
+    part = _route(account="Codex", full=True)
+    assert sorted(h["text"] for h in part["holds"]) == [
+        "keep Codex for reviews", "keep everything calm", "no jobs on this Mac tonight"]
+
+
+def test_the_refusal_after_a_narrow_read_says_to_read_without_account():
+    assert "without `account`" in routing._READ_AGAIN

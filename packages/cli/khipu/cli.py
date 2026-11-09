@@ -561,12 +561,13 @@ def _fold_gateway_liveness(liveness: dict, gw_liveness: dict, aegis_gw: dict) ->
 def _without_repeated_limit(routing_warnings: list[str], plan_usage: dict) -> list[str]:
     """The routing warnings, less "The first account in your priority, X, is
     limited ..." when the plan warning "Plan nearly used up: X ..." already
-    says X is at its limit: the owner reads it once."""
+    says X is at its limit: the owner reads it once. Only the limit repeats
+    the plan warning; "paused by you" and "down" say something else and stay."""
     from khipu import usage as _usage
 
     full = {a.get("account") for a in plan_usage.get("accounts") or []
             if isinstance(a, dict) and (a.get("used_pct") or 0) >= _usage.ALERT_PCT}
-    drop = tuple(f"The first account in your priority, {label}, is " for label in full if label)
+    drop = tuple(f"The first account in your priority, {label}, is limited" for label in full if label)
     return [w for w in routing_warnings if not (drop and w.startswith(drop))]
 
 
