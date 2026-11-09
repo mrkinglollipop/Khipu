@@ -37,6 +37,17 @@ rsync -a \
   --exclude '.ruff_cache' \
   "$ROOT/packages/cli/" "$OUT/packages/cli/"
 
+# The bundle has no git, so the commit it was built from goes into the bundle
+# itself (read by khipu.build_info: `khipu --version`, doctor, the promote's
+# version line). Written before the signing steps, so it is sealed with the rest.
+# Without git here the file is left out and the build says "commit unknown".
+BUILD_COMMIT="$(git -C "$ROOT" rev-parse --short=8 HEAD 2>/dev/null || true)"
+if [[ "$BUILD_COMMIT" =~ ^[0-9a-f]{7,40}$ ]]; then
+  printf '%s\n' "$BUILD_COMMIT" >"$OUT/BUILD_COMMIT"
+else
+  echo "warning: no git commit to stamp into the bundle; it will report 'commit unknown'" >&2
+fi
+
 rsync -a "$ROOT/ops/migrations/" "$OUT/ops/migrations/"
 cp "$ROOT/ops/docker/Dockerfile.pgvector" "$OUT/ops/docker/Dockerfile.pgvector"
 

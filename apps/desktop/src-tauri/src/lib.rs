@@ -646,6 +646,17 @@ async fn khipu_embed_backfill() -> Result<String, String> {
 /// `khipu_embed_backfill` and `khipu_migrate`.
 const JOBS_REFRESH_ARGV: &[&str] = &["jobs", "refresh"];
 
+/// Bring the hooks Khipu already wired into Claude Code and Cursor up to what
+/// this build installs (`khipu integrations refresh`, no arguments), run at
+/// every launch right after the jobs refresh. A new build's launch is the first
+/// moment its hook rules can be applied (nothing else re-runs `integrations
+/// install`), and a launch of an unchanged build finds nothing to change and
+/// writes nothing. It never installs into a harness with no Khipu hook, and it
+/// never rewrites Codex's hooks (Codex stops running a changed hook until the
+/// owner reviews it); the CLI side enforces both. A fixed argv, like the jobs
+/// refresh: `integrations` stays one subcommand the webview names itself.
+const HOOKS_REFRESH_ARGV: &[&str] = &["integrations", "refresh"];
+
 #[tauri::command]
 async fn khipu_jobs_refresh() -> Result<String, String> {
     run_khipu_cli_async(JOBS_REFRESH_ARGV.iter().map(|s| s.to_string()).collect()).await
@@ -5570,6 +5581,22 @@ pub fn run() {
                         eprintln!("[khipu-jobs] refresh failed: {e}");
                     }
                 }
+                // After a new build the harnesses' hook lists may be older
+                // than this build installs; one after the other, never both
+                // at once.
+                match run_khipu_cli_async(
+                    HOOKS_REFRESH_ARGV.iter().map(|s| s.to_string()).collect(),
+                )
+                .await
+                {
+                    Ok(out) => {
+                        let snippet: String = out.chars().take(200).collect();
+                        eprintln!("[khipu-hooks] refresh: {snippet}");
+                    }
+                    Err(e) => {
+                        eprintln!("[khipu-hooks] refresh failed: {e}");
+                    }
+                }
             });
 
             let handle = app.handle().clone();
@@ -5900,6 +5927,14 @@ mod run_khipu_guard_tests {
         use super::JOBS_REFRESH_ARGV;
         assert_eq!(JOBS_REFRESH_ARGV, &["jobs", "refresh"]);
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"jobs"));
+    }
+
+    #[test]
+    fn the_launch_hooks_refresh_is_a_fixed_argv_that_only_refreshes() {
+        // Never `integrations install`: a first install is the owner's choice,
+        // and the CLI's refresh leaves a harness with no Khipu hook alone.
+        use super::HOOKS_REFRESH_ARGV;
+        assert_eq!(HOOKS_REFRESH_ARGV, &["integrations", "refresh"]);
     }
 
     #[test]

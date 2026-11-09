@@ -135,7 +135,12 @@ _CODE_FACTS = (
     "    disk = json.loads(meta.read_text(encoding='utf-8')).get('schema_version')\n"
     "except (OSError, ValueError):\n"
     "    pass\n"
-    "print(json.dumps({'version': khipu.__version__, 'schema': h.SNAPSHOT_SCHEMA_VERSION,"
+    "try:\n"
+    "    from khipu import build_info\n"
+    "    stamp = build_info.stamp()\n"
+    "except Exception:\n"
+    "    stamp = None\n"
+    "print(json.dumps({'version': khipu.__version__, 'stamp': stamp, 'schema': h.SNAPSHOT_SCHEMA_VERSION,"
     " 'disk_schema': disk, 'replica': str(h.snapshot_path())}))\n"
 )
 
@@ -1446,6 +1451,19 @@ def _code_facts(root: Path) -> dict[str, Any]:
     return out if isinstance(out, dict) else {"error": "unexpected output"}
 
 
+def _build_label(facts: dict[str, Any], root: Path) -> str:
+    """``0.4.15 (25718b62)`` for the code at ``root``: its own stamp when it
+    has one, else the version with the commit git reports for a checkout (older
+    code has no stamp), else ``commit unknown``."""
+    if facts.get("stamp"):
+        return str(facts["stamp"])
+    short = None
+    if (Path(root) / ".git").exists():
+        head = _head(Path(root))
+        short = head[:8] if head else None
+    return f"{facts.get('version')} ({short or 'commit unknown'})"
+
+
 def _version_tuple(text: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", str(text or ""))[:3]) or (0,)
 
@@ -1466,9 +1484,9 @@ def gate_version(candidate: Path) -> tuple[bool, str]:
             return False, f"live: {live['error']}"
         if _version_tuple(cand["version"]) < _version_tuple(live["version"]):
             return False, f"candidate {cand['version']} is older than live {live['version']}"
-        parts.append(f"version {live['version']} -> {cand['version']}")
+        parts.append(f"version {_build_label(live, live_root)} -> {_build_label(cand, Path(candidate))}")
     else:
-        parts.append(f"version {cand['version']} (no live code to compare)")
+        parts.append(f"version {_build_label(cand, Path(candidate))} (no live code to compare)")
     disk, want = cand.get("disk_schema"), cand.get("schema")
     if disk is None:
         parts.append("no replica on disk")
@@ -1620,6 +1638,27 @@ def _before_flip() -> dict[str, Any] | None:
     return precompile(live) if live is not None else None
 
 
+def _refresh_hooks(live: Path, env: dict[str, str]) -> dict[str, Any]:
+    """Bring the hooks already wired into Claude Code and Cursor up to the code
+    just made live (``khipu integrations refresh``), run by that code so it
+    applies its own rules, not those of the process that started this promote.
+    Codex is only reported: it stops running a changed hook until the owner
+    reviews it. Never raises and never fails a promotion: a problem comes back
+    as ``{"ok": False, "error": ...}`` and is printed with the result."""
+    try:
+        r = _run([_hook_python(), "-m", "khipu", "integrations", "refresh"], env=env, timeout=120)
+        try:
+            res = json.loads(r.stdout or "")
+        except ValueError:
+            res = None
+        if not isinstance(res, dict) or "harnesses" not in res:
+            return {"ok": False, "error": _tail(r.stderr or r.stdout) or f"integrations refresh exited {r.returncode}"}
+        res["ok"] = r.returncode == 0 and res.get("ok") is True
+        return res
+    except Exception as exc:  # noqa: BLE001 — a refresh problem is reported, never raised
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _after_flip() -> dict[str, Any]:
     """Re-render any plist the new live code renders differently, restart
     the two long-running jobs that hold the old modules, then wake the
@@ -1648,6 +1687,7 @@ def _after_flip() -> dict[str, Any]:
             refreshed["error"] = _tail(r.stderr or r.stdout) or f"jobs refresh exited {r.returncode}"
         out["jobs_refresh"] = {k: refreshed.get(k) for k in ("ok", "refreshed", "current", "external", "error", "results")
                                if k in refreshed}
+        out["hooks_refresh"] = _refresh_hooks(live, env)
     uid = os.getuid()
     for label in (PLIST_QUEUE_DRAIN, PLIST_RECALL_DAEMON):
         if not _plist_path(label).is_file():
@@ -1953,6 +1993,25 @@ def status() -> dict[str, Any]:
     }
 
 
+def _hooks_lines(after: dict[str, Any]) -> list[str]:
+    """What the hook refresh after a flip did, one line each: a file changed
+    and what changed, a failure (which never failed the promote), Codex waiting
+    on the owner."""
+    res = after.get("hooks_refresh")
+    if res is None:
+        return []
+    try:
+        from khipu.integrations import format_hook_refresh
+
+        lines = format_hook_refresh(res)
+    except Exception as exc:  # noqa: BLE001 — printing the result must not fail it
+        lines = [f"hooks refresh result could not be printed: {type(exc).__name__}: {exc}"]
+    if not res.get("ok"):
+        lines.insert(0, "hooks refresh failed (the promote itself is not affected)"
+                        + (f": {res['error']}" if res.get("error") else ""))
+    return lines
+
+
 def format_result(out: dict[str, Any]) -> str:
     """Plain-text rendering of a promote / rollback / gate-only / status result."""
     lines = []
@@ -1997,12 +2056,14 @@ def format_result(out: dict[str, Any]) -> str:
             after = out.get("after") or {}
             if after.get("kick_failed"):
                 lines.append(f"kickstart failed: {after['kick_failed']}")
+            lines.extend(_hooks_lines(after))
     else:
         lines.append(f"not done: {out.get('error')}")
         for result in ((out.get("after") or {}).get("jobs_refresh") or {}).get("results") or []:
             if not result.get("ok"):
                 lines.append(f"  {result.get('job') or 'job'} failed: {result.get('error') or result}")
         if out.get("live_changed"):
+            lines.extend(_hooks_lines(out.get("after") or {}))
             lines.append(f"live is now {Path(out['slot']).name}; deployment is partial. {MCP_NOTE}")
         elif action == "promote":
             lines.append("live is unchanged")

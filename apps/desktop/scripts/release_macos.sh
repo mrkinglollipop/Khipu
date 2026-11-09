@@ -329,6 +329,15 @@ if [[ ! -d "$BUNDLE" ]]; then
   exit 1
 fi
 
+# Say which commit this app is in its Info.plist too (the bundled CLI reads the
+# same commit from khipu-resources/BUILD_COMMIT, written by bundle_cli.sh). Done
+# before the re-sign below, which seals it.
+if [[ -f "$DESKTOP/khipu-resources/BUILD_COMMIT" ]]; then
+  BUILD_COMMIT="$(tr -d '[:space:]' <"$DESKTOP/khipu-resources/BUILD_COMMIT")"
+  /usr/libexec/PlistBuddy -c "Delete :KhipuBuildCommit" "$BUNDLE/Contents/Info.plist" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Add :KhipuBuildCommit string $BUILD_COMMIT" "$BUNDLE/Contents/Info.plist"
+fi
+
 # Tauri signs the outer .app; nested Resources Mach-O still need Developer ID
 # + timestamp (notary Invalid without this). Re-sign inside-out, then rebuild
 # the DMG so the image matches the sealed .app.
