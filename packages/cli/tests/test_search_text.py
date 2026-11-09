@@ -37,6 +37,48 @@ class TokenHitCountTest(unittest.TestCase):
         self.assertEqual(token_hit_count("earth art", ["art"]), 1)
         self.assertEqual(token_hit_count("earth", ["art"]), 0)
 
+    def test_a_later_whole_word_counts_after_an_inner_one(self) -> None:
+        self.assertEqual(token_hit_count("earth, then art", ["art"]), 1)
+        self.assertEqual(token_hit_count("earth_art art_ x", ["art"]), 1)  # the underscore is a boundary
+        self.assertEqual(token_hit_count("art2 2art éart", ["art"]), 0)  # digits and letters are not
+
+
+class NamesMatchesTheWordBoundaryPatternTest(unittest.TestCase):
+    """``_names`` finds a word with ``str.find`` instead of the lookbehind
+    pattern that cost about 0.3 s of CPU per prompt; it must answer exactly
+    what the pattern answers, for every kind of character."""
+
+    @staticmethod
+    def _pattern(blob: str, tok: str) -> bool:
+        import re
+
+        from khipu import search_text
+
+        if search_text._CJK_RE.search(tok):
+            return tok in blob
+        return re.search(search_text._WORD_BOUNDARY.format(tok=re.escape(tok)), blob) is not None
+
+    def test_random_text_in_every_script_agrees_with_the_pattern(self) -> None:
+        import random
+
+        from khipu.search_text import _names
+
+        alphabet = list("ab_ -.1\n") + ["\u00b2", "\u0663", "\u00e9", "\u00c9", "\u0301", "\u0131",
+                                          "\u6f22", "\U0001d7d8", "\u01c5"]
+        rnd = random.Random(20261109)
+        for _ in range(50_000):
+            blob = "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 12)))
+            tok = "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 3)))
+            self.assertEqual(_names(blob, tok), self._pattern(blob, tok), (blob, tok))
+
+    def test_the_word_class_is_str_isalnum(self) -> None:
+        import re
+
+        word = re.compile(r"[^\W_]")
+        for code in range(0x110000):
+            ch = chr(code)
+            self.assertEqual(word.match(ch) is not None, ch.isalnum(), hex(code))
+
 
 class HybridRerankTest(unittest.TestCase):
     def test_recap_chip_query_lifts_the_lexical_hit(self) -> None:
