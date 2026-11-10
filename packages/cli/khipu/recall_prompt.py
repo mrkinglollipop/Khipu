@@ -4075,11 +4075,14 @@ def prompt_routing_budget_rate(*, now: datetime | None = None, warn_pct: float =
     """The share of recent prompts whose routing read was skipped for lack
     of time (``ROUTING_OUT_OF_TIME``: ``skipped`` in all, and each of them
     apart), over the last ``_ROUTING_RATE_MAX_CALLS`` prompts with the push
-    on in the last 7 days. ``warn`` when more than ``warn_pct`` percent of
-    20 or more did (0: never warn). Missing telemetry reports
+    on in the last 24 hours (the same window as the prompt-recall row, so a
+    quiet Mac does not report last week's failures as current). Fewer than 20
+    such prompts is no rate: ``rate_pct`` stays None and ``message`` says
+    "not enough recent prompts to tell". ``warn`` when more than ``warn_pct``
+    percent of 20 or more did (0: never warn). Missing telemetry reports
     ``available: False``."""
     now = now or datetime.now(timezone.utc)
-    cutoff = now.timestamp() - _OUTCOMES_WINDOW_S
+    cutoff = now.timestamp() - _OUTCOMES_OWNER_WINDOW_S
     out: dict[str, Any] = {"available": False, "count": 0, "skipped": 0, "skipped_budget": 0,
                            "skipped_fold_busy": 0, "skipped_busy": 0, "skipped_starting": 0, "rate_pct": None,
                            "warn_pct": warn_pct, "warn": False}
@@ -4110,7 +4113,11 @@ def prompt_routing_budget_rate(*, now: datetime | None = None, warn_pct: float =
     out.update(available=True, count=len(statuses), skipped=skipped, skipped_budget=each["skipped:budget"],
                skipped_fold_busy=each["skipped:fold-busy"], skipped_busy=each["skipped:busy"],
                skipped_starting=each["skipped:starting"])
-    if statuses:
+    if len(statuses) >= _ROUTING_RATE_MIN_CALLS:
         out["rate_pct"] = round(100.0 * skipped / len(statuses), 2)
+    else:
+        out["insufficient"] = True
+        out["message"] = (f"not enough recent prompts to tell ({len(statuses)} with routing on in the last "
+                          f"{_OUTCOMES_OWNER_WINDOW_S // 3600} hours; {_ROUTING_RATE_MIN_CALLS} are needed)")
     out["warn"] = bool(warn_pct and len(statuses) >= _ROUTING_RATE_MIN_CALLS and out["rate_pct"] > warn_pct)
     return out

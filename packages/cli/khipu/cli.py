@@ -520,7 +520,7 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     }
 
 
-def _hook_wiring_block() -> dict:
+def _hook_wiring_block(*, ask_codex: bool = False) -> dict:
     """The doctor row for the hooks each harness has wired: current, or behind
     this version, with the fix. Warning-level only: it is never in `ok`, since
     the promote gate runs doctor on the candidate and a stale hook list must
@@ -528,7 +528,7 @@ def _hook_wiring_block() -> dict:
     try:
         from khipu import integrations as integ
 
-        return integ.hook_wiring_report()
+        return integ.hook_wiring_report(ask_codex=True) if ask_codex else integ.hook_wiring_report()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         return {"harnesses": [], "ok": False, "error": f"{type(e).__name__}: {e}",
                 "warnings": [f"could not compare the wired hooks with this version ({type(e).__name__}: {e})"]}
@@ -558,17 +558,37 @@ def _fold_gateway_liveness(liveness: dict, gw_liveness: dict, aegis_gw: dict) ->
             liveness["ok"] = False
 
 
-def _without_repeated_limit(routing_warnings: list[str], plan_usage: dict) -> list[str]:
+def _without_repeated_limit(routing_warnings: list[str], plan_usage: dict,
+                            first: dict | None = None) -> list[str]:
     """The routing warnings, less "The first account in your priority, X, is
     limited ..." when the plan warning "Plan nearly used up: X ..." already
     says X is at its limit: the owner reads it once. Only the limit repeats
-    the plan warning; "paused by you" and "down" say something else and stay."""
+    the plan warning; "paused by you" and "down" say something else and stay.
+
+    The account is compared by identity (harness and login folder, as the
+    usage cache keys it), not by display text: the priority's label and the
+    plan row's label are written by different readers and need not match.
+    ``first`` is the routing block's ``priority.first``; without it the
+    labels are compared, ignoring case."""
     from khipu import usage as _usage
 
-    full = {a.get("account") for a in plan_usage.get("accounts") or []
-            if isinstance(a, dict) and (a.get("used_pct") or 0) >= _usage.ALERT_PCT}
-    drop = tuple(f"The first account in your priority, {label}, is limited" for label in full if label)
-    return [w for w in routing_warnings if not (drop and w.startswith(drop))]
+    def identity(account: dict) -> str | None:
+        if not isinstance(account, dict) or not account.get("harness"):
+            return None
+        try:
+            return _usage._key({"harness": account["harness"], "home": account.get("home")})
+        except Exception:  # noqa: BLE001 - an odd entry is just not matched
+            return None
+
+    full = [a for a in plan_usage.get("accounts") or []
+            if isinstance(a, dict) and (a.get("used_pct") or 0) >= _usage.ALERT_PCT]
+    labels = {str(a.get("account")).casefold() for a in full if a.get("account")}
+    keys = {k for k in map(identity, full) if k}
+    labels_to_drop = set(labels)
+    if first and first.get("label") and identity(first) in keys:
+        labels_to_drop.add(str(first["label"]).casefold())
+    drop = tuple(f"the first account in your priority, {label}, is limited" for label in labels_to_drop)
+    return [w for w in routing_warnings if not (drop and w.casefold().startswith(drop))]
 
 
 def _doctor_rerank() -> tuple[dict, list[str]]:
@@ -952,7 +972,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         claude_homes_block = _integ.claude_homes_report()
     except Exception as e:  # noqa: BLE001
         claude_homes_block = {"homes": [], "error": f"{type(e).__name__}: {e}"}
-    hook_wiring_block = _hook_wiring_block()
+    hook_wiring_block = _hook_wiring_block(ask_codex=True)
     # T3's own files are read-only.  It is omitted entirely when no T3
     # settings file exists, so a normal non-T3 install never gets a phantom
     # provider card.  A malformed settings file still counts as detected: its
@@ -1143,7 +1163,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "promotion": _promotion_block(),
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
         "warnings": (list(plan_usage_block.get("warnings") or [])
-                     + _without_repeated_limit(routing_block.get("warnings") or [], plan_usage_block)
+                     + _without_repeated_limit(routing_block.get("warnings") or [], plan_usage_block,
+                                             (routing_block.get("priority") or {}).get("first"))
                      + list(owner_direction_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
                      + list(schema.get("warnings") or [])
