@@ -4307,6 +4307,9 @@ def cmd_promote(args: argparse.Namespace) -> int:
     if len(chosen) > 1:
         print(json.dumps({"ok": False, "error": "choose one of --rollback, --status, --gate-only, --retry-queued"}))
         return 2
+    if args.apply_migrations and (args.rollback or args.status or args.retry_queued or args.gate_only):
+        print(json.dumps({"ok": False, "error": "--apply-migrations applies to a promotion only"}))
+        return 2
     if (args.rollback or args.status or args.retry_queued) and args.ref:
         print(json.dumps({"ok": False, "error": "a ref applies to a promotion or --gate-only only"}))
         return 2
@@ -4319,7 +4322,7 @@ def cmd_promote(args: argparse.Namespace) -> int:
     elif args.gate_only:
         out = pm.gate_only(args.gate_only, args.ref)
     else:
-        out = pm.promote(args.ref or "origin/main")
+        out = pm.promote(args.ref or "origin/main", apply_migrations=bool(args.apply_migrations))
     if args.json:
         print(json.dumps(out, indent=2, default=str))
     else:
@@ -6611,6 +6614,8 @@ def build_parser() -> argparse.ArgumentParser:
                      metavar="STEP", help="Run one gate step (doctor, recall, capture, version); never flips")
     pmt.add_argument("--retry-queued", action="store_true",
                      help="Run the promotion queued while the hub was out of reach, if the hub answers now")
+    pmt.add_argument("--apply-migrations", action="store_true",
+                     help="Before the gate, apply the database migrations the new code ships (using the new code)")
     pmt.add_argument("--json", action="store_true", help="Print the full result as JSON")
     pmt.set_defaults(func=cmd_promote)
 
