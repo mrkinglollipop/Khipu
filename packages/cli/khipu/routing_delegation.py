@@ -503,7 +503,7 @@ def hook_main(raw: str, environ=None) -> tuple[dict, dict | None, str | None]:
 # noted: a field under any name still marks the job's first turn.
 _BRIEF_FIELDS = {"Agent": ("prompt",), "Task": ("prompt",), "spawn_agent": ("message",)}
 # The field each desktop session tool hands its brief in: noted whatever its
-# length (``owner_turns.note_brief``'s ``short``). Its other text values keep
+# length, and kept eight days (``owner_turns.note_brief``'s ``start``). Its other text values keep
 # the four-word floor, so a title or a name never becomes a brief.
 _START_BRIEF_FIELDS = {"mcp__ccd_session__start_session": "prompt",
                        "mcp__ccd_session__hand_off_to_session": "remaining_plan"}
@@ -558,7 +558,7 @@ def note_brief(payload: dict, env) -> None:
         harness = owner_turns.harness_of(env, payload)
         own = start_brief(payload)
         for brief in briefs_of(payload):
-            owner_turns.note_brief(brief, parent=parent, harness=harness, short=brief == own)
+            owner_turns.note_brief(brief, parent=parent, harness=harness, start=brief == own)
     except Exception:  # noqa: BLE001 - noting a brief never fails the call
         pass
 

@@ -1267,3 +1267,68 @@ def test_desktop_launched_refuses_a_pin_whose_name_the_kernel_does_not_have(monk
     known = _deleted_agent_tree(monkeypatch, lambda agent: [agent])
     known[11] = {**known[11], "name": "bash", "path": "/bin/bash"}
     assert owner_turns.desktop_launched(9) is False
+
+
+# ---- fix round 2: short start briefs match whole turns only; start briefs keep 8 days ----
+
+DAY = 24 * 3600
+
+
+def _age_briefs(seconds: float) -> None:
+    """Every noted brief line, as if noted ``seconds`` before T0."""
+    path = owner_turns.folder() / "briefs.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    path.write_text("".join(json.dumps({**r, "ts": T0 - seconds}) + "\n" for r in rows), encoding="utf-8")
+
+
+def test_a_short_start_brief_over_20_characters_matches_only_the_whole_turn(home, launched, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fork", "title": "Resume", "prompt": "Resume Codex immediately"})
+    typed = _started("please Resume Codex immediately, then pause Grok until 5pm", "owner-typed")
+    assert typed["delegated"] is False and typed["eligible"] is True
+    whole = _started("Resume Codex immediately", "started-whole")
+    assert whole["eligible"] is False
+
+
+def test_a_four_word_start_brief_still_matches_inside_a_longer_turn(home, launched, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    brief = "Resume Codex lanes immediately"
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fork", "title": "Resume", "prompt": brief})
+    turn = _started("some wrapper words " + brief, "wrapped-four")
+    assert turn["delegated"] is True and turn["eligible"] is False
+
+
+def test_a_start_brief_is_kept_eight_days(home, launched, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fresh", "title": "Build", "prompt": BRIEF})
+    _age_briefs(25 * 3600)
+    late = _started(BRIEF, "fresh-late")
+    assert late["eligible"] is False
+    _age_briefs(9 * DAY)
+    assert owner_turns.brief_for(BRIEF, now=T0) is None
+
+
+def test_an_ordinary_brief_is_still_kept_one_day(home, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("Agent", {"prompt": BRIEF, "description": "build"})
+    _age_briefs(25 * 3600)
+    assert owner_turns.brief_for(BRIEF, now=T0) is None
+
+
+def test_noting_an_ordinary_brief_keeps_a_three_day_old_start_brief(home, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fresh", "title": "Build", "prompt": BRIEF})
+    _age_briefs(3 * DAY)
+    other = "Run the capture suite and report the failures back here."
+    owner_turns.note_brief(other, parent="p", harness="claude_code", now=T0)
+    assert owner_turns.brief_for(BRIEF, now=T0) is not None
+    assert owner_turns.brief_for(other, now=T0) is not None
+    # The timer's sweep keeps it too, and drops it once eight days have passed.
+    owner_turns.sweep(now=T0)
+    assert owner_turns.brief_for(BRIEF, now=T0) is not None
+    owner_turns.sweep(now=T0 + 6 * DAY)
+    assert owner_turns.brief_for(BRIEF, now=T0 + 6 * DAY) is None
