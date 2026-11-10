@@ -22,6 +22,8 @@ import {
 import khipuIcon from "./assets/khipu-icon.png";
 import { Sidebar, TabBar, Toolbar, ViewSwitch } from "./shell";
 import { Accounts } from "./accounts/Accounts";
+import { RunningNow } from "./accounts/RunningNow";
+import { useRunning } from "./accounts/running";
 import { Today } from "./today/Today";
 import type { NavItem } from "./shell";
 import {
@@ -2734,6 +2736,9 @@ export default function App() {
   // block nothing (the record is guidance, not a gate).
   // Accounts and routing is its own rail destination; Work shows the accounts too.
   const routing = useRouting(tab === "home" || tab === "work" || tab === "routing");
+  // Accounts view: Room right now or Running now (Order and rules is still its older screen).
+  const [acctView, setAcctView] = useState<"room" | "running" | "rules">("room");
+  const runningNow = useRunning(tab === "routing");
   // Work (docs/plans/2026-10-15-work-view.md, phase 4): the live view, read
   // every few seconds while Work is open and once a minute for the rail
   // badge otherwise. The Owed tab folded into Work as its own section
@@ -3940,7 +3945,7 @@ export default function App() {
       <main className="main" aria-busy={workingLabel != null}>
         {tab === "routing" ? (
           <Toolbar title="Accounts">
-            {/* Running now (slice A5) and Order and rules (A6) open their older screens until they land. */}
+            {/* Order and rules (A6) opens its older screen until it lands. */}
             <ViewSwitch
               label="Accounts view"
               options={[
@@ -3948,8 +3953,8 @@ export default function App() {
                 { id: "running", label: "Running now" },
                 { id: "rules", label: "Order and rules" },
               ]}
-              value="room"
-              onChange={(v) => { if (v === "running") setTab("work"); else if (v === "rules") setTab("routing-old"); }}
+              value={acctView}
+              onChange={(v) => { if (v === "rules") setTab("routing-old"); else setAcctView(v); }}
             />
           </Toolbar>
         ) : toolbarTitle ? <Toolbar title={toolbarTitle} heading={false} /> : null}
@@ -3981,7 +3986,7 @@ export default function App() {
               active={tab === "home" && !showOldHome}
               onOlderHome={() => setShowOldHome(true)}
               onOpen={(link) => {
-                if (link === "running-now") setTab("work"); // until slice A5 lands Running now
+                if (link === "running-now") { setAcctView("running"); setTab("routing"); }
                 else if (link === "accounts") setTab("routing");
                 else if (link === "search") setTab("recall");
                 else setTab("settings");
@@ -5805,13 +5810,15 @@ export default function App() {
 
         <section className={`${panelClass("routing")} ac-panel`}>
           <PaneBoundary key={paneRetryKeys.routing} title={PANE_TITLES.routing} onRetry={retryActivePane}>
-            {tab === "routing" ? (
+            {tab === "routing" && acctView === "running" ? <RunningNow hook={runningNow} /> : null}
+            {tab === "routing" && acctView !== "running" ? (
               <Accounts
                 routing={routing}
                 plans={plans.data}
                 thisMac={thisMac}
                 onReloadPlans={() => plans.load()}
                 onOpenOlder={() => setTab("routing-old")}
+                running={runningNow}
               />
             ) : null}
           </PaneBoundary>

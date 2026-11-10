@@ -452,6 +452,11 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   "app-accounts": { title: "The whole window, Accounts", fake: { accounts: true }, render: () => <App /> },
   "app-accounts-problem": { title: "The whole window, Accounts, something wrong", fake: { accounts: true, accountsProblem: true }, render: () => <App /> },
   "app-accounts-ahead": { title: "The whole window, Accounts, one conversation running ahead", fake: { accounts: true, accountsAhead: true }, render: () => <App /> },
+  "app-running": { title: "The whole window, Accounts, Running now", fake: { accounts: true, running: true }, render: () => <App /> },
+  "app-running-silent": { title: "The whole window, Running now, a runner stopped reporting", fake: { accounts: true, running: true, runningSilent: true }, render: () => <App /> },
+  "app-running-none": { title: "The whole window, Running now, no runner reporting", fake: { accounts: true, running: true, runningNone: true }, render: () => <App /> },
+  "app-running-stale": { title: "The whole window, Running now, the other Mac is out of date", fake: { accounts: true, running: true, runningStale: true }, render: () => <App /> },
+  "app-running-fail": { title: "The whole window, Running now, the read fails", fake: { accounts: true, running: true, runningFail: true }, render: () => <App /> },
   "app-accounts-refuse": { title: "The whole window, Accounts, a pause is refused", fake: { accounts: true, accountsRefuse: true }, render: () => <App /> },
   "setup-signed-out": {
     title: "Setup: a default login that is not signed in",

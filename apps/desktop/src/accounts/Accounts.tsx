@@ -18,6 +18,8 @@ import { AccountPage, ReceiptLine, RunningAheadRows } from "./AccountPage";
 import { orderedAccounts, readLine, rowModel } from "./accountsModel";
 import type { RowModel } from "./accountsModel";
 import { useAccountWrites } from "./useAccountWrites";
+import { RunningHere } from "./RunningNow";
+import type { RunningHook } from "./running";
 import "./accounts-new.css";
 
 function Meter({ row }: { row: RowModel }) {
@@ -54,7 +56,7 @@ function AccountRow({ row, selected, onSelect }: { row: RowModel; selected: bool
   );
 }
 
-export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp, onOpenOlder }: {
+export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp, onOpenOlder, running }: {
   routing: RoutingState;
   plans: UsageReport | null | undefined;
   thisMac: string | null;
@@ -62,6 +64,8 @@ export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp,
   /** Tests pin the clock; the app uses the real one. */
   now?: Date;
   onOpenOlder?: () => void;
+  /** What job runners report (slice A5), for "Running here now" on the account page. */
+  running?: RunningHook;
 }) {
   const [clock, setClock] = useState(() => new Date());
   useEffect(() => {
@@ -158,7 +162,8 @@ export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp,
         <ArrowLeft size={16} aria-hidden /> All accounts
       </button>
       <AccountPage a={selected} row={row} view={view} plans={plans} now={now} writes={writes} overrides={overrides}
-        thisMac={thisMacName} onSignedIn={async () => { await Promise.all([reread(), onReloadPlans?.()]); }} />
+        thisMac={thisMacName} onSignedIn={async () => { await Promise.all([reread(), onReloadPlans?.()]); }}
+        runningHere={running ? <RunningHere accountKey={selected.key} accountLabel={selected.label} hook={running} now={nowProp} /> : undefined} />
     </>
   ) : null;
   return (

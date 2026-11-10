@@ -68,7 +68,7 @@ describe("App in the new window", () => {
     }
   });
 
-  it("Accounts is the new place, with its view switch; Running now and Order and rules open the older screens until their slices land", async () => {
+  it("Accounts is the new place, with its view switch; Running now is drawn in Accounts and Order and rules opens its older screen until its slice lands", async () => {
     store.set("khipu.welcome.completed", "1");
     answers(true);
     render(<App />);
@@ -83,9 +83,28 @@ describe("App in the new window", () => {
     if (older0.getAttribute("aria-expanded") !== "true") fireEvent.click(older0);
     await waitFor(() => expect(within(main).getByRole("button", { name: "Accounts and routing" })).toHaveAttribute("aria-current", "page"));
     fireEvent.click(within(main).getByRole("button", { name: "Accounts" }));
+    // Running now stays in Accounts (slice A5): the switch shows it and Work is not opened.
     fireEvent.click(within(screen.getByRole("group", { name: "Accounts view" })).getByRole("button", { name: "Running now" }));
-    const older = within(main).getByRole("button", { name: "Older screens" });
-    if (older.getAttribute("aria-expanded") !== "true") fireEvent.click(older);
-    await waitFor(() => expect(within(main).getByRole("button", { name: "Work" })).toHaveAttribute("aria-current", "page"));
+    expect(within(screen.getByRole("group", { name: "Accounts view" })).getByRole("button", { name: "Running now" })).toHaveAttribute("aria-pressed", "true");
+    expect(within(main).getByRole("button", { name: "Accounts" })).toHaveAttribute("aria-current", "page");
+  });
+  it("the five checks' link on Today opens Running now in Accounts, not the old Work screen", async () => {
+    store.set("khipu.welcome.completed", "1");
+    const area = (key: string, name: string, link: string) => ({ key, name, state: "ok", line: `${name}.`, khipu_doing: "", you_do: "Nothing.", link });
+    const health = { checked_at: new Date().toISOString(), mac: "M5", headline: "Everything is working.", jobs_running: 0, silent_runners: [], free_gb: 80, last_backup_at: null, agent_note: "",
+      areas: [area("saving", "Saving memory", "where-memory-is-kept"), area("finding", "Finding things", "search"), area("routing", "Routing", "accounts"), area("database", "Database and disk", "backups"), area("jobs", "Jobs and other checks", "running-now")] };
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "dsn_configured") return true;
+      if (cmd === "khipu_health") return JSON.stringify(health);
+      if (cmd === "khipu_running") return JSON.stringify({ updated_at: new Date().toISOString(), macs: [{ mac: "m5", name: "M5", this_mac: true, as_of: new Date().toISOString(), stale: false, runners: [] }] });
+      return JSON.stringify({ ok: true });
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "See the five checks" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Open Running now" }));
+    const main = screen.getByRole("navigation", { name: "Main" });
+    await waitFor(() => expect(within(main).getByRole("button", { name: "Accounts" })).toHaveAttribute("aria-current", "page"));
+    expect(within(screen.getByRole("group", { name: "Accounts view" })).getByRole("button", { name: "Running now" })).toHaveAttribute("aria-pressed", "true");
+    expect((await screen.findAllByText(/No job runner is reporting on M5\./)).length).toBeGreaterThan(0);
   });
 });

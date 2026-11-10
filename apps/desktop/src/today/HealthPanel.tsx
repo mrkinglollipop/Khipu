@@ -7,7 +7,7 @@ const STATE_WORD: Record<HealthArea["state"], string> = {
   ok: "Working", warn: "Needs a look", err: "Needs attention", unknown: "Couldn’t check",
 };
 
-/** Where an area's link goes. Running now is the old Work screen until it lands. */
+/** Where an area's link goes. Running now is in Accounts. */
 export const LINK_LABEL: Record<string, string> = {
   "running-now": "Open Running now",
   accounts: "Open Accounts",
