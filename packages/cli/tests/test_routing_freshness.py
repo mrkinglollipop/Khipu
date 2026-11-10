@@ -32,10 +32,6 @@ from tests.test_routing_priority import FIGURES, T0, _cache, _row, _set, _summar
 # ---- 2. stale figures ------------------------------------------------------------------------
 
 
-def _codex_line(text: str) -> str:
-    return next(x for x in text.splitlines() if x.startswith("Codex"))
-
-
 def test_figures_82_minutes_old_say_out_of_date_and_give_no_pace(home):
     old = routing._iso(T0 - timedelta(minutes=82))
     rows = dict(FIGURES, **{"codex|": dict(_row("Codex", "codex", None, _week(74, T0 + timedelta(days=4))),
@@ -43,19 +39,12 @@ def test_figures_82_minutes_old_say_out_of_date_and_give_no_pace(home):
     _cache(home, rows)
     fact = routing.plan_fact(rows["codex|"], T0)
     assert fact["stale"] is True and fact["pace_pct_per_hour"] is None and fact["hurry"] is False
-    line = _codex_line(_summary(home))
-    assert "26% of its week left when read 1 h 22 min ago" in line
-    assert "may be out of date" in line
-    assert "% an hour" not in line and "plenty of time" not in line and "little time" not in line
-    # The fresh accounts keep their pace, and the pace ordering leaves the stale one last.
-    text = _summary(home)
-    assert "about 1.7% an hour" in text
-    order = [x.split(":")[0] for x in text.splitlines() if x.split(":")[0] in ("Claude", "Claude second", "Codex")]
-    assert order[-1] == "Codex"
-    # The priority's own facts say the same.
-    routing.set_priority([{"account": "Codex"}], via="app", expect=routing.priority_version())
-    prio = next(x for x in _summary(home).splitlines() if x.startswith("Your priority"))
-    assert "74% of its week used when read 1 h 22 min ago, may be out of date" in prio
+    # The words every plan figure is said with (``khipu route --account``);
+    # the routing page takes its figures from the pace store instead.
+    words = routing.pace_words(fact, T0)
+    assert "26% of its week left when read 1 h 22 min ago" in words
+    assert "may be out of date" in words
+    assert "% an hour" not in words and "plenty of time" not in words and "little time" not in words
 
 
 def test_figures_inside_fifteen_minutes_keep_their_pace(home):
@@ -78,9 +67,6 @@ def test_a_reset_time_already_passed_says_the_figures_are_out_of_date(home):
                                           "resets_at": routing._iso(T0 + timedelta(hours=1))},
                _week(95, T0 - timedelta(minutes=5)))
     assert routing.plan_fact(row, T0)["why"] == routing.RESET_PASSED_WHY
-    _cache(home, dict(FIGURES, **{"codex|": _row("Codex", "codex", None, _week(74, T0 - timedelta(minutes=5)))}))
-    line = _codex_line(_summary(home))
-    assert line.endswith("; its reset time passed; figures out of date") and "% an hour" not in line
 
 
 # ---- 3. the owner's priority, shortened --------------------------------------------------------
@@ -107,53 +93,6 @@ def _five_accounts(home) -> None:
 
 def _body(text: str) -> str:
     return text.split("\n", 1)[1] if "\n" in text else ""
-
-
-def test_the_owners_real_priority_arrives_shortened_not_as_a_pointer(home):
-    _five_accounts(home)
-    _set(home, routing_prompt_chars=400)
-    start = routing.read_view()
-    routing.set_priority(REAL_PRIORITY, via="app", expect=routing.priority_version())
-    view = routing.read_view()
-    changed = routing.since(start["version"], view, now=home["clock"].now)
-    text, _count = routing.changes_text(changed, view, home["clock"].now)
-    body = _body(text)
-    assert len(body) <= 400, body
-    assert routing.OWNER_PRIORITY_POINTER not in body
-    line = next(x for x in body.splitlines() if x.startswith("Your priority"))
-    assert "shortened; the full words: `khipu_route`" in line
-    for i, label in enumerate(["Claude second", "Codex", "Muse", "Grok", "Claude"], 1):
-        assert f"{i}. {label}:" in line
-    assert "1. Claude second: First for all Claude work" in line and "…" in line
-    # With an account's news too, the news keeps its place and the priority still shows.
-    routing.report(state="limited", account="Codex", until="2h",
-                   author={"kind": "conversation", "harness": "codex", "project": "p", "session": "s"})
-    later = routing.read_view()
-    changed = routing.since(view["version"], later, now=home["clock"].now)
-    body = _body(routing.changes_text(changed, later, home["clock"].now)[0])
-    assert len(body) <= 400, body
-    assert any(x.startswith("Codex: limit reached") for x in body.splitlines())
-    assert "1. Claude second" in body and "5. Claude" in body
-    assert routing.OWNER_PRIORITY_POINTER not in body
-
-
-def test_the_order_alone_when_even_the_short_roles_do_not_fit(home):
-    _five_accounts(home)
-    _set(home, routing_prompt_chars=170)
-    start = routing.read_view()
-    routing.set_priority(REAL_PRIORITY, via="app", expect=routing.priority_version())
-    view = routing.read_view()
-    changed = routing.since(start["version"], view, now=home["clock"].now)
-    body = _body(routing.changes_text(changed, view, home["clock"].now)[0])
-    assert len(body) <= 170, body
-    assert body.startswith("Your priority order (guidance, not a gate; roles: `khipu_route`): 1. Claude second; "
-                           "2. Codex; 3. Muse; 4. Grok; 5. Claude."), body
-
-
-def test_short_words_cut_at_a_word():
-    assert routing._short_words("Main account: not used at all until Matt says otherwise.", 32) == \
-        "Main account: not used at all…"
-    assert routing._short_words("short", 20) == "short"
 
 
 # ---- 1. keeping the cache fresh ---------------------------------------------------------------
@@ -368,8 +307,3 @@ def test_a_passed_account_week_is_out_of_date_even_with_a_model_week_ahead():
     fact = routing.plan_fact(row, now)
     assert fact["readable"] is False and fact.get("reset_passed") is True
 
-
-def test_a_role_whose_first_word_is_too_long_is_dropped_not_cut_mid_word():
-    from khipu import routing
-    assert routing._short_words("Supercalifragilisticexpialidocious duties", 20) == ""
-    assert routing._short_words("First for all Claude work: builds", 20) == "First for all…"

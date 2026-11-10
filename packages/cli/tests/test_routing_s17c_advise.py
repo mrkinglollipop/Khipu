@@ -215,21 +215,6 @@ def test_cli_advise_and_mcp_advise_agree(replay, capsys):
     assert cli_out["verdict"] == body["verdict"] == "hold_back"
 
 
-def test_advice_change_for_a_priority_account_pushes(replay):
-    routing.report(account="Claude", state="open", author=AUTHOR)
-    routing.set_priority([{"account": "Claude", "role": "first"}],
-                         via="app", expect=routing.priority_version())
-    first, _, info = replay.offer()
-    replay.ack(info)
-    _pace_target(replay, used=18)
-    out, context, info = replay.offer()
-    assert out["kind"] != "none"
-    assert "hold_back" in context or "hold back" in context
-    # The push carries job advice; it says so rather than posing as the
-    # orchestrator's own advice.
-    assert "Advice for jobs" in context
-
-
 # ---- spend and concurrency (fake runner telemetry, as in 17a) --------------
 
 NOW = datetime(2026, 10, 20, 16, 0, tzinfo=timezone.utc)

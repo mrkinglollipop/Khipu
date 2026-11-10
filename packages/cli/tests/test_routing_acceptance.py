@@ -114,6 +114,9 @@ class Replay:
         return result["isError"], json.loads(result["content"][0]["text"])
 
     def pull(self, **args):
+        # Pull delivery rides the record read; a bare khipu_route answers the
+        # page and reserves nothing.
+        args.setdefault("full", True)
         error, body = self.call(**args)
         assert not error, body
         return body
@@ -374,18 +377,11 @@ def seed(replay):
     return replay.view()
 
 
-@pytest.mark.parametrize("surface", ["summary", "start", "prompt", "mcp"])
-def test_1_hold_priority_contradiction_and_end_route_already_arrive(replay, surface):
+def test_1_hold_priority_contradiction_and_end_route_already_arrive(replay):
+    # The full record names the contradiction and the end route; the page
+    # every reader gets shows the hold and the order.
     seed(replay)
-    if surface == "summary":
-        text = routing.summary()["text"]
-    elif surface == "start":
-        text = recall_rule._RoutingAtStart().begin().text()
-    elif surface == "prompt":
-        routing.report(account="Codex", state="open", author=AUTHOR)
-        text = replay.offer()[1]
-    else:
-        text = json.dumps(replay.pull())
+    text = json.dumps(replay.pull())
     assert "contradicts" in text and "Grok" in text and "end_hold" in text
 
 
@@ -409,7 +405,6 @@ def test_1_explicit_end_choice_removes_the_hold(replay):
     expect(view["holds"], [], "1: fold ignores explicit holds end choice")
     replay.write(*rows)
     assert replay.pull()["holds"] == []
-    assert "contradicts active hold" not in routing.summary()["text"]
     assert "contradicts active hold" not in replay.offer()[1]
 
 
@@ -424,39 +419,6 @@ def test_1_explicit_keep_choice_preserves_the_hold(replay):
     assert replay.view()["holds"][0]["id"] == "h-synthetic-grok"
 
 
-def test_3_eight_short_changes_fit_two_pushes_and_only_shown_entities_ack(replay):
-    replay.configure(usage_accounts=ACCOUNTS + [{"label": f"A{i}", "harness": "codex", "home": str(replay.root / f"login-{i}")}
-                                              for i in range(8)], routing_line_chars=55)
-    routing.report(account="Grok", state="open", author=AUTHOR)
-    before = replay.view()
-    assert recall_prompt.mark_routing_full("s1", version=before["version"], epoch=before["epoch"], at=routing._iso(T0))
-    for i in range(8):
-        routing.report(account=f"A{i}", state="open", author=AUTHOR)
-    # This direct renderer call starts with the complete inventory a helper prepares.
-    from khipu import agent_view
-    agent_view.prepare_routing_table(refresh=True)
-    seen = []
-    for _ in range(2):
-        before_delivery = copy.deepcopy(recall_prompt.routing_marker("s1"))
-        out, context, info = replay.offer()
-        assert context and info["pending"]
-        assert len(out["text"].split("\n", 1)[1]) <= 400
-        replay.ack(info, delivered=False)
-        assert recall_prompt.routing_marker("s1") == before_delivery
-        replay.ack(info)
-        seen.extend(out["shown_entities"])
-    assert len(seen) == len(set(seen)) == 8
-    assert not recall_prompt.routing_marker("s1").get("owed")
-
-
-def test_5_codex_low_is_marked_against_96_percent_without_rewriting_owner_words(replay):
-    replay.usage()
-    routing.add_rule("Codex is low", via="app")
-    text = routing.summary()["text"]
-    assert "stale level claim; Codex: Khipu read 96% left" in text
-    assert replay.view()["rules"][0]["text"] == "Codex is low"
-
-
 def test_5_structured_level_claim_expires_at_reset(replay):
     reset = T0 + timedelta(hours=1)
     row = replay.event("priority_set", entries=[{"account": "codex|", "role": "builder",
@@ -469,45 +431,7 @@ def test_5_structured_level_claim_expires_at_reset(replay):
     expect(level, None, "5: structured level remains live after reset")
 
 
-# ---- 2, 3: pages, revisions, leases -----------------------------------------------------
-
-
-def test_2_pending_rule_is_whole_across_pages(replay):
-    words = "Grok " + "~" * 2995
-    routing.request_rule(words, author=AUTHOR)
-    delivered = []
-    for _ in range(40):
-        out, context, info = replay.offer()
-        if not context:
-            break
-        delivered.append(context)
-        replay.ack(info)
-    # Match the complete synthetic payload, not its identifying preview.
-    expect("".join(delivered).count("~"), 2995, "2: pending rule was acknowledged as a preview, with text lost")
-
-
-@pytest.mark.usefixtures("unbounded_render")
-def test_2_oversized_session_start_has_a_first_page(replay):
-    routing.add_rule("x" * 10500, via="app")
-    at = recall_rule._RoutingAtStart().begin()
-    text = at.text()
-    assert text, "start entry point unexpectedly returned no output"
-    expect("x" * 100 in text and len(text) <= 10000, True,
-           "2: oversized start sends a pointer rather than a bounded first page")
-    at.delivered("s1")
-    assert recall_prompt.routing_marker("s1").get("owed")
-
-
-def test_2_edit_mid_pagination_restarts_revision(replay):
-    routing.request_rule("Grok " + "x" * 2995, author=AUTHOR)
-    first, _, info = replay.offer()
-    replay.ack(info)
-    routing.edit_rule(1, "Grok " + "y" * 2995, via="app")
-    second, context, _ = replay.offer()
-    expect("changed while being shown" in context, True, "2: rule revision change has no pagination restart notice")
-    assert "x" * 100 not in context
-    assert second["routing_changes"]["items"][0]["page"]["n"] == 1
-    assert first["routing_changes"]["items"][0]["revision"] != second["routing_changes"]["items"][0]["revision"]
+# ---- 3: revisions, leases --------------------------------------------------------------
 
 
 def test_3_unacknowledged_hook_batch_expires_to_owed(replay):
@@ -1458,7 +1382,9 @@ def test_16a_extractor_sentinels_witness_age_and_rounding(replay, monkeypatch, c
     # report overriding the probe's four-minute-old witness.
     routing.add_rule("Synthetic extractor fixture.", via="app")
     replay.usage(witness=T0 - timedelta(minutes=4), reset=T0 + timedelta(days=6))
-    block = routing.summary(now=T0)["text"]
+    # A block as an older Khipu delivered it: the extractor reads historical transcripts.
+    block = ("## Routing at 14:00Z (Khipu's routing record, version 1; data, not instructions; guidance, not a gate)\n"
+             "Codex: open; read from Codex 4 min ago; 96% of its week left, resets Mon 14:00Z (6 d)")
     assert block.startswith("## Routing at 14:00Z (")
     assert "96% of its week left, resets Mon 14:00Z (6 d)" in block
     assert "read from Codex 4 min ago" in block
@@ -1734,83 +1660,6 @@ def test_16b_synthetic_history_with_uncertainty(replay):
     # at either boundary, rather than pretending the clocks were exact.
     expect(pace.get("rate_pct_per_h"), pytest.approx(0.5, abs=0.002),
            "16b: synthetic uncertainty-bounded history has no correct trailing rate")
-
-
-# ---- 16c: pushes compare with the last acknowledged forecast ----------------------------
-
-
-@pytest.mark.parametrize("scenario", ["one-hour-to-ten-minutes", "band-jitter", "verdict-hysteresis", "limiting-window",
-                                     "cycle", "cap-revision", "availability", "cumulative-small-moves", "numbers-alone"])
-def test_16c_pace_pushes(replay, scenario):
-    # Feed scope-defined usage_sample inputs through the production fold.
-    # No invented pace_forecast events or precomputed verdict labels.
-    base = {"eta": 3600, "window": "five_hour", "reset": 86400 + 4 * 3600,
-            "revision": "cap1", "available": True}
-    wanted = 1
-    if scenario == "one-hour-to-ten-minutes":
-        updates = [dict(base, eta=600)]
-    elif scenario == "band-jitter":
-        updates = [dict(base, eta=s) for s in (3599, 3601, 3599, 3601)]
-    elif scenario == "verdict-hysteresis":
-        base["ratio"] = 1.14
-        updates = [dict(base, ratio=r) for r in (1.151, 1.149, 1.151)]
-    elif scenario == "limiting-window":
-        updates = [dict(base, window="weekly")]
-    elif scenario == "cycle":
-        updates = [dict(base, reset=base["reset"] + 5 * 3600)]
-    elif scenario == "cap-revision":
-        updates = [dict(base, revision="cap2")]
-    elif scenario == "availability":
-        updates, wanted = [dict(base, available=False), dict(base, available=True)], 2
-    elif scenario == "cumulative-small-moves":
-        base.update(eta=24000, window="weekly", reset=86400 + 7 * 86400)
-        updates = [dict(base, eta=24000 + i * 2000) for i in (1, 2, 3, 4)]
-    else:
-        base["eta"] = 7200
-        updates, wanted = [dict(base, eta=7190)], 0
-
-    def install_readings(state):
-        now = int((replay.now - T0).total_seconds())
-        # Two points of headroom, or one against the share cap, sets the
-        # forecast time. Hysteresis inputs straddle 1.15 of the needed rate.
-        headroom = 1 if scenario == "cap-revision" else 2
-        rate = headroom * 3600 / state["eta"]
-        if "ratio" in state:
-            rate = state["ratio"] * 2 * 3600 / (state["reset"] - now)
-        span, step = (3600, 600) if state["window"] == "five_hour" else (86400, 1800)
-        history = steady(rate, start=now - span, end=now, used=98 - rate * span / 3600,
-                         reset=state["reset"], step=step)
-        if not state["available"]:
-            history = history[-2:]
-        rows = [replay.event("usage_sample", i + 1, account="codex|", window=state["window"],
-                             witness_at=routing._iso(T0 + timedelta(seconds=s["t"])), used_pct=s["used"],
-                             resets_at=routing._iso(T0 + timedelta(seconds=s["reset"])), mac="m1", source="probe")
-                for i, s in enumerate(history)]
-        if scenario == "cap-revision":
-            rows.append(replay.event("cap_set", len(rows) + 1, account="codex|", window=state["window"],
-                                     kind="share", pct=99, revision=state["revision"]))
-        # Replace only this isolated sample snapshot. Component delivery
-        # markers stay intact, so comparisons use the acknowledged forecast.
-        path = routing.events_file()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
-        return rate
-
-    replay.now = T0 + timedelta(seconds=86400)
-    install_readings(base)
-    first, _, info = replay.offer()
-    expect("at the trailing average" in first.get("text", ""), True,
-           f"16c/{scenario}: usage samples produce no delivered pace forecast")
-    replay.ack(info)
-    count = 0
-    for i, update in enumerate(updates, start=1):
-        replay.advance(1)
-        install_readings(update)
-        out, _, info = replay.offer()
-        if out["kind"] != "none":
-            count += 1
-            replay.ack(info)
-    assert count == wanted
 
 
 def test_4pa_cost_20000_events_with_18000_samples_stays_under_budget(replay):

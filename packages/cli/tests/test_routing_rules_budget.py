@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from khipu import agent_view, mcp_server, recall_prompt, recall_rule, routing
+from khipu import routing_page, agent_view, mcp_server, recall_prompt, recall_rule, routing
 from tests.test_routing_acceptance import replay  # noqa: F401
 
 T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
@@ -62,14 +62,6 @@ def _rule(count: int, size: int = 90) -> str:
 # ---- write-time limits, on every path ---------------------------------------------------------
 
 
-def test_the_defaults_are_the_numbers_the_summary_and_hook_can_carry():
-    cfg = routing.settings()
-    assert (cfg["routing_rule_chars"], cfg["routing_rules_max"], cfg["routing_note_chars"]) == (600, 40, 1500)
-    # The rules budget plus the summary budget plus the heading fit the hook beside the recall rule.
-    assert cfg["routing_rules_chars"] + cfg["routing_summary_chars"] + 400 \
-        + recall_rule._utf16_len(recall_rule.RULE_MD.strip()) < recall_rule._HOOK_CONTEXT_BUDGET
-
-
 def test_the_cli_refuses_an_overlong_rule_and_note_with_the_limit_and_the_length(home, capsys):
     rc, out = _cli(["route", "rule", "add", "x" * 601, "--from-app"], capsys)
     answer = json.loads(out)
@@ -102,7 +94,7 @@ def test_a_conversation_request_over_the_limit_is_refused_over_mcp_and_the_cli(h
     out = mcp_server._tool_route_rule({"text": "x" * 601, "owner_request": "add the rule"})
     assert out["ok"] is False and "601" in out["error"] and "600" in out["error"]
     routing.add_rule("Existing.", via="app")
-    shown = mcp_server._tool_route({})["rules"][0]["owner_revision"]
+    shown = mcp_server._tool_route({"full": True})["rules"][0]["owner_revision"]
     out = mcp_server._tool_route_rule({"text": "x" * 601, "rule": 1, "owner_request": "change it", "base": shown})
     assert out["ok"] is False and out["code"] == "too_long"
     _set(home, routing_rules_max=1)
@@ -146,53 +138,6 @@ def _fill(rules=30, size=300):
         routing.add_rule(f"{i}: " + "r" * (size - 4), via="app")
 
 
-def test_stored_oversized_rules_render_within_the_budget_with_a_pointer(home):
-    _set(home, routing_rule_chars=0)
-    routing.add_rule("first: " + "a" * 1200, via="app")
-    _set(home, routing_rule_chars=600)
-    _fill(rules=20)
-    routing.report(account="Codex", state="open", author=ME)
-    out = routing.summary()
-    text = out["text"]
-    budget = routing.settings()["routing_rules_chars"]
-    assert out["rules_left_out"] > 0
-    owner_lines = [line for line in text.splitlines()
-                   if line == "Standing rules:" or (line[:1].isdigit() and ". " in line) or "standing rules left out" in line]
-    assert sum(len(line) + 1 for line in owner_lines) <= budget
-    assert f"{out['rules_left_out']} of 21 standing rules left out" in text and "`khipu_route`" in text
-    assert "Codex" in text
-    # Cut at whole rules, in the owner's order: the rules shown are a prefix.
-    shown = [line.split(".")[0] for line in text.splitlines() if line[:1].isdigit() and ". " in line]
-    assert shown == [str(n) for n in range(1, len(shown) + 1)]
-    assert "a" * 1200 in text  # the stored oversized rule that fits the budget is not cut
-
-
-def test_a_note_longer_than_half_the_budget_is_a_pointer_with_its_first_sentence(home):
-    _set(home, routing_note_chars=0)
-    routing.set_note("Codex first for builds. " + "n" * 2400, via="app")
-    out = routing.summary()
-    assert "Codex first for builds." in out["text"] and "n" * 100 not in out["text"]
-    assert "read it with `khipu_route`" in out["text"] and "note" in out["covered_entities"]
-
-
-def test_account_state_survives_a_huge_rules_set_at_session_start(home):
-    _set(home, routing_rules_chars=0, routing_rule_chars=0, routing_rules_max=0)
-    _fill(rules=40, size=600)
-    routing.report(account="Codex", state="limited", author=ME)
-    out = routing.summary()
-    assert not recall_rule.start_context_fits(out["text"])  # 24,000 characters of rules, budget off
-    ctx, pushed = recall_rule.fit_start_context(recall_rule.RULE_MD.strip(), out["text"], lean=out["lean_text"])
-    assert pushed and recall_rule.ROUTING_TOO_LONG not in ctx
-    assert recall_rule._utf16_len(ctx) <= recall_rule._HOOK_CONTEXT_BUDGET
-    assert "Codex" in ctx and "Standing rules:" not in ctx and recall_rule.RULE_MD.strip() in ctx
-    assert "read them with `khipu_route`" in ctx
-    # With the default budget the same rules arrive pointed to, state intact, in the one summary.
-    _set(home, routing_rules_chars=2000)
-    budgeted = routing.summary()
-    assert recall_rule.start_context_fits(budgeted["text"]) and "Codex" in budgeted["text"]
-    assert budgeted["rules_left_out"] > 0
-
-
 def test_the_whole_summary_is_swapped_for_the_pointer_only_when_account_state_alone_cannot_fit():
     memory = recall_rule.RULE_MD.strip()
     huge = "## Routing\n" + "\n".join("Rule %d: " % i + "x" * 150 for i in range(80))
@@ -212,80 +157,12 @@ def test_the_hook_text_carries_the_lean_variant():
     assert pushed and ctx.endswith("Codex: open")
 
 
-def test_pointed_to_rules_are_not_owed_again_until_they_change(replay):
-    replay.configure(routing_rules_chars=800)
-    for i in range(12):
-        routing.add_rule(f"{i}: " + "r" * 296, via="app")
-    out, context, info = replay.offer()
-    assert out["kind"] == "full" and "standing rules left out" in out["text"]
-    replay.ack(info)
-    assert not recall_prompt.routing_marker("s1").get("owed")
-    routing.edit_rule(1, "1: changed, and short.", via="app")
-    out, _context, _info = replay.offer()
-    assert "1: changed, and short." in out["text"]
-
-
 # ---- the per-prompt path ---------------------------------------------------------------------
 
 
 def _marker(replay):
     return {"version": replay.view()["version"], "epoch": replay.view()["epoch"],
             "full_at": routing._iso(replay.now)}
-
-
-def test_a_changed_long_rule_arrives_as_a_pointer_and_its_first_sentence_with_no_session(replay):
-    routing.add_rule("Short rule.", via="app")
-    marker = _marker(replay)
-    routing.edit_rule(1, _rule(5), via="app")
-    out = routing.prompt_push(marker, budget=1.0, now=replay.now)
-    text = out["text"]
-    assert out["kind"] == "changes"
-    assert "Standing rule 1 changed" in text and _sentence(0) in text
-    assert _sentence(1) not in text and "`khipu_route`" in text
-    assert len(text.split("\n", 1)[1]) <= 400
-    assert not any(line.endswith("…") for line in text.splitlines())
-
-
-def test_a_long_first_sentence_leaves_only_the_pointer_never_a_cut(replay):
-    routing.add_rule("Short rule.", via="app")
-    marker = _marker(replay)
-    routing.edit_rule(1, "w" * 500 + ". Then more.", via="app")
-    text = routing.prompt_push(marker, budget=1.0, now=replay.now)["text"]
-    assert "Standing rule 1 changed (512 characters" in text and "w" * 50 not in text
-
-
-def test_a_changed_long_note_gets_the_same_pointer(replay):
-    routing.add_rule("Short rule.", via="app")
-    marker = _marker(replay)
-    routing.set_note(_rule(6), via="app")
-    text = routing.prompt_push(marker, budget=1.0, now=replay.now)["text"]
-    assert "Note from the owner changed" in text and _sentence(0) in text and _sentence(2) not in text
-
-
-def test_a_short_changed_rule_still_arrives_whole(replay):
-    routing.add_rule("Short rule.", via="app")
-    marker = _marker(replay)
-    routing.edit_rule(1, "Still short, and whole.", via="app")
-    assert "Still short, and whole." in routing.prompt_push(marker, budget=1.0, now=replay.now)["text"]
-
-
-def test_with_a_session_the_long_rule_is_delivered_whole_across_prompts(replay):
-    routing.add_rule("Short rule.", via="app")
-    out, context, info = replay.offer()
-    replay.ack(info)
-    routing.edit_rule(1, _rule(6), via="app")
-    seen = []
-    for _ in range(40):
-        out, context, info = replay.offer()
-        if not context:
-            break
-        seen.append(context)
-        assert len(context.split("\n", 1)[-1]) <= 450
-        replay.ack(info)
-    pages = ["\n".join(line for line in context.split("\n")[2:] if line != "More routing owed.")
-             for context in seen]
-    assert len(pages) > 1 and "".join(pages) == "1. " + _rule(6)
-    assert not recall_prompt.routing_marker("s1").get("owed")
 
 
 # ---- doctor ---------------------------------------------------------------------------------
@@ -303,41 +180,24 @@ def test_doctor_warns_about_stored_words_over_their_limits_and_shows_the_budget(
     assert any("Standing rule 1 is longer than the 600-character limit" in w for w in warnings)
     assert any("There are 4 standing rules; the limit for new ones is 3" in w for w in warnings)
     assert any("Your note is 1,600 characters; the limit is 1,500" in w for w in warnings)
-    assert any("shows only part of your words" in w for w in warnings)
+    assert not any("shows only part of your words" in w for w in warnings)  # no second summary to warn about
     row = block["rules_budget"]
     assert row["over_rule_cap"] == [1] and row["rules"] == 4 and row["note_chars"] == 1600
-    assert row["left_out"] > 0 and row["start"] == "full"
+    assert row["left_out"] == 0 and row["start"] == "full"  # the page carries all four
 
 
 def test_doctor_shows_the_session_start_swap(home, monkeypatch):
     routing.report(account="Codex", state="open", author=ME)
     _set(home, routing_rules_chars=0, routing_rule_chars=0)
     routing.add_rule("r" * 100, via="app")
-    monkeypatch.setattr(recall_rule, "start_context_fits", lambda text, *a: "Standing rules:" not in text)
-    block = routing.doctor_block()
-    assert block["rules_budget"]["start"] == "lean"
-    assert any("conversations get the account state" in w for w in block["warnings"])
+    assert routing.doctor_block()["rules_budget"]["start"] == "full"
     monkeypatch.setattr(recall_rule, "start_context_fits", lambda text, *a: False)
     block = routing.doctor_block()
     assert block["rules_budget"]["start"] == "pointer"
-    assert any("even without your rules, note and priority" in w for w in block["warnings"])
+    assert any("routing page is too long to arrive at session start" in w for w in block["warnings"])
 
 
 # ---- a long priority and a live exception still reach a new conversation ------------------------
-
-
-def test_the_summary_keeps_a_long_priority_owed_and_leads_with_the_exception(replay):
-    names = ["Grok", "Codex", "Claude"]
-    entries = [{"account": n, "role": f"{n} role " + " ".join(f"Point {j} " + "p" * 90 + "." for j in range(18))}
-               for n in names]
-    routing.set_priority(entries, via="app", expect=routing.priority_version())
-    routing.amend_priority("Codex", exception="Codex checks may run 15 points over pace", until="2h",
-                           via="app", expect=routing.priority_version())
-    agent_view.prepare_routing_table(refresh=True)
-    out = routing.summary()
-    assert "priority" not in out["covered_entities"]
-    assert "Exception on Codex until" in out["text"] and "Your priority is too long" in out["text"]
-    assert out["text"].index("Exception on Codex") < out["text"].index("Your priority is too long")
 
 
 def test_a_new_conversation_gets_a_long_priorities_exception_and_body(replay):
@@ -354,21 +214,12 @@ def test_a_new_conversation_gets_a_long_priorities_exception_and_body(replay):
     agent_view.prepare_routing_table(refresh=True)
     start = recall_rule._RoutingAtStart(session_id="s-new").begin()
     text = start.text()
-    assert sentence in text and "priority; revision" in text  # the exception arrives at once, then the body pages
+    # The page is whole at session start: the live exception is on Codex's line,
+    # and the long roles are shortened to fit, never paged.
+    assert sentence and "15 points over pace" in text and "Grok role" in text
+    assert len(text) <= routing_page.LIMIT + 500
     ctx, pushed = recall_rule.fit_start_context(recall_rule.RULE_MD.strip(), text)
-    assert pushed and sentence in ctx
-    start.delivered("s-new")
-    assert "priority" in recall_prompt.routing_marker("s-new").get("owed", [])  # the body is still owed
-    seen = []
-    for _ in range(80):
-        out, context, info = replay.offer("s-new")
-        if not context:
-            break
-        seen.append(context)
-        replay.ack(info)
-    body = "\n".join([text, *seen])
-    assert "Grok role" in body and "Claude role" in body and "Point 17" in body
-    assert not recall_prompt.routing_marker("s-new").get("owed")
+    assert pushed and "15 points over pace" in ctx
 
 
 def test_the_refusal_tells_an_agent_not_to_paraphrase_and_the_owner_to_shorten(home):

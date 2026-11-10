@@ -60,6 +60,7 @@ def _call(name: str, arguments: dict | None = None) -> tuple[bool, dict]:
 
 
 def _route(**arguments) -> dict:
+    arguments.setdefault("full", True)  # the record; a bare khipu_route answers the routing page
     is_error, body = _call("khipu_route", arguments)
     assert not is_error, body
     return body

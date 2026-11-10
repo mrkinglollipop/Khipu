@@ -534,9 +534,7 @@ def test_the_table_pointer_moves_the_version_and_never_carries_its_prose(home):
     _set(home, routing_table=str(table))
     view = routing.read_view()
     first = view["version"]
-    assert routing.summary(view, now=T0)["text"].splitlines()[1] == (
-        "These account lines are newer than the routing table's account rows; the table's NOW block was "
-        "last stamped 13:48Z, 1 h 12 min ago.")
+    assert "PROSE-MARKER" not in routing.light_status()["text"]
     home["clock"].advance(minutes=5)
     routing.read_view()
     assert routing.read_view()["version"] == first  # nothing changed

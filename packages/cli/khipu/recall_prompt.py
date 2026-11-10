@@ -3603,12 +3603,27 @@ def log_terminal_outcome(raw: str, reason: str, *, ms: float = 0.0) -> None:
     _log(f"session={session} reason={reason} ms={ms:.1f} hits=[] legs=[] degraded=None")  # text-safe: session id is the harness id, reason a fixed code
 
 
+def _route_session_field(session: str | None) -> str:
+    """`` route_session=<key>``: the session key this conversation's routing
+    ledger is filed under (``routing_delivery.hook_session`` in this hook's
+    environment), written just before ``routing=`` so doctor and
+    ``khipu_route`` find that ledger from anywhere (``routing_health``).
+    Empty when the hook resolved none."""
+    if not isinstance(session, str) or not session.strip():
+        return ""
+    # As the delegation log's fields: one token, no whitespace or control characters.
+    return " route_session=" + "".join("_" if (c.isspace() or not c.isprintable()) else c for c in session)[:200]
+
+
 def finish_delivery(delivery: dict[str, Any], *, delivered: bool, reason: str | None = None) -> None:
     finish = delivery.pop("finish", None)
     if finish is not None:
         finish(delivered)
     # After dedup's own commit, which holds the session's lock until here.
     routed = _routing_delivered(delivery.pop("routing", None), delivered)
+    route_session = delivery.pop("route_session", None)
+    if routed:
+        routed = _route_session_field(route_session) + routed
     result = delivery.pop("result", None)
     if result is not None:
         if reason:
@@ -3619,8 +3634,8 @@ def finish_delivery(delivery: dict[str, Any], *, delivered: bool, reason: str | 
         stage = f" stage={result['stage']}" if result.get("stage") else ""
         stage += " offline=1" if result.get("offline") else ""
         ms = round((time.monotonic() - delivery["started"]) * 1000, 1) if "started" in delivery else result["ms"]
-        # routing= goes last, after degraded=, stage= and offline=, so every reader of
-        # this line (doctor's outcome rate, the promotion gate) still parses it.
+        # routing= goes last, after degraded=, stage=, offline= and route_session=, so
+        # every reader of this line (doctor's outcome rate, the promotion gate) still parses it.
         _log(f"session={session} reason={result['reason']} ms={ms} hits={hit_ids} "
              f"legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}{routed}")  # text-safe: ids, fixed reason codes and leg names only; no query text
 
@@ -3688,9 +3703,11 @@ def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
         delivery.update(result=result, raw=raw, started=started)
         if routed:
             delivery["routing"] = routed
+            delivery["route_session"] = getattr(routing, "session", None)
     else:
         # No delivery to confirm: the marker never moves, and the block is sent again.
-        routed_log = f" routing={routed['status']}" if routed else ""
+        routed_log = (f"{_route_session_field(getattr(routing, 'session', None))} routing={routed['status']}"
+                      if routed else "")
         _log(
             f"session={session_id or '?'} reason={result['reason']} ms={result['ms']} "
             f"hits={hit_ids} legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}"
