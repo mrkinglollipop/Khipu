@@ -251,3 +251,82 @@ def test_the_command_always_exits_zero_even_with_no_hub_and_a_broken_work_view(m
 def test_a_job_with_no_runner_name_is_grouped_under_an_unnamed_runner(tmp_path):
     runners, _ = runners_for(tmp_path, [job()], [], runner=None)
     assert [r["name"] for r in runners] == [running_now.UNNAMED] and runners[0]["heartbeat_at"] is None
+
+
+# ---- the sweep's last stage keeps this Mac's running part fresh itself -----------------------------------------------
+
+
+def _sweep(monkeypatch, capsys, calls):
+    import argparse
+
+    from khipu import cli, jobs, owner_direction, replica_heal, routing, storage
+
+    monkeypatch.setattr(storage, "sweep_if_due", lambda: calls.append("storage") or {"ok": True})
+    monkeypatch.setattr(replica_heal, "run", lambda: calls.append("replica") or {"ok": True, "action": "none"})
+    monkeypatch.setattr(owner_direction, "timer", lambda: calls.append("owner") or {"ok": True})
+    monkeypatch.setattr(jobs, "_write_job_state", lambda *a: calls.append("job_state"))
+    monkeypatch.setattr(routing, "poll_refold", lambda: calls.append("routing_copy") or {"ok": True})
+    rc = cli.cmd_snapshot(argparse.Namespace(snapshot_cmd="heal"))
+    return rc, json.loads(capsys.readouterr().out)
+
+
+def _lanes():
+    return [{"name": "lanes", "heartbeat_at": BEAT, "silent": False, "silent_since": None, "last_finished_at": None,
+             "jobs": []}]
+
+
+def _mine(rows=None):
+    return [r for r in macs.read_rows()[0] if r["mac"] == ME]
+
+
+def test_the_sweep_refreshes_and_publishes_the_running_jobs_with_no_khipu_running_before(world, monkeypatch, capsys):  # noqa: F811
+    calls: list = []
+    monkeypatch.setattr(running_now, "this_mac_runners", lambda *a, **k: calls.append("runners") or _lanes())
+    assert macs._remembered() == {}  # nobody ran `khipu running`
+    rc, out = _sweep(monkeypatch, capsys, calls)
+    assert rc == 0 and out["mac_status"] == {"ok": True, "running": "fresh"}
+    assert calls == ["storage", "replica", "owner", "job_state", "routing_copy", "runners"]  # routing copy first
+    [mine] = _mine()
+    assert mine["running"]["runners"][0]["name"] == "lanes"
+
+
+def test_a_failing_build_still_publishes_the_rest_of_the_row_and_the_earlier_stages_ran_first(world, monkeypatch, capsys):  # noqa: F811
+    calls: list = []
+    monkeypatch.setattr(running_now, "this_mac_runners", lambda *a, **k: calls.append("runners") or None)
+    rc, out = _sweep(monkeypatch, capsys, calls)
+    assert rc == 0 and out["mac_status"] == {"ok": True, "running": "failed"}
+    assert calls.index("routing_copy") < calls.index("runners")
+    [mine] = _mine()
+    assert mine["version"] == "0.4.15 (aaaa1111)" and (mine["running"] or {}).get("runners") is None
+    # a kept part under 15 minutes old is still published; a build that raises counts as failed too
+    macs.remember_runners(_lanes())
+    monkeypatch.setattr(running_now, "this_mac_runners", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    rc, out = _sweep(monkeypatch, capsys, [])
+    assert rc == 0 and out["mac_status"] == {"ok": True, "running": "failed"}
+    assert _mine()[0]["running"]["runners"][0]["name"] == "lanes"
+
+
+def test_a_slow_build_is_cut_off_and_the_row_is_still_published(world, monkeypatch, capsys):  # noqa: F811
+    import time
+
+    from khipu import cli
+
+    calls: list = []
+    monkeypatch.setattr(cli, "MAC_STATUS_MAX_S", 1.0)
+    monkeypatch.setattr(running_now, "this_mac_runners", lambda *a, **k: calls.append("runners") or time.sleep(60))
+    started = time.monotonic()
+    rc, out = _sweep(monkeypatch, capsys, calls)
+    assert time.monotonic() - started < 10
+    assert rc == 0 and out["mac_status"] == {"ok": True, "running": "failed"}
+    assert calls.index("routing_copy") < calls.index("runners") and _mine()
+
+
+def test_with_the_hub_known_down_the_sweep_builds_nothing(world, monkeypatch, capsys):  # noqa: F811
+    calls: list = []
+    monkeypatch.setattr("khipu.hub_reach.known_unreachable", lambda: {"since": "x"})
+    monkeypatch.setattr(running_now, "this_mac_runners", lambda *a, **k: calls.append("runners") or _lanes())
+    monkeypatch.setattr(work, "build_view", lambda *a, **k: calls.append("view"))
+    monkeypatch.setattr(db, "connect", lambda **kw: calls.append("connect"))
+    rc, out = _sweep(monkeypatch, capsys, calls)
+    assert rc == 0 and out["mac_status"] == {"ok": False, "why": "hub_unreachable", "running": "skipped"}
+    assert "runners" not in calls and "view" not in calls and "connect" not in calls

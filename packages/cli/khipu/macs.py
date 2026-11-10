@@ -2,7 +2,9 @@
 
 Each Mac writes only its own row of ``mac_status`` (migration 0052): when ``khipu health`` runs and as the last
 stage of the five-minute snapshot heal timer. Neither builds the work view: the running part of the row is the one
-``khipu running`` last kept on this Mac (``remember_runners``), published while it is under ``STALE_AFTER_S`` old. A reader gets this Mac live plus every other Mac's row; a row the hub last
+``khipu running`` last kept on this Mac (``remember_runners``), published while it is under ``STALE_AFTER_S`` old.
+The sweep's last stage refreshes that part itself (``refresh_running``) inside its own time cap, so a Mac's running
+jobs reach the other Mac without anyone opening ``khipu running``. A reader gets this Mac live plus every other Mac's row; a row the hub last
 heard from more than ``STALE_AFTER_S`` ago is marked ``stale``, never shown as current.
 
 The row is a closed list of fields (``project``), built the way the routing copy builds its payload: only the
@@ -286,6 +288,25 @@ def remember_runners(runners: list | None, *, now: datetime | None = None) -> No
     old = _remembered()
     running = old.get("running") if isinstance(old.get("running"), dict) else {"count": None, "silent": []}
     _write_cache(dict(old, running=dict(running, runners=runners), runners_at=_iso(now or datetime.now(timezone.utc))))
+
+
+def refresh_running(now: datetime | None = None) -> bool | None:
+    """Build this Mac's running jobs the way ``khipu running`` does and keep them (the sweep's last stage, before it
+    publishes). ``None``: nothing was built (no Mac identity, or the hub is already known to be down, so the row
+    cannot be written). ``False``: the work view could not be read, so what was kept stays. ``True``: kept fresh."""
+    if not local_mac_id():
+        return None
+    from khipu import hub_reach
+
+    if hub_reach.known_unreachable():
+        return None
+    from khipu import running_now
+
+    runners = running_now.this_mac_runners(now)
+    if runners is None:
+        return False
+    remember_runners(runners, now=now)
+    return True
 
 
 def _kept_runners(now: datetime | None = None) -> list | None:

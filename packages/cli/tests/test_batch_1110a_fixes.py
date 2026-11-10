@@ -94,7 +94,7 @@ def test_the_sweep_publishes_the_status_row_after_the_routing_copy(fake_world, m
     assert cli.cmd_snapshot(argparse.Namespace(snapshot_cmd="heal")) == 0
     out = json.loads(capsys.readouterr().out)
     assert calls == ["storage", "replica", "owner", "job_state", "routing_copy", "mac_status"]
-    assert out["mac_status"] == {"ok": True}
+    assert out["mac_status"] == {"ok": True, "running": "skipped"}  # no Mac identity here: nothing built
     keys = list(out)
     assert keys.index("routing_copy") < keys.index("mac_status")
 
@@ -127,4 +127,4 @@ def test_the_sweep_builds_no_work_view_for_the_status_row(fake_world, monkeypatc
     monkeypatch.setattr(work, "build_view", lambda *a, **k: calls.append("view"))
     assert cli.cmd_snapshot(argparse.Namespace(snapshot_cmd="heal")) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["mac_status"] == {"ok": False, "why": "hub_unreachable"} and "view" not in calls
+    assert out["mac_status"] == {"ok": False, "why": "hub_unreachable", "running": "skipped"} and "view" not in calls

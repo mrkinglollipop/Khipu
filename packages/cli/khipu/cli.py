@@ -4384,14 +4384,28 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
                 out["routing_copy"] = routing.poll_refold()
         except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
             out["routing_copy"] = timer_error(exc)
-        # This Mac's own status row for "Your Macs": the last stage, so nothing above waits on it. Skipped when the
-        # hub is already known to be down; it builds no work view (the running part is the one `khipu running`
-        # kept). A hub that is down or an older hub without the table is a note in the receipt, never a failure.
+        # This Mac's own status row for "Your Macs": the last stage, so nothing above waits on it. It first refreshes
+        # this Mac's running jobs (built as `khipu running` builds them) and then publishes, both inside
+        # MAC_STATUS_MAX_S: the build gets half, the publish the rest. Skipped entirely, with nothing built, when the
+        # hub is already known to be down. A build that fails or runs out of time still publishes the rest of the
+        # row (with the kept running part if it is under 15 minutes old, else none). A hub that is down or an older
+        # hub without the table is a note in the receipt, never a failure.
         try:
+            import time
+
             from khipu import deadline, macs
 
-            with deadline.limit(MAC_STATUS_MAX_S, "the Mac status row"):
-                out["mac_status"] = macs.publish()
+            started = time.monotonic()
+            running = "failed"
+            try:
+                with deadline.limit(MAC_STATUS_MAX_S / 2, "this Mac's running jobs"):
+                    built = macs.refresh_running()
+                running = "skipped" if built is None else ("fresh" if built else "failed")
+            except Exception:  # noqa: BLE001 — the row goes out without a fresh running part
+                running = "failed"
+            with deadline.limit(max(MAC_STATUS_MAX_S / 2, MAC_STATUS_MAX_S - (time.monotonic() - started)),
+                                "the Mac status row"):
+                out["mac_status"] = dict(macs.publish(), running=running)
         except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
             out["mac_status"] = timer_error(exc)
         print(json.dumps(out, indent=2))
