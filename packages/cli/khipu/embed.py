@@ -2798,6 +2798,8 @@ def hybrid_search(
     source: str | None = None,
     include_libraries: bool | None = None,
     rank: Callable[[list[dict[str, Any]], Any], list[dict[str, Any]]] | None = None,
+    owner_words_only: bool = False,
+    memory_fields: bool = False,
 ) -> dict[str, Any]:
     # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Default retrieval engine (W2.1-W2.3): fused hybrid, or single-mode.
@@ -2857,6 +2859,13 @@ def hybrid_search(
     ``cosine_ms``, ``literal_ms``, ``lexical_ms``, ``fusion_ms``, ``enrich_ms``
     and ``total_ms``, all milliseconds. Each row an episode produced carries
     ``ts`` / ``project`` / ``harness``; a topic or node carries ``ts`` only.
+
+    ``owner_words_only`` ("only my words"): episodes only, and only those with a
+    line of the owner's own (``verbatim.quotes``) holding the phrase or every
+    query word; that line is the row's ``quote``. ``memory_fields`` (implied by
+    it) appends ``quote``, ``title``, ``tool``, ``mac`` and ``project`` to every
+    row, for ``khipu search`` and the Memory screen; the per-prompt path passes
+    neither, so it pays nothing.
     """
     from khipu.cli import _literal_candidates
     from khipu.search_text import search_phrase, explicit_search_tokens, order_search_evidence, session_query
@@ -2883,6 +2892,11 @@ def hybrid_search(
         if kind == LIBRARY_KIND and include_libraries is False:
             raise ValueError("kind 'library' conflicts with include_libraries=False")
 
+    if owner_words_only:
+        if kind not in (None, "episode"):
+            raise ValueError("owner words search episodes only")
+        kind = "episode"
+        memory_fields = True
     limit = max(1, int(limit))
     # Every leg is timed and reported in the payload's `timing` block (phase 5
     # addendum): a 12.5 s search told nobody WHICH leg cost the 12.5 s.
@@ -2936,10 +2950,15 @@ def hybrid_search(
             try:
                 with try_hub_connect() as lit_conn:
                     with lit_conn.cursor() as lit_cur:
-                        literal_box["rows"] = _literal_candidates(
-                            lit_cur, query, oversample, kind=literal_kind, filters=filters,
-                            fast=literal_kind != "node", owner_words=True
-                        )
+                        if owner_words_only:
+                            from khipu.memory_rows import owner_candidates
+
+                            literal_box["rows"] = owner_candidates(lit_cur, query, oversample, filters)
+                        else:
+                            literal_box["rows"] = _literal_candidates(
+                                lit_cur, query, oversample, kind=literal_kind, filters=filters,
+                                fast=literal_kind != "node", owner_words=True
+                            )
             except BaseException as exc:  # noqa: BLE001 — memory answer must not sink on literal
                 literal_box["error"] = f"{type(exc).__name__}: {exc}"[:120]
             finally:
@@ -2994,9 +3013,14 @@ def hybrid_search(
             if literal_thread is None and want_literal:
                 literal_kind = kind if kind in _LITERAL_KINDS else None
                 _t = time.monotonic()
-                literal_rows = _literal_candidates(
-                    cur, query, oversample, kind=literal_kind, filters=filters
-                )
+                if owner_words_only:
+                    from khipu.memory_rows import owner_candidates
+
+                    literal_rows = owner_candidates(cur, query, oversample, filters)
+                else:
+                    literal_rows = _literal_candidates(
+                        cur, query, oversample, kind=literal_kind, filters=filters
+                    )
                 timing["literal_ms"] = round((time.monotonic() - _t) * 1000, 1)
 
             if lib_legs is not None:
@@ -3153,6 +3177,10 @@ def hybrid_search(
             from khipu.tombstones import without_hidden_episodes
 
             fused = without_hidden_episodes(fused)
+            if owner_words_only:
+                from khipu.memory_rows import keep_owner_matches
+
+                fused = keep_owner_matches(cur, fused, query)
 
             # Absolute relevance gate: the list unchanged when any row is
             # evidence, empty when none is. Once, after fusion, graph expansion
@@ -3266,6 +3294,10 @@ def hybrid_search(
             fused = order_search_evidence(fused, len(tokens))
             fused = _fair_fill(fused, limit)
             fused = order_search_evidence(fused, len(tokens))
+            if memory_fields:
+                from khipu.memory_rows import annotate_search_rows
+
+                fused = annotate_search_rows(cur, fused, query)
             timing["enrich_ms"] = round((time.monotonic() - _t) * 1000, 1)
 
     from khipu.recency import HALF_LIFE_DAYS

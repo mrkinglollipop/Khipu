@@ -72,3 +72,76 @@ def test_snapshot_session(hub, monkeypatch, tmp_path):
     con.execute("UPDATE episodes SET deleted_at='2026-11-06' WHERE id=1")
     con.commit()
     assert not hs.search_stale_payload(sid,12)['results']
+
+
+def _owner_corpus(hub, tmp_path):
+    from tests.test_search_indexed_words import install_words
+    install_words(hub, tmp_path)
+    conn = hub.connect()
+    quotes = json.dumps({'quotes': ['please keep the violet reset intact', 'second line']})
+    agent_only = json.dumps({'commands': ['echo violet reset'], 'note': 'agent says violet reset',
+                             'errors': ['violet reset failed'], 'quotes': ['unrelated owner line']})
+    conn.execute("INSERT INTO episodes (ts,summary,raw,session_id,project,harness,origin,verbatim) VALUES "
+                 "(now(),'Reset work. More detail follows here.','{}','codex:aaaaaaaa-0000-0000-0000-000000000001','khipu','codex','gateway:x',%s::jsonb),"
+                 "(now(),'The violet reset was discussed by the agent','{}','claude_code:aaaaaaaa-0000-0000-0000-000000000002','khipu','claude_code',NULL,%s::jsonb)",
+                 (quotes, agent_only))
+    conn.commit()
+    return [str(r[0]) for r in conn.execute('SELECT id FROM episodes ORDER BY id')]
+
+
+def test_owner_words_only_matches_the_owners_lines(hub, monkeypatch, tmp_path):
+    configure_hub(monkeypatch, hub)
+    ids = _owner_corpus(hub, tmp_path)
+    monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: kw['timing'].update(embed_ms=0.0, cosine_ms=0.0) or
+                        [dict(kind='episode', id=i, score=.9 - n / 10, rank_text='x', label='x', snippet='x') for n, i in enumerate(ids)])
+    for mode in ('literal', 'hybrid'):
+        plain = embed.hybrid_search('violet reset', mode=mode)
+        assert set(r['id'] for r in plain['results']) >= set(ids) or mode == 'literal'
+        assert 'quote' not in plain['results'][0]  # callers without the option see the old keys
+        out = embed.hybrid_search('violet reset', mode=mode, owner_words_only=True)
+        assert [r['id'] for r in out['results']] == [ids[0]], mode
+        row = out['results'][0]
+        assert row['quote'] == 'please keep the violet reset intact'
+        assert row['title'] == 'Reset work.'
+        assert row['tool'] == 'Codex' and row['mac'] is None and row['project'] == 'khipu'
+        assert {'quote', 'title', 'tool', 'mac', 'project'} <= set(row)
+
+
+def test_owner_words_only_agent_line_never_matches(hub, monkeypatch, tmp_path):
+    configure_hub(monkeypatch, hub)
+    _owner_corpus(hub, tmp_path)
+    monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: [])
+    # the words appear only in an agent's command, error and note
+    for mode in ('literal', 'hybrid'):
+        assert not embed.hybrid_search('echo violet', mode=mode, owner_words_only=True)['results']
+        assert not embed.hybrid_search('violet reset failed', mode=mode, owner_words_only=True)['results']
+        assert not embed.hybrid_search('agent says', mode=mode, owner_words_only=True)['results']
+    with __import__('pytest').raises(ValueError):
+        embed.hybrid_search('violet', kind='topic', owner_words_only=True)
+
+
+def test_search_rows_carry_memory_fields_only_when_asked(hub, monkeypatch, tmp_path):
+    configure_hub(monkeypatch, hub)
+    ids = _owner_corpus(hub, tmp_path)
+    monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: [])
+    plain = embed.hybrid_search('violet reset', mode='literal')['results']
+    asked = embed.hybrid_search('violet reset', mode='literal', memory_fields=True)['results']
+    assert all('quote' not in r and 'mac' not in r for r in plain)
+    by_id = {r['id']: r for r in asked}
+    assert by_id[ids[0]]['quote'] == 'please keep the violet reset intact'
+    assert by_id[ids[1]]['quote'] == 'The violet reset was discussed by the agent'  # summary line, no owner line
+    assert by_id[ids[1]]['tool'] == 'Claude Code'
+
+
+def test_activity_rows_carry_memory_fields(hub, monkeypatch, tmp_path):
+    from khipu import activity, db
+    configure_hub(monkeypatch, hub)
+    monkeypatch.setattr(activity, 'connect', lambda **kw: hub.connect())
+    ids = _owner_corpus(hub, tmp_path)
+    out = activity.activity_payload(limit=5)
+    by_id = {str(r['id']): r for r in out['recent']}
+    row = by_id[ids[0]]
+    assert (row['quote'], row['title'], row['tool'], row['mac'], row['project']) == \
+           ('please keep the violet reset intact', 'Reset work.', 'Codex', None, 'khipu')
+    assert by_id[ids[1]]['quote'] == 'unrelated owner line'
+    assert list(row)[-5:] == ['quote', 'title', 'tool', 'mac', 'project']
