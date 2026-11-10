@@ -520,7 +520,7 @@ class WatcherPathTest(unittest.TestCase):
             memory = claude_root / "-repo-a" / "memory"
             for name in ("one", "two", "three"):
                 _write(memory / f"{name}.md", _sample_note_text().replace("khipu-state-of-play", name))
-            cur = _FakeTopicsCursor()
+            cur = self.cur = _FakeTopicsCursor()
             with mock.patch.object(notes, "claude_projects_root", return_value=claude_root), \
                     mock.patch.object(notes, "codex_memories_root", return_value=Path(td) / "no-codex"), \
                     mock.patch.object(notes, "_project_for_slug", return_value="acme/repo-a"), \
@@ -558,6 +558,66 @@ class WatcherPathTest(unittest.TestCase):
             again = notes.reconcile(dry_run=False, changed_only=True)
             self.assertEqual((again["candidates"], again["written"]), (0, 0))
             connect.assert_not_called()
+
+        self._run(body)
+
+    def _live(self):
+        return sorted(sl for sl, row in self.cur.topics.items() if not row.get("deleted_at"))
+
+    def test_a_deleted_note_is_tombstoned_by_the_changed_only_pass(self):
+        def body(memory, connect):
+            notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual(len(self._live()), 3)
+            (memory / "two.md").unlink()
+            got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual(got["deleted"], 1)
+            self.assertEqual(got["tombstone"]["tombstoned"], 1)
+            self.assertEqual(len(self._live()), 2)
+            self.assertFalse([sl for sl in self._live() if sl.startswith("note:two")])
+            connect.reset_mock()
+            again = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual(again["deleted"], 0)
+            connect.assert_not_called()
+
+        self._run(body)
+
+    def test_a_renamed_note_ends_as_one_live_note(self):
+        def body(memory, _connect):
+            notes.reconcile(dry_run=False, changed_only=True)
+            (memory / "two.md").rename(memory / "two-renamed.md")
+            notes.reconcile(dry_run=False, changed_only=True)
+            live = self._live()
+            self.assertEqual(len(live), 3, live)
+            self.assertEqual(len([sl for sl in live if "two" in sl]), 1, live)
+            # and the next pass has nothing left to do
+            self.assertEqual(notes.reconcile(dry_run=False, changed_only=True)["deleted"], 0)
+
+        self._run(body)
+
+    def test_a_folder_that_cannot_be_listed_tombstones_nothing(self):
+        def body(memory, _connect):
+            notes.reconcile(dry_run=False, changed_only=True)
+            for f in memory.glob("*.md"):
+                f.unlink()
+            real = notes.os.listdir
+
+            def unreadable(path):
+                if Path(path) == memory:
+                    raise PermissionError("not today")
+                return real(path)
+
+            with mock.patch.object(notes.os, "listdir", unreadable), \
+                    mock.patch.object(notes, "_log") as log:
+                got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual(got["deleted"], 0)
+            self.assertEqual(got["folders_not_listed"], [str(memory)])
+            self.assertEqual(len(self._live()), 3)
+            self.assertTrue(any("could not be listed" in str(c) for c in log.call_args_list))
+            # the same folder missing outright is treated the same way
+            shutil_target = memory.parent / "gone"
+            memory.rename(shutil_target)
+            got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual((got["deleted"], len(self._live())), (0, 3))
 
         self._run(body)
 

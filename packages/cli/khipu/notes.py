@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -564,22 +565,25 @@ def _redirect_topic_dict(old_slug: str, new_slugs: list[str]) -> dict[str, Any]:
     }
 
 
-def _tombstone_missing_notes(cur) -> dict[str, Any]:
+def _tombstone_missing_notes(cur, only_slugs: set[str] | None = None) -> dict[str, Any]:
     """F5: mark a ``note:`` topic ``deleted_at = now()`` when its
     ``source_path`` file no longer exists. Circuit-broken the same way the
     wiki reconcile is (``khipu.mirror.reconcile_from_files``'s mass-tombstone
     guard): never more than ``TOMBSTONE_MAX_FRACTION`` of live note topics in
     one run — a mount blip that makes every memory dir read as empty must
     not silently empty the corpus. Only the full (non ``changed_only``)
-    reconcile calls this; it needs every live note topic's row, which a
-    Stop-hook-cheap changed-only pass does not fetch."""
+    reconcile calls this with no ``only_slugs``; the watcher's changed-only
+    pass calls it with just the slugs whose files it saw disappear
+    (``_deleted_indexed_notes``), so the same checks and the same circuit
+    breaker apply to both."""
     cur.execute(
         "SELECT slug, source_path FROM topics WHERE slug LIKE %s AND deleted_at IS NULL",
         (NOTE_SLUG_PREFIX + "%",),
     )
     rows = cur.fetchall()
     total = len(rows)
-    missing = [slug for slug, path in rows if not path or not Path(path).is_file()]
+    missing = [slug for slug, path in rows
+               if (only_slugs is None or slug in only_slugs) and (not path or not Path(path).is_file())]
     out: dict[str, Any] = {"checked": total, "missing": len(missing), "tombstoned": 0, "skipped": False}
     if not missing:
         return out
@@ -610,6 +614,29 @@ def _any_memory_root_exists() -> bool:
     if codex_memories_root().is_dir():
         return True
     return bool(cursor_memory_roots()) or bool(aegis_memory_roots())
+
+
+def _deleted_indexed_notes(files_state: dict, present_paths: set[str]) -> tuple[dict[str, str], list[str]]:
+    """Indexed notes (from the state file) whose file is gone, found by listing
+    each note's folder only: no note is opened. Returns ``({path: slug}, folders
+    that could not be listed)``. A folder that is missing or unreadable at this
+    moment (an unmounted volume, a permission error) contributes nothing to the
+    first result, so a blip cannot tombstone its notes."""
+    listings: dict[str, set[str] | None] = {}
+    gone: dict[str, str] = {}
+    for path, entry in files_state.items():
+        if path in present_paths or not isinstance(entry, dict) or not entry.get("slug"):
+            continue
+        parent = str(Path(path).parent)
+        if parent not in listings:
+            try:
+                listings[parent] = set(os.listdir(parent))
+            except OSError:
+                listings[parent] = None
+        names = listings[parent]
+        if names is not None and Path(path).name not in names:
+            gone[path] = entry["slug"]
+    return gone, sorted(p for p, names in listings.items() if names is None)
 
 
 def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str, Any]:
@@ -647,6 +674,16 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
     for redirect in collision_report["redirects"]:
         redirect["new_slugs"] = sorted(item["parsed"]["slug"] for item in plan if item["base_slug"] == redirect["old_slug"])
     inventory = plan
+    deleted_paths: dict[str, str] = {}
+    unlisted: list[str] = []
+    if changed_only:
+        # The watcher fires when a note is deleted or renamed, so this pass also
+        # retires indexed notes whose file is gone (folder listings only).
+        deleted_paths, unlisted = _deleted_indexed_notes(files_state, {i["path"] for i in plan})
+        live_slugs = {i["parsed"]["slug"] for i in plan}
+        deleted_slugs = {sl for sl in deleted_paths.values() if sl not in live_slugs}
+    else:
+        deleted_slugs = set()
     if changed_only:
         plan = [item for item in plan if item["signature"] != {k: files_state.get(item["path"], {}).get(k) for k in ("mtime", "size")}
                 or item["parsed"]["slug"] != files_state.get(item["path"], {}).get("slug")]
@@ -664,11 +701,16 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
         "slugs": [p["parsed"]["slug"] for p in plan],
         "duplicate_copies": collision_report["duplicate_copies"],
         "collisions_reslugged": collision_report["collisions_reslugged"],
+        "deleted": len(deleted_paths),
+        "folders_not_listed": unlisted,
     }
+    if unlisted:
+        _log(f"changed-only pass: {len(unlisted)} folder(s) could not be listed, "
+             f"no note from them was tombstoned: {', '.join(unlisted[:5])}")
     if dry_run:
         return out
     run_tombstone = (not changed_only) and _any_memory_root_exists()
-    if not plan and not run_tombstone:
+    if not plan and not run_tombstone and not deleted_paths:
         if changed_only:
             _write_state({
                 "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
@@ -761,6 +803,11 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
                     _log(f"redirect write failed for {redirect['old_slug']}: {exc}")
             if run_tombstone:
                 out["tombstone"] = _tombstone_missing_notes(cur)
+            elif deleted_paths:
+                out["tombstone"] = _tombstone_missing_notes(cur, only_slugs=deleted_slugs)
+                if not out["tombstone"].get("skipped"):
+                    for gone in deleted_paths:
+                        new_files_state.pop(gone, None)
         conn.commit()
     out["ok"] = not out["errors"]
     _write_state({
