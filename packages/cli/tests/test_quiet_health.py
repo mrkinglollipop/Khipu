@@ -368,6 +368,7 @@ def test_a_mac_with_the_notes_watcher_loaded_is_green(monkeypatch):
     from khipu import launchd_gen
 
     monkeypatch.setattr(jobs, "_job_entry", lambda name: {"plist_loaded": True})
+    monkeypatch.setattr(jobs, "launchd_state", lambda label: {"loaded": True, "spawn_failed": False, "last_exit": 0})
     monkeypatch.setattr(launchd_gen, "watch_list_drift", lambda: {"installed": ["/m/a"], "unwatched": [], "stale": []})
     assert jobs.notes_watch_health()["ok"] is True
 
@@ -376,6 +377,7 @@ def test_the_health_check_names_a_notes_folder_that_exists_but_is_not_watched(mo
     from khipu import jobs, launchd_gen
 
     monkeypatch.setattr(jobs, "_job_entry", lambda name: {"plist_loaded": True})
+    monkeypatch.setattr(jobs, "launchd_state", lambda label: {"loaded": True, "spawn_failed": False, "last_exit": 0})
     monkeypatch.setattr(launchd_gen, "watch_list_drift",
                         lambda: {"installed": ["/m/a"], "unwatched": ["/m/b"], "stale": []})
     row = jobs.notes_watch_health()
