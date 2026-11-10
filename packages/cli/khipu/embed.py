@@ -3143,8 +3143,6 @@ def hybrid_search(
 
             floor_info: dict[str, Any] | None = None
 
-            # graph candidates are not called here: with them on, the prompt and status paths found 84 of 120 golden hits against 96 with them off (jobs/2026-11-10/b2-switch-measure.md). The module is kept, unreachable.
-
             fused = _apply_search_filters(
                 cur, fused, project=project, since=since, until=until,
                 session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,

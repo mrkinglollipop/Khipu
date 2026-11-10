@@ -233,7 +233,7 @@ khipu graph <node-id> --hops 2                           # connections
 
 **Semantic** mode uses cosine plus token overlap only. `--semantic` still works as a deprecated alias.
 
-Search always applies the absolute relevance floor (an unrelated query returns nothing), validity ranking, graph candidates and time interpretation. There are no switches for them, and there is no rerank stage.
+Search always applies the absolute relevance floor (an unrelated query returns nothing), validity ranking and time interpretation. There are no switches for them, and there is no rerank stage.
 
 **Filters** work in the CLI and the MCP tool: `--kind`, `--source` (one library), `--project`, `--since`, `--until` (ISO dates or `7d`), `--session-id`, `--harness`, `--via`. Hybrid and literal accept episode, topic, node and library; semantic accepts episode, topic, media and library. The MCP tool also accepts `t3_thread` and `tz`; the CLI has no `--t3-thread` or `--tz` flags. Timezone defaults to UTC, including for an unknown zone. Natural-language time interpretation applies only when no explicit `since` or `until` is given.
 

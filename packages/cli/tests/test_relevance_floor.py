@@ -206,14 +206,6 @@ def test_a_prompt_that_names_something_remembered_still_recalls_it_with_the_swit
     assert any(h["kind"] == "episode" and h["id"] == "1" for h in result["hits"])
 
 
-def test_graph_candidates_do_not_resurrect_an_abstention(tmp_path, monkeypatch):
-    _on(monkeypatch)
-    monkeypatch.setenv("KHIPU_FEATURE_GRAPH_CANDIDATES", "1")
-    with corpus.installed_corpus(tmp_path):
-        result = rp.prior_work_for_prompt(UNRELATED, cwd=None)
-    assert result["hits"] == []
-
-
 def test_the_local_lane_runs_the_gate_once(tmp_path, monkeypatch):
     _on(monkeypatch)
     with corpus.installed_corpus(tmp_path), \
