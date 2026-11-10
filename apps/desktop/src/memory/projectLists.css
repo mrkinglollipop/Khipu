@@ -1,0 +1,40 @@
+/* Project work lists (slice A8). Every class starts pl-. Tokens come from App.css. */
+.pl-cap { margin: 0 12px 16px; color: var(--muted); font-size: var(--t-lg); line-height: 1.5; }
+.pl-projects { display: flex; flex-direction: column; gap: 2px; }
+.pl-projects > .pl-proj { flex: none; height: auto; min-height: 44px; border: 0; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.pl-proj[aria-disabled="true"] { cursor: default; }
+.pl-name { font-weight: 600; font-size: var(--t-lg); color: var(--text); }
+.pl-count { font-size: var(--t-lg); color: var(--text-2); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pl-count.muted { color: var(--muted); }
+.pl-page { display: flex; flex-direction: column; }
+.pl-back { height: auto; display: none; align-items: center; gap: 4px; align-self: flex-start; margin: 0 0 16px -8px; padding: 8px; min-height: 44px; border: 0; border-radius: var(--r-sm); background: none; color: var(--accent-text); font: inherit; cursor: pointer; }
+.pl-head h2 { margin: 0; font-size: var(--t-2xl); line-height: 1.2; }
+.pl-sub { margin: 4px 0 0; color: var(--muted); font-size: var(--t-lg); }
+.pl-kept { margin: 24px 0 8px; color: var(--muted); font-size: var(--t-lg); }
+.pl-page section { margin-top: 32px; }
+.pl-page h3 { margin: 0 0 8px; padding-bottom: 8px; font-size: var(--t-lg); border-bottom: 1px solid var(--border); }
+.pl-lines { list-style: none; margin: 0; padding: 0; }
+.pl-line { display: grid; grid-template-columns: 1fr auto auto; align-items: baseline; column-gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.pl-title { font-size: var(--t-lg); overflow-wrap: anywhere; }
+.pl-note { color: var(--text-2); font-size: var(--t-md); text-align: right; }
+.pl-act { height: auto; padding: 4px 10px; min-height: 28px; border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--surface); color: var(--text); font: inherit; font-size: var(--t-md); cursor: pointer; }
+.pl-act:disabled { opacity: 0.55; cursor: default; }
+.pl-act:focus-visible, .pl-link:focus-visible, .pl-back:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+@media (hover: hover) and (pointer: fine) {
+  .pl-act:not(:disabled):hover { background: var(--surface-2); }
+  .pl-link:hover { color: var(--accent-hover); }
+}
+.pl-foot { margin: 24px 0 0; color: var(--muted); font-size: var(--t-lg); }
+.pl-link { height: auto; display: inline; padding: 0; border: 0; background: none; color: var(--accent-text); font: inherit; text-decoration: underline; cursor: pointer; }
+.pl-empty { margin: 8px 12px; color: var(--muted); font-size: var(--t-lg); }
+.pl-page .pl-empty { margin-left: 0; }
+.pl-error { margin: 12px 0; padding: 12px; border-radius: var(--r-md); background: var(--err-soft); color: var(--err); font-size: var(--t-md); }
+.pl-note-box { margin: 12px 0; padding: 12px; border-radius: var(--r-md); background: var(--warn-soft); color: var(--warn); font-size: var(--t-md); }
+@media (max-width: 899px) {
+  .pl-page .pl-back { display: inline-flex; }
+}
+@media (max-width: 639px) {
+  .pl-line { grid-template-columns: 1fr auto; row-gap: 4px; }
+  .pl-note { grid-column: 1; text-align: left; grid-row: 2; }
+  .pl-act { grid-column: 2; grid-row: 1 / span 2; align-self: center; min-height: 44px; }
+}

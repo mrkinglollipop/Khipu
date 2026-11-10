@@ -30,6 +30,7 @@ import {
 } from "../src/FoundAccounts";
 import type { AccountRefs } from "../src/FoundAccounts";
 import App from "../src/App";
+import { ProjectLists } from "../src/memory/ProjectLists";
 import { RoutingSettings } from "../src/RoutingSettings";
 import { OfflineBanner, SavedOnThisMac, WaitingToSync } from "../src/OfflineBanner";
 import { OfflineWaitsCard } from "../src/SettingsControls";
@@ -444,6 +445,9 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   // Move around with the sidebar. Answers come from fakes/shell.ts.
   app: { title: "The whole window", render: () => <App /> },
   "app-quiet": { title: "The whole window, nothing needs you", fake: { quiet: true }, render: () => <App /> },
+  // Memory › Project work lists on its own, and with no project holding a list.
+  "worklists": { title: "Project work lists", render: () => <ProjectLists /> },
+  "worklists-none": { title: "Project work lists, none yet", fake: { noProjects: true }, render: () => <ProjectLists /> },
   "app-welcome": { title: "The whole window, first run", fake: { welcome: true }, render: () => <App /> },
   "setup-signed-out": {
     title: "Setup: a default login that is not signed in",
@@ -478,7 +482,7 @@ function Page() {
       </main>
     );
   }
-  if (hash.startsWith("app") || hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst" || hash === "routing-settings-cde" || hash === "routing-settings-cde-worst" || hash.startsWith("routing-overrides")) {
+  if (hash.startsWith("app") || hash.startsWith("worklists") || hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst" || hash === "routing-settings-cde" || hash === "routing-settings-cde-worst" || hash.startsWith("routing-overrides")) {
     // The Settings pane at its app width, uncapped by the 960 state frame.
     return <div style={{ height: "100%" }} data-state={hash}>{st.render()}</div>;
   }

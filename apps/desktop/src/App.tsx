@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import khipuIcon from "./assets/khipu-icon.png";
 import { Sidebar, TabBar, Toolbar } from "./shell";
+import { ProjectLists } from "./memory/ProjectLists";
 import type { NavItem } from "./shell";
 import {
   Callout,
@@ -1424,7 +1425,7 @@ export default function App() {
   const [graphBusy, setGraphBusy] = useState(false);
   // Recall holds Search and the graph walk; the walk is a sub-view of a result,
   // not a peer destination (audit IA).
-  const [recallView, setRecallView] = useState<"search" | "graph">("search");
+  const [recallView, setRecallView] = useState<"search" | "graph" | "projects">("search");
   // One cached array per status. Home's preview, the rail badge and the Owed
   // screen's own table all read this, so a write that moves a row between two
   // statuses cannot leave one of them stale (phase 4: the segmented control
@@ -4706,10 +4707,12 @@ export default function App() {
                   label: "Graph",
                   hint: "Walk what a topic or node is connected to.",
                 },
+                { value: "projects", label: "Project work lists", hint: "What is done and not done in each project." },
               ]}
             />
           </PanelHeader>
-          <div className="panel-body wide">
+          {recallView === "projects" ? <ProjectLists onOwedClose={(id) => owedWrite(id, [`--close=${id}`])} /> : null}
+          <div className="panel-body wide" style={recallView === "projects" ? { display: "none" } : undefined}>
             {recallView === "search" ? (
               <>
             <div className="inline">
