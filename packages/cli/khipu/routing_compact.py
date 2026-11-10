@@ -194,7 +194,16 @@ def health(now: datetime | None = None) -> dict:
                      "red": {"lines": LINES_RED, "bytes": BYTES_RED}},
            "last_compaction": last.get("at"), "last_result": last.get("result"),
            "archives": len(_archives())}
-    gone, total = (_droppable() if now is None else _droppable(now)) if level != "green" else (0, 0)
+    over_trigger = lines > LINES_TRIGGER or nbytes > BYTES_TRIGGER
+    gone, total = (_droppable() if now is None else _droppable(now)) if level != "green" or over_trigger else (0, 0)
+    if over_trigger and total and gone and gone >= MIN_GAIN * total:
+        overdue = _overdue(last, now or routing._now())
+        if overdue:
+            out["overdue"] = True
+            out["overdue_why"] = overdue
+            if level == "green":
+                out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes) and is overdue for "
+                                  f"compaction: {overdue}")
     if level != "green":
         local, remote = _stored_rows()
         rows = local + remote
@@ -239,6 +248,32 @@ def health(now: datetime | None = None) -> dict:
                                             f"observations compaction can remove{outcome}"
                                             if level == "red" else "."))
     return out
+
+
+OVERDUE_AFTER_S = 24 * 3600
+
+
+def _overdue(last: dict, now: datetime) -> str | None:
+    """Why a record over its compaction line has gone a day without an
+    attempt, in plain words, or None when an attempt is recent enough.
+    Compaction runs from two jobs: the queue-drain job (every 5 minutes,
+    while the routing push is on) and the nightly job (on the nightly host
+    only), so a Mac without the first never compacts."""
+    tried = routing._parse(last.get("attempted_at"))
+    if tried is not None and (now - tried).total_seconds() < OVERDUE_AFTER_S:
+        return None
+    since = f"the last attempt was {routing._iso(tried)}" if tried else "no attempt is recorded"
+    try:
+        from khipu import features, jobs
+
+        if not features.enabled("routing_push"):
+            return f"the routing push is switched off, so the queue-drain job skips it ({since})."
+        if not jobs._plist_loaded(jobs._JOB_SPECS["queue_drain"]["plist"]):
+            return (f"the queue-drain job, which runs it on this Mac, is not installed or not loaded ({since}); "
+                    "the nightly job runs it only on the nightly host.")
+    except Exception:  # noqa: BLE001 - the reason is a courtesy
+        return f"{since}."
+    return f"the queue-drain job is loaded but has not attempted it ({since})."
 
 
 def _stored_rows():

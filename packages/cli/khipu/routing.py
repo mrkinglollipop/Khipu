@@ -10068,6 +10068,7 @@ def doctor_block(now: datetime | None = None) -> dict:
     return {"routing_delivery": delivery_health, "rules_budget": rules_block,
             "priority": {"set": held is not None, "pending": bool(held and held.get("pending")),
                          "entries": [e["label"] for e in (held or {}).get("entries") or []],
+                         "first": _first_priority_identity(held, view),
                          "line": priority_line(held, now, view=view) if held else None},
             "record": bool(view.get("record")), "version": view["version"], "folded_at": view.get("folded_at"),
             "log": log_health, "prompt_budget": budget,
@@ -10087,6 +10088,19 @@ def doctor_block(now: datetime | None = None) -> dict:
             "warnings": warnings, "notes": notes,
             "contradictions": list(view.get("contradictions") or []),
             "rule_hygiene": list(view.get("rule_hygiene") or [])}
+
+
+def _first_priority_identity(held: dict | None, view: dict) -> dict | None:
+    """The first priority account by identity (harness and home), so doctor
+    can tell it is the account a plan warning names whatever either label
+    says. None when no priority is set or the account is not tracked."""
+    if not held or not held.get("entries"):
+        return None
+    first = held["entries"][0]
+    entry = next((a for a in view["accounts"] if a["key"] == first["account"]), None)
+    if entry is None:
+        return None
+    return {"label": entry["label"], "harness": entry.get("harness"), "home": entry.get("home")}
 
 
 def _long_silent(runner: dict, now: datetime) -> datetime | None:

@@ -4283,12 +4283,18 @@ def format_hook_refresh(res: dict[str, Any]) -> list[str]:
     return lines or ["hooks: every wired harness is current"]
 
 
-def hook_wiring_report() -> dict[str, Any]:
+def hook_wiring_report(*, ask_codex: bool = False) -> dict[str, Any]:
     """`khipu doctor`'s hook row: per detected harness, whether the hooks wired
     now are what this version would install, from the same dry run an install
     uses. ``warnings`` is plain text for each one that is not, with the fix. It
     is warning-level by design: the promote gate runs doctor on the candidate,
-    and a stale hook list must not block the promote that refreshes it."""
+    and a stale hook list must not block the promote that refreshes it.
+
+    ``ask_codex`` (the full ``khipu doctor`` only): Codex runs a hook only
+    after its owner reviewed it, so when Khipu's hooks are installed in Codex
+    the row also asks Codex (``codex_hook_trust``, read-only, a few seconds at
+    most) and says "installed and trusted", "installed, waiting for your
+    review in Codex" or "installed; could not ask Codex"."""
     rows, warnings = [], []
     for harness in HOOK_PLAN_HARNESSES:
         label = _HOOK_LABELS[harness]
@@ -4322,6 +4328,23 @@ def hook_wiring_report() -> dict[str, Any]:
                 fix = (f"run `khipu integrations install {harness}` (a promote or an app update "
                        "refreshes it by itself)")
             warnings.append(f"{label}: the wired hooks are behind this version ({shown}); {fix}")
+    if ask_codex:
+        for row in rows:
+            if row["harness"] != "codex" or row.get("state") not in ("current", "stale"):
+                continue
+            try:
+                from khipu import codex_hook_trust
+
+                answer = codex_hook_trust.ask()
+            except Exception as e:  # noqa: BLE001 - a failed question is "could not ask"
+                answer = {"state": "unknown", "words": f"installed; could not ask Codex ({type(e).__name__})"}
+            row["trust"] = answer["state"]
+            row["words"] = answer["words"]
+            if answer["state"] == "waiting":
+                if row["state"] == "current":
+                    row["state"] = "waiting for review"
+                warnings.append("Codex: Khipu's hooks are installed, waiting for your review in Codex; "
+                                "until you approve them there, Codex does not run them.")
     return {"harnesses": rows, "warnings": warnings, "ok": not warnings}
 
 
