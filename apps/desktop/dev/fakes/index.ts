@@ -8,6 +8,7 @@
 // wins. Answers are sent as JSON text, like the real `invoke`; wrap one in
 // `raw()` for a command whose real answer is a bare value (e.g. `true`).
 import { shellFakes } from "./shell";
+import { orderRulesFakes } from "./orderRules";
 
 export type FakeSwitches = Record<string, unknown>;
 export type FakeHandler = (cmd: string, args: Record<string, unknown> | undefined, flags: FakeSwitches) => unknown | undefined;
@@ -15,7 +16,7 @@ export type FakeHandler = (cmd: string, args: Record<string, unknown> | undefine
 export { RAW, raw, isRaw } from "./raw";
 export type { Raw } from "./raw";
 
-export const FAKE_HANDLERS: FakeHandler[] = [shellFakes];
+export const FAKE_HANDLERS: FakeHandler[] = [shellFakes, orderRulesFakes];
 
 export function fakeAnswer(cmd: string, args: Record<string, unknown> | undefined, flags: FakeSwitches): unknown | undefined {
   for (const handler of FAKE_HANDLERS) {

@@ -31,6 +31,7 @@ import {
 import type { AccountRefs } from "../src/FoundAccounts";
 import App from "../src/App";
 import { RoutingSettings } from "../src/RoutingSettings";
+import { OrderAndRules } from "../src/accounts/OrderAndRules";
 import { OfflineBanner, SavedOnThisMac, WaitingToSync } from "../src/OfflineBanner";
 import { OfflineWaitsCard } from "../src/SettingsControls";
 import { SetupAccountsStep } from "../src/SetupAccounts";
@@ -444,6 +445,9 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   // Move around with the sidebar. Answers come from fakes/shell.ts.
   app: { title: "The whole window", render: () => <App /> },
   "app-quiet": { title: "The whole window, nothing needs you", fake: { quiet: true }, render: () => <App /> },
+  // Accounts > Order and rules (slice A6): alone, and inside the window (`#app-rules`: open Accounts, then Order and rules). Answers come from fakes/orderRules.ts.
+  "order-rules": { title: "Order and rules", fake: { orderRules: true }, render: () => <OrderAndRules active onSeeAll={() => {}} /> },
+  "app-rules": { title: "The whole window, with Order and rules", fake: { orderRules: true }, render: () => <App /> },
   "app-welcome": { title: "The whole window, first run", fake: { welcome: true }, render: () => <App /> },
   "setup-signed-out": {
     title: "Setup: a default login that is not signed in",

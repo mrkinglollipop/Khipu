@@ -20,7 +20,8 @@ import {
   X,
 } from "lucide-react";
 import khipuIcon from "./assets/khipu-icon.png";
-import { Sidebar, TabBar, Toolbar } from "./shell";
+import { Sidebar, TabBar, Toolbar, ViewSwitch } from "./shell";
+import { OrderAndRules } from "./accounts/OrderAndRules";
 import type { NavItem } from "./shell";
 import {
   Callout,
@@ -1212,6 +1213,7 @@ const OwedRow = memo(function OwedRow({
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("home");
+  const [acctView, setAcctView] = useState<"room" | "rules">("room");
   const [paneRetryKeys, setPaneRetryKeys] = useState<Record<Tab, number>>({
     "first-run": 0, home: 0, activity: 0, recall: 0, revisions: 0, work: 0, harnesses: 0, routing: 0, settings: 0, guides: 0,
   });
@@ -3908,6 +3910,9 @@ export default function App() {
     </>
   );
   const toolbarTitle = PLACE_TITLES[tab];
+  // Accounts: the old routing screen stays as "Room right now" until its
+  // replacement lands (A4); Order and rules is slice A6's piece.
+  const accountsRules = tab === "routing" && acctView === "rules";
 
   return (
     <div className="shell sh-window">
@@ -3922,7 +3927,16 @@ export default function App() {
       />
 
       <main className="main" aria-busy={workingLabel != null}>
-        {toolbarTitle ? <Toolbar title={toolbarTitle} heading={false} /> : null}
+        {tab === "routing" ? (
+          <Toolbar title="Accounts" heading={accountsRules}>
+            <ViewSwitch
+              label="Accounts view"
+              options={[{ id: "room", label: "Room right now" }, { id: "rules", label: "Order and rules" }]}
+              value={acctView}
+              onChange={setAcctView}
+            />
+          </Toolbar>
+        ) : toolbarTitle ? <Toolbar title={toolbarTitle} heading={false} /> : null}
         <WorkingBanner label={workingLabel} />
         <div className="main-content">
         <section className={panelClass("first-run")}>
@@ -5760,9 +5774,10 @@ export default function App() {
 
         <section className={panelClass("routing")}>
           <PaneBoundary key={paneRetryKeys.routing} title={PANE_TITLES.routing} onRetry={retryActivePane}>
-          <PanelHeader title="Accounts and routing" lede="Accounts, routing rules, and what needs your attention." />
-          <div className="panel-body wide">
-            {tab === "routing" ? <RoutingSettings
+          {accountsRules ? null : <PanelHeader title="Accounts and routing" lede="Accounts, routing rules, and what needs your attention." />}
+          {accountsRules ? <OrderAndRules active /> : null}
+          <div className="panel-body wide" style={accountsRules ? { display: "none" } : undefined}>
+            {tab === "routing" && !accountsRules ? <RoutingSettings
               active
               plansState={plans}
               onSetUpAccounts={openAccountsStepInFirstRun}
