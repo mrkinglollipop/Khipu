@@ -33,7 +33,7 @@ OTHER_MAC = "Your other Mac"
 ROW_FIELDS = ("name", "version", "saving", "health", "running", "signins")
 HEALTH_FIELDS = ("checked_at", "state", "areas", "routing_version", "free_gb", "last_backup_at")
 AREA_FIELDS = ("key", "state")
-RUNNING_FIELDS = ("count", "silent")
+RUNNING_FIELDS = ("count", "silent", "runners")  # "runners" is the closed list in running_now.RUNNER_FIELDS
 SILENT_FIELDS = ("name", "since")
 SIGNIN_FIELDS = ("harness", "label", "signed_in")
 
@@ -107,7 +107,9 @@ def _running(raw) -> dict | None:
         name = _text(item.get("name"), _RUNNER) if isinstance(item, dict) else None
         if name:
             silent.append({"name": name, "since": _iso(item.get("since"))})
-    return {"count": _count(raw.get("count")), "silent": silent}
+    from khipu import running_now
+
+    return {"count": _count(raw.get("count")), "silent": silent, "runners": running_now.project_runners(raw.get("runners"))}
 
 
 def _signins(raw) -> list | None:
@@ -263,10 +265,20 @@ def _remembered() -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
-def local_row(doc: dict | None = None) -> dict:
+def local_row(doc: dict | None = None, *, share: bool = False) -> dict:
     """This Mac's closed row now. With a health document, that is what it reports; without one (the timer), the
-    last health this Mac kept; with neither, saving, health and running are ``None`` (not known)."""
+    last health this Mac kept; with neither, saving, health and running are ``None`` (not known). ``share`` adds
+    this Mac's running jobs (a hub read) for the row it publishes; a live ``khipu macs`` read leaves them out."""
     base = _from_health(doc) if doc else _remembered()
+    if share:
+        try:
+            from khipu import running_now
+
+            runners = running_now.this_mac_runners()
+        except Exception:  # noqa: BLE001 - no running part is "not known", never a failure of the row
+            runners = None
+        if runners is not None:
+            base = dict(base, running=dict(base.get("running") or {"count": None, "silent": []}, runners=runners))
     row = project(dict(base, name=mac_label(), version=version_stamp(), signins=sign_ins()))
     if row["health"] is not None and not doc:
         row["health"]["routing_version"] = routing_version()
@@ -286,7 +298,7 @@ def publish(row: dict | None = None, *, mac: str | None = None) -> dict:
 
         if hub_reach.known_unreachable():
             return {"ok": False, "why": "hub_unreachable"}
-        row = project(row if row is not None else local_row())
+        row = project(row if row is not None else local_row(share=True))
         from khipu import db
 
         with db.connect(statement_timeout_s=HUB_TIMEOUT_S) as conn:

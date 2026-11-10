@@ -248,6 +248,6 @@ def cmd_health(args) -> int:
     print(json.dumps(doc, indent=2, ensure_ascii=False))
     if report:
         # Tell the hub how this Mac is, after the report is out; a write that fails changes nothing above.
-        macs.publish(macs.local_row(doc))
+        macs.publish(macs.local_row(doc, share=True))
         macs.remember_health(doc)
     return 0

@@ -75,7 +75,8 @@ def test_the_projection_keeps_only_the_listed_fields():
     assert list(row["health"]) == list(macs.HEALTH_FIELDS)
     assert row["health"]["areas"] == [{"key": "saving", "state": "ok"}]
     assert row["health"]["free_gb"] == 80.0
-    assert row["running"] == {"count": 2, "silent": [{"name": "codex", "since": "2026-11-10T09:00:00Z"}]}
+    assert row["running"] == {"count": 2, "silent": [{"name": "codex", "since": "2026-11-10T09:00:00Z"}], "runners": None}
+    assert list(row["running"]) == list(macs.RUNNING_FIELDS)
     assert row["signins"] == [{"harness": "claude", "label": "Work", "signed_in": True}]
     blob = json.dumps(row)
     for leak in ("/Users", "~", "hello", "secret", "headline", "agent_note", "words"):

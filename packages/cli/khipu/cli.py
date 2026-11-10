@@ -5151,6 +5151,10 @@ def build_parser() -> argparse.ArgumentParser:
     mc.add_argument("--json", action="store_true", help="Print JSON (the only form)")
     mc.set_defaults(func=lambda args: __import__("khipu.macs", fromlist=["cmd_macs"]).cmd_macs(args))
 
+    rn = sub.add_parser("running", help="Which jobs are running, on which Mac, and which have gone quiet (this Mac live, the other as last reported)")
+    rn.add_argument("--json", action="store_true", help="Print JSON (the only form)")
+    rn.set_defaults(func=lambda args: __import__("khipu.running_now", fromlist=["cmd_running"]).cmd_running(args))
+
     ny = sub.add_parser("needs-you", help="Everything waiting on the owner, in the app and MCP's own words")
     ny.add_argument("--json", action="store_true", help="Print the complete structured answer")
     choose = ny.add_mutually_exclusive_group()

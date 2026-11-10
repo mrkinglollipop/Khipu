@@ -1707,6 +1707,7 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
                 if job["state"] == "running" and quiet and not job["quiet"]:
                     times.append(updated + timedelta(seconds=quiet))
                 job["account_ref"] = _account_ref(job, runner, routing_info)
+                job["runner"] = runner  # which runner reported it (khipu running joins it to the runner's heartbeat)
                 board["jobs"].append(job)
                 if job["state"] in ("running", "queued", "waiting") and source["state"] != "gone" and not gone:
                     live.append(job)
