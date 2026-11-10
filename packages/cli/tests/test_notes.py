@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import tempfile
 import textwrap
 import unittest
@@ -613,13 +614,131 @@ class WatcherPathTest(unittest.TestCase):
             self.assertEqual(got["folders_not_listed"], [str(memory)])
             self.assertEqual(len(self._live()), 3)
             self.assertTrue(any("could not be listed" in str(c) for c in log.call_args_list))
-            # the same folder missing outright is treated the same way
-            shutil_target = memory.parent / "gone"
-            memory.rename(shutil_target)
-            got = notes.reconcile(dry_run=False, changed_only=True)
-            self.assertEqual((got["deleted"], len(self._live())), (0, 3))
+        self._run(body)
+
+    def test_a_quiet_pass_reads_no_note_file_and_opens_no_connection(self):
+        def body(_memory, connect):
+            notes.reconcile(dry_run=False, changed_only=True)
+            connect.reset_mock()
+            real = Path.read_text
+            reads: list[str] = []
+
+            def counting(self_, *a, **k):
+                if self_.suffix == ".md":
+                    reads.append(str(self_))
+                return real(self_, *a, **k)
+
+            with mock.patch.object(Path, "read_text", counting), \
+                    mock.patch.object(Path, "read_bytes", side_effect=AssertionError("read_bytes")):
+                got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual((got["candidates"], got["written"], got["deleted"]), (0, 0, 0))
+            self.assertEqual(reads, [])
+            connect.assert_not_called()
 
         self._run(body)
+
+    def test_a_folder_created_after_install_is_picked_up_and_the_watch_list_refreshed_once(self):
+        from khipu import cli, launchd_gen
+
+        def body(memory, _connect):
+            notes.reconcile(dry_run=False, changed_only=True)
+            installed = [str(memory)]  # what the job was installed with
+            _write(memory.parent.parent / "-repo-b" / "memory" / "late.md",
+                   _sample_note_text().replace("khipu-state-of-play", "late"))
+            got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual((got["candidates"], got["written"]), (1, 1))
+            with mock.patch.object(launchd_gen, "installed_watch_paths", return_value=installed), \
+                    mock.patch.object(launchd_gen, "refresh_watch_list", return_value={"ok": True, "started": True}) as refresh:
+                result = cli._refresh_notes_watch_list()
+            refresh.assert_called_once()
+            self.assertTrue(result["changed"] and result["ok"])
+            self.assertEqual(result["unwatched"], [str(memory.parent.parent / "-repo-b" / "memory")])
+            # a list that already matches is left alone
+            now = [str(p) for p in notes.memory_dirs()]
+            with mock.patch.object(launchd_gen, "installed_watch_paths", return_value=now), \
+                    mock.patch.object(launchd_gen, "refresh_watch_list") as refresh:
+                self.assertEqual(cli._refresh_notes_watch_list(), {"changed": False})
+            refresh.assert_not_called()
+
+        self._run(body)
+
+    def test_a_failed_watch_list_refresh_does_not_stop_the_pass(self):
+        from khipu import cli, launchd_gen
+
+        def body(memory, _connect):
+            _write(memory.parent.parent / "-repo-b" / "memory" / "late.md",
+                   _sample_note_text().replace("khipu-state-of-play", "late"))
+            got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual(got["written"], 4)  # the pass did its work first
+            with mock.patch.object(launchd_gen, "installed_watch_paths", return_value=[str(memory)]), \
+                    mock.patch.object(launchd_gen, "refresh_watch_list", return_value={"ok": False, "error": "launchctl said no"}), \
+                    contextlib.redirect_stderr(__import__("io").StringIO()) as err:
+                result = cli._refresh_notes_watch_list()
+            self.assertFalse(result["ok"])
+            self.assertIn("watch list refresh failed: launchctl said no", err.getvalue())
+            with mock.patch.object(launchd_gen, "watch_list_drift", side_effect=RuntimeError("boom")), \
+                    contextlib.redirect_stderr(__import__("io").StringIO()):
+                self.assertFalse(cli._refresh_notes_watch_list()["ok"])
+
+        self._run(body)
+
+    def _with_second_project(self, body):
+        def wrapped(memory, connect):
+            root = memory.parent.parent
+            for name in ("b1",):
+                _write(root / "-repo-b" / "memory" / f"{name}.md", _sample_note_text().replace("khipu-state-of-play", name))
+            notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual(len(self._live()), 4)
+            body(root, connect)
+
+        self._run(wrapped)
+
+    def test_a_deleted_project_folder_with_a_listable_parent_retires_its_notes(self):
+        def body(root, _connect):
+            shutil.rmtree(root / "-repo-b" / "memory")
+            got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual((got["deleted"], got["tombstone"]["tombstoned"]), (1, 1))
+            self.assertEqual(len(self._live()), 3)
+            self.assertEqual(notes.reconcile(dry_run=False, changed_only=True)["deleted"], 0)
+
+        self._with_second_project(body)
+
+    def test_a_deleted_project_folder_respects_the_per_pass_limit(self):
+        def body(root, _connect):
+            shutil.rmtree(root / "-repo-a" / "memory")  # 3 of 4 live notes: looks like a blip
+            got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertTrue(got["tombstone"]["skipped"])
+            self.assertEqual(len(self._live()), 4)
+
+        self._with_second_project(body)
+
+    def test_a_folder_whose_parent_is_missing_too_retires_nothing(self):
+        def body(root, _connect):
+            shutil.rmtree(root / "-repo-b")
+            got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual(got["deleted"], 0)
+            self.assertEqual(got["folders_not_listed"], [str(root / "-repo-b" / "memory")])
+            self.assertEqual(len(self._live()), 4)
+
+        self._with_second_project(body)
+
+    def test_a_folder_that_exists_but_is_unreadable_retires_nothing(self):
+        def body(root, _connect):
+            target = root / "-repo-b" / "memory"
+            for f in target.glob("*.md"):
+                f.unlink()
+            real = notes.os.listdir
+
+            def unreadable(path):
+                if Path(path) == target:
+                    raise PermissionError("not today")
+                return real(path)
+
+            with mock.patch.object(notes.os, "listdir", unreadable):
+                got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual((got["deleted"], len(self._live())), (0, 4))
+
+        self._with_second_project(body)
 
     def test_the_stop_hook_and_nightly_no_longer_scan_notes(self):
         self.assertFalse(hasattr(notes, "hook_reconcile"))

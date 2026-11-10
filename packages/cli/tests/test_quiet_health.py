@@ -365,5 +365,19 @@ def test_a_mac_without_the_notes_watcher_says_so_and_names_the_install_command(m
 def test_a_mac_with_the_notes_watcher_loaded_is_green(monkeypatch):
     from khipu import jobs
 
+    from khipu import launchd_gen
+
     monkeypatch.setattr(jobs, "_job_entry", lambda name: {"plist_loaded": True})
+    monkeypatch.setattr(launchd_gen, "watch_list_drift", lambda: {"installed": ["/m/a"], "unwatched": [], "stale": []})
     assert jobs.notes_watch_health()["ok"] is True
+
+
+def test_the_health_check_names_a_notes_folder_that_exists_but_is_not_watched(monkeypatch):
+    from khipu import jobs, launchd_gen
+
+    monkeypatch.setattr(jobs, "_job_entry", lambda name: {"plist_loaded": True})
+    monkeypatch.setattr(launchd_gen, "watch_list_drift",
+                        lambda: {"installed": ["/m/a"], "unwatched": ["/m/b"], "stale": []})
+    row = jobs.notes_watch_health()
+    assert row["ok"] is False and "/m/b" in row["error"] and "not watching 1 notes folder" in row["error"]
+    assert row["fix"] == "run `khipu jobs install notes_watch`"

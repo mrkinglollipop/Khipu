@@ -1446,6 +1446,19 @@ def notes_watch_health() -> dict[str, Any]:
         return {"ok": False, "applicable": True, "error": f"{type(exc).__name__}: {exc}",
                 "fix": "run `khipu jobs install notes_watch`"}
     if loaded:
+        try:
+            from khipu.launchd_gen import watch_list_drift
+
+            drift = watch_list_drift()
+        except Exception as exc:  # noqa: BLE001 - a failed comparison must not look like a pass
+            return {"ok": False, "applicable": True, "error": f"could not compare the watch list: {type(exc).__name__}: {exc}",
+                    "fix": "run `khipu jobs install notes_watch`"}
+        if drift.get("unwatched"):
+            n = len(drift["unwatched"])
+            return {"ok": False, "applicable": True, "unwatched": drift["unwatched"],
+                    "error": f"the notes watcher is not watching {n} notes folder{'s' if n != 1 else ''} that exist"
+                             f" (for example {drift['unwatched'][0]}), so edits there are indexed only on its 30-minute timer",
+                    "fix": "run `khipu jobs install notes_watch`"}
         return {"ok": True, "applicable": True}
     return {"ok": False, "applicable": True,
             "error": "the notes watcher is not installed, so edited notes are not indexed",
