@@ -98,6 +98,16 @@ def test_it_is_on_by_default(world):
     assert owner_turns.settings()["enabled"] is True
 
 
+
+def _named(marker: dict) -> dict:
+    """The fixed-words lines naming who made each change after ``marker``
+    (``khipu_route since``): the routing page itself names no author."""
+    view = routing.read_view()
+    got = routing.since(marker["version"], view, epoch=marker["epoch"])
+    text = "\n".join(got["directions"])
+    return {"kind": "changes" if text else "none", "text": text, "version": view["version"],
+            "epoch": view["epoch"]}
+
 def test_a_direction_goes_from_the_hook_to_the_record_and_back(world, khipu_app, monkeypatch):
     routing.report(account="Claude", state="open",
                    author={"kind": "conversation", "harness": "codex", "project": "p", "session": "s-other"})
@@ -111,7 +121,7 @@ def test_a_direction_goes_from_the_hook_to_the_record_and_back(world, khipu_app,
     (line,) = [x for x in _log() if x.get("kind") == "action"]
     assert (line["action"], line["auth"], line["binding"], line["turn"], line["session"]) == \
         ("route.pause", "direction", "hook", turn, SESSION)
-    assert "by your direction" in routing.prompt_push(seen, budget=5.0)["text"]
+    assert "by your direction" in _named(seen)["text"]
 
     # A conversation with no recent owner turn is refused, and changes nothing.
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "e2e-session-never-typed")

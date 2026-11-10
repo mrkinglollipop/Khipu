@@ -42,6 +42,8 @@ export type OwnerAction = {
   binding?: "hook" | "token" | "session";
   via_session?: string;
   state?: string | null;
+  /** The Mac the change was made on ("M5"); null when the line doesn't say. */
+  mac?: string | null;
   runs_at?: string;
   no_undo?: string;
   after?: Record<string, unknown> | null;

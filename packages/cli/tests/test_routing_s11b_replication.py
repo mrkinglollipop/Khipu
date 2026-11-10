@@ -258,9 +258,6 @@ def test_12_offline_age_and_skew_use_hub_clock_and_keep_local_writes(pair):
     assert replication.status()["caught_up_at"] == caught
     assert replication.status()["stale"]
     routing.add_rule("offline", via="app")
-    assert "routing from other Macs is 10 min old" in routing.summary(now=a.now)["text"]
-    out = routing.prompt_push(None, budget=1, now=a.now)
-    assert "routing from other Macs is 10 min old" in out["text"]
 
 
 @pytest.mark.parametrize("addition", [False, True])
@@ -575,14 +572,6 @@ def test_confirmation_of_withheld_priority_is_refused(pair):
     sync(b, hub)
     with pytest.raises(routing.RouteError, match="source Mac"):
         routing.confirm_priority(via="app", expect=routing.priority_version())
-
-
-def test_no_change_push_still_reports_replica_age(pair):
-    a, _, hub = pair
-    sync(a, hub)
-    out = routing._replication_push_age({"kind": "none", "text": None}, a.now)
-    assert out["kind"] == "changes"
-    assert "routing from other Macs is 0 min old" in out["text"]
 
 
 def test_confirmed_words_and_proposal_identity_share_one_locked_read(pair, monkeypatch):

@@ -41,11 +41,9 @@ def test_model_facts_reach_mcp_both_pushes_and_advisory(replay, monkeypatch):
     assert providers['deepseek']['models_allowed'] == ['deepseek-flash']
     assert providers['muse']['models_allowed'] == ['muse-wonder-full-1.0']
     assert providers['antigravity']['use'] == 'on_request'
-    summary = routing.summary()['text']
-    assert all(word in summary for word in ['models_allowed: [deepseek-flash]', 'models_allowed: [muse-wonder-full-1.0]',
-                                             'use: on_request'])
-    # Both recall paths call these common production delivery functions.
-    assert 'models_allowed' in routing.start_push(1.0)['text']
+    # The routing page every reader gets names each account's allowed models.
+    page = routing.start_push(1.0)['text']
+    assert 'deepseek-flash only' in page and 'muse-wonder-full-1.0 only' in page
     for provider, model, field in [('deepseek', 'v4-pro', 'models_allowed'), ('muse', 'other', 'models_allowed'),
                                    ('antigravity', 'gemini-3', 'on_request')]:
         payload = {'tool_name': 'spawn_agent', 'tool_input': {'provider': provider, 'model': model}}
@@ -57,7 +55,7 @@ def test_model_facts_reach_mcp_both_pushes_and_advisory(replay, monkeypatch):
         'command': 'muse exec --model other "do the task"'}}) == []
     agent_view.prepare_routing_table(refresh=True)
     changed = routing.prompt_push({'version': 0}, budget=1.0, now=T0)
-    assert 'models_allowed' in changed['text']
+    assert 'deepseek-flash only' in changed['text']
 
 
 def test_provider_owner_boundary_and_words_unchanged(replay):

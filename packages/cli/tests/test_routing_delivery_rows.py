@@ -335,6 +335,9 @@ def test_owner_local_delivery_names_never_reach_other_surfaces(planted, monkeypa
     elif surface == "child":
         start = routing.start_push(budget=2, moment="delegation",
                                    child_component="agent:synthetic", child_session="synthetic-recipient")
+        # Reserved by the hook once it holds the answer (``recall_rule._RoutingAtStart.text``).
+        start = routing_delivery.offer(start, session="synthetic-recipient", component="agent:synthetic",
+                                       deferred=True)
         assert routing_delivery.acknowledge("synthetic-recipient", start["routing_changes"], now=planted.now)
         pages = []
         for _ in range(20):
@@ -343,10 +346,12 @@ def test_owner_local_delivery_names_never_reach_other_surfaces(planted, monkeypa
                 break
             pages.append(page)
             assert routing_delivery.acknowledge("synthetic-recipient", page["routing_changes"], now=planted.now)
-        assert start and start["text"] and pages
+        # The page went whole at the start; a tool result gets it again only
+        # when it changes, so ``pages`` may well be empty.
+        assert start and start["text"]
         output = [start, pages, routing_delivery.snapshot("synthetic-recipient", "agent:synthetic")]
     elif surface == "mcp":
-        error, output = planted.call(session_id="synthetic-recipient")
+        error, output = planted.call(session_id="synthetic-recipient", full=True)
         assert not error and output["accounts"]
     elif surface == "replication":
         events = routing._read_all_events()[0]
