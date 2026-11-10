@@ -481,6 +481,42 @@ def _parse_antigravity(d: dict) -> list[tuple[str, str]] | None:
     return [("user" if kind == "USER_INPUT" else "assistant", text)] if text.strip() else []
 
 
+# Claude Code writes a message the owner types while a turn is running only as
+# an ``attachment`` line: {"type": "attachment", "attachment": {"type":
+# "queued_command", "prompt": "<text>", "commandMode": "prompt", "origin":
+# {"kind": "human"}}} (2.1.304 to 2.1.322 seen; some builds leave ``origin``
+# out). No ``user`` line follows with the text; only the request log copied it.
+# Other origin kinds queue machine messages the same way, none of them typed.
+# ``peer`` (another session: <agent-message>, <cross-session-message>) reached
+# the window through an unclosed <system-reminder> in its request-log copy,
+# counted as a typed turn; it is kept now as a relayed message is (its body,
+# outer tag stripped) and never counted. ``task-notification`` (commandMode
+# ``task-notification``) and, with no origin, a monitor's tagged event
+# (<ci-monitor-event>) had copies only in system blocks or closed reminders,
+# which never reached the window, so they still yield nothing. The provisional
+# roles let ``read_window`` drop the attachment when the same text also
+# arrives as a later user line, and keep a peer's message out of the count.
+_QUEUED_USER = "queued:user"
+_QUEUED_PEER = "queued:peer"
+
+
+def _queued_command(d: dict) -> list[tuple[str, str]]:
+    a = d.get("attachment")
+    if not isinstance(a, dict) or a.get("type") != "queued_command":
+        return []
+    prompt = a.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return []
+    origin = a.get("origin")
+    kind = origin.get("kind") if isinstance(origin, dict) else None
+    if kind == "human" or (kind is None and a.get("commandMode") == "prompt"
+                           and not prompt.lstrip().startswith("<")):
+        return [(_QUEUED_USER, prompt)]
+    if kind == "peer":
+        return [(_QUEUED_PEER, prompt)]
+    return []
+
+
 def _parse_line(d: dict) -> list[tuple[str, str]]:
     """One transcript line → zero or more (role, text) items, for any of the
     shapes Khipu reads (sniffed per line, so a mixed file still works):
@@ -492,7 +528,20 @@ def _parse_line(d: dict) -> list[tuple[str, str]]:
                    "agent_message", "message": ...}}  (+ function_call items)
       Antigravity {"type": "USER_INPUT"|"PLANNER_RESPONSE"|"AGENCY_TOOL_CALL",
                    "content": ..., "step_index": n}
+
+    Claude Code's own request logging (``api-request``, ``api-request-blob``,
+    ``api-request-shape``, seen from 2.1.293) is not conversation: a blob line
+    carries a ``message`` with a role, but it copies a prompt, brief or skill
+    body already written as a ``user`` line, or a tool call already written as
+    an ``assistant`` line, so it yields nothing. The one thing a blob used to
+    carry that no ordinary line does, a message the owner typed while a turn
+    was running, is read from its ``attachment`` line (``_queued_command``).
     """
+    kind = d.get("type")
+    if isinstance(kind, str) and kind.startswith("api-request"):
+        return []
+    if kind == "attachment":
+        return _queued_command(d)
     antigravity = _parse_antigravity(d)
     if antigravity is not None:
         return antigravity
@@ -657,6 +706,20 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
         if not isinstance(d, dict) or d.get("isMeta"):
             continue
         parsed.extend((d, role, text, min(line_end, end)) for role, text in _parse_line(d))
+    if any(role in (_QUEUED_USER, _QUEUED_PEER) for _, role, _, _ in parsed):
+        # A queued message is a user message once: dropped when a later user
+        # line in this window carries the same text.
+        later: set[str] = set()
+        resolved: list[tuple[dict, str, str, int]] = []
+        for d, role, text, line_end in reversed(parsed):
+            if role in (_QUEUED_USER, _QUEUED_PEER):
+                if _clean_user_text(text).strip() in later:
+                    continue
+                role = "user"
+            elif role == "user":
+                later.add(_clean_user_text(text).strip())
+            resolved.append((d, role, text, line_end))
+        parsed = resolved[::-1]
     # Deduplicate only paired representations of the same turn (adjacent in
     # order, ignoring tools), never a later repeat that reuses the same text.
     # Index event_msg turns by (role, text, turn-ordinal) so matching is O(n).
@@ -749,6 +812,12 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             if not text.strip():
                 continue
             stand_in = _machine_user_message(text)
+            if (stand_in is None and d.get("type") == "attachment"
+                    and any(r == _QUEUED_PEER for r, _ in _queued_command(d))):
+                # Another session's message queued mid-turn: kept as a relayed
+                # message is, never a typed turn.
+                stand_in = (_OUTER_TAG.sub("", text.strip()).strip()
+                            or f"[notification: peer message, {len(text):,} chars]")
             real = stand_in is None
             if stand_in is not None:
                 text = stand_in
