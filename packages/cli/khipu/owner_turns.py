@@ -11,7 +11,8 @@ never recorded as this conversation's typed turn.
 One file per session, ``<capture home>/owner-turns/<session>.jsonl``, mode
 0600 in a 0700 folder: never synced, captured, searched or backed up. Each
 line is a time and facts about the turn, never its text. Lines older than
-``RETENTION_S`` go on the next write or read of the file, and on the timer's
+``RETENTION_S`` (a brief line: its own ``keep`` when it has one) go on the
+next write or read of the file, and on the timer's
 ``sweep`` (the replica-refresh job) when neither comes. Beside them,
 ``known-processes/<pid>.json`` keeps what a hook read about its issuer for as
 long as that process lives (``_pin_issuer``). Standard library plus
@@ -43,6 +44,10 @@ from khipu import antigravity_db, hook_shape, t3
 from khipu.turn_text import clean_user_text, is_machine, owner_text
 
 RETENTION_S = 24 * 3600
+# A brief noted from a desktop session tool's own brief field: its proposal
+# card can be started up to a week after the call that carried the brief, so
+# the line keeps its own retention (``keep``). Owner turns keep a day.
+START_BRIEF_RETENTION_S = 8 * 24 * 3600
 # Front ends whose typed turns are the owner's. ``harness:entrypoint``, where
 # the entrypoint is Claude Code's CLAUDE_CODE_ENTRYPOINT ("cli" a terminal,
 # Remote Control and the JetBrains plugin included; "claude-desktop" and
@@ -276,6 +281,23 @@ def dispatched_lane(env: dict) -> bool:
 # T3's Agent SDK sets these for its own top-level threads too, so inside T3
 # they are not evidence of a job; T3's delegated-thread record decides.
 _T3_SDK_LINEAGE = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_HOST_SESSION_ID")
+# The Claude desktop app runs Claude Code through the Agent SDK too: every
+# conversation it shows has CLAUDE_CODE_CHILD_SESSION=1 and the app's own
+# handle for that conversation ("local_<uuid>") as its host session id, which
+# never equals Claude Code's own session id (seen 2026-11-10).
+DESKTOP_ENTRYPOINTS = ("claude-desktop", "claude-desktop-3p")
+
+
+def desktop_conversation(env: dict) -> bool:
+    """The environment of a Claude desktop app conversation: the app's
+    entrypoint and a host id in the app's ``local_`` form. Anything started
+    from its shell inherits both, so it counts only with ``desktop_launched``
+    (and a ``claude -p`` is recorded ``sdk-cli`` by its issuer's command
+    line); the runner's lane marker, ``KHIPU_JOB`` and a parent session
+    still mark a job."""
+    entry = (env.get("CLAUDE_CODE_ENTRYPOINT") or "").strip()
+    host = (env.get("CLAUDE_CODE_HOST_SESSION_ID") or "").strip()
+    return entry in DESKTOP_ENTRYPOINTS and host.startswith("local_")
 
 
 def job_marker(env: dict) -> bool:
@@ -290,8 +312,13 @@ def _marked(env: dict, session: str, *, t3_thread: bool) -> bool:
     if dispatched_lane(env):
         return True
     # The lane marker's meaning ("0" is the owner's) is ``dispatched_lane``'s.
+    # The desktop app's environment alone is not enough: an Agent SDK script,
+    # a nested agent or anything else started from the conversation's shell
+    # inherits it, so only a process tree that reaches the app itself
+    # (``desktop_launched``) skips the SDK markers.
+    sdk = t3_thread or (desktop_conversation(env) and desktop_launched())
     own = {k: v for k, v in env.items()
-           if k != "CLAUDE_DISPATCHED_LANE" and not (t3_thread and k in _T3_SDK_LINEAGE)}
+           if k != "CLAUDE_DISPATCHED_LANE" and not (sdk and k in _T3_SDK_LINEAGE)}
     if session and not (own.get("CLAUDE_CODE_SESSION_ID") or "").strip():
         own["CLAUDE_CODE_SESSION_ID"] = session
     return routing_advice.is_dispatched(own)
@@ -304,7 +331,10 @@ def dispatched_job(env: dict, session: str = "", *, t3_thread: bool = False) -> 
     lane marker, then the lineage markers ``routing_advice.is_dispatched``
     reads (``KHIPU_JOB=1``, a parent session, a Claude Code child, a host
     session id that is not this session's), with ``session`` standing in
-    for an own id the environment does not name. ``t3_thread``: the session
+    for an own id the environment does not name. The Claude desktop app sets
+    the child and host-id markers for every conversation it runs, so they are
+    skipped there when this process descends from the app itself
+    (``desktop_conversation`` and ``desktop_launched``). ``t3_thread``: the session
     runs in T3, where the Claude Code child and host-id markers are set for
     the owner's own threads too, so they are skipped and T3's record of a
     delegated child thread decides; a lookup that does not complete fails
@@ -378,7 +408,12 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: 
         # Claude Code turns only "cli" into "sdk-cli" for ``claude -p``: a
         # job started from a desktop, VS Code or remote session keeps that
         # session's entrypoint, so the issuer's own command line decides.
-        if (issuer or {}).get("print") and not entry.startswith("sdk-"):
+        # ``headless`` is the wider test (``-pc`` and other grouped short flags
+        # carry ``-p`` with no ``print`` flag); it counts for the desktop app,
+        # whose own ``-p`` jobs inherit its entrypoint and, with it, no longer
+        # its SDK markers (``desktop_conversation``).
+        if not entry.startswith("sdk-") and ((issuer or {}).get("print") or (
+                entry in DESKTOP_ENTRYPOINTS and (issuer or {}).get("headless") is True)):
             return "sdk-cli"
         # A session T3 Code runs has a T3 thread, whatever entrypoint it
         # reports: T3 turns are never owner turns, so membership decides, not
@@ -499,22 +534,29 @@ def _hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def note_brief(text: str, *, parent: str, harness: str, now: float | None = None) -> None:
+def note_brief(text: str, *, parent: str, harness: str, now: float | None = None, start: bool = False) -> None:
     """A delegation's brief (the delegation hook calls this): a turn whose
     text is this brief is a dispatched job's, never the owner's, and the
     brief names the parent session the job was started from. Only hashes
-    of the brief are kept."""
+    of the brief are kept. ``start`` (a desktop session tool's own brief
+    field only): kept ``START_BRIEF_RETENTION_S``, and kept under the usual
+    floors (four words, 20 characters) too, where it matches only a turn
+    whose whole text is the brief (``brief_for``)."""
     norm = _norm(text or "")
     # Kept while owner direction is off too: a turn that could turn it back
     # on is recorded then, and a brief must never pass for one.
-    if len(norm) < 20 or not parent:
+    if not norm or not parent or (len(norm) < 20 and not start):
         return
-    head = norm[:_HEAD]
-    line = {"ts": time.time() if now is None else now, "sha": _hash(norm), "head_sha": _hash(head),
-            "head_len": len(head), "parent": parent, "harness": harness}
+    line = {"ts": time.time() if now is None else now, "sha": _hash(norm)}
+    if not (start and (len(norm.split()) < 4 or len(norm) < 20)):
+        head = norm[:_HEAD]
+        line.update(head_sha=_hash(head), head_len=len(head))
+    line.update(parent=parent, harness=harness)
+    if start:
+        line["keep"] = START_BRIEF_RETENTION_S
     try:
         path = _ensure_folder() / "briefs.jsonl"
-        lines = [b for b in _read_lines(path) if line["ts"] - float(b.get("ts") or 0) < RETENTION_S]
+        lines = [b for b in _read_lines(path) if line["ts"] - _ts(b) < _brief_keep(b)]
         _write_private(path, "".join(json.dumps(_no_text(b)) + "\n" for b in lines + [line]))
     except OSError:
         pass
@@ -523,6 +565,15 @@ def note_brief(text: str, *, parent: str, harness: str, now: float | None = None
 def _no_text(brief: dict) -> dict:
     """A brief line as it is kept now: an older line's copied words go."""
     return {k: v for k, v in brief.items() if k != "head"}
+
+
+def _brief_keep(brief: dict) -> float:
+    """How long a brief line is kept: its own ``keep`` when it holds one (a
+    start brief, at most ``START_BRIEF_RETENTION_S``), else ``RETENTION_S``."""
+    keep = brief.get("keep")
+    if isinstance(keep, (int, float)) and not isinstance(keep, bool) and 0 < keep <= START_BRIEF_RETENTION_S:
+        return float(keep)
+    return RETENTION_S
 
 
 def brief_for(text: str, now: float | None = None) -> dict | None:
@@ -535,7 +586,7 @@ def brief_for(text: str, now: float | None = None) -> dict | None:
     starts = [0] + [i + 1 for i, c in enumerate(norm[:_HEAD_SCAN]) if c == " "]
     heads: dict[int, set[str]] = {}
     for b in reversed(_read_lines(folder() / "briefs.jsonl")):
-        if now - float(b.get("ts") or 0) >= RETENTION_S:
+        if now - _ts(b) >= _brief_keep(b):
             continue
         if b.get("sha") == whole:
             return b
@@ -1005,6 +1056,53 @@ def t3_launched(issuer) -> bool:
     return False
 
 
+_DESKTOP_BUNDLE = "claude.app"
+
+
+def _desktop_app(exe: str) -> bool:
+    """``exe`` runs from the Claude desktop app's bundle (its helpers
+    included): the outermost bundle is Claude.app, directly in /Applications
+    or ~/Applications, matched as ``_t3_app`` matches."""
+    try:
+        path = Path(os.path.realpath(exe))
+    except (OSError, ValueError):
+        return False
+    for i, part in enumerate(path.parts):
+        if part.casefold().endswith(".app"):
+            return part.isascii() and part.casefold() == _DESKTOP_BUNDLE \
+                and _in_trusted_place(Path(*path.parts[:i]))
+    return False
+
+
+def desktop_launched(pid: int | None = None) -> bool:
+    """Whether the agent above ``pid`` (default: this process) was started by
+    the Claude desktop app itself: past hook shells (sh, bash, dash), the
+    first process is no shell, interpreter or print-mode run, and its parent
+    runs from the app's bundle. A ``claude -p`` (or any agent) started from a
+    desktop conversation's shell has that shell or a print flag on the way,
+    so it is not. The agent may be known by its pinned record after an
+    update deleted its file (``_known_info``, as ``hook_issuer``); its
+    parent, the app, only as the kernel has it. Anything unreadable is not."""
+    me = _proc_info(os.getpid() if pid is None else pid)
+    if me is None:
+        return False
+    cur = me[0]
+    for _ in range(_ISSUER_MOST):
+        info = _known_info(cur)
+        if info is None:
+            return False
+        parent, exe, _start = info
+        name = os.path.basename(os.path.realpath(exe))
+        if name in HOOK_SHELLS:
+            cur = parent
+            continue
+        if _scripted_launcher(name, _proc_args(cur)):
+            return False
+        above = _proc_info(parent)
+        return above is not None and _desktop_app(above[1])
+    return False
+
+
 def hook_issuer(shim: str = PROMPT_SHIM) -> dict | None:
     """The process that ran this hook. The recorder's parent must be the
     prompt shim (a shell running ``khipu-prompt-recall``; ``shim`` names
@@ -1173,7 +1271,9 @@ def _prune(path: Path, now: float) -> int:
     except FileNotFoundError:
         return 0
     rows = _read_lines(path) if raw else []
-    kept = [r for r in rows if now - _ts(r) < RETENTION_S]
+    # A brief line keeps its own retention (``_brief_keep``); turn lines a day.
+    keep = _brief_keep if path.name == "briefs.jsonl" else (lambda r: RETENTION_S)
+    kept = [r for r in rows if now - _ts(r) < keep(r)]
     gone = len(raw.splitlines()) - len(kept)
     if any("head" in r or "text" in r for r in kept):
         kept = [{k: v for k, v in r.items() if k not in ("head", "text")} for r in kept]

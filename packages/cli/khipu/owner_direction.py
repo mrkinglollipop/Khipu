@@ -208,7 +208,7 @@ def check(action: str, *, env=None, now: float | None = None, reading: bool = Fa
     try:
         turn = _recent_turn(session, conf, now)
     except DirectionRefused:
-        if any(t.get("entrypoint") in ("t3", "t3-unverified") for t in owner_turns.turns(session, now)):
+        if _t3_conversation(session, owner_turns.turns(session, now)):
             # A T3 conversation (or one whose hook could not read T3's record in
             # time, which T3's record is asked again here): its hook turns never
             # count directly; T3's own record of the owner's messages does
@@ -263,6 +263,28 @@ _ASK_NOW = ("Not confirmed yet: no message the owner typed in this conversation 
 def _usable_t3_turn(t: dict) -> bool:
     return t.get("entrypoint") == "t3" and not any(
         t.get(k) for k in ("dispatched", "helper", "wrapped", "delegated", "machine"))
+
+
+def _t3_conversation(session: str, turns_: list[dict]) -> bool:
+    """Whether T3's record proves the owner in this conversation: a turn the
+    hook recorded as T3's, or a turn whose T3 lookup could not be read
+    (``t3-unverified``) unless T3's record, read now, settles that no thread
+    runs this session. A lookup that still can't be read keeps the T3 path,
+    which refuses (``t3_unreadable``). An unread turn never counts itself
+    (``owner_turns.eligible``); one unread lookup only stops poisoning a
+    conversation T3 never ran."""
+    entries = {t.get("entrypoint") for t in turns_}
+    if "t3" in entries:
+        return True
+    if "t3-unverified" not in entries:
+        return False
+    from khipu import t3
+
+    for _ in range(_OWNER_T3_ATTEMPTS if t3.owner_read_active() else 2):
+        threads, definitive = t3.session_thread_ids_result(session)
+        if definitive:
+            return bool(threads)
+    return True
 
 
 def _t3_thread_of(session: str) -> str:
@@ -438,7 +460,7 @@ def note_read(shown: list[str], *, env=None, now: float | None = None) -> str | 
         session = _caller_session(environ)
         with _requests_locked() as path, t3.owner_read_budget():
             turns_ = owner_turns.turns(session, now)
-            in_t3 = any(t.get("entrypoint") in ("t3", "t3-unverified") for t in turns_)
+            in_t3 = _t3_conversation(session, turns_)
             if not in_t3 and owner_turns.dispatched_job(environ, session):
                 return None
             thread = _t3_bound(environ, session, now)[0] if in_t3 else None
@@ -541,7 +563,7 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
             extra = {}
             if terminal or authorized is not None:
                 pass
-            elif any(t.get("entrypoint") in ("t3", "t3-unverified") for t in turns_):
+            elif _t3_conversation(session, turns_):
                 with t3.owner_read_budget():
                     thread, _ = _t3_bound(environ, session, now)
                     seeded = None if class_c(action, args) else _seed(thread, session, signature(action, args))
@@ -814,7 +836,7 @@ def _t3_turn(environ, session: str, now: float, action: str) -> dict | None:
 
 def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
     recorded = owner_turns.turns(session, now)
-    if any(t.get("entrypoint") in ("t3", "t3-unverified") for t in recorded):
+    if _t3_conversation(session, recorded):
         raise DirectionRefused("no_recorded_turn", "This conversation's turns were recorded as T3's, but T3's "
                                                    "record no longer shows it, so Khipu can't confirm here.")
     if owner_turns.dispatched_job(environ, session):

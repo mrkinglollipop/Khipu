@@ -87,7 +87,7 @@ def test_a_refresh_updates_claude_and_cursor_and_leaves_codex_alone(home):
     # Claude Code: the missing SubagentStop and the narrowed matcher, in the installer's words.
     assert by["claude_code"]["state"] == "changed"
     assert any("hooks.SubagentStop += khipu-stop-hook" in c for c in by["claude_code"]["changes"])
-    assert any("khipu-delegation-hook matcher -> " + integ.DELEGATION_MATCHER in c
+    assert any("khipu-delegation-hook matcher -> " + integ.CLAUDE_DELEGATION_MATCHER in c
                for c in by["claude_code"]["changes"])
     assert all(str(home / ".claude" / "settings.json") in c for c in by["claude_code"]["changes"]
                if "hooks." in c)
@@ -99,7 +99,7 @@ def test_a_refresh_updates_claude_and_cursor_and_leaves_codex_alone(home):
     assert (home / ".claude" / "settings.json").read_bytes() != before[".claude/settings.json"]
     assert (home / ".cursor" / "hooks.json").read_bytes() != before[".cursor/hooks.json"]
     settings = json.loads((home / ".claude" / "settings.json").read_text())
-    assert settings["hooks"]["PreToolUse"][0]["matcher"] == integ.DELEGATION_MATCHER
+    assert settings["hooks"]["PreToolUse"][0]["matcher"] == integ.CLAUDE_DELEGATION_MATCHER
     assert integ.hook_plan("claude_code")["changes"] == []
     assert integ.hook_plan("cursor")["changes"] == []
     # Codex: not one byte of its files, and the owner is told what waits.
