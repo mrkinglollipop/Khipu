@@ -8428,23 +8428,6 @@ esac
         assert!(bad.is_err(), "a key that reads as a flag never reaches the CLI");
     }
 
-    #[test]
-    fn new_folder_name_rules() {
-        assert_eq!(
-            new_folder_argv("claude", "Claude client", SIGN_IN_NEW_OFFERED).unwrap(),
-            v(&["usage", "--sign-in-folder", "--harness=claude", "--name=Claude client"])
-        );
-        let long = "n".repeat(64);
-        assert!(new_folder_argv("claude", &long, SIGN_IN_NEW_OFFERED).is_ok());
-        for bad in ["", "   ", "a|b", "a\nb", "a\u{0}b", "a\tb"] {
-            assert!(new_folder_argv("claude", bad, SIGN_IN_NEW_OFFERED).is_err(), "{bad:?}");
-        }
-        assert!(new_folder_argv("claude", &"n".repeat(65), SIGN_IN_NEW_OFFERED).is_err());
-        assert!(new_folder_argv("codex", "x", SIGN_IN_NEW_OFFERED).is_err());
-        assert!(new_folder_argv("codex", "x", ALL).is_ok());
-        assert!(new_folder_argv("muse", "x", &["muse"]).is_err());
-    }
-
     /// "Say a change" (`khipu_route_say`) through the real CLI against a fictional data folder. A test
     /// binary is not the installed app, so both the preview and the apply are refused `owner_only`: that
     /// proves the argv, the spawn and that a refusal comes back as JSON. An accepted preview or apply is

@@ -68,7 +68,7 @@ describe("App in the new window", () => {
     }
   });
 
-  it("Accounts is the new place, with its view switch; Running now is drawn in Accounts and Order and rules opens its older screen until its slice lands", async () => {
+  it("Accounts is the new place, with its view switch; Running now and Order and rules are views of it", async () => {
     store.set("khipu.welcome.completed", "1");
     answers(true);
     render(<App />);
@@ -78,11 +78,10 @@ describe("App in the new window", () => {
     const views = screen.getByRole("group", { name: "Accounts view" });
     expect(within(views).getByRole("button", { name: "Room right now" })).toHaveAttribute("aria-pressed", "true");
     fireEvent.click(within(views).getByRole("button", { name: "Order and rules" }));
-    // Hidden panels keep their headings in jsdom (no stylesheet), so the older screen is told by its sidebar item.
-    const older0 = within(main).getByRole("button", { name: "Older screens" });
-    if (older0.getAttribute("aria-expanded") !== "true") fireEvent.click(older0);
-    await waitFor(() => expect(within(main).getByRole("button", { name: "Accounts and routing" })).toHaveAttribute("aria-current", "page"));
-    fireEvent.click(within(main).getByRole("button", { name: "Accounts" }));
+    expect(await screen.findByRole("textbox", { name: "Change something by saying it" })).toBeVisible();
+    expect(within(views).getByRole("button", { name: "Order and rules" })).toHaveAttribute("aria-pressed", "true");
+    const main2 = within(main);
+    expect(main2.getByRole("button", { name: "Accounts" })).toHaveAttribute("aria-current", "page");
     // Running now stays in Accounts (slice A5): the switch shows it and Work is not opened.
     fireEvent.click(within(screen.getByRole("group", { name: "Accounts view" })).getByRole("button", { name: "Running now" }));
     expect(within(screen.getByRole("group", { name: "Accounts view" })).getByRole("button", { name: "Running now" })).toHaveAttribute("aria-pressed", "true");

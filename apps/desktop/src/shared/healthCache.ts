@@ -1,8 +1,9 @@
 // The last answer of `khipu health --json`, kept so a screen can show it at
 // once and refresh in the background (the real check takes about a minute).
-// Shared by Settings and, later, Today. Held in memory and mirrored to
-// localStorage so the next launch has something to show too; storage that is
-// missing or refuses is ignored.
+// Shared by Today and Settings, so both show the same answer and neither
+// waits for the check. Held in memory and mirrored to localStorage so the next
+// launch has something to show too; storage that is missing or refuses is
+// ignored.
 import { useEffect, useRef, useState } from "react";
 import { callCli } from "../settingsCli";
 
@@ -44,9 +45,45 @@ export function saveHealth(doc: unknown, at: number = Date.now()): void {
   listeners.forEach((l) => l());
 }
 
+/** Hear about every newly kept answer (a screen shows it at once). */
+export function subscribeHealth(fn: () => void): () => void {
+  listeners.add(fn);
+  return () => {
+    listeners.delete(fn);
+  };
+}
+
+export type RefreshResult = { ok: true; doc: Record<string, unknown> & { areas: unknown[] } } | { ok: false; error: string };
+let inflight: Promise<RefreshResult> | null = null;
+let inflightSince = 0;
+/** A check that has not answered in this long is given up on, so one that hangs
+ *  can never stop every later refresh. */
+const INFLIGHT_MAX_MS = 3 * 60 * 1000;
+
+/** Ask Khipu for a new answer and keep it. Screens that ask while a check is
+ *  already running share it, so the (slow) check never runs twice at once. */
+export function refreshHealth(): Promise<RefreshResult> {
+  if (inflight && Date.now() - inflightSince < INFLIGHT_MAX_MS) return inflight;
+  const run: Promise<RefreshResult> = callCli<Record<string, unknown> & { areas: unknown[] }>("khipu_health")
+    .then((res): RefreshResult => {
+      if (res.ok && res.data && Array.isArray(res.data.areas)) {
+        saveHealth(res.data);
+        return { ok: true, doc: res.data };
+      }
+      return { ok: false, error: res.ok ? "Khipu gave an unreadable answer." : res.error };
+    })
+    .finally(() => {
+      if (inflight === run) inflight = null;
+    });
+  inflight = run;
+  inflightSince = Date.now();
+  return run;
+}
+
 /** Test helper: forget the kept answer. */
 export function clearHealthCache(): void {
   memo = null;
+  inflight = null;
   loadedFromStorage = true;
   try {
     window.localStorage.removeItem(KEY);
@@ -88,15 +125,10 @@ export function useHealth<T extends { areas: unknown[] }>(active: boolean): Heal
     started.current = true;
     let live = true;
     setRefreshing(true);
-    void callCli<T>("khipu_health").then((res) => {
+    void refreshHealth().then((res) => {
       if (!live) return;
       setRefreshing(false);
-      if (res.ok && res.data && Array.isArray(res.data.areas)) {
-        saveHealth(res.data);
-        setError(null);
-      } else {
-        setError(res.ok ? "Khipu gave an unreadable answer." : res.error);
-      }
+      setError(res.ok ? null : res.error);
     });
     return () => {
       live = false;

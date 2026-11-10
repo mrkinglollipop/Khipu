@@ -362,7 +362,7 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
         if (f.routeReplication) return routeReplication().view;
         if (f.route15a) return route15a().view;
         if (f.route15b) return route15b().view;
-        return { accounts: [], priority: null };
+        return { accounts: [], priority: null, this_mac: "M5" };
       case "khipu_account_sign_in":
         return { ok: true, row: liveRow({ account: CLIENT.name ?? "Claude client" }) };
       default:

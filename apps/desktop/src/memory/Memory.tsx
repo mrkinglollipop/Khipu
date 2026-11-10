@@ -5,16 +5,14 @@
 // on the right. Under 900 px it is one column: the list, then the conversation
 // with a Back button.
 //
-// Slice A8 (project work lists) plugs in here, in this file only:
-//   1. add `{ id: "projects", label: "Project work lists" }` to VIEWS;
-//   2. import ProjectLists from "./ProjectLists";
-//   3. render it in the `view === "projects"` branch below, in place of the
-//      search Split. The toolbar switch appears by itself once VIEWS has two.
+// The toolbar switch has two views: Search (above) and Project work lists
+// (`ProjectLists`, which draws its own list and detail).
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { Loader2, Search } from "lucide-react";
 import { Body, Split, Toolbar, ViewSwitch, useListKeys } from "../shell";
 import { ConversationPage } from "./Conversation";
+import { ProjectLists } from "./ProjectLists";
 import { ForgetDialog } from "./ForgetDialog";
 import { forgetConversation } from "./forget";
 import { RecentList, ResultList } from "./Results";
@@ -22,8 +20,11 @@ import { conversationOf, groupByDay, readSearch, rowsOf } from "./model";
 import type { Conversation, MemoryRow, Run } from "./model";
 import "./memory.css";
 
-type MemoryView = "search";
-const VIEWS: { id: MemoryView; label: string }[] = [{ id: "search", label: "Search" }];
+type MemoryView = "search" | "projects";
+const VIEWS: { id: MemoryView; label: string }[] = [
+  { id: "search", label: "Search" },
+  { id: "projects", label: "Project work lists" },
+];
 
 const TRY = ["room for Grok Bot", "update together"];
 
@@ -37,10 +38,13 @@ type Found =
 export function Memory({
   run,
   onForgotten,
+  onOwedClose,
 }: {
   run: Run;
   /** Called after a conversation was forgotten, so other screens drop it too. */
   onForgotten?: (id: number) => void;
+  /** Called when a work-list line that finishes an owed item is marked done. */
+  onOwedClose?: (id: number) => Promise<void> | void;
 }) {
   const [view, setView] = useState<MemoryView>("search");
   const [query, setQuery] = useState("");
@@ -290,15 +294,19 @@ export function Memory({
       <Toolbar title="Memory">
         {VIEWS.length > 1 ? <ViewSwitch label="Memory view" options={VIEWS} value={view} onChange={setView} /> : null}
       </Toolbar>
-      <Body>
-        <Split
-          list={list}
-          listLabel="Search"
-          detail={detail}
-          detailLabel={selected ? selected.title : "No conversation open"}
-          detailOpen={selected != null}
-        />
-      </Body>
+      {view === "projects" ? (
+        <ProjectLists onOwedClose={onOwedClose} />
+      ) : (
+        <Body>
+          <Split
+            list={list}
+            listLabel="Search"
+            detail={detail}
+            detailLabel={selected ? selected.title : "No conversation open"}
+            detailOpen={selected != null}
+          />
+        </Body>
+      )}
       <ForgetDialog
         row={forgetting}
         busy={forgetBusy}

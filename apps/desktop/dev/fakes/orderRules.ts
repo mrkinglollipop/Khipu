@@ -107,7 +107,7 @@ export const orderRulesFakes: FakeHandler = (cmd, args, flags) => {
   switch (cmd) {
     case "khipu_route_view":
       return {
-        record: true, version: 14, checked_at: new Date().toISOString(), priority_version: "p5",
+        record: true, this_mac: "M5", version: 14, checked_at: new Date().toISOString(), priority_version: "p5",
         accounts: ACCOUNTS.map((label) => ({ key: keyOf(label), label, harness: label.split(" ")[0].toLowerCase(), state: "open" })),
         holds: [], priority: { entries: state.order, version: "p5" }, rules: state.rules,
       };

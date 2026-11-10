@@ -477,6 +477,7 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   "app-running-none": { title: "The whole window, Running now, no runner reporting", fake: { accounts: true, running: true, runningNone: true }, render: () => <App /> },
   "app-running-stale": { title: "The whole window, Running now, the other Mac is out of date", fake: { accounts: true, running: true, runningStale: true }, render: () => <App /> },
   "app-running-fail": { title: "The whole window, Running now, the read fails", fake: { accounts: true, running: true, runningFail: true }, render: () => <App /> },
+  "app-accounts-all": { title: "The whole window, Accounts with all three views and every fake on", fake: { accounts: true, running: true, orderRules: true }, render: () => <App /> },
   "app-accounts-refuse": { title: "The whole window, Accounts, a pause is refused", fake: { accounts: true, accountsRefuse: true }, render: () => <App /> },
   "setup-signed-out": {
     title: "Setup: a default login that is not signed in",

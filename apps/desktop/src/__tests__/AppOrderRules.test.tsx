@@ -1,6 +1,5 @@
-// The hook that makes Order and rules reachable from the Accounts place (slice
-// A6): a view switch on the Accounts toolbar. "Room right now" is still the old
-// routing screen until its replacement lands.
+// Order and rules is one view of the Accounts place (slice A6, joined to the new
+// Accounts place): the third choice on the Accounts toolbar switch.
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
@@ -40,23 +39,25 @@ afterEach(() => {
 });
 
 describe("Accounts place: Order and rules", () => {
-  it("is one view of Accounts, and the old routing screen is still the other", async () => {
+  it("is one view of Accounts, beside Room right now and Running now", async () => {
     render(<App />);
     const main = await screen.findByRole("navigation", { name: "Main" });
     fireEvent.click(within(main).getByRole("button", { name: "Accounts" }));
     const views = await screen.findByRole("group", { name: "Accounts view" });
     expect(within(views).getByRole("button", { name: "Room right now" })).toHaveAttribute("aria-pressed", "true");
-    expect(await screen.findByRole("heading", { name: "Accounts and routing" })).toBeVisible();
+    expect(within(views).getByRole("button", { name: "Running now" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByRole("textbox", { name: "Change something by saying it" })).toBeNull();
 
     fireEvent.click(within(views).getByRole("button", { name: "Order and rules" }));
     expect(await screen.findByRole("textbox", { name: "Change something by saying it" })).toBeVisible();
     await waitFor(() => expect(document.querySelector(".or-order")?.textContent).toContain("Codex"));
-    expect(screen.queryByRole("heading", { name: "Accounts and routing" })).toBeNull();
-    // The toolbar names the place with the page's heading while the old header is gone.
+    expect(within(views).getByRole("button", { name: "Order and rules" })).toHaveAttribute("aria-pressed", "true");
+    // The toolbar is the page's one heading.
+    expect(document.querySelectorAll(".sh-toolbar h1")).toHaveLength(1);
     expect(document.querySelector(".sh-toolbar h1")?.textContent).toBe("Accounts");
+    expect(within(main).getByRole("button", { name: "Accounts" })).toHaveAttribute("aria-current", "page");
 
     fireEvent.click(within(views).getByRole("button", { name: "Room right now" }));
-    await waitFor(() => expect(screen.getByRole("heading", { name: "Accounts and routing" })).toBeVisible());
-    expect(screen.queryByRole("textbox", { name: "Change something by saying it" })).toBeNull();
+    await waitFor(() => expect(screen.queryByRole("textbox", { name: "Change something by saying it" })).toBeNull());
   });
 });

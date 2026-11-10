@@ -1,8 +1,10 @@
 // The answer `khipu_health` gives (slice B1) and how Today reads it.
 // The check can take many seconds, so the last answer is kept and shown at
-// once with its time; a refresh runs in the background and never blocks.
-import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+// once with its time; a refresh runs in the background and never blocks. The
+// kept answer is the one in `shared/healthCache`, so Today and Settings show
+// the same answer.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lastHealth, refreshHealth, subscribeHealth } from "../shared/healthCache";
 
 export type HealthState = "ok" | "warn" | "err" | "unknown";
 
@@ -29,14 +31,22 @@ export type Health = {
 };
 
 const STATES: HealthState[] = ["ok", "warn", "err", "unknown"];
-const STORE_KEY = "khipu.today.health.v1";
 const REFRESH_MS = 5 * 60 * 1000;
 
 /** Reads the CLI's JSON; null when it is not a health answer. An area with a
  *  state we do not know counts as "unknown", never as fine. */
 export function parseHealth(text: string): Health | null {
   try {
-    const v = JSON.parse(text) as Partial<Health>;
+    return parseHealthDoc(JSON.parse(text));
+  } catch {
+    return null;
+  }
+}
+
+/** The same, for an answer already read as JSON. */
+export function parseHealthDoc(doc: unknown): Health | null {
+  try {
+    const v = doc as Partial<Health>;
     if (!v || typeof v !== "object" || !Array.isArray(v.areas) || typeof v.checked_at !== "string") return null;
     const areas = v.areas.map((a) => ({
       key: String(a?.key ?? ""),
@@ -60,23 +70,6 @@ export function parseHealth(text: string): Health | null {
     };
   } catch {
     return null;
-  }
-}
-
-function readStored(): Health | null {
-  try {
-    const raw = window.localStorage.getItem(STORE_KEY);
-    return raw ? parseHealth(raw) : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeStored(text: string): void {
-  try {
-    window.localStorage.setItem(STORE_KEY, text);
-  } catch {
-    /* no storage: the answer just is not kept between visits */
   }
 }
 
@@ -135,46 +128,30 @@ export type HealthHook = {
  *  five minutes while Today is on screen. A failure or a slow answer keeps
  *  what is shown; it is never an error screen. */
 export function useHealth(active: boolean): HealthHook {
-  const [health, setHealth] = useState<Health | null>(() => readStored());
+  const [kept, setKept] = useState(() => lastHealth<unknown>());
   const [checking, setChecking] = useState(false);
   const [failed, setFailed] = useState(false);
-  const [answeredAt, setAnsweredAt] = useState<number | null>(() => {
-    const h = readStored();
-    const t = h ? Date.parse(h.checked_at) : NaN;
-    return Number.isNaN(t) ? null : t;
-  });
-  const running = useRef(false);
   const alive = useRef(true);
   useEffect(() => {
     alive.current = true;
-    return () => { alive.current = false; };
+    const stop = subscribeHealth(() => { if (alive.current) setKept(lastHealth<unknown>()); });
+    return () => { alive.current = false; stop(); };
   }, []);
 
+  const health = useMemo(() => (kept ? parseHealthDoc(kept.doc) : null), [kept]);
+  const answeredAt = useMemo(() => {
+    if (!health) return null;
+    const t = Date.parse(health.checked_at);
+    return Number.isNaN(t) ? (kept?.at ?? null) : t;
+  }, [health, kept]);
+
   const refresh = useCallback(() => {
-    if (running.current) return;
-    running.current = true;
     setChecking(true);
-    void (async () => {
-      try {
-        const text = await invoke<string>("khipu_health");
-        const parsed = parseHealth(text);
-        if (!alive.current) return;
-        if (parsed) {
-          writeStored(text);
-          setHealth(parsed);
-          const t = Date.parse(parsed.checked_at);
-          setAnsweredAt(Number.isNaN(t) ? Date.now() : t);
-          setFailed(false);
-        } else {
-          setFailed(true);
-        }
-      } catch {
-        if (alive.current) setFailed(true);
-      } finally {
-        running.current = false;
-        if (alive.current) setChecking(false);
-      }
-    })();
+    void refreshHealth().then((res) => {
+      if (!alive.current) return;
+      setChecking(false);
+      setFailed(!res.ok);
+    });
   }, []);
 
   useEffect(() => {

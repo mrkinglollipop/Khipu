@@ -78,9 +78,9 @@ function when(iso: string | undefined): string {
   return d.toLocaleString([], { weekday: "short", day: "numeric", month: "short", hour: "numeric", minute: "2-digit" });
 }
 
-/** Who made it and how. `mac` comes with backend slice B8; until then a line
- *  says how, without the Mac. */
-export function whoWords(a: OwnerAction & { mac?: string }): string {
+/** Who made it and how, and on which Mac when the line says (`mac`, from the
+ *  backend); a line without one shows none. */
+export function whoWords(a: OwnerAction): string {
   const on = a.mac ? `, on ${a.mac}` : "";
   const how =
     a.auth === "app" ? `You, in the app${on}`

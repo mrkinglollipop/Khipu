@@ -262,7 +262,7 @@ describe("other cards", () => {
 });
 
 describe("All changes", () => {
-  const line = (over: Partial<OwnerAction> & { mac?: string }): OwnerAction => ({ id: "c1d2e3f4", at: "2026-11-04T21:12:00Z", action: "route.pause", target: "glm|", auth: "app", state: "applied", ...over });
+  const line = (over: Partial<OwnerAction>): OwnerAction => ({ id: "c1d2e3f4", at: "2026-11-04T21:12:00Z", action: "route.pause", target: "glm|", auth: "app", state: "applied", ...over });
   it("lists every change newest first, with one Undo per press", async () => {
     let actions = [line({}), line({ id: "d2e3f4a5", action: "route.rule.add", target: "6", no_undo: "a reason", mac: "M1" })];
     invokeMock.mockImplementation((cmd: string) => {
@@ -276,7 +276,9 @@ describe("All changes", () => {
     const onChanged = vi.fn();
     render(<ChangesPanel onClose={() => {}} onChanged={onChanged} />);
     await screen.findByText("Paused Glm");
-    expect(screen.getByText(/You, on M1|You, in the app, on M1|You, through an agent, on M1/)).toBeTruthy();
+    expect(screen.getByText(/You, in the app, on M1/)).toBeTruthy();
+    // A line without a Mac shows none.
+    expect(screen.getByText(/^You, in the app · /).textContent).not.toMatch(/ on /);
     const undos = screen.getAllByRole("button", { name: /^Undo:/ });
     expect(undos).toHaveLength(1); // the second line has no undo
     await act(async () => { fireEvent.click(undos[0]); fireEvent.click(undos[0]); });

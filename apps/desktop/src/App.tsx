@@ -29,7 +29,6 @@ import { RunningNow } from "./accounts/RunningNow";
 import { useRunning } from "./accounts/running";
 import { Today } from "./today/Today";
 import { useNeedsYou } from "./today/needs";
-import { ProjectLists } from "./memory/ProjectLists";
 import { OrderAndRules } from "./accounts/OrderAndRules";
 import type { NavItem } from "./shell";
 import {
@@ -1443,7 +1442,7 @@ export default function App() {
   const [graphBusy, setGraphBusy] = useState(false);
   // Recall holds Search and the graph walk; the walk is a sub-view of a result,
   // not a peer destination (audit IA).
-  const [recallView, setRecallView] = useState<"search" | "graph" | "projects">("search");
+  const [recallView, setRecallView] = useState<"search" | "graph">("search");
   // One cached array per status. Home's preview, the rail badge and the Owed
   // screen's own table all read this, so a write that moves a row between two
   // statuses cannot leave one of them stale (phase 4: the segmented control
@@ -3918,8 +3917,11 @@ export default function App() {
   const workBlocking = work.data?.counts.blocking ?? 0;
   const workQuiet = work.data?.counts.quiet ?? 0;
   const harnessBadge = harnessesBadge(liveness, claudeHomes, t3Gap);
+  // Each old screen once, one name each, in the order of the places that replace them.
   const olderItems: NavItem[] = [
     placeItem("home", <CircleCheck size={18} aria-hidden />, "The home screen from before Today", { id: "oldhome", label: "Home" }),
+    placeItem("routing-old", NAV_ICONS.routing, "Accounts, routing rules, and what needs your attention", {}),
+    placeItem("recall", <Search size={18} aria-hidden />, "The old search and graph screen"),
     placeItem("work", NAV_ICONS.work, WORK_LEDE, {
       badge: workWaiting + workQuiet > 0 ? (
         <span className={workWaiting ? "nav-badge" : "nav-badge quiet"}
@@ -3929,7 +3931,6 @@ export default function App() {
         </span>
       ) : undefined,
     }),
-    placeItem("recall", <Search size={18} aria-hidden />, "The old search and graph screen"),
     placeItem("activity", NAV_ICONS.activity, "Every session Khipu recorded"),
     placeItem("harnesses", NAV_ICONS.harnesses, "Claude Code · Cursor · Aegis · Codex", {
       badge: harnessBadge ? <span className={harnessBadge.quiet ? "nav-count quiet" : "nav-count"}>{harnessBadge.n}</span> : undefined,
@@ -3939,7 +3940,6 @@ export default function App() {
         <span className="nav-count" aria-label={guidesBadge === 1 ? "1 setup left" : `${guidesBadge} setups left`}>{guidesBadge}</span>
       ) : undefined,
     }),
-    placeItem("routing-old", NAV_ICONS.routing, "Accounts, routing rules, and what needs your attention", {}),
     placeItem("revisions", <RailIcon d={<path d="M4 3v10M12 3v10M4 8h8" />} />, "Edits to the same memory made in two places"),
     { id: "settings-old", label: "Settings (older)", icon: <SlidersHorizontal size={18} aria-hidden />, hint: "The earlier Settings screen" },
   ];
@@ -4805,6 +4805,7 @@ export default function App() {
               <Memory
                 run={runKhipu}
                 onForgotten={(id) => setActivityList((rows) => rows.filter((row) => row.id !== id))}
+                onOwedClose={(id) => owedWrite(id, [`--close=${id}`])}
               />
             ) : null}
           </PaneBoundary>
@@ -4827,12 +4828,10 @@ export default function App() {
                   label: "Graph",
                   hint: "Walk what a topic or node is connected to.",
                 },
-                { value: "projects", label: "Project work lists", hint: "What is done and not done in each project." },
               ]}
             />
           </PanelHeader>
-          {recallView === "projects" ? <ProjectLists onOwedClose={(id) => owedWrite(id, [`--close=${id}`])} /> : null}
-          <div className="panel-body wide" style={recallView === "projects" ? { display: "none" } : undefined}>
+          <div className="panel-body wide">
             {recallView === "search" ? (
               <>
             <div className="inline">

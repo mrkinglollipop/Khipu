@@ -16,6 +16,12 @@ export const LINK_LABEL: Record<string, string> = {
   "where-memory-is-kept": "Open Settings",
 };
 
+/** Khipu's own lines often begin "Khipu keeps trying…"; they already say who,
+ *  so the "Khipu:" label is left off those rather than saying it twice. */
+function startsWithKhipu(line: string): boolean {
+  return /^\s*khipu\b/i.test(line);
+}
+
 function clock(iso: string): string {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
@@ -75,7 +81,7 @@ export function HealthPanel({
                 <h3>{a.name}<span className="td-state"> · {STATE_WORD[a.state]}</span></h3>
                 <p>{a.state === "unknown" ? "Couldn’t check this just now." : a.line}</p>
                 {a.state === "unknown" ? null : extra(a, h as Health).map((t) => <p key={t} className="td-more">{t}</p>)}
-                {a.khipu_doing ? <p><b>Khipu:</b> {a.khipu_doing}</p> : null}
+                {a.khipu_doing ? <p>{startsWithKhipu(a.khipu_doing) ? null : <b>Khipu: </b>}{a.khipu_doing}</p> : null}
                 {a.state === "warn" || a.state === "err" ? <p><b>You:</b> {a.you_do || "Nothing."}</p> : null}
                 {LINK_LABEL[a.link] && (a.key === "jobs" || a.state === "warn" || a.state === "err") ? (
                   <button type="button" className="td-link" onClick={() => onOpen(a.link)}>{LINK_LABEL[a.link]}</button>
