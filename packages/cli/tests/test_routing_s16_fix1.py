@@ -154,6 +154,8 @@ def test_unmatched_limit_age_starts_with_the_current_continuous_run(replay):
 def test_completed_child_marker_keeps_pruned_render_proof(replay):
     routing.add_rule("Synthetic completed child rule.", via="app")
     child = routing.start_push(moment="delegation", child_component="agent:c", child_session="s1")
+    # Reserved by the hook once it holds the answer (``recall_rule._RoutingAtStart.text``).
+    child = routing_delivery.offer(child, session="s1", component="agent:c", deferred=True)
     assert child and child["shown_entities"]
     assert routing_delivery.acknowledge("s1", child["routing_changes"])
     assert routing_delivery.snapshot("s1", "agent:c")["done_shown"]

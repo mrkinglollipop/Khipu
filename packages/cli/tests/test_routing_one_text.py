@@ -199,6 +199,12 @@ def test_doctor_rows_say_per_conversation_and_per_subagent_that_the_page_was_han
     rows = {row["component"]: row for row in _rows(home)}
     assert rows["main"]["page"] == rows["agent:a1"]["page"] == "behind"
     assert "next prompt or tool call" in rows["main"]["page_why"]
+    # A subagent's hook runs on its delegation tool calls only (review of #534, R3).
+    assert "when it next delegates" in rows["agent:a1"]["page_why"]
+    assert "khipu_route" in rows["agent:a1"]["page_why"]
+    assert "tool call" not in rows["agent:a1"]["page_why"]
+    delivery = ms._route_page(routing, {"session": routing_delivery.hook_session(PARENT)})["delivery"]
+    assert delivery["subagents"]["why"] == [rows["agent:a1"]["page_why"]]
 
 
 def test_a_page_the_hook_took_and_never_confirmed_reads_as_owed_and_why(home):  # noqa: F811
@@ -216,6 +222,57 @@ def test_a_page_the_hook_took_and_never_confirmed_reads_as_owed_and_why(home):  
     assert late["page"] == "never" and "ran out of time" in late["why"]
     pull = routing_delivery.page_receipt(None, _revision(), routing._now(), harness="cursor")
     assert "khipu_route" in pull["why"]
+
+
+def _prompt_line(session_id, status, *, route_session=None):
+    """One per-prompt log line, as the prompt hook writes it, stamped by the test clock."""
+    stamp = routing._now().strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = recall_prompt._log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(f"{stamp} [khipu-prompt-recall] session={session_id} reason=ok ms=1.0 hits=[] legs=[] "
+                f"degraded=None{recall_prompt._route_session_field(route_session)} routing={status}\n")
+
+
+def test_a_claude_code_conversations_late_prompt_read_reaches_its_row_and_its_delivery_block(home, monkeypatch):  # noqa: F811
+    # Review of #534, R2: the conversation's hooks run with CLAUDE_CODE_SESSION_ID
+    # set, so its ledger is filed under claude:<id>; doctor and the app run
+    # without it and must still find that ledger from the prompt log.
+    _record()
+    agent_view.prepare_routing_table(refresh=True)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", PARENT)
+    session = routing_delivery.hook_session(PARENT)
+    assert session == f"claude:{PARENT}"
+    out = routing.prompt_push(None, budget=1.0, session_id=session)
+    assert routing_delivery.acknowledge(session, out["routing_changes"], take=True)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    assert routing_delivery._path(PARENT).name != routing_delivery.canonical_path(session).name
+    home["clock"].advance(minutes=2)
+    routing.report(account="Codex", state="open", author=ME)  # a new page; the next prompt's read runs late
+    _prompt_line(PARENT, "skipped:budget", route_session=session)
+    rows = [row for row in _rows(home) if row["component"] == "main"]
+    assert len(rows) == 1 and rows[0]["page"] == "behind", rows
+    assert "ran out of time (skipped:budget)" in rows[0]["page_why"]
+    delivery = ms._route_page(routing, {"session": session})["delivery"]
+    assert delivery["main"]["page"] == "behind" and "ran out of time" in delivery["main"]["why"]
+    # A later prompt that got its page clears the reason.
+    _prompt_line(PARENT, "full", route_session=session)
+    assert "ran out of time" not in ms._route_page(routing, {"session": session})["delivery"]["main"]["why"]
+
+
+def test_an_older_prompt_line_with_only_the_bare_id_still_finds_its_ledger(home):  # noqa: F811
+    _record()
+    agent_view.prepare_routing_table(refresh=True)
+    session = routing_delivery.hook_session(PARENT)  # no harness environment: the bare id
+    out = routing.prompt_push(None, budget=1.0, session_id=session)
+    assert routing_delivery.acknowledge(session, out["routing_changes"], take=True)
+    home["clock"].advance(minutes=2)
+    routing.report(account="Codex", state="open", author=ME)
+    _prompt_line(PARENT, "skipped:budget")  # written before route_session= existed
+    rows = [row for row in _rows(home) if row["component"] == "main"]
+    assert rows and "ran out of time" in rows[0]["page_why"]
+    keys = routing_health._last_status_by_ledger({PARENT: "full", ("ledger", session): "skipped:budget"})
+    assert keys == {routing_delivery._path(PARENT).name: "skipped:budget"}  # the later line wins
 
 
 def test_khipu_route_delivery_block_names_the_conversation_and_counts_its_subagents(home, monkeypatch):  # noqa: F811
@@ -249,7 +306,9 @@ def test_per_agent_ledgers_stay_bounded_finished_and_stale(home):  # noqa: F811
     session = routing_delivery.hook_session(PARENT)
 
     def start(name):
-        answer = routing._start_page(routing.read_view(), routing._now(), component=f"agent:{name}", session=session)
+        planned = routing._start_page(routing.read_view(), routing._now(), component=f"agent:{name}", session=session)
+        # As the hook does once it holds the answer (``recall_rule._RoutingAtStart.text``).
+        answer = routing_delivery.offer(planned, session=session, component=f"agent:{name}", deferred=True)
         assert routing_delivery.acknowledge(session, answer["routing_changes"], take=True)
 
     start("old")
@@ -335,24 +394,98 @@ def test_a_subagent_handed_each_new_page_never_reads_as_stalled(home, monkeypatc
         assert _hook(_tool(), monkeypatch) == {}
 
 
-def test_a_live_subagent_whose_reads_always_arrive_late_still_goes_red(home, monkeypatch):  # noqa: F811
+def test_the_read_in_the_hooks_child_process_holds_no_lease(home, monkeypatch):  # noqa: F811
+    # What the forked read returns may arrive after the hook stopped
+    # waiting: it must leave nothing reserved that nobody will print, so the
+    # subagent's next tool call is handed the page at once (review of #534, R1).
+    _record()
+    _parent_page()
+    _hook(_start(), monkeypatch)
+    home["clock"].advance(minutes=2)
+    routing.report(account="Codex", state="open", author=ME)  # a new page
+    late = routing._child_page_plan()
+    assert late and late["text"].startswith("ROUTING ")
+    state = _ledger()["agent:a1"]
+    assert not state.get("flight")
+    assert routing_delivery.page_receipt(state, _revision(), routing._now())["page"] == "behind"
+    home["clock"].advance(seconds=5)
+    assert _ctx(_hook(_tool(), monkeypatch)).startswith("ROUTING ")
+
+
+def _page_flight(agent="a1"):
+    state = _ledger().get(f"agent:{agent}") or {}
+    items = (((state.get("flight") or {}).get("out") or {}).get("routing_changes") or {}).get("items") or []
+    return [item for item in items if item.get("entity") == "page"]
+
+
+def test_a_tool_call_read_that_finishes_after_the_deadline_reserves_nothing(home, monkeypatch):  # noqa: F811
+    import time
+
+    from tests.test_routing_page_delivery import _set
+
+    _record()
+    _hook(_start(), monkeypatch)
+    _hook(_tool(), monkeypatch)
+    home["clock"].advance(minutes=2)
+    routing.report(account="Codex", state="open", author=ME)
+    _set(home, routing_prompt_budget_ms=50)
+    real = routing_page_file.read
+
+    def slow():
+        with routing._finishing():  # the forked read runs on past its deadline here
+            time.sleep(0.4)
+        return real()
+
+    monkeypatch.setattr(routing_page_file, "read", slow)
+    began = time.monotonic()
+    assert _hook(_tool(), monkeypatch) == {}
+    assert time.monotonic() - began < 0.4
+    time.sleep(1.0)  # the late child has finished its read and exited
+    assert not _page_flight()
+    monkeypatch.setattr(routing_page_file, "read", real)
+    _set(home, routing_prompt_budget_ms=1000)
+    assert _ctx(_hook(_tool(), monkeypatch)).startswith("ROUTING ")
+
+
+def test_a_subagent_start_that_finishes_after_the_deadline_reserves_nothing(home, monkeypatch):  # noqa: F811
+    import time
+
+    from tests.test_routing_page_delivery import _set
+
+    _record()
+    _set(home, routing_start_budget_ms=200)
+    real = routing._start_view
+
+    def slow(now):
+        with routing._finishing():  # folding a view to save: the start child runs on past its deadline
+            time.sleep(0.8)
+        return real(now)
+
+    monkeypatch.setattr(routing, "_start_view", slow)
+    began = time.monotonic()
+    assert _hook(_start(), monkeypatch) == {}
+    assert time.monotonic() - began < 0.7
+    time.sleep(1.5)  # the late child has finished its fold and exited
+    assert not _page_flight()
+    monkeypatch.setattr(routing, "_start_view", real)
+    _set(home, routing_start_budget_ms=1000)
+    assert _ctx(_hook(_start(), monkeypatch)).startswith("ROUTING ")
+    assert not _page_flight()  # printed and confirmed by that hook
+
+
+def test_a_subagent_whose_reads_always_arrive_late_is_never_shown_as_holding_the_page(home, monkeypatch):  # noqa: F811
     _record()
     _hook(_start(), monkeypatch)
     home["clock"].advance(minutes=2)
     routing.report(account="Codex", state="open", author=ME)
     for _ in range(4):
         home["clock"].advance(seconds=70)
-        # Read in the forked child, and its hook had stopped waiting: nothing is printed or confirmed.
-        assert routing._child_page_push_inline(PARENT, "a1")
-    health = _agent_health(home)
-    assert health["status"] == "red" and "lease-expired-twice" in health["reasons"]
-    receipt = routing_delivery.page_receipt(routing_delivery.snapshot(routing_delivery.hook_session(PARENT), "agent:a1"),
-                                            _revision(), routing._now())
-    assert receipt["page"] == "in_flight"
-    home["clock"].advance(seconds=70)
-    receipt = routing_delivery.page_receipt(routing_delivery.snapshot(routing_delivery.hook_session(PARENT), "agent:a1"),
-                                            _revision(), routing._now())
-    assert receipt["page"] == "owed" and "never confirmed" in receipt["why"]
+        # Read in the forked child, and its hook had stopped waiting: nothing is printed or reserved.
+        assert routing._child_page_plan()
+    state = routing_delivery.snapshot(routing_delivery.hook_session(PARENT), "agent:a1")
+    assert not state.get("flight")
+    receipt = routing_delivery.page_receipt(state, _revision(), routing._now(), child=True)
+    assert receipt["page"] == "behind" and "next delegates" in receipt["why"]
 
 
 def test_cold_imports_are_paid_before_the_page_reads_budget(home, monkeypatch):  # noqa: F811
@@ -366,7 +499,7 @@ def test_cold_imports_are_paid_before_the_page_reads_budget(home, monkeypatch): 
     routing.report(account="Codex", state="open", author=ME)
     _set(home, routing_prompt_budget_ms=100)
     warm = {"done": False}
-    read = routing._child_page_push_inline
+    read = routing._child_page_plan
 
     def cold_read(*args, **kwargs):
         if not warm["done"]:
@@ -374,7 +507,7 @@ def test_cold_imports_are_paid_before_the_page_reads_budget(home, monkeypatch): 
         return read(*args, **kwargs)
 
     monkeypatch.setattr(routing, "prompt_imports", lambda: warm.update(done=True))
-    monkeypatch.setattr(routing, "_child_page_push_inline", cold_read)
+    monkeypatch.setattr(routing, "_child_page_plan", cold_read)
     assert _ctx(_hook(_tool(), monkeypatch)).startswith("ROUTING ")
 
 

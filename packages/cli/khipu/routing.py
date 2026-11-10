@@ -11494,24 +11494,44 @@ def start_budget() -> float:
     return min(max(0, ms), START_BUDGET_MOST_MS) / 1000.0
 
 
-def _child_page_push_inline(session_id: str, agent_id: str, now: datetime | None = None, *,
-                            kick=None) -> dict | None:
-    """The routing page for a subagent's tool result, as the per-prompt push
-    builds it for its parent (``page_push``) but in the subagent's own
+def _child_page_plan(now: datetime | None = None, *, kick=None) -> dict | None:
+    """What the forked read in ``child_page_push`` hands its hook: the
+    routing page planned for the ledger (``page_plan``), reserved nowhere.
+    Only the hook process reserves it (``_child_page_offer``), once it holds
+    the text it is about to print, so a read that comes back after the
+    hook's deadline leaves nothing in flight for nobody to confirm. None
+    when the push is off."""
+    if push_off("delegation"):
+        return None
+    return _page_planned(budget=prompt_budget(), now=now, kick=kick)
+
+
+def _child_page_offer(planned: dict | None, session_id: str, agent_id: str) -> dict | None:
+    """Reserve a planned page (``_child_page_plan``) in the subagent's own
     ``agent:<agent_id>`` component: offered only when that component has
     not acknowledged the page's current signature, so it is sent again
-    exactly when it would be sent again to the parent. None when nothing is
-    owed."""
-    if push_off("delegation"):
+    exactly when it would be sent again to the parent. While a page is
+    leased, a parallel tool call gets nothing (``resend=False``). None when
+    nothing is owed."""
+    if not isinstance(planned, dict) or not isinstance(planned.get("delivery_plan"), dict):
         return None
     from khipu import routing_delivery
 
     session = routing_delivery.hook_session(session_id)
-    marker = routing_delivery.Marker({}, session=session, component=f"agent:{agent_id}")
-    out = page_push(marker, budget=prompt_budget(), now=now, kick=kick, resend=False)
+    out = _page_offer(planned, session=session, component=f"agent:{agent_id}", resend=False)
     if not out.get("routing_changes"):
         return None
     return dict(out, session=session)
+
+
+def _child_page_push_inline(session_id: str, agent_id: str, now: datetime | None = None, *,
+                            kick=None) -> dict | None:
+    """The routing page for a subagent's tool result, read and reserved in
+    this process (``_child_page_plan``, then ``_child_page_offer``), as the
+    per-prompt push builds it for its parent (``page_push``) but in the
+    subagent's own ``agent:<agent_id>`` component. None when nothing is
+    owed."""
+    return _child_page_offer(_child_page_plan(now, kick=kick), session_id, agent_id)
 
 
 def child_page_push(session_id: str | None, agent_id: str | None, *,
@@ -11523,12 +11543,13 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
 
     Like the parent's per-prompt push, the read runs in a forked child under
     ``routing_prompt_budget_ms``: a slow read returns nothing on time instead
-    of blocking the subagent's tool call. The child reserves the page as the
-    parent's prompt child does; an answer that came back too late stays in
-    flight for the lease and is offered again to the next tool call after
-    the lease runs out, so nothing is reserved for nobody for longer
-    than the lease. While a page is leased, a parallel tool call gets
-    nothing: the same page is never printed twice."""
+    of blocking the subagent's tool call. The child only plans the page
+    (``_child_page_plan``); this process reserves it (``_child_page_offer``)
+    once it holds the child's whole answer before the deadline, as the
+    parent's session start does (``recall_rule._RoutingAtStart.text``). An
+    answer that came back too late reserves nothing, so the next tool call
+    is offered the page at once. While a page is leased, a parallel tool
+    call gets nothing: the same page is never printed twice."""
     if not session_id or not agent_id or push_off("delegation"):
         return None
     budget = prompt_budget()
@@ -11572,7 +11593,7 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
                 signal.setitimer(signal.ITIMER_REAL,
                                  max(0.0, deadline - time.monotonic()) + 0.05)
                 kicks: list = []
-                page = _child_page_push_inline(session_id, agent_id, now, kick=kicks.append)
+                page = _child_page_plan(now, kick=kicks.append)
                 if page:
                     data = memoryview(json.dumps(page).encode("utf-8"))
                     while data:
@@ -11606,10 +11627,10 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
             if not chunk:
                 break
             chunks.append(chunk)
-        page = json.loads(b"".join(chunks).decode("utf-8")) if chunks else None
-        if not isinstance(page, dict) or not page.get("routing_changes"):
-            return None
-        return page
+        planned = json.loads(b"".join(chunks).decode("utf-8")) if chunks else None
+        # In hand before the deadline: only now is the page reserved (one
+        # ledger transaction, its lock wait bounded by ``_transaction``).
+        return _child_page_offer(planned, session_id, agent_id)
     except Exception:  # noqa: BLE001 - routing never breaks the hook
         return None
     finally:
@@ -11636,9 +11657,11 @@ def start_push(budget: float | None = None, moment: str = "start", *,
     "delegation", for a subagent at its start), or None when the push is
     off. Folds outside the routing lock and waits for it, to save the view,
     at most half of ``budget`` (then answers from an unsaved fold). A
-    subagent's page is offered in its own ``child_component`` of
-    ``child_session``'s ledger; with no ``child_session`` (a Codex native
-    child, an unidentified agent) it is a snapshot reserved nowhere. The
+    subagent's page is planned for its own ``child_component`` of
+    ``child_session``'s ledger and reserved there by the hook
+    (``recall_rule._RoutingAtStart.text``); with no ``child_session`` (a
+    Codex native child, an unidentified agent) it is a snapshot reserved
+    nowhere. The
     hook bounds the whole call and treats any exception as nothing to push.
     ``session_id`` is accepted for older callers: the parent's hook attaches
     its session itself (``recall_rule._RoutingAtStart``)."""
@@ -11978,17 +12001,15 @@ def _page_answer(page: dict, now: datetime, cfg: dict) -> dict:
             "epoch": page.get("epoch"), "generation": [], "count": 0, "why": "page", "notices": []}
 
 
-def page_push(marker: dict | None, *, budget: float, now: datetime | None = None,
-              session_id: str | None = None, kick=None, resend: bool = True,
-              fold_wait: float | None = None) -> dict:
-    """What the per-prompt hook adds (``prompt_push``'s answer) with the page
-    as what routing delivers: the page whole when this conversation has not
-    yet acknowledged its current signature, else ``kind: none``. Reads
-    page.txt and the conversation's ledger, nothing else. Only when there is
-    no page yet does it read the saved view (as ``_prompt_view`` does, never
-    folding when one exists) and write the page from it. ``kick(reason)``
-    is called when the record may have moved past the page, so the caller
-    refolds off the prompt path (``refold_in_background``)."""
+def _page_planned(*, budget: float, now: datetime | None = None, kick=None,
+                  fold_wait: float | None = None) -> dict:
+    """The page as routing delivers it (``_page_answer``), planned for the
+    ledger (``routing_delivery.page_plan``) and reserved nowhere. Reads
+    page.txt, nothing else. Only when there is no page yet does it read the
+    saved view (as ``_prompt_view`` does, never folding when one exists)
+    and write the page from it. ``kick(reason)`` is called when the record
+    may have moved past the page, so the caller refolds off the prompt path
+    (``refold_in_background``)."""
     from khipu import routing_delivery, routing_page_file
 
     now = now or _now()
@@ -12005,19 +12026,37 @@ def page_push(marker: dict | None, *, budget: float, now: datetime | None = None
         why = routing_page_file.behind(page, now)
         if why and kick is not None:
             kick(why)
-    out = _page_answer(page, now, cfg)
-    session = getattr(marker, "session", None) or session_id
-    if not session:
-        return {k: v for k, v in out.items() if k not in ("page", "sig")}
-    component = getattr(marker, "component", "main")
-    planned = routing_delivery.page_plan(out, now, cfg)
+    return routing_delivery.page_plan(_page_answer(page, now, cfg), now, cfg)
+
+
+def _page_offer(planned: dict, *, session: str, component: str = "main", resend: bool = True) -> dict:
+    """Reserve a planned page (``_page_planned``) in one component of
+    ``session``'s ledger: the page whole when that component has not yet
+    acknowledged its current signature, else ``kind: none``."""
+    from khipu import routing_delivery
+
     answer = routing_delivery.offer(planned, session=session, component=component, deferred=True, resend=resend)
     if not answer.get("routing_changes"):
-        return {"kind": "none", "text": None, "version": out["version"], "epoch": out["epoch"],
+        return {"kind": "none", "text": None, "version": planned["version"], "epoch": planned["epoch"],
                 "generation": [], "count": 0}
     # The ledger keeps what is owed; the session marker gets no entity list
     # (an earlier Khipu reading it back would not know a ``page`` entity).
     return dict({k: v for k, v in answer.items() if k not in ("page", "sig")}, owed_entities=[], shown_entities=[])
+
+
+def page_push(marker: dict | None, *, budget: float, now: datetime | None = None,
+              session_id: str | None = None, kick=None, resend: bool = True,
+              fold_wait: float | None = None) -> dict:
+    """What the per-prompt hook adds (``prompt_push``'s answer) with the page
+    as what routing delivers: the page whole when this conversation has not
+    yet acknowledged its current signature, else ``kind: none``. Reads
+    page.txt and the conversation's ledger, nothing else (``_page_planned``,
+    then ``_page_offer``)."""
+    planned = _page_planned(budget=budget, now=now, kick=kick, fold_wait=fold_wait)
+    session = getattr(marker, "session", None) or session_id
+    if not session:
+        return {k: v for k, v in planned.items() if k not in ("page", "sig", "delivery_plan")}
+    return _page_offer(planned, session=session, component=getattr(marker, "component", "main"), resend=resend)
 
 
 def _start_page(view: dict, now: datetime, *, component: str | None = None,
@@ -12029,9 +12068,10 @@ def _start_page(view: dict, now: datetime, *, component: str | None = None,
     A parent conversation (no ``component``): its session is attached by
     the hook (``recall_rule._RoutingAtStart``), and the page shares the
     hook's room with the recall rule. A subagent: the page whole, bounded
-    only by the hook's own cap, offered in its ``component`` of
-    ``session``'s ledger for its hook to acknowledge once printed; with no
-    ``session`` it is a snapshot that reserves nothing."""
+    only by the hook's own cap, planned for its ``component`` of
+    ``session``'s ledger, which its hook reserves once it holds the answer
+    and acknowledges once printed; with no ``session`` it is a snapshot
+    that reserves nothing."""
     from khipu import recall_rule, routing_delivery, routing_page_file
 
     cfg = settings()
@@ -12045,10 +12085,12 @@ def _start_page(view: dict, now: datetime, *, component: str | None = None,
         answer = routing_delivery.offer(planned)
     else:
         planned["delivery_plan"]["max_chars"] = recall_rule._HOOK_CONTEXT_BUDGET
-        if session:
-            answer = routing_delivery.offer(planned, session=session, component=component, deferred=True)
-        else:
-            answer = routing_delivery.offer(planned, component=component)
+        # Rendered against no ledger, as the parent's start is: the hook
+        # reserves it in ``component`` of ``session``'s ledger only once it
+        # holds this answer before its deadline (``_RoutingAtStart.text``),
+        # so a start read that came back late reserves nothing.
+        answer = routing_delivery.offer(planned, component=component)
+        if not session:
             for key in ("routing_changes", "delivery_reservation", "delivery_plan"):
                 answer.pop(key, None)
     return {k: v for k, v in answer.items() if k not in ("page", "sig")}

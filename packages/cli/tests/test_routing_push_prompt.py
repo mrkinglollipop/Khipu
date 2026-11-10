@@ -30,7 +30,7 @@ from pathlib import Path
 import pytest
 
 from khipu import agent_view
-from khipu import paths, promote, recall_daemon, recall_prompt, routing
+from khipu import paths, promote, recall_daemon, recall_prompt, routing, routing_delivery
 
 T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
 ACCOUNTS = [{"label": "Claude", "harness": "claude"},
@@ -270,6 +270,10 @@ def test_the_routing_field_ends_the_log_line_and_every_reader_still_parses_it(ho
     doctor = recall_prompt._LOG_LINE_RE.match(line)
     assert doctor and doctor["reason"] == "ok"
     assert line.index(" degraded=") < line.index(" routing=")
+    # The ledger's own session key, just before routing= (review of #534, R2).
+    assert f" route_session={routing_delivery.hook_session(SESSION)} routing=full" in line
+    assert promote._DEGRADED_RE.search(line)["degraded"] == "None"
+    assert recall_prompt.routing_status_of(line) == "full"
 
 
 # ---- what is sent ------------------------------------------------------------------------------
@@ -592,7 +596,6 @@ def _u16(text: str) -> int:
 
 
 def _assert_note_arrives_whole_in_context(first, pull):
-    from khipu import routing_delivery
 
     output, offset, payloads = first, 0, []
     for _ in range(80):

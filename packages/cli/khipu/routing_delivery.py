@@ -176,9 +176,16 @@ def _visible_nonwhole(entries, progress, rendered):
 
 
 def _path(session):
+    return canonical_path(hook_session(session))
+
+
+def canonical_path(session):
+    """The ledger file of an already canonical session (``hook_session``'s
+    answer in the hook that wrote it), resolved again in no environment: a
+    reader such as doctor runs where ``hook_session`` would map the bare id
+    to a different name."""
     from khipu import recall_prompt
 
-    session = hook_session(session)
     # A collision-resistant name for the complete canonical identity:
     # sanitizing or truncating it made distinct identities share a file.
     digest = hashlib.sha256(session.encode("utf-8")).hexdigest()
@@ -593,7 +600,7 @@ def _when(value):
     return stamp if stamp is not None and stamp.tzinfo else None
 
 
-def page_receipt(state, revision, now, *, harness=None, last_status=None):
+def page_receipt(state, revision, now, *, harness=None, last_status=None, child=False):
     """``{"page": one of PAGE_STATES, "why": words or None}`` for one
     component, with ``revision`` the current page's (``page_revision``).
 
@@ -605,7 +612,12 @@ def page_receipt(state, revision, now, *, harness=None, last_status=None):
     prompt's read ran out of time (``last_status``, the prompt log's
     ``routing=`` field), or a client with no hooks that must pull it.
     ``behind``: an earlier page was handed over and nothing has asked since
-    this one. ``never``: no page was ever offered here."""
+    this one. ``never``: no page was ever offered here.
+
+    ``child``: a subagent's ``agent:...`` component. Its hook runs at its
+    start and on its delegation tool calls only (the installed matcher),
+    so a later page reaches it when it next delegates, or when it reads
+    ``khipu_route`` itself; its words never promise its next tool call."""
     # Only a harness known to have no hooks must pull; an unidentified one
     # may well be a hooked conversation whose hook did not say which it is.
     pull = health_harness(harness) in _PULL_ONLY_HARNESSES - {"unknown"}
@@ -630,30 +642,41 @@ def page_receipt(state, revision, now, *, harness=None, last_status=None):
                     "why": "reserved for the hook or pull that took it; counted once that one confirms it"}
     if entry and entry.get("revision") == revision:
         if entry.get("expired") or (flight and _when(flight.get("until")) and _when(flight["until"]) <= now):
-            why = ("the hook that took it never confirmed it (killed or out of time before it printed); "
-                   "the next prompt or tool call offers it again")
+            why = ("the hook that took it never confirmed it (killed or out of time before it printed); " +
+                   (f"it is offered again {_CHILD_NEXT}" if child else "the next prompt or tool call offers it again"))
         elif entry.get("offset"):
             why = "only part of it fitted beside the hook's other text; the rest follows on the next prompt"
         elif late:
             why = late
         elif pull:
             why = must_pull
+        elif child:
+            why = f"offered, and not taken since; it goes {_CHILD_NEXT}"
         else:
             why = "offered, and no prompt or tool call has taken it since"
         return {"page": "owed", "why": why}
     if (entry and entry.get("acked")) or done.get(PAGE_ENTITY):
         return {"page": "behind", "why": late or (must_pull if pull else
+                f"an earlier page was handed over; this one goes {_CHILD_NEXT}" if child else
                 "an earlier page was handed over; this one goes with the next prompt or tool call")}
     return {"page": "never", "why": late or (must_pull if pull else
             "no page has been offered here yet (an older Khipu sent the earlier summary, or nothing has asked)")}
 
 
-def page_delivery(session, revision, now):
+# Where a later page reaches a subagent: its hook runs on delegation tool
+# calls only (``integrations.DELEGATION_MATCHER``), never on its other tools.
+_CHILD_NEXT = ("to this subagent when it next delegates (Agent, Task, spawn_agent or delegate_task), "
+               "or when it reads khipu_route itself")
+
+
+def page_delivery(session, revision, now, *, last_status=None):
     """``khipu_route``'s ``delivery`` block for one conversation: the
     current page's receipt for each component of its ledger (``main``, the
     pull component ``mcp``, and each subagent's ``agent:...``), with no
-    session id or agent id in it (subagents are counted, not named). Never
-    writes or reserves anything."""
+    session id or agent id in it (subagents are counted, not named).
+    ``last_status``: the conversation's last prompt ``routing=`` status
+    (``routing_health.last_prompt_status``), so ``main`` can say its last
+    read ran out of time. Never writes or reserves anything."""
     attachment, data = {}, {}
     path = _path(session)
     try:
@@ -668,8 +691,9 @@ def page_delivery(session, revision, now):
     out = {"revision": revision, "readable": True}
     for component in ("main", "mcp"):
         out[component] = page_receipt(data.get(component), revision, now,
-                                      harness=harness if component == "main" else "unknown")
-    agents = [page_receipt(state, revision, now, harness=(state or {}).get("harness"))
+                                      harness=harness if component == "main" else "unknown",
+                                      last_status=last_status if component == "main" else None)
+    agents = [page_receipt(state, revision, now, harness=(state or {}).get("harness"), child=True)
               for name, state in data.items() if name.startswith("agent:") and isinstance(state, dict)]
     out["subagents"] = {"count": len(agents),
                         **{word: sum(a["page"] == word for a in agents) for word in PAGE_STATES},

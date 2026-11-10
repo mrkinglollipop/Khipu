@@ -2686,8 +2686,14 @@ def _route_page(routing, identity=None) -> dict:
            "full_record": ROUTE_FULL_POINTER}
     try:
         revision = routing_delivery.page_revision(routing_page_file.render(view, now)[1]["sig"])
-        out["delivery"] = (routing_delivery.page_delivery(identity["session"], revision, now) if identity
-                           else "untracked: pass session_id")
+        if identity:
+            from khipu import routing_health
+
+            out["delivery"] = routing_delivery.page_delivery(
+                identity["session"], revision, now,
+                last_status=routing_health.last_prompt_status(identity["session"], now))
+        else:
+            out["delivery"] = "untracked: pass session_id"
     except Exception:  # noqa: BLE001 - the receipt is optional; the page is the answer
         out["delivery"] = {"readable": False}
     return out

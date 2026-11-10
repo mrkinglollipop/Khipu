@@ -160,6 +160,8 @@ def test_partial_report_never_reaches_any_non_owner_surface(replay, monkeypatch)
     outputs = {"push": routing.start_push(budget=2, session_id="synthetic-recipient")}
     start = routing.start_push(budget=2, moment="delegation", child_component="agent:synthetic", child_session="synthetic-child")
     assert start and start["text"]
+    # Reserved by the hook once it holds the answer (``recall_rule._RoutingAtStart.text``).
+    start = routing_delivery.offer(start, session="synthetic-child", component="agent:synthetic", deferred=True)
     assert routing_delivery.acknowledge("synthetic-child", start["routing_changes"], now=replay.now)
     pages = []
     for _ in range(20):

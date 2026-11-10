@@ -353,7 +353,7 @@ These are the defaults. Each is a setting you can change or switch off.
 
 These are yours:
 
-- **Standing rules.** Plain-language rules such as "never use this account for that kind of work". Khipu shows them and folds them into every summary. It does not enforce them.
+- **Standing rules.** Plain-language rules such as "never use this account for that kind of work". Khipu shows them and folds them into the routing page. It does not enforce them.
 - **Note.** One note to every conversation, shown word for word.
 - **Pause.** Mark an account paused, optionally until a time. Lift it later.
 - **Clear.** Clear an account's state, or dismiss one report.
@@ -595,9 +595,9 @@ Every reader gets the same text: the routing page (`khipu route --page`), at mos
 
 - **Session start**: the page, whole, every time. It has a time budget of 1 second by default.
 - **Each prompt**: the page again only when its signature changed (a status word, the owner's order or the owner's words; a percentage moving on its own does not count). Read from `page.txt`, never folded on the prompt.
-- **Delegation**: a hook watches the moment an agent hands work to another one (agent and task calls, `spawn_agent` and `delegate_task`; shell commands are not watched, since a job started from a shell gets routing at its own session start). It adds what the prompt push would add. A child gets the same page at its start. A Claude Code subagent gets it again on its own tool calls when its signature changed, under the same rule, in its own ledger component; a Codex child reads later pages through its own Khipu pull calls under its own identity. A child's receipt never settles the parent's.
+- **Delegation**: a hook watches the moment an agent hands work to another one (agent and task calls, `spawn_agent` and `delegate_task`; shell commands are not watched, since a job started from a shell gets routing at its own session start). It adds what the prompt push would add. A child gets the same page at its start. A Claude Code subagent gets it again, when its signature changed, under the same rule and in its own ledger component, only when it next delegates: the hook runs on its delegation tool calls (agent and task calls, `spawn_agent`, `delegate_task`), not on its other tools, so a subagent that does not delegate reads a later page with `khipu_route` itself; a Codex child reads later pages through its own Khipu pull calls under its own identity. A child's receipt never settles the parent's.
 
-Unacknowledged batches have a 60-second lease by default; a batch the hook took and never confirmed is offered again on the next prompt or tool call.
+Unacknowledged batches have a 60-second lease by default; a batch the hook took and never confirmed is offered again on the next prompt or delegation tool call (for a subagent, when it next delegates). A subagent's routing read that comes back after its hook's deadline reserves nothing: the hook process reserves the page only once it holds the text it is about to print.
 
 The hooks never deny or alter a call. The delegation context arrives alongside the tool result, after the call. They are installed by `khipu integrations install` for Claude Code and Codex (Codex runs them only after you approve Khipu's hooks in Codex). Cursor hears routing at session start only: it gets no per-prompt or delegation hook. Aegis refuses these hooks; it, Grok Build and cloud agents hear routing only when they ask. See [Integrations](integrations.md).
 
@@ -605,7 +605,7 @@ A background helper in the warm recall service polls the sources every 10 second
 
 ### Command line
 
-`khipu route` prints the routing page: the accounts in the owner's order with their status words, then his rules. `--full` prints the whole record. Useful flags: `--json` (always the whole record, as the app reads it), `--summary` (the earlier session-start summary), `--brief` (text for a job runner brief), `--account A`, and `--since V` (only what changed after version V).
+`khipu route` prints the routing page: the accounts in the owner's order with their status words, then his rules. `--full` prints the whole record. Useful flags: `--json` (always the whole record, as the app reads it), `--summary` and `--brief` (both print the routing page; `--brief` is the text for a job runner brief), `--account A`, and `--since V` (only what changed after version V).
 
 The page is also what the hooks deliver. Every saved fold writes it to `page.txt` beside the view, atomically, with the time it was rendered. Session start sends it whole. The per-prompt hook reads that file, never the view or the log, and sends the page again only when an account's status word, the owner's order or his words (rules, roles, exceptions, holds, caps, plan terms) change. A percentage, a reset time or measured spend moving on its own does not resend it. A page older than `routing_not_refreshed_after` goes out with a line giving its time.
 

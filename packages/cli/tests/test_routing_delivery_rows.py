@@ -335,6 +335,9 @@ def test_owner_local_delivery_names_never_reach_other_surfaces(planted, monkeypa
     elif surface == "child":
         start = routing.start_push(budget=2, moment="delegation",
                                    child_component="agent:synthetic", child_session="synthetic-recipient")
+        # Reserved by the hook once it holds the answer (``recall_rule._RoutingAtStart.text``).
+        start = routing_delivery.offer(start, session="synthetic-recipient", component="agent:synthetic",
+                                       deferred=True)
         assert routing_delivery.acknowledge("synthetic-recipient", start["routing_changes"], now=planted.now)
         pages = []
         for _ in range(20):
