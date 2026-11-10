@@ -146,6 +146,7 @@ _AUTOMATED_OPENINGS = re.compile(
     r"|This session is being continued from a previous conversation"   # compaction summary
     r"|[^\n(\"'?]{0,40}\(scheduled(?:,|\s+(?:task|run)\b)"   # "Lane check (scheduled, not Matt)..."
     r"|Act as the [^\n.]{0,60}sub-?agent\b"           # a brief sent to a delegated job
+    r"|\[Workflow harness\b"                          # a Workflow agent's relayed request or brief
     r")",
     re.I,
 )
@@ -154,7 +155,7 @@ _AUTOMATED_OPENINGS = re.compile(
 def is_automated(text: str) -> bool:
     """True when a stored owner line was not typed by the owner: a harness
     envelope, a machine notification, a scheduled-task prompt, a compaction
-    summary or a brief another agent sent to a job."""
+    summary, a brief another agent sent to a job, or a Workflow harness frame."""
     if not isinstance(text, str):
         return False
     return (is_machine(text) or HARNESS_MESSAGE_RE.match(text) is not None
