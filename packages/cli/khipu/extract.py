@@ -656,49 +656,40 @@ def _verbatim_quotes(user_messages: list[str]) -> list[str]:
     return [q[:VERBATIM_QUOTE_CHARS] for q in picked]
 
 
-# ``owner_lines``: every user message of the window the owner typed (not
-# ``turn_text.is_automated``), in order, without duplicates. ``quotes`` keeps
-# only three messages, and in a long conversation those three are usually a
-# compaction summary, a scheduled prompt and a task notice, so the owner's own
-# lines were stored nowhere "only my words" could find them. Caps: 1,000 chars
-# a line (a typed line is rarely longer; the search quote is cut to 300 around
-# the match anyway), 40 lines and 16,000 chars a window (a capture window holds
-# a few turns; 16 KB is under 2% of the gateway's 1 MiB body cap). Over a cap,
-# lines are dropped from the middle, so the oldest and the newest stay.
+# ``owner_lines``: every user message of the window the owner typed, in order,
+# without duplicates. ``quotes`` keeps only three messages, and in a long
+# conversation those three are usually a compaction summary, a scheduled prompt
+# and a task notice, so the owner's own lines were stored nowhere "only my
+# words" could find them. Which messages were typed is decided by
+# ``session_capture.read_window`` on the original message, before capture
+# rewrites machine messages (a relayed cross-session body loses its tag and
+# would read as typed), and rides on the queued job; it is never re-derived
+# from the rendered window. Caps: 1,000 chars a line (a typed line is rarely
+# longer; the search quote is cut to 300 around the match anyway), 40 lines and
+# 16,000 chars a window (a capture window holds a few turns; 16 KB is under 2%
+# of the gateway's 1 MiB body cap). Over a cap, lines are dropped from the
+# middle, so the oldest and the newest stay.
 OWNER_LINE_CHARS = 1_000
 OWNER_LINES_MAX = 40
 OWNER_LINES_TOTAL_CHARS = 16_000
-_RENDERED_TURN_PREFIXES = ("USER: ", "ASSISTANT: ", "[tool] ")
 # Capture-now's stand-in turn (session_capture) when no transcript turn is
 # unread: written by the agent that asked for the capture, not typed.
 _CAPTURE_NOTE_PREFIX = "Capture note: "
 
 
-def _verbatim_user_turns(text: str) -> list[str]:
-    """Whole USER messages from session_capture.render()'s output: a message
-    with blank lines in it is several ``\\n\\n`` blocks, and only a block that
-    opens with a rendered role prefix starts a new message."""
-    turns: list[tuple[bool, list[str]]] = []
-    for block in text.split("\n\n"):
-        if block.startswith(_RENDERED_TURN_PREFIXES):
-            is_user = block.startswith("USER: ")
-            turns.append((is_user, [block[len("USER: "):] if is_user else block]))
-        elif turns:
-            turns[-1][1].append(block)
-    return [m for m in ("\n\n".join(parts).strip() for is_user, parts in turns if is_user) if m]
-
-
-def _owner_lines(text: str) -> list[str]:
-    """The typed user messages of the window, oldest first, each clipped to
-    OWNER_LINE_CHARS; over OWNER_LINES_MAX or OWNER_LINES_TOTAL_CHARS the
-    middle ones go. Never raises: a failure here keeps no owner lines and
-    never fails a capture."""
+def owner_lines(typed: list[str]) -> list[str]:
+    """``typed`` (the window's typed user messages, from read_window) as
+    stored: stripped, each clipped to OWNER_LINE_CHARS, deduped, untagged
+    automated openings (``turn_text.is_automated``) dropped too; over
+    OWNER_LINES_MAX or OWNER_LINES_TOTAL_CHARS the middle ones go. Never
+    raises: a failure keeps no owner lines and never fails a capture."""
     try:
         from khipu.turn_text import is_automated
 
         lines = list(dict.fromkeys(
-            msg[:OWNER_LINE_CHARS] for msg in _verbatim_user_turns(text)
-            if not (msg.startswith(_CAPTURE_NOTE_PREFIX) or is_automated(msg))))
+            msg.strip()[:OWNER_LINE_CHARS] for msg in typed
+            if isinstance(msg, str) and msg.strip()
+            and not (msg.strip().startswith(_CAPTURE_NOTE_PREFIX) or is_automated(msg))))
         if len(lines) > OWNER_LINES_MAX:
             head = OWNER_LINES_MAX // 2
             lines = lines[:head] + lines[len(lines) - (OWNER_LINES_MAX - head):]
@@ -711,8 +702,8 @@ def _owner_lines(text: str) -> list[str]:
 
 
 def extract_verbatim(text: str) -> dict[str, list[str]]:
-    """errors / commands / paths / quotes / owner_lines pulled from a rendered
-    capture window. Never raises; an empty/unmatched window returns {}."""
+    """errors / commands / paths / quotes pulled from a rendered capture
+    window. Never raises; an empty/unmatched window returns {}."""
     if not text:
         return {}
     errors = [m.strip() for m in _VERBATIM_ERROR_RE.findall(text)]
@@ -740,9 +731,6 @@ def extract_verbatim(text: str) -> dict[str, list[str]]:
         out["paths"] = _verbatim_cap(paths, VERBATIM_CLASS_CAP)
     if quotes:
         out["quotes"] = _verbatim_cap(quotes, VERBATIM_CLASS_CAP)
-    owner_lines = _owner_lines(text)
-    if owner_lines:
-        out["owner_lines"] = owner_lines
     return out
 
 
@@ -1037,10 +1025,7 @@ def extract_memory(transcript: str, *, cwd: str = "", job: bool = False) -> dict
         raise RuntimeError("extract: model summary is missing or has an invalid type")
     verbatim_only = False
     if not summary:
-        # ``owner_lines`` only repeats user turns ``quotes`` already holds; it
-        # must not decide whether a window is kept.
-        if not (any(k != "owner_lines" for k in extract_verbatim(transcript))
-                or extract_deliverables(transcript)
+        if not (extract_verbatim(transcript) or extract_deliverables(transcript)
                 or any(parsed.get(k) for k in ("decisions", "preferences", "open_loops",
                                                "closed_loops"))):
             return None

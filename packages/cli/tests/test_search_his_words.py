@@ -253,82 +253,181 @@ from tests.test_capture_replay_duplicate import at_the_key, pg  # noqa: E402,F40
 FAKE_KEY = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd'
 TYPED_ONE = f'we have to test everything ourselves, token {FAKE_KEY}\n\nand then report back'
 TYPED_TWO = 'dont stop until we are done with the purple harbour'
-ORCHESTRATOR_WINDOW = '\n\n'.join([
-    'USER: This session is being continued from a previous conversation that ran out of context. '
-    'Summary: the owner wants the lanes checked.',
-    'ASSISTANT: Picking up where we left off.',
-    'USER: Lane check (scheduled, not Matt). Quick and quiet; read every lane and report. ' + 'detail ' * 400,
-    'ASSISTANT: Lanes read.',
-    'USER: ' + TYPED_ONE,
-    '[tool] Bash',
-    'ASSISTANT: Running it.',
-    'USER: ' + TYPED_TWO,
-    'ASSISTANT: On it.',
-    'USER: <task-notification><summary>job finished: test everything ourselves</summary></task-notification>',
-])
+TYPED_THREE = 'one more typed line about the amber lighthouse'
+RELAYED = 'please re-run the lexical parity harness on the fresh copy'
+RELAYED_TWO = 'second relay: check the tangerine bridge results'
+# Every user-role message capture rewrites or drops, each with words no typed
+# line has; none may ever reach owner_lines.
+MACHINE = {
+    'cross-session message': f'<cross-session-message from="aegis-1">{RELAYED}</cross-session-message>',
+    'cross-session idle': '<cross-session-idle from="aegis-2">idle teammate cobalt quarry</cross-session-idle>',
+    'cross-session delivery': '<cross-session-delivery>delivered note saffron meadow</cross-session-delivery>',
+    'task notification': '<task-notification><task-id>t1</task-id><summary>job finished: crimson '
+                         'orchard</summary><result>' + 'r' * 300 + '</result></task-notification>',
+    'local command output': '<local-command-stdout>local output velvet canyon</local-command-stdout>',
+    'slash command': '<command-name>/clear</command-name><command-args>granite tundra</command-args>',
+    'hook context only': '<system-reminder>reminder text ivory delta</system-reminder>',
+    'scheduled prompt': 'Lane check (scheduled, not Matt). Quick and quiet; read every lane, emerald '
+                        'ridge. ' + 'detail ' * 400,
+}
+MACHINE_WORDS = ('lexical parity harness', 'tangerine bridge', 'magenta glacier', 'cobalt quarry', 'saffron meadow', 'crimson orchard',
+                 'velvet canyon', 'granite tundra', 'ivory delta', 'emerald ridge', 'continued from')
 
 
-def _drain(transcript, *, owner_lines=True):
+def _user_row(text, **extra):
+    return {'type': 'user', 'message': {'role': 'user', 'content': text}, **extra}
+
+
+def _assistant_row(text):
+    return {'type': 'assistant', 'message': {'role': 'assistant', 'content': text}}
+
+
+def _orchestrator_rows():
+    rows = [_user_row('This session is being continued from a previous conversation that ran out of '
+                      'context. Summary: the owner wants the lanes checked.', isCompactSummary=True),
+            _assistant_row('Picking up where we left off.')]
+    for n, (kind, text) in enumerate(MACHINE.items()):
+        rows += [_user_row(text), _assistant_row(f'noted {n}')]
+        if kind == 'cross-session message':
+            rows += [_user_row(TYPED_ONE), _assistant_row('Running it.')]
+        if kind == 'local command output':
+            rows += [_user_row(TYPED_TWO), _assistant_row('On it.')]
+    # a typed line followed straight away by a relayed message: one rendered block
+    rows += [_user_row(TYPED_THREE),
+             _user_row(f'<cross-session-message from="aegis-3">{RELAYED_TWO}</cross-session-message>'),
+             _assistant_row('Both read.'),
+             _user_row('<task-notification><summary>last job: magenta glacier</summary></task-notification>')]
+    return rows
+
+
+def _queue(tmp_path, rows, sid='11111111-2222-3333-4444-555555555555', event='SessionEnd'):
+    """Write a Claude Code transcript and run the real capture hook over it;
+    return the queued job."""
+    path = tmp_path / '.claude' / 'projects' / 'p' / f'{sid}.jsonl'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    out = session_capture.hook_main(json.dumps({'hook_event_name': event, 'session_id': sid,
+                                                'cwd': str(tmp_path), 'transcript_path': str(path)}),
+                                    'claude_code')
+    assert out.get('due'), out
+    jobs = session_capture.queued_jobs()
+    assert len(jobs) == 1, jobs
+    return jobs[0]
+
+
+def _drain_job(job_path, *, drop_owner_lines=False):
     """Run the real drain over one queued job; return (capture payload, the
     summariser's input)."""
-    import tempfile
-    from pathlib import Path
+    if drop_owner_lines:
+        job = json.loads(job_path.read_text())
+        job.pop('owner_lines', None)
+        job_path.write_text(json.dumps(job))
+    with mock.patch.object(session_capture, 'queued_jobs', return_value=[job_path]), \
+            mock.patch.object(session_capture, '_claim', side_effect=lambda p: p), \
+            mock.patch.object(session_capture, '_reclaim_stale', return_value=0), \
+            mock.patch.object(session_capture, '_record_drain'), \
+            mock.patch.object(hub_snapshot, 'sync_decision_changes', return_value={}), \
+            mock.patch('khipu.t3.thread_for_session', return_value=None), \
+            mock.patch.object(extract, '_generate', return_value='{"summary":"Checked the lanes."}') as gen, \
+            mock.patch.object(capture, 'capture', return_value=0) as cap:
+        assert session_capture.drain()['captured'] == 1
+    return cap.call_args.args[0], [c.args for c in gen.call_args_list]
 
-    with tempfile.TemporaryDirectory() as tmp:
-        job = Path(tmp) / 'job.json'
-        job.write_text(json.dumps(dict(harness='claude_code', session_id='11111111-2222-3333-4444-555555555555',
-                                       transcript=transcript, event='Stop', ts='2026-11-10T12:00:00Z')))
-        with mock.patch.object(session_capture, 'queued_jobs', return_value=[job]), \
-                mock.patch.object(session_capture, '_claim', side_effect=lambda p: p), \
-                mock.patch.object(session_capture, '_reclaim_stale', return_value=0), \
-                mock.patch.object(session_capture, '_record_drain'), \
-                mock.patch.object(hub_snapshot, 'sync_decision_changes', return_value={}), \
-                mock.patch('khipu.t3.thread_for_session', return_value=None), \
-                mock.patch.object(extract, '_generate', return_value='{"summary":"Checked the lanes."}') as gen, \
-                (mock.patch.object(extract, '_owner_lines', return_value=[]) if not owner_lines
-                 else __import__('contextlib').nullcontext()), \
-                mock.patch.object(capture, 'capture', return_value=0) as cap:
-            assert session_capture.drain()['captured'] == 1
-        return cap.call_args.args[0], [c.args for c in gen.call_args_list]
+
+def _captured(tmp_path, rows=None):
+    job_path = _queue(tmp_path, rows or _orchestrator_rows())
+    job = json.loads(job_path.read_text())
+    payload, _ = _drain_job(job_path)
+    return job, payload
 
 
 def _land(payload):
     return str(capture.write_pg(deepcopy(payload))['episode_id'])
 
 
-def test_orchestrator_window_keeps_both_typed_lines_and_finds_each(at_the_key, monkeypatch):
+def test_orchestrator_window_keeps_typed_lines_only_and_finds_each(at_the_key, monkeypatch, tmp_path):
     configure_hub(monkeypatch, at_the_key)
     monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: [])
-    payload, _ = _drain(ORCHESTRATOR_WINDOW)
+    job, payload = _captured(tmp_path)
+    window = job['transcript']
+    # the window text is as before: the relayed body is kept, tag stripped
+    assert RELAYED in window and 'cross-session-message' not in window
+    assert f'USER: {TYPED_THREE}\n{RELAYED_TWO}' in window      # merged into one rendered block
     vb = payload['verbatim']
-    # quotes are exactly what they were: first, longest, last (all automated here)
-    assert vb['quotes'] == extract._verbatim_quotes(extract._verbatim_user_messages(ORCHESTRATOR_WINDOW))
-    assert not any(TYPED_TWO in q for q in vb['quotes'])
-    # owner_lines hold the two typed lines, whole, in order; no automated one
-    assert len(vb['owner_lines']) == 2
-    assert vb['owner_lines'][0].startswith('we have to test everything ourselves')
-    assert 'and then report back' in vb['owner_lines'][0]
-    assert vb['owner_lines'][1] == TYPED_TWO
+    # quotes are exactly what they were: first, longest, last
+    assert vb['quotes'] == extract._verbatim_quotes(extract._verbatim_user_messages(window))
+    # owner_lines: the three typed lines, whole and in order, redacted; no machine message
+    assert vb['owner_lines'] == [TYPED_ONE.replace(FAKE_KEY, '[REDACTED]'), TYPED_TWO, TYPED_THREE]
+    assert job['owner_lines'] == vb['owner_lines']
+    for words in MACHINE_WORDS:
+        assert not any(words in line for line in vb['owner_lines']), words
     eid = _land(payload)
     with at_the_key.connect() as conn:
         stored = conn.execute('SELECT verbatim, raw FROM episodes WHERE id = %s', (int(eid),)).fetchone()
-    # the key was redacted on the way in, same as a quote's would be
     assert FAKE_KEY not in json.dumps(stored[0]) and FAKE_KEY not in json.dumps(stored[1])
-    assert '[REDACTED]' in stored[0]['owner_lines'][0]
-    assert stored[1]['verbatim']['owner_lines'] == stored[0]['owner_lines']
+    assert stored[1]['verbatim']['owner_lines'] == stored[0]['owner_lines'] == vb['owner_lines']
     for mode in ('literal', 'hybrid'):
         for query, quoted in (('test everything ourselves', 'we have to test everything ourselves'),
-                              ('purple harbour', TYPED_TWO)):
+                              ('purple harbour', TYPED_TWO), ('amber lighthouse', TYPED_THREE)):
             out = embed.hybrid_search(query, mode=mode, owner_words_only=True)['results']
             assert [r['id'] for r in out] == [eid], (mode, query)
             assert out[0]['quote'].startswith(quoted), (mode, query)
             assert FAKE_KEY not in out[0]['quote']
+        for words in MACHINE_WORDS:
+            out = embed.hybrid_search(words, mode=mode, owner_words_only=True)['results']
+            assert not out, (mode, words, out)
 
 
-def test_a_forgotten_conversation_is_neither_matched_nor_quoted(at_the_key, monkeypatch):
+def test_each_rewritten_machine_message_alone_gives_no_owner_lines(tmp_path, monkeypatch):
+    for n, (kind, text) in enumerate(MACHINE.items()):
+        home = tmp_path / f'k{n}'
+        monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(home))
+        rows = [_user_row(text), _assistant_row('noted ' + 'y' * 300), _user_row(text + ' again'),
+                _assistant_row('noted again')]
+        if kind == 'hook context only':   # dropped whole: nothing to capture without a reply
+            rows = [rows[0], _assistant_row('reply ' + 'y' * 300)]
+        job_path = _queue(home, rows, sid=f'00000000-0000-0000-0000-0000000010{n:02d}')
+        job = json.loads(job_path.read_text())
+        assert 'owner_lines' not in job, (kind, job.get('owner_lines'))
+        payload, _ = _drain_job(job_path)
+        assert 'owner_lines' not in (payload.get('verbatim') or {}), kind
+
+
+def test_idle_sweep_window_carries_owner_lines_too(tmp_path, monkeypatch):
+    import os
+    import time
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'sweep'))
+    path = tmp_path / 'idle.jsonl'
+    path.write_text(''.join(json.dumps(r) + '\n' for r in [
+        _user_row(MACHINE['cross-session message']), _assistant_row('ok ' + 'y' * 300),
+        _user_row(TYPED_TWO), _assistant_row('fine')]))
+    raw = json.dumps({'hookEventName': 'Stop', 'session_id': 'idle', 'cwd': str(tmp_path),
+                      'transcript_path': str(path)})
+    assert not session_capture.hook_main(raw, 'claude_code')['due']
+    old = time.time() - session_capture.MIN_MINUTES * 60 - 60
+    state = session_capture.load_state('claude_code', 'idle')
+    state['seen_ts'] = old
+    session_capture.save_state('claude_code', 'idle', state)
+    os.utime(path, (old, old))
+    assert session_capture.sweep_idle(now=time.time())['swept'] == 1
+    job = json.loads(session_capture.queued_jobs()[0].read_text())
+    assert RELAYED in job['transcript']
+    assert job['owner_lines'] == [TYPED_TWO]
+
+
+def test_a_job_queued_without_the_marker_gets_no_owner_lines(tmp_path, monkeypatch):
+    """A job from before this change carries no typed list; the rendered
+    window is never re-read for one."""
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'old'))
+    payload, _ = _drain_job(_queue(tmp_path, _orchestrator_rows()), drop_owner_lines=True)
+    assert 'owner_lines' not in payload['verbatim'] and payload['verbatim']['quotes']
+    assert 'owner_lines' not in extract.extract_verbatim('USER: ' + TYPED_TWO)
+
+
+def test_a_forgotten_conversation_is_neither_matched_nor_quoted(at_the_key, monkeypatch, tmp_path):
     configure_hub(monkeypatch, at_the_key)
     monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: [])
-    payload, _ = _drain(ORCHESTRATOR_WINDOW)
+    _, payload = _captured(tmp_path)
     eid = _land(payload)
     assert embed.hybrid_search('purple harbour', mode='literal', owner_words_only=True)['results']
     with at_the_key.connect() as conn, conn.cursor() as cur:
@@ -340,14 +439,17 @@ def test_a_forgotten_conversation_is_neither_matched_nor_quoted(at_the_key, monk
         assert not any(TYPED_TWO in (r.get('quote') or '') for r in out)
 
 
-def test_summariser_input_is_unchanged(at_the_key):
-    with_lines, prompts = _drain(ORCHESTRATOR_WINDOW)
-    without, prompts_before = _drain(ORCHESTRATOR_WINDOW, owner_lines=False)
+def test_summariser_input_is_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'a'))
+    with_lines, prompts = _drain_job(_queue(tmp_path, _orchestrator_rows()))
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'b'))     # same transcript, fresh capture state
+    without, prompts_before = _drain_job(_queue(tmp_path, _orchestrator_rows()), drop_owner_lines=True)
     assert prompts == prompts_before                       # the model saw the same text
     assert 'owner_lines' in with_lines['verbatim'] and 'owner_lines' not in without['verbatim']
     assert {k: v for k, v in with_lines['verbatim'].items() if k != 'owner_lines'} == without['verbatim']
-    assert {k: v for k, v in with_lines.items() if k != 'verbatim'} == \
-           {k: v for k, v in without.items() if k != 'verbatim'}
+    volatile = {'verbatim', 'ts', 'checkout', 'repo_root', 'project', 'scope', 'transcript_range'}
+    assert {k: v for k, v in with_lines.items() if k not in volatile} == \
+           {k: v for k, v in without.items() if k not in volatile}
 
 
 def test_embedded_and_ranked_text_ignore_owner_lines():
@@ -438,27 +540,28 @@ def test_owner_words_function_and_index_cover_owner_lines_and_old_rows_are_uncha
 
 def test_owner_lines_caps_keep_the_oldest_and_the_newest():
     msgs = [f'typed line {i:03d} ' + 'w' * 20 for i in range(100)]
-    window = '\n\n'.join(f'USER: {m}\n\nASSISTANT: ok' for m in msgs)
-    lines = extract.extract_verbatim(window)['owner_lines']
+    lines = extract.owner_lines(msgs)
     assert len(lines) == extract.OWNER_LINES_MAX
     half = extract.OWNER_LINES_MAX // 2
     assert lines[:half] == msgs[:half] and lines[half:] == msgs[-half:]
     long = ['L%02d ' % i + 'x' * 3000 for i in range(30)]
-    lines = extract.extract_verbatim('\n\n'.join(f'USER: {m}' for m in long))['owner_lines']
+    lines = extract.owner_lines(long)
     assert all(len(x) == extract.OWNER_LINE_CHARS for x in lines)
     assert sum(len(x) for x in lines) <= extract.OWNER_LINES_TOTAL_CHARS
     assert lines[0].startswith('L00') and lines[-1].startswith('L29')
-    # duplicates kept once; automated turns and capture-now's stand-in never
-    window = '\n\n'.join(['USER: same line', 'USER: same line', 'USER: ' + AUTOMATED['job brief'],
-                          'USER: Capture note: remember this', 'USER: ' + AUTOMATED['compaction summary']])
-    assert extract.extract_verbatim(window)['owner_lines'] == ['same line']
-    assert 'owner_lines' not in extract.extract_verbatim('USER: ' + AUTOMATED['scheduled'])
+    # duplicates kept once; untagged automated openings and capture-now's stand-in never
+    assert extract.owner_lines(['same line', 'same line', AUTOMATED['job brief'],
+                                'Capture note: remember this', AUTOMATED['compaction summary']]) == ['same line']
 
 
 def test_owner_lines_never_fail_a_capture():
     with mock.patch('khipu.turn_text.is_automated', side_effect=RuntimeError('boom')):
-        out = extract.extract_verbatim('USER: hello there')
-    assert out['quotes'] == ['hello there'] and 'owner_lines' not in out
+        assert extract.owner_lines(['hello there']) == []
+    with mock.patch.object(extract, 'owner_lines', side_effect=RuntimeError('boom')):
+        assert session_capture._owner_lines_by_part([{'text': 'USER: hi'}], ['hi']) == [[]]
+    parts = [{'text': 'USER: a first line'}, {'text': 'USER: a second line\n\nUSER: a first line'}]
+    assert session_capture._owner_lines_by_part(parts, ['a first line', 'a second line', 'a first line']) == \
+           [['a first line'], ['a second line', 'a first line']]
 
 
 def test_redact_payload_treats_owner_lines_as_quotes():
