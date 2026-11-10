@@ -33,6 +33,12 @@
 	<key>WatchPaths</key>
 	<array>{{WATCH_PATHS}}
 	</array>
+	<!-- A memory folder created after install is not in WatchPaths. Every pass
+	     compares the watch list with the folders that exist now and, when they
+	     differ, rewrites and reloads this job; this timer makes sure a pass
+	     runs even when no watched folder changed. -->
+	<key>StartInterval</key>
+	<integer>1800</integer>
 	<key>ThrottleInterval</key>
 	<integer>30</integer>
 	<key>StandardOutPath</key>

@@ -172,25 +172,27 @@ def test_run_never_raises_and_names_every_skipped_step(monkeypatch, capsys):
 
     err = capsys.readouterr().err
     for step in ("drain skipped", "mirror skipped", "outbox drain skipped",
-                 "notes-reconcile skipped", "embed catch-up skipped"):
+                 "embed catch-up skipped"):
         assert step in err, (step, err)
     assert "session=sid-9" in err
 
 
-def test_run_says_when_the_notes_step_was_not_needed(monkeypatch, capsys, tmp_path):
+def test_run_does_not_scan_notes_at_the_end_of_a_turn(monkeypatch, capsys, tmp_path):
     import khipu.embed
     import khipu.mirror
     import khipu.notes
 
+    def boom(*_a, **_k):
+        raise AssertionError("the stop hook must not touch notes")
+
     monkeypatch.setattr(hb, "_drain", lambda *a, **k: None)
     monkeypatch.setattr(khipu.mirror, "sync_recent_episodes", lambda *_a, **_k: {})
     monkeypatch.setattr(khipu.embed, "embed_recent_missing", lambda **_k: {"embedded": 0})
-    monkeypatch.setattr(khipu.notes, "hook_reconcile", lambda: {"skipped": "recent", "age_s": 5.0})
+    monkeypatch.setattr(khipu.notes, "reconcile", boom)
 
     hb.run(str(tmp_path), "claude_code", "sid-5")
 
-    err = capsys.readouterr().err
-    assert "notes-reconcile not needed (recent)" in err and "notes-reconcile skipped" not in err
+    assert "notes-reconcile" not in capsys.readouterr().err
 
 
 # --- the real hook script ----------------------------------------------------

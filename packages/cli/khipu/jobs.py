@@ -391,7 +391,7 @@ def _record_nightly_step(
     """F3/D1: persist this nightly's step-by-step outcome to
     ``nightly-last.json`` (one entry per step: name/ok/counts/error/ts) —
     the "green because the evidence never arrived" class (audit
-    2026-08-17): notes reconcile, embed backfill, mark-stale and hygiene
+    2026-08-17): embed backfill, mark-stale and hygiene
     outcomes were logged as free text and never read by anything. Phase 6
     reads this file; written here so it exists starting now. Written after
     EVERY step (not once at the end) so a step that hangs or crashes the
@@ -450,7 +450,6 @@ def _run_nightly_locked() -> int:
         driver_error = "driver timed out" if rc == 124 else f"driver failed (exit {rc})"
     _record_nightly_step(steps, "consolidate_nightly", ok=(rc == 0),
                          counts={"rc": rc}, error=driver_error)
-    _record_nightly_step(steps, "notes_reconcile", **_step_result(_reconcile_notes_if_due()))
     _record_nightly_step(steps, "embed_backfill", **_step_result(_embed_backfill()))
     _record_nightly_step(steps, "summary_kind_backfill", **_step_result(_summary_kind_backfill()))
     _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))
@@ -1021,22 +1020,6 @@ def _provenance_nightly() -> dict[str, Any]:
     return out
 
 
-def _reconcile_notes_if_due() -> dict[str, Any]:
-    """W4.3: piggyback `khipu.notes.reconcile` on the nightly cadence, the
-    additive,
-    best-effort, and must never turn a good nightly run into a bad one on
-    doctor/status (the external CONSOLIDATE_NIGHTLY driver's exit code above
-    is the one that actually gates job_status/doctor)."""
-    try:
-        from khipu import notes
-
-        out = notes.reconcile(dry_run=False)
-    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
-        out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
-    _nightly_log(f"notes-reconcile: {json.dumps(out, default=str)[:600]}")
-    return out
-
-
 def nightly_last() -> dict[str, Any] | None:
     """D1: read back the per-step evidence `_record_nightly_step` writes.
     None when the nightly has never recorded a run on this Mac (not a
@@ -1087,10 +1070,6 @@ def nightly_consolidate_ts(log_mtime: float | None, *, slack_s: float) -> float 
 # "green because evidence never arrived" (audit 2026-08-17), the same class
 # `_record_nightly_step`'s own docstring names.
 _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
-    "notes_reconcile_ok": (
-        "notes_reconcile",
-        "run `khipu notes reconcile` and check the error",
-    ),
     "embed_provider_ok": (
         "embed_backfill",
         "check the embedding provider key/credentials, then run `khipu jobs install nightly`"
@@ -1452,7 +1431,38 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
             "source": source,
             **({"carried": True} if step_name in carried_names else {}),
         }
+    # Not a nightly step: an edited note is picked up only by the notes watcher.
+    out["notes_reconcile_ok"] = notes_watch_health()
     return out
+
+
+def notes_watch_health() -> dict[str, Any]:
+    """The notes watcher is the only thing that picks up an edited note by
+    itself, so a Mac without it loaded would never index one. One doctor block,
+    keyed like the nightly steps; the fix is the install command."""
+    try:
+        loaded = bool(_job_entry("notes_watch").get("plist_loaded"))
+    except Exception as exc:  # noqa: BLE001 - a failed check must not look like a pass
+        return {"ok": False, "applicable": True, "error": f"{type(exc).__name__}: {exc}",
+                "fix": "run `khipu jobs install notes_watch`"}
+    if loaded:
+        try:
+            from khipu.launchd_gen import watch_list_drift
+
+            drift = watch_list_drift()
+        except Exception as exc:  # noqa: BLE001 - a failed comparison must not look like a pass
+            return {"ok": False, "applicable": True, "error": f"could not compare the watch list: {type(exc).__name__}: {exc}",
+                    "fix": "run `khipu jobs install notes_watch`"}
+        if drift.get("unwatched"):
+            n = len(drift["unwatched"])
+            return {"ok": False, "applicable": True, "unwatched": drift["unwatched"],
+                    "error": f"the notes watcher is not watching {n} notes folder{'s' if n != 1 else ''} that exist"
+                             f" (for example {drift['unwatched'][0]}), so edits there are indexed only on its 30-minute timer",
+                    "fix": "run `khipu jobs install notes_watch`"}
+        return {"ok": True, "applicable": True}
+    return {"ok": False, "applicable": True,
+            "error": "the notes watcher is not installed, so edited notes are not indexed",
+            "fix": "run `khipu jobs install notes_watch`"}
 
 
 def skipped_step_names(health: dict[str, dict[str, Any]]) -> list[str]:

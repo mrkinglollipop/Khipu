@@ -1764,6 +1764,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     harness = getattr(args, "harness", None)
     via = getattr(args, "via", None)
     source = getattr(args, "source", None)
+    owner_words = bool(getattr(args, "owner_words", False))
     provenance = {"via": via} if via else {}
     try:
         from khipu.embed import hybrid_search
@@ -1771,7 +1772,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         payload = hybrid_search(
             args.query, limit=args.limit, mode=mode, kind=kind, project=project,
             since=since, until=until, session_id=session_id, harness=harness,
-            source=source, **provenance,
+            source=source, owner_words_only=owner_words, memory_fields=True, **provenance,
         )
     except ValueError as err:
         print(json.dumps({"ok": False, "error": str(err)}))
@@ -1782,6 +1783,10 @@ def cmd_search(args: argparse.Namespace) -> int:
         if kind == "library" or source:
             print(json.dumps({"ok": False, "error": (
                 "library search needs the hub; the offline snapshot holds no libraries")}))
+            return 2
+        if owner_words:
+            print(json.dumps({"ok": False, "error": (
+                "searching only your words needs the hub; the offline snapshot cannot do it")}))
             return 2
         try:
             payload = search_stale_payload(
@@ -3067,6 +3072,28 @@ def cmd_hygiene(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refresh_notes_watch_list() -> dict:
+    """The watcher's pass: if the folders the installed job watches differ from
+    the memory folders that exist now, rewrite and reload the job (once), and
+    say so on stderr. A failure here never stops the pass."""
+    try:
+        from khipu import launchd_gen
+
+        drift = launchd_gen.watch_list_drift()
+        if drift["installed"] is None or not (drift["unwatched"] or drift["stale"]):
+            return {"changed": False}
+        result = launchd_gen.refresh_watch_list()
+    except Exception as e:  # noqa: BLE001 — the pass has already done its work
+        result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        drift = {"unwatched": [], "stale": []}
+    if result.get("ok"):
+        print(f"[khipu-notes] watch list differs ({len(drift['unwatched'])} new, {len(drift['stale'])} gone): "
+              "reloading the notes-watch job", file=sys.stderr)
+    else:
+        print(f"[khipu-notes] watch list refresh failed: {result.get('error')}", file=sys.stderr)
+    return {"changed": True, "unwatched": drift["unwatched"], "stale": drift["stale"], **result}
+
+
 def cmd_notes(args: argparse.Namespace) -> int:
     """W4.3 + Phase 5 (organisation without the user): `khipu notes ...`.
 
@@ -3085,6 +3112,8 @@ def cmd_notes(args: argparse.Namespace) -> int:
             dry_run=bool(getattr(args, "dry_run", False)),
             changed_only=bool(getattr(args, "changed_only", False)),
         )
+        if getattr(args, "changed_only", False) and not getattr(args, "dry_run", False):
+            report["watch_list"] = _refresh_notes_watch_list()
         print(json.dumps(report, indent=2, default=str))
         return 0
     if cmd == "index":
@@ -4326,6 +4355,7 @@ def cmd_jobs(args: argparse.Namespace) -> int:
 
 
 ROUTING_COPY_MAX_S = 230
+MAC_STATUS_MAX_S = 15
 
 
 def cmd_snapshot(args: argparse.Namespace) -> int:
@@ -4369,7 +4399,7 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001 — no timer stage starves the next
             out["job_state"] = timer_error(exc)
         # The routing copy between Macs must not depend on a prompt helper
-        # being alive. Last, so a slow hub cannot delay the stages above.
+        # being alive. After every local stage, so a slow hub cannot delay them.
         try:
             from khipu import deadline, routing
 
@@ -4378,6 +4408,30 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
                 out["routing_copy"] = routing.poll_refold()
         except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
             out["routing_copy"] = timer_error(exc)
+        # This Mac's own status row for "Your Macs": the last stage, so nothing above waits on it. It first refreshes
+        # this Mac's running jobs (built as `khipu running` builds them) and then publishes, both inside
+        # MAC_STATUS_MAX_S: the build gets half, the publish the rest. Skipped entirely, with nothing built, when the
+        # hub is already known to be down. A build that fails or runs out of time still publishes the rest of the
+        # row (with the kept running part if it is under 15 minutes old, else none). A hub that is down or an older
+        # hub without the table is a note in the receipt, never a failure.
+        try:
+            import time
+
+            from khipu import deadline, macs
+
+            started = time.monotonic()
+            running = "failed"
+            try:
+                with deadline.limit(MAC_STATUS_MAX_S / 2, "this Mac's running jobs"):
+                    built = macs.refresh_running()
+                running = "skipped" if built is None else ("fresh" if built else "failed")
+            except Exception:  # noqa: BLE001 — the row goes out without a fresh running part
+                running = "failed"
+            with deadline.limit(max(MAC_STATUS_MAX_S / 2, MAC_STATUS_MAX_S - (time.monotonic() - started)),
+                                "the Mac status row"):
+                out["mac_status"] = dict(macs.publish(), running=running)
+        except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
+            out["mac_status"] = timer_error(exc)
         print(json.dumps(out, indent=2))
         return rc
     if args.snapshot_cmd == "status":
@@ -5135,6 +5189,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     d.set_defaults(func=cmd_doctor)
 
+    hf = sub.add_parser("health", help="The five checks the app shows, as plain rows (a view over doctor)")
+    hf.add_argument("--json", action="store_true", help="Print JSON (the only form)")
+    hf.set_defaults(func=lambda args: __import__("khipu.health_five", fromlist=["cmd_health"]).cmd_health(args))
+
+    mc = sub.add_parser("macs", help="One status row per Mac, shared through the hub (this Mac live, the others as last reported)")
+    mc.add_argument("--json", action="store_true", help="Print JSON (the only form)")
+    mc.set_defaults(func=lambda args: __import__("khipu.macs", fromlist=["cmd_macs"]).cmd_macs(args))
+
+    rn = sub.add_parser("running", help="Which jobs are running, on which Mac, and which have gone quiet (this Mac live, the other as last reported)")
+    rn.add_argument("--json", action="store_true", help="Print JSON (the only form)")
+    rn.set_defaults(func=lambda args: __import__("khipu.running_now", fromlist=["cmd_running"]).cmd_running(args))
+
     ny = sub.add_parser("needs-you", help="Everything waiting on the owner, in the app and MCP's own words")
     ny.add_argument("--json", action="store_true", help="Print the complete structured answer")
     choose = ny.add_mutually_exclusive_group()
@@ -5254,6 +5320,10 @@ def build_parser() -> argparse.ArgumentParser:
     se.add_argument("--session-id", dest="session_id", help="Episode session_id prefix match")
     se.add_argument("--harness", help="Prefix of session_id before the colon")
     se.add_argument("--via", help="Exact capture origin, e.g. t3")
+    se.add_argument(
+        "--owner-words", dest="owner_words", action="store_true",
+        help="Match only the owner's own lines (episodes only), in every mode",
+    )
     se.set_defaults(func=cmd_search)
 
     em = sub.add_parser(

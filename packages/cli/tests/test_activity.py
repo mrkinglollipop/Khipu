@@ -170,7 +170,7 @@ class ActivityPayloadTest(unittest.TestCase):
 
     def test_the_limit_reaches_the_recent_query(self):
         _, cur, _ = self._run()
-        self.assertEqual(cur.params[-1], (3,))
+        self.assertIn((3,), cur.params)  # the memory-fields lookup runs after it
 
 
 class ProjectSliceTest(unittest.TestCase):

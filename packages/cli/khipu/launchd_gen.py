@@ -8,6 +8,7 @@ import plistlib
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
@@ -276,6 +277,49 @@ def render_watch_paths_xml() -> str:
 
     lines = [f"\n\t\t<string>{escape(str(p))}</string>" for p in memory_dirs()]
     return "".join(lines)
+
+
+def installed_watch_paths() -> list[str] | None:
+    """The WatchPaths the installed notes-watch plist carries; None when it is
+    not installed or cannot be read."""
+    plist = _installed_plist(_plist_path(PLIST_NOTES_WATCH))
+    paths = plist.get("WatchPaths") if isinstance(plist, dict) else None
+    return [str(p) for p in paths] if isinstance(paths, list) else None
+
+
+def watch_list_drift() -> dict[str, Any]:
+    """Folders the installed notes-watch job watches against the memory folders
+    that exist now (``notes.memory_dirs()``). ``installed`` is None when no plist
+    can be read. ``unwatched`` exist but are not watched; ``stale`` are watched
+    but gone."""
+    from khipu.notes import memory_dirs
+
+    wanted = [str(p) for p in memory_dirs()]
+    installed = installed_watch_paths()
+    if installed is None:
+        return {"installed": None, "unwatched": [], "stale": []}
+    return {
+        "installed": installed,
+        "unwatched": sorted(set(wanted) - set(installed)),
+        "stale": sorted(set(installed) - set(wanted)),
+    }
+
+
+def refresh_watch_list() -> dict[str, Any]:
+    """Rewrite and reload the notes-watch job with today's folders, by running
+    ``khipu jobs install notes_watch`` (the same code as the command) detached.
+    The caller is that very job, and the reload stops it, so the install runs
+    in its own session and the caller does not wait for it. Whether it worked
+    is read back later from ``watch_list_drift``."""
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "khipu", "jobs", "install", "notes_watch"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": True, "started": True}
 
 
 def render_plist(job: str, environ: dict[str, str] | None = None) -> bytes:
