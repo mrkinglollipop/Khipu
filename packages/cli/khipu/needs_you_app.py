@@ -95,7 +95,10 @@ def last_answer() -> dict | None:
 
 
 def read(key: str | None = None) -> dict:
-    """The list as the app shows it. Reading changes nothing."""
+    """The list as the app shows it, or with ``key`` that one item with its
+    words whole (the read ``needs-you --item`` makes). Each item says whether
+    its words were cut (``cut``); an item read by its key never is. Reading
+    changes nothing."""
     token = needs_you.FOR_APP.set(True)
     try:
         answer = needs_you.waiting(key=key, record_read=False)
@@ -103,9 +106,25 @@ def read(key: str | None = None) -> dict:
         needs_you.FOR_APP.reset(token)
     if isinstance(answer, dict):
         answer["this_mac"] = this_mac()
+        for item in answer.get("items") or []:
+            if isinstance(item, dict):
+                item["cut"] = item.get("cut") is True
         if not answer.get("total"):
             answer["last_answer"] = last_answer()
     return answer
+
+
+NOT_FOUND = "That item is no longer waiting. Nothing was changed; read the list again."
+
+
+def read_one(key: str) -> tuple[int, dict]:
+    """(exit code, JSON) for one item read whole by its key; ``not_found``
+    when no item has that key now."""
+    answer = read(key)
+    items = answer.get("items") if isinstance(answer, dict) else None
+    if not items or len(items) != 1 or items[0].get("key") != key:
+        return _no("not_found", NOT_FOUND, key=key)
+    return 0, dict(answer, key=key)
 
 
 def _line_for(out: dict) -> dict | None:
@@ -172,7 +191,7 @@ def answer(key: str, said: str, expect: str | None = None) -> tuple[int, dict]:
     shown = read(key)
     items = shown.get("items") if isinstance(shown, dict) else None
     if not items or len(items) != 1 or items[0].get("key") != key:
-        return _no("not_found", "That item is no longer waiting. Nothing was changed; read the list again.")
+        return _no("not_found", NOT_FOUND)
     item = items[0]
     pin = pin_of(item.get("settle"))
     if pin is not None and expect != pin:
@@ -211,7 +230,8 @@ ONLY_THE_APP = ("Only the Khipu app can answer this way; it was not the app that
 
 
 def run_cli(args) -> int:
-    """``khipu needs-you --from-app [--item KEY]`` reads the app's list;
+    """``khipu needs-you --from-app`` reads the app's list, and with
+    ``--item KEY`` one item whole;
     ``khipu needs-you --from-app --answer KEY yes|no`` answers one item.
     Always JSON."""
     from khipu.cli import _strict_json
@@ -229,4 +249,6 @@ def run_cli(args) -> int:
         return say(*answer(key, said, getattr(args, "expect", None)))
     if args.yes or args.no:
         return say(*_no("bad_args", "The app answers with --answer KEY yes or no."))
-    return say(0, read(args.item))
+    if args.item:
+        return say(*read_one(args.item))
+    return say(0, read())

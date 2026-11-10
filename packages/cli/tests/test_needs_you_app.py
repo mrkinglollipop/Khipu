@@ -385,3 +385,59 @@ def test_the_terminal_path_and_the_mcp_list_have_no_pin_field(world):
     _setting_request(world)
     item = needs_you.waiting(record_read=False)["items"][0]
     assert "expect" not in item
+
+
+# ---- one item read whole ----------------------------------------------------------------------
+
+LONG = "the words " * 70 + "THE TAIL"
+
+
+def test_a_long_item_is_cut_in_the_list_and_whole_by_its_key_with_the_same_pin(world, khipu_app, capsys):
+    _rule_added(world, LONG)
+    _setting_request(world)
+    _app(world, khipu_app)
+    code, listed = _cli(capsys, "--json", "--from-app")
+    assert code == 0
+    by = {i["kind"]: i for i in listed["items"]}
+    cut = by["rule"]
+    assert cut["cut"] is True and "THE TAIL" not in cut["words"]
+    assert by["setting"]["cut"] is False
+    code, one = _cli(capsys, "--json", "--from-app", f"--item={cut['key']}")
+    assert code == 0 and one["ok"] is True and one["key"] == cut["key"]
+    (whole,) = one["items"]
+    assert whole["cut"] is False and "THE TAIL" in whole["words"] and "read_full" not in whole
+    for field in ("key", "kind", "expect", "from_words", "mac", "ago", "settle", "confirm_does", "undo_does"):
+        assert whole[field] == cut[field], field
+    assert whole["expect"]
+
+
+def test_an_answer_with_the_pin_from_the_full_read_settles_it(world, khipu_app, capsys):
+    _rule_added(world, LONG)
+    _app(world, khipu_app)
+    (key,) = [i["key"] for i in _cli(capsys, "--json", "--from-app")[1]["items"]]
+    code, one = _cli(capsys, "--json", "--from-app", f"--item={key}")
+    pin = one["items"][0]["expect"]
+    code, out = _answer(capsys, key, "yes", expect=pin)
+    assert code == 0, out
+    rule = next(r for r in routing.read_view()["rules"] if "THE TAIL" in r["text"])
+    assert not rule.get("pending") and out["receipt"]["action_id"]
+
+
+def test_an_unknown_key_is_not_found(world, khipu_app, capsys):
+    _app(world, khipu_app)
+    code, out = _cli(capsys, "--json", "--from-app", "--item=rule:rule-nothing-here")
+    assert code == 2 and out == {"ok": False, "code": "not_found", "key": "rule:rule-nothing-here",
+                                 "error": needs_you_app.NOT_FOUND}
+
+
+def test_the_mcp_list_and_the_terminal_item_read_are_unchanged_by_the_full_read(world, capsys):
+    _rule_added(world, LONG)
+    _setting_request(world)
+    by = {i["kind"]: i for i in needs_you.waiting(record_read=False)["items"]}
+    assert by["rule"]["cut"] is True and by["rule"]["read_full"] == {"tool": "khipu_needs_you",
+                                                                      "args": {"key": by["rule"]["key"]}}
+    assert "cut" not in by["setting"]
+    assert not (APP_FIELDS | {"this_mac"}) & set(by["rule"])
+    code, out = _cli(capsys, "--json", "--item", by["rule"]["key"])
+    assert code == 0 and "THE TAIL" in out["items"][0]["words"]
+    assert "cut" not in out["items"][0] and not APP_FIELDS & set(out["items"][0])
