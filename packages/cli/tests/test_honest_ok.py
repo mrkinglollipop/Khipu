@@ -208,52 +208,10 @@ def test_a_second_note_that_pushes_an_older_one_out_is_reported(tmp_path, monkey
 
 # ---- 4. rerank on with no model behind it ------------------------------------------
 
-def test_status_says_why_there_is_no_rerank_model():
-    from khipu import rerank
-
-    with mock.patch("khipu.models.synth_settings", return_value={"provider": "claude-cli"}):
-        status = rerank.status()
-    assert status["usable"] is False and "API provider" in status["reason"]
-    with mock.patch("khipu.models.synth_settings",
-                    return_value={"provider": "local", "endpoint": "", "model_id": ""}):
-        assert rerank.status()["usable"] is False
-    with mock.patch("khipu.models.synth_settings",
-                    return_value={"provider": "local", "endpoint": "http://127.0.0.1:1/v1", "model_id": "m"}):
-        assert rerank.status()["usable"] is True
 
 
-def test_a_search_with_rerank_on_and_no_model_records_the_skip(monkeypatch):
-    from khipu import rerank
-    from tests.test_rerank import _corpus_rows, _fake_hub, _search
-
-    rows = _corpus_rows()
-    monkeypatch.delenv("KHIPU_FEATURE_RERANK", raising=False)
-    with _fake_hub(rows):
-        baseline = _search()
-    monkeypatch.setenv("KHIPU_FEATURE_RERANK", "1")
-    with _fake_hub(rows), mock.patch.object(rerank, "_call_model", side_effect=rerank._Unavailable("no key")):
-        staged = _search()
-    assert staged["results"] == baseline["results"]
-    # Switched on with nothing to run on is not a degraded search: the stage
-    # simply did not apply, and doctor says so once.
-    assert "degraded_legs" not in staged
-    block = staged["rerank"]
-    assert block["applied"] is False and block["reason"] == "no-provider" and block["skipped"] is True
-    assert staged["timing"]["rerank_skipped"] == "no-provider"
 
 
-def test_doctor_shows_a_rerank_switch_with_no_model_plainly(monkeypatch):
-    from khipu import cli
-
-    monkeypatch.setenv("KHIPU_FEATURE_RERANK", "1")
-    with mock.patch("khipu.models.synth_settings", return_value={"provider": "claude-cli"}):
-        block, warnings = cli._doctor_rerank()
-    assert block["enabled"] is True and block["usable"] is False
-    assert len(warnings) == 1 and "rerank" in warnings[0] and "no rerank model" in warnings[0]
-    assert "khipu features --set rerank off" in warnings[0] and "degraded_legs" not in warnings[0]
-    monkeypatch.setenv("KHIPU_FEATURE_RERANK", "0")
-    block, warnings = cli._doctor_rerank()
-    assert block["enabled"] is False and warnings == []
 
 
 def test_capture_now_on_the_command_line_says_when_it_cut_the_note(tmp_path, monkeypatch, capsys):

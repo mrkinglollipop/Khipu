@@ -233,9 +233,9 @@ khipu graph <node-id> --hops 2                           # connections
 
 **Semantic** mode uses cosine plus token overlap only. `--semantic` still works as a deprecated alias.
 
-Two optional stages sit behind feature switches, both off by default: a rerank pass (one model call over 12 candidates) and an absolute relevance floor. See `khipu features`. With rerank on and no synth model that can answer (a CLI provider, a local endpoint with no model, or a cloud provider with no key), search skips the stage without a call: the `rerank` block says `applied: false, skipped: true, reason: "no-provider"`, `degraded_legs` lists `rerank`, and `timing.rerank_skipped` is set. `khipu doctor` shows a `rerank` block (`enabled`, `usable`, `provider`, `reason`) and a warning when it is on with no model.
+Search always applies the absolute relevance floor (an unrelated query returns nothing), validity ranking, graph candidates and time interpretation. There are no switches for them, and there is no rerank stage.
 
-**Filters** work in the CLI and the MCP tool: `--kind`, `--source` (one library), `--project`, `--since`, `--until` (ISO dates or `7d`), `--session-id`, `--harness`, `--via`. Hybrid and literal accept episode, topic, node and library; semantic accepts episode, topic, media and library. The MCP tool also accepts `t3_thread` and `tz`; the CLI has no `--t3-thread` or `--tz` flags. Timezone defaults to UTC, including for an unknown zone. Natural-language time interpretation applies only with its feature switch on and no explicit `since` or `until`.
+**Filters** work in the CLI and the MCP tool: `--kind`, `--source` (one library), `--project`, `--since`, `--until` (ISO dates or `7d`), `--session-id`, `--harness`, `--via`. Hybrid and literal accept episode, topic, node and library; semantic accepts episode, topic, media and library. The MCP tool also accepts `t3_thread` and `tz`; the CLI has no `--t3-thread` or `--tz` flags. Timezone defaults to UTC, including for an unknown zone. Natural-language time interpretation applies only when no explicit `since` or `until` is given.
 
 **Graph** walks expand the neighbourhood of a node. A topic slug works as an id. A digit id is an episode, and its neighbourhood is that capture's topics.
 

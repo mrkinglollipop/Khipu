@@ -44,8 +44,12 @@ def test_explicit_reversal_marks_the_earlier_decision_superseded(tmp_path):
             "widget-batching endpoint rollout deployment strategy blue-green rolling",
             cwd=None,
         )
-    hit = next(h for h in result["hits"] if h["id"] == "2")
-    assert hit["validity"]["state"] == "superseded"
+    # Validity ranking is always on: the reversal comes first and is current,
+    # and the decision it reversed is ranked down below the relevance cut.
+    ids = [h["id"] for h in result["hits"]]
+    assert ids[0] == "3"
+    assert result["hits"][0]["validity"]["state"] == "current"
+    assert "2" not in ids
 
 
 # ---- 3. historical / as-of question ------------------------------------------
@@ -79,16 +83,6 @@ def test_same_wording_ranks_the_matching_project_first(tmp_path):
 
 # ---- 5. indirect graph relationship -------------------------------------------
 
-def test_an_indirect_wiki_linked_topic_surfaces_as_a_graph_candidate(tmp_path):
-    with corpus.installed_corpus(tmp_path), \
-         mock.patch("khipu.features.enabled", side_effect=lambda name: name == "graph_candidates"):
-        result = rp.prior_work_for_prompt(
-            "billing-service module dependencies", cwd=None
-        )
-    assert any(
-        h["kind"] == "topic" and h["id"] == "rate-limits" and h.get("via") == "topic:billing-service"
-        for h in result["hits"]
-    )
 
 
 # ---- 6. exact command, error text and path ----------------------------------

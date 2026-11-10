@@ -3143,29 +3143,7 @@ def hybrid_search(
 
             floor_info: dict[str, Any] | None = None
 
-            # Graph candidates (Phase 3, session A): switch-gated, own 400ms
-            # deadline, dropped entirely (never partially) on a miss — named
-            # in `degraded_legs`. Seeds are the top 5 rows of `fused` exactly
-            # as fused above, before any filter/enrichment pass touches it.
-            from khipu import features as _features
-
-            if _features.enabled("graph_candidates"):
-                try:
-                    from khipu import graph_candidates as _gc
-
-                    gc_deadline = time.monotonic() + _gc.HUB_LEG_DEADLINE_S
-                    cand_rows, missed = _gc.hub_candidates(cur, fused, deadline=gc_deadline)
-                    if missed:
-                        degraded_legs.append("graph_candidates")
-                    elif cand_rows:
-                        # One more ranked list beside the original ones, not
-                        # a second fusion over `fused`: that replaced every
-                        # row's summed vote with its bare rank and tied the
-                        # first candidate with the first hit.
-                        fused = fuse_ranked_lists([*lists, cand_rows], limit=oversample)
-                except Exception as exc:  # noqa: BLE001 — a candidate-leg failure must not sink the search
-                    degraded_legs.append("graph_candidates")
-                    timing["graph_candidates_error"] = str(exc)[:120]
+            # graph candidates are not called here: with them on, the prompt and status paths found 84 of 120 golden hits against 96 with them off (jobs/2026-11-10/b2-switch-measure.md). The module is kept, unreachable.
 
             fused = _apply_search_filters(
                 cur, fused, project=project, since=since, until=until,
@@ -3191,34 +3169,9 @@ def hybrid_search(
                 try:
                     from khipu import relevance as _relevance
 
-                    if _relevance.enabled():
-                        fused, floor_info = _relevance.gate(fused, len(tokens))
+                    fused, floor_info = _relevance.gate(fused, len(tokens))
                 except Exception as exc:  # noqa: BLE001 — a policy failure must not sink the search
                     timing["relevance_floor_error"] = str(exc)[:120]
-
-            # Optional reranker: switch-gated, own 2.5s deadline, run only on
-            # rows that already passed the filters (nothing forgotten or out
-            # of scope reaches the provider) and dropped whole on any failure.
-            rerank_info: dict[str, Any] | None = None
-            if _features.enabled("rerank"):
-                try:
-                    from khipu import rerank as _rerank
-
-                    fused, rerank_info, rerank_failed = _rerank.stage(
-                        query, fused, mode=mode, token_count=len(tokens),
-                        topic_sources=provider_text.episode_ids_of_topics(
-                            cur, [str(r.get("id")) for r in fused[:_rerank.MAX_CANDIDATES]
-                                  if r.get("kind") == "topic"]),
-                    )
-                    if rerank_failed:
-                        degraded_legs.append("rerank")
-                    if rerank_info.get("skipped"):
-                        timing["rerank_skipped"] = rerank_info.get("reason")
-                except Exception as exc:  # noqa: BLE001 — a rerank failure must not sink the search
-                    degraded_legs.append("rerank")
-                    rerank_info = {"applied": False, "model": None, "ms": 0.0,
-                                   "candidates": 0, "reason": "error"}
-                    timing["rerank_error"] = str(exc)[:120]
 
             # Time interpretation (Phase 3, session A): switch-gated, and
             # only when the caller passed no explicit since/until — an
@@ -3226,7 +3179,7 @@ def hybrid_search(
             # top of what the caller already asked for. A boost, never a
             # filter: nothing found here is ever excluded.
             interpretation: dict[str, Any] | None = None
-            if not since and not until and _features.enabled("time_interpretation"):
+            if not since and not until:
                 try:
                     from datetime import datetime as _datetime
                     from datetime import timezone as _timezone
@@ -3314,8 +3267,6 @@ def hybrid_search(
         out["libraries"] = lib_names
     if interpretation:
         out["time_interpretation"] = interpretation
-    if rerank_info is not None:
-        out["rerank"] = rerank_info
     if floor_info is not None:
         out["relevance_floor"] = floor_info
     return out

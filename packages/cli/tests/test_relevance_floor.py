@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from unittest import mock
 
 import pytest
@@ -20,7 +21,31 @@ from khipu import features, recall_eval, relevance
 from khipu import recall_prompt as rp
 from tests.fixtures import corpus
 from tests.test_recall_prompt import _FakeConnCtx, _fake_enrich_with_zero_decisions
-from tests.test_rerank import _Conn, _corpus_rows
+
+def _corpus_rows() -> list[dict]:
+    """Candidate rows from the synthetic corpus (no ``ts``, so the recency
+    bonus, which reads the wall clock, cannot differ between two runs)."""
+    now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    rows = []
+    for i, ep in enumerate(e for e in corpus._named_episodes(now) if not e.deleted_at):
+        rows.append({
+            "kind": "episode", "id": str(ep.id), "label": f"episode {ep.id}",
+            "snippet": ep.summary, "score": round(0.9 - i * 0.01, 4),
+            "rank_text": corpus._episode_rank_text(ep), "project": ep.project,
+        })
+    return rows
+
+
+class _Conn:
+    def cursor(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
 
 ENV = "KHIPU_FEATURE_RELEVANCE_FLOOR"
 UNRELATED = "spreadsheet macro recalculation freeze pane workbook"
@@ -141,14 +166,8 @@ def test_the_floor_is_overridable_by_config_and_ignores_a_bad_value():
         assert relevance.gate(rows, 3)[0] == rows
 
 
-def test_a_broken_switch_lookup_reads_as_off():
-    with mock.patch.object(features, "enabled", side_effect=RuntimeError("config broke")):
-        assert relevance.enabled() is False
 
 
-def test_the_switch_defaults_off_and_the_capability_is_advertised():
-    assert features.enabled("relevance_floor") is False
-    assert "search.relevance_floor" in features.capabilities()
 
 
 # ---- local prompt lane ---------------------------------------------------------
@@ -307,12 +326,6 @@ def _ids(payload):
     return [r["id"] for r in payload["results"]]
 
 
-@pytest.mark.parametrize("mode", ["hybrid", "semantic"])
-def test_explicit_search_keeps_every_row_with_the_switch_off(mode):
-    with _hub_of(_no_evidence_rows()):
-        payload = em.hybrid_search(QUERY, limit=8, mode=mode)
-    assert set(_ids(payload)) == {"k1", "n1", "n2"}
-    assert "relevance_floor" not in payload
 
 
 @pytest.mark.parametrize("mode", ["hybrid", "semantic"])
@@ -411,40 +424,10 @@ def _stable(result):
     return out
 
 
-def test_with_the_switch_off_the_local_lane_is_identical_and_never_consults_the_gate(tmp_path, monkeypatch):
-    with corpus.installed_corpus(tmp_path):
-        default = [_stable(rp.prior_work_for_prompt(q, cwd=None, budget_ms=600)) for q in _QUERIES]
-        monkeypatch.setenv(ENV, "0")
-        with mock.patch.object(relevance, "gate", side_effect=AssertionError("gate consulted")) as gate:
-            explicit_off = [_stable(rp.prior_work_for_prompt(q, cwd=None, budget_ms=600)) for q in _QUERIES]
-        gate.assert_not_called()
-    assert default == explicit_off
 
 
-def test_with_the_switch_off_explicit_search_is_identical(monkeypatch):
-    rows = _corpus_rows()
-    with _hub_of(rows, literal=rows[:6]):
-        default = em.hybrid_search(QUERY, limit=8)
-    monkeypatch.setenv(ENV, "0")
-    with _hub_of(rows, literal=rows[:6]), \
-            mock.patch.object(relevance, "gate", side_effect=AssertionError("gate consulted")) as gate:
-        explicit_off = em.hybrid_search(QUERY, limit=8)
-    gate.assert_not_called()
-
-    def strip(p):
-        return {k: v for k, v in p.items() if k != "timing"}
-
-    assert strip(default) == strip(explicit_off)
 
 
-def test_with_the_switch_off_the_hub_lane_is_identical(monkeypatch):
-    lex, cos = [_lex("1", "gateway only")], [_cos("2", 0.3), _cos("3", 0.2)]
-    default = _hub(lex, cos)
-    monkeypatch.setenv(ENV, "0")
-    with mock.patch.object(relevance, "gate", side_effect=AssertionError("gate consulted")) as gate:
-        explicit_off = _hub(lex, cos)
-    gate.assert_not_called()
-    assert default == explicit_off
 
 
 def test_every_positive_scenario_query_still_finds_its_episode_with_the_switch_on(tmp_path, monkeypatch):
@@ -469,122 +452,3 @@ def test_the_no_relevant_memory_scenario_passes_with_the_switch_on(tmp_path, mon
     assert result["hits"] == []
     assert result["context"] == ""
     assert result["prior_work_meta"]["outcome"] == "no_match"
-
-
-# ---- recall eval ---------------------------------------------------------------
-
-def _fake_search_by_switch(query, **kw):
-    on = os.environ[ENV] == "1"
-    by_query = {
-        "found": (["a", "b"], ["a", "b"]),
-        "lost": (["b"], []),
-        "never found": (["x"], []),
-        "nothing remembered": (["x"], []),
-    }
-    off_ids, on_ids = by_query[query]
-    return {"results": [{"id": i} for i in (on_ids if on else off_ids)]}
-
-
-_ENTRIES = [
-    {"query": "found", "expect": ["b"]},
-    {"query": "lost", "expect": ["b"]},
-    {"query": "nothing remembered", "expect_none": True},
-]
-
-
-def test_eval_lists_the_positives_whose_query_the_gate_emptied_and_scores_abstention():
-    with mock.patch.object(em, "hybrid_search", side_effect=_fake_search_by_switch):
-        report = recall_eval.run_relevance_eval(_ENTRIES, ("explicit",), floor=True)
-    summary = report["paths"]["explicit"]
-    assert summary["emptied_positives"] == ["lost"]
-    assert (summary["abstain_total"], summary["abstain_correct"], summary["abstain_correct_without"]) == (1, 1, 0)
-    assert (summary["positives"], summary["positives_found"]) == (2, 1)
-    assert ENV not in os.environ
-
-
-def test_a_positive_that_was_empty_before_the_gate_is_not_blamed_on_it():
-    entries = [{"query": "never found", "expect": ["zzz"]}]
-    with mock.patch.object(em, "hybrid_search", side_effect=_fake_search_by_switch):
-        report = recall_eval.run_relevance_eval(entries, ("explicit",), floor=True)
-    assert report["paths"]["explicit"]["emptied_positives"] == []
-    empty = {"results": []}
-    with mock.patch.object(em, "hybrid_search", return_value=empty):
-        report = recall_eval.run_relevance_eval(entries, ("explicit",), floor=True)
-    assert report["paths"]["explicit"]["emptied_positives"] == []
-
-
-def test_eval_with_the_switch_off_scores_only_the_baseline():
-    with mock.patch.object(em, "hybrid_search", side_effect=_fake_search_by_switch) as hs:
-        report = recall_eval.run_relevance_eval(_ENTRIES, ("explicit",), floor=False)
-    summary = report["paths"]["explicit"]
-    assert "emptied_positives" not in summary
-    assert (summary["abstain_total"], summary["abstain_correct"]) == (1, 0)
-    assert hs.call_count == 3
-
-
-def test_eval_restores_a_switch_the_caller_had_set(monkeypatch):
-    monkeypatch.setenv(ENV, "1")
-    with mock.patch.object(em, "hybrid_search", side_effect=_fake_search_by_switch):
-        recall_eval.run_relevance_eval(_ENTRIES[:1], ("explicit",), floor=True)
-    assert os.environ[ENV] == "1"
-
-
-def test_eval_scores_the_prompt_and_status_paths_with_the_switch_forced_each_way():
-    def fake_prompt(query, **kw):
-        on = os.environ[ENV] == "1"
-        return {
-            "hits": [] if on else [{"id": "x"}], "reason": "ok",
-            "prior_work_meta": {
-                "outcome": "no_match" if on else "match",
-                "legs": ["lexical"], "degraded": None, "reason": "ok",
-            },
-        }
-
-    entries = [{"query": "nothing remembered", "expect_none": True}]
-    with mock.patch("khipu.recall_prompt.prior_work_for_prompt", side_effect=fake_prompt):
-        report = recall_eval.run_relevance_eval(entries, ("prompt", "status"), floor=True)
-    for path in ("prompt", "status"):
-        assert report["paths"][path]["abstain_correct"] == 1
-        assert report["paths"][path]["abstain_correct_without"] == 0
-
-
-def _golden(tmp_path, entries):
-    golden = tmp_path / "golden.jsonl"
-    golden.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
-    return golden
-
-
-def _args(golden, **kw):
-    base = dict(recall_cmd="eval", golden=str(golden), rerank=None, path=None, record=None,
-                compare=None, replay=None, relevance_floor="on")
-    base.update(kw)
-    return argparse.Namespace(**base)
-
-
-def test_the_recall_eval_command_fails_and_names_an_emptied_positive(tmp_path, capsys):
-    from khipu import cli
-
-    golden = _golden(tmp_path, _ENTRIES)
-    with mock.patch.object(em, "hybrid_search", side_effect=_fake_search_by_switch):
-        assert cli.cmd_recall(_args(golden)) == 1
-    captured = capsys.readouterr()
-    assert "[EMPTIED] path=explicit 'lost'" in captured.err
-    assert json.loads(captured.out)["relevance_floor"] == "on"
-
-
-def test_the_recall_eval_command_passes_when_no_positive_is_emptied(tmp_path, capsys):
-    from khipu import cli
-
-    golden = _golden(tmp_path, [_ENTRIES[0], _ENTRIES[2]])
-    with mock.patch.object(em, "hybrid_search", side_effect=_fake_search_by_switch):
-        assert cli.cmd_recall(_args(golden)) == 0
-    assert json.loads(capsys.readouterr().out)["paths"]["explicit"]["emptied_positives"] == []
-
-
-def test_the_recall_eval_command_rejects_combinations_it_cannot_honour(tmp_path, capsys):
-    from khipu import cli
-
-    golden = _golden(tmp_path, _ENTRIES[:1])
-    assert cli.cmd_recall(_args(golden, record=str(tmp_path / "control.json"))) == 2
-    assert cli.cmd_recall(_args(golden, rerank="on")) == 2
-    capsys.readouterr()

@@ -1,8 +1,6 @@
 /* Settings -> Optional features (docs/plans/2026-09-30-settings-parity.md).
-   One switch per entry in `khipu.features.FEATURES`, in the order the gate
-   record recommends them, then the three that were measured and rejected.
-   The wording of each cost and each measurement comes from
-   docs/research/switch-gates-2026-09-29.md; nothing here is a new number.
+   One switch per entry in `khipu.features.FEATURES` (only the routing switch
+   is left; the search switches were deleted and are always on).
 
    The CLI owns the state. A toggle calls `khipu features --set`, then the
    section re-reads `khipu features`, so a switch the environment decides
@@ -12,8 +10,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { Tag } from "./ui";
 import { callCli, useCliState } from "./settingsCli";
-import type { ConfigShape, FeaturesShape, JobsShape } from "./settingsCli";
-import { SettingField, unitRangeError } from "./SettingsControls";
+import type { FeaturesShape, JobsShape } from "./settingsCli";
 
 type FeatureRow = {
   name: string;
@@ -26,39 +23,6 @@ type FeatureRow = {
   /** A switch this one depends on. */
   needs?: { name: string; label: string };
 };
-
-export const RECOMMENDED_FEATURES: ReadonlyArray<FeatureRow> = [
-  {
-    name: "validity_ranking",
-    label: "Rank current decisions above reversed ones",
-    what: "Recall tells a decision that still stands from one that was later reversed, and ranks the reversed one lower.",
-  },
-  {
-    name: "time_interpretation",
-    label: "Understand time phrases in a search",
-    what: "A phrase such as “last week” in a search narrows and ranks the results by date.",
-  },
-  {
-    name: "relevance_floor",
-    label: "Return nothing when nothing matches",
-    what: "When the best matches are not close to what you asked, search comes back empty instead of showing the nearest unrelated notes.",
-  },
-  {
-    name: "rerank",
-    label: "Reorder top results with a model",
-    what: "A model reads the top search results and puts the best match first.",
-    cost: "Adds about 0.8 s to a search and makes one model call per search.",
-  },
-];
-
-export const REJECTED_FEATURES: ReadonlyArray<FeatureRow> = [
-  {
-    name: "graph_candidates",
-    label: "Add results found through the graph",
-    what: "Search also offers results reached by following links in the knowledge graph.",
-    found: "A blind judge preferred the results without it 59 to 4, with 18 ties.",
-  },
-];
 
 /* Routing truth, phase 3a (docs/plans/2026-10-14-routing-truth.md). Off by
    default; the same switch is in Settings -> Accounts and routing ->
@@ -82,7 +46,6 @@ export function envName(feature: string): string {
 
 export function OptionalFeatures({ active }: { active: boolean }) {
   const features = useCliState<FeaturesShape>("khipu_features_show", active);
-  const config = useCliState<ConfigShape>("khipu_config_show", active);
   const jobs = useCliState<JobsShape>("khipu_jobs_status", active);
   const [recall, setRecall] = useState<RecallStatus | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -142,7 +105,6 @@ export function OptionalFeatures({ active }: { active: boolean }) {
 
   const installed = jobs.data?.[RECALL_JOB]?.plist_loaded === true;
   const running = recall?.ok === true;
-  const floor = config.data?.relevance_cosine_floor;
 
   function renderRow(row: FeatureRow, group: "recommended" | "routing" | "rejected") {
     const state = features.data?.features?.[row.name];
@@ -198,35 +160,6 @@ export function OptionalFeatures({ active }: { active: boolean }) {
               here.
             </p>
           ) : null}
-          {row.name === "relevance_floor" ? (
-            <SettingField
-              label="Lowest match score that counts"
-              mono
-              narrow
-              inputMode="decimal"
-              value={floor ? String(floor.value) : ""}
-              canReset={floor?.source === "file"}
-              resetLabel="Use default"
-              help={
-                <>
-                  Used only while this switch is on. On the current index, unrelated subjects scored 0.57 to 0.64
-                  at best and real prompts scored 0.67 to 0.82. The default is {floor ? String(floor.default) : "0.65"}.
-                </>
-              }
-              onSave={async (v) => {
-                const bad = unitRangeError(v, false);
-                if (bad) return bad;
-                const res = await callCli("khipu_config_set", { key: "relevance.cosine_floor", value: v });
-                await config.reload();
-                return res.ok ? null : res.error;
-              }}
-              onReset={async () => {
-                const res = await callCli("khipu_config_unset", { key: "relevance.cosine_floor" });
-                await config.reload();
-                return res.ok ? null : res.error;
-              }}
-            />
-          ) : null}
           {errors[row.name] ? (
             <p className="set-error" role="alert">
               {errors[row.name]}
@@ -253,11 +186,6 @@ export function OptionalFeatures({ active }: { active: boolean }) {
           Couldn&apos;t refresh; showing the last value: {features.error}
         </p>
       ) : null}
-
-      <div className="section-card">
-        <div className="section-head">Search and memory</div>
-        <div className="opt-list">{RECOMMENDED_FEATURES.map((r) => renderRow(r, "recommended"))}</div>
-      </div>
 
       <div className="section-card">
         <div className="section-head">Local recall service</div>
@@ -312,15 +240,6 @@ export function OptionalFeatures({ active }: { active: boolean }) {
       <div className="section-card">
         <div className="section-head">Routing</div>
         <div className="opt-list">{ROUTING_FEATURES.map((r) => renderRow(r, "routing"))}</div>
-      </div>
-
-      <div className="section-card rejected">
-        <div className="section-head">Measured, not recommended</div>
-        <p className="opt-group-note">
-          Each of these was tested before release and stays off by default. They remain here for anyone who wants to
-          try them.
-        </p>
-        <div className="opt-list">{REJECTED_FEATURES.map((r) => renderRow(r, "rejected"))}</div>
       </div>
     </>
   );

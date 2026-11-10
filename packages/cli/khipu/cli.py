@@ -591,24 +591,6 @@ def _without_repeated_limit(routing_warnings: list[str], plan_usage: dict,
     return [w for w in routing_warnings if not (drop and w.casefold().startswith(drop))]
 
 
-def _doctor_rerank() -> tuple[dict, list[str]]:
-    """The rerank switch and whether a model stands behind it. On with no
-    model, searches skip the stage and say so in the ``rerank`` block (never in
-    ``degraded_legs``: nothing broke); that is one plain line here, never a gate."""
-    try:
-        from khipu import rerank
-
-        block = rerank.status()
-    except Exception as e:  # noqa: BLE001 — visibility only
-        return {"error": f"{type(e).__name__}: {e}"}, []
-    if block["enabled"] and not block["usable"]:
-        return block, [
-            f"rerank is switched on but there is no rerank model to run it ({block['reason']}), so searches "
-            "skip it. To settle it, run `khipu features --set rerank off` (or point the synth model at an "
-            "API provider with a key)."]
-    return block, []
-
-
 def _storage_warnings(local: dict) -> list[str]:
     """Held work (outbox dead, held capture jobs) past a count: never gating."""
     return list((local.get("storage") or {}).get("warnings") or [])
@@ -1002,7 +984,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         features_block = features.states()
     except Exception as e:  # noqa: BLE001
         features_block = {"error": f"{type(e).__name__}: {e}"}
-    rerank_block, rerank_warnings = _doctor_rerank()
     # Phase 2, session C: candidate supersession links awaiting review —
     # The worker threads' answers, joined in the order their not_configured
     # names and liveness rows used to be added.
@@ -1142,7 +1123,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         **({"t3": t3_health} if t3_health is not None else {}),
         **({"project_renames": project_renames_block} if project_renames_block is not None else {}),
         "features": features_block,
-        "rerank": rerank_block,
         "plan_usage": plan_usage_block,
         "routing": routing_block,
         # Things that are true but need nothing from the owner today (a job runner silent for
@@ -1168,7 +1148,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
                      + list(owner_direction_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
                      + list(schema.get("warnings") or [])
-                     + list(fact_provenance.get("warnings") or []) + rerank_warnings + _disk_space_warnings(local)
+                     + list(fact_provenance.get("warnings") or []) + _disk_space_warnings(local)
                      + _replica_schema_warnings(local) + _recall_outcomes_warnings(local)
                      + _storage_warnings(local) + _owner_writes_warnings()
                      + list(hook_wiring_block.get("warnings") or [])),
@@ -4525,60 +4505,6 @@ def cmd_recall(args: argparse.Namespace) -> int:
             print(json.dumps(result, indent=2))
             return 0 if result.get("ok") else 2
 
-        rerank_arg = getattr(args, "rerank", None)
-        if rerank_arg:
-            if (path_arg != "explicit" or record_to or compare_to or replay_from
-                    or getattr(args, "relevance_floor", None)):
-                print(json.dumps({"ok": False, "error": "--rerank scores the explicit path only; "
-                                  "it cannot combine with --path, --record, --compare, --replay "
-                                  "or --relevance-floor"}))
-                return 2
-            try:
-                entries = recall_eval.load_golden(golden_path or recall_eval.default_golden_path())
-            except (OSError, ValueError) as exc:
-                print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
-                return 2
-            report = recall_eval.run_rerank_eval(entries, rerank=(rerank_arg == "on"))
-            for row in report["rows"]:
-                print(f"rank without={row['rank_without']} with={row['rank_with']} {row['query']!r}",
-                      file=sys.stderr)
-            print(json.dumps(report, indent=2, default=str))
-            return 0
-
-        floor_arg = getattr(args, "relevance_floor", None)
-        if floor_arg:
-            if record_to or compare_to or replay_from:
-                print(json.dumps({"ok": False, "error": "--relevance-floor cannot combine with "
-                                  "--record, --compare or --replay"}))
-                return 2
-            try:
-                entries = recall_eval.load_golden(golden_path or recall_eval.default_golden_path())
-            except (OSError, ValueError) as exc:
-                print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
-                return 2
-            paths = recall_eval.ALL_PATHS if path_arg == "all" else (path_arg,)
-            report = recall_eval.run_relevance_eval(
-                entries, paths, floor=(floor_arg == "on"), budget_ms=budget_ms
-            )
-            for path, summary in report["paths"].items():
-                for query in summary.get("emptied_positives", []):
-                    print(f"[EMPTIED] path={path} {query!r}", file=sys.stderr)
-            print(json.dumps(report, indent=2, default=str))
-            summaries = list(report["paths"].values())
-            floor_regression = floor_arg == "on" and any(
-                not row.get("expect_none")
-                and bool(row.get("hit_without"))
-                and not bool(row.get("hit_with"))
-                for row in report.get("rows", [])
-            )
-            ok = bool(summaries) and all(
-                s.get("entries", 0) > 0
-                and s["abstain_correct"] == s["abstain_total"]
-                and not s.get("emptied_positives")
-                for s in summaries
-            ) and not floor_regression
-            return 0 if ok else 1
-
         # Legacy fast path: zero new flags touched -> byte-identical to the
         # original W6.3 command. run_eval/eval_one/load_golden are untouched
         # by Phase 1 session A, so an existing golden file or script must
@@ -6716,20 +6642,6 @@ def build_parser() -> argparse.ArgumentParser:
     reval.add_argument(
         "--replay", default=None,
         help="Build no-expectation entries from a query_log.jsonl instead of the golden file; only valid with --record/--compare",
-    )
-    reval.add_argument(
-        "--rerank", choices=["on", "off"], default=None,
-        help=(
-            "Score the explicit path with the optional reranker switched on or off for this process "
-            "only; 'on' scores each entry both ways and reports the expected id's rank with and without"
-        ),
-    )
-    reval.add_argument(
-        "--relevance-floor", dest="relevance_floor", choices=["on", "off"], default=None,
-        help=(
-            "Score the chosen --path(s) with the absolute relevance gate switched on or off for this "
-            "process only; 'on' scores each entry both ways and lists every golden positive whose query the gate emptied"
-        ),
     )
     reval.add_argument("--sample", type=int, default=None, help="With --replay: cap to N entries")
     reval.add_argument("--seed", type=int, default=0, help="With --replay --sample: deterministic sampling seed")

@@ -489,8 +489,7 @@ class HubAuditRegressionTest(unittest.TestCase):
             con.close()
             profiles.clear_learned()
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
-                 mock.patch("khipu.embed.embed_one", return_value=[1.0, 0.0]), \
-                 mock.patch("khipu.relevance.enabled", return_value=True):
+                 mock.patch("khipu.embed.embed_one", return_value=[1.0, 0.0]):
                 direct = hs.semantic_search_snapshot("never seen phrase", limit=2)
                 payload = hs.search_stale_payload("never seen phrase", 2, semantic=True)
                 hs._MATRIX_CACHE.clear()
@@ -512,8 +511,7 @@ class HubAuditRegressionTest(unittest.TestCase):
             con.close()
             profiles.clear_learned()
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
-                 mock.patch("khipu.embed.embed_one", return_value=[1.0, 0.0]), \
-                 mock.patch("khipu.relevance.enabled", return_value=True):
+                 mock.patch("khipu.embed.embed_one", return_value=[1.0, 0.0]):
                 payload = hs.search_stale_payload("needle", 1, semantic=True)
         self.assertEqual([row["id"] for row in payload["results"]], ["1"])
 

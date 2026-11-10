@@ -1,10 +1,7 @@
 """Khipu's switch registry and capability signal (Phase 0, session B).
 
-A closed set of named switches for every optional behavior the memory-
-reasoning work adds (ranking changes, candidate generation, extraction
-prompts, model use — "Engineering rules added in review" § Switches,
-docs/plans/2026-09-27-memory-reasoning-scope.md): each defaults off, and
-with every switch off, existing outputs are unchanged except for added keys.
+The closed set of named switches. Only ``routing_push`` is left: the search
+and ranking switches were deleted and those behaviours are always on.
 
 Precedence mirrors ``khipu.config``'s ``FLOAT_SETTINGS``/``LIST_SETTINGS``:
 environment (``KHIPU_FEATURE_<NAME>``) wins, then ``features`` in
@@ -27,13 +24,16 @@ from khipu import __version__
 # anything else outright; states() reports an unknown name found in config.json
 # or the environment instead of silently accepting or dropping it.
 FEATURES: dict[str, str] = {
-    "validity_ranking": "Have recall honor validity/supersession state instead of ranking every row as equally current.",
-    "graph_candidates": "Let bounded graph traversal contribute candidate results to recall.",
-    "time_interpretation": "Parse natural-language time in a query and use it to filter/rank results.",
-    "rerank": "Run an independently switchable reranking stage over candidate results.",
-    "relevance_floor": "Drop rows with no keyword hit and a cosine similarity below an absolute floor, so an unrelated prompt returns nothing.",
     "routing_push": "Tell each conversation, at its start and after compaction, the owner's standing rules and note and which accounts are open, limited, paused or down, and before each prompt what changed since it last heard (Khipu's routing record; it reports and never routes).",
 }
+
+# Switches that were deleted because their behaviour is now always on (or, for
+# rerank, deleted outright). An old config.json may still hold these keys, and
+# an old environment may still set them; they are ignored, never reported.
+RETIRED = frozenset({
+    "validity_ranking", "graph_candidates", "time_interpretation", "rerank", "relevance_floor",
+    "briefs", "reflect", "decision_details",
+})
 
 _ENV_PREFIX = "KHIPU_FEATURE_"
 _TRUE_WORDS = {"1", "true", "on", "yes"}
@@ -62,9 +62,7 @@ _CAPABILITIES = (
     # Phase 2, session C.
     # Phase 3, session A.
     "search.time_interpretation",
-    "search.graph_candidates",
     # Phase 3, session B.
-    "search.rerank",
     "replica.deliverables",
     "search.relevance_floor",
     "recall.daemon",
@@ -155,12 +153,12 @@ def _unknown_names() -> list[str]:
 
     cfg = load_config().get("features")
     cfg = cfg if isinstance(cfg, dict) else {}
-    found = {k for k in cfg if k not in FEATURES}
+    found = {k for k in cfg if k not in FEATURES and k not in RETIRED}
     for env_name in os.environ:
         if not env_name.startswith(_ENV_PREFIX):
             continue
         candidate = env_name[len(_ENV_PREFIX):].lower()
-        if candidate not in FEATURES:
+        if candidate not in FEATURES and candidate not in RETIRED:
             found.add(candidate)
     return sorted(found)
 

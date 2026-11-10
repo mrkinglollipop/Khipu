@@ -29,7 +29,7 @@ There are 59 top-level commands; the reference below includes storage, ledger, w
 | `revisions` | Topic revisions, including edits that lost a last-write-wins conflict. `--slug`, `--show ID`. |
 | `secrets` | Shows whether the database address and model keys are present (Keychain, environment or file). Never prints values. |
 | `git-sync` | Reports whether the memory-tree git auto-sync is alive. Exits 2 if red. |
-| `features` | Shows feature switches. `--set NAME VALUE` changes one. |
+| `features` | Shows the one feature switch left (`routing_push`). `--set NAME VALUE` changes it. |
 
 `doctor` flags:
 
@@ -72,7 +72,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 - `recall status`: shows whether the service is up.
 - `recall log [--tail N]`: shows the search query log (default 20).
 - `recall zero-results [--days]` (default 7): lists queries that found nothing.
-- `recall eval`: scores a golden set. Flags: `--golden`, `--path explicit|prompt|status|all` (default `explicit`), `--budget-ms`, `--record`, `--compare`, `--allow-changes`, `--replay`, `--rerank on|off`, `--relevance-floor on|off`, `--sample`, `--seed`.
+- `recall eval`: scores a golden set. Flags: `--golden`, `--path explicit|prompt|status|all` (default `explicit`), `--budget-ms`, `--record`, `--compare`, `--allow-changes`, `--replay`, `--sample`, `--seed`.
 
 ## Explicit asks and archived commitments
 
