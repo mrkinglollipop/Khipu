@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
+import { openScreen } from "./nav";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
@@ -31,7 +32,7 @@ describe("App — Recall edges", () => {
       return JSON.stringify({ counts: {}, recent: [], episode_count: 0 });
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Recall" }));
+    await openScreen("Recall");
     fireEvent.change(screen.getByRole("textbox", { name: "Search" }), { target: { value: "offline miss" } });
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
     expect(await screen.findByText("No matches in offline copy")).toBeInTheDocument();
@@ -52,7 +53,7 @@ describe("App — Recall edges", () => {
       return JSON.stringify({ counts: {}, recent: [], episode_count: 0 });
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Recall" }));
+    await openScreen("Recall");
     fireEvent.change(screen.getByRole("textbox", { name: "Search" }), { target: { value: "dated query" } });
     fireEvent.click(screen.getByRole("button", { name: "+ Filter" }));
     fireEvent.change(screen.getByRole("textbox", { name: "Since" }), { target: { value: "not-a-date" } });
@@ -77,7 +78,7 @@ describe("App — Recall edges", () => {
       return JSON.stringify({ counts: {}, recent: [], episode_count: 0 });
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Recall" }));
+    await openScreen("Recall");
     for (const query of ["older", "newer"]) {
       fireEvent.change(screen.getByRole("textbox", { name: "Search" }), { target: { value: query } });
       fireEvent.click(screen.getByRole("button", { name: "Search" }));
@@ -117,11 +118,11 @@ describe("App — Recall edges", () => {
       return JSON.stringify({ counts: {}, recent: [] });
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Recall" }));
+    await openScreen("Recall");
     fireEvent.change(screen.getByRole("textbox", { name: "Search" }), { target: { value: "pending" } });
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
     await screen.findByText("Searching…");
-    fireEvent.click(screen.getByRole("button", { name: "Activity" }));
+    await openScreen("Activity");
     fireEvent.click((await screen.findByText("Activity source")).closest("button") as HTMLButtonElement);
     await screen.findByText("Exact detail");
     fireEvent.click(screen.getByRole("button", { name: "Open in Recall" }));
@@ -147,16 +148,16 @@ describe("App — Recall edges", () => {
       return JSON.stringify({ counts: {}, recent: [] });
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Recall" }));
+    await openScreen("Recall");
     fireEvent.change(screen.getByRole("textbox", { name: "Search" }), { target: { value: "shared id" } });
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
     await screen.findByText("Topic hit");
-    fireEvent.click(screen.getByRole("button", { name: "Activity" }));
+    await openScreen("Activity");
     fireEvent.click((await screen.findByText("Episode seven")).closest("button") as HTMLButtonElement);
     fireEvent.click(await screen.findByRole("button", { name: "Forget" }));
     fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Forget" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    fireEvent.click(screen.getByRole("button", { name: "Recall" }));
+    await openScreen("Recall");
     expect(screen.queryByText("Episode hit")).not.toBeInTheDocument();
     expect(screen.getByText("Topic hit")).toBeInTheDocument();
   });

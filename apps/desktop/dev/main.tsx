@@ -29,6 +29,7 @@ import {
   useAccountsFinder,
 } from "../src/FoundAccounts";
 import type { AccountRefs } from "../src/FoundAccounts";
+import App from "../src/App";
 import { RoutingSettings } from "../src/RoutingSettings";
 import { OfflineBanner, SavedOnThisMac, WaitingToSync } from "../src/OfflineBanner";
 import { OfflineWaitsCard } from "../src/SettingsControls";
@@ -438,6 +439,12 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   "home-cards-live": { title: "Home cards, live against the fake", fake: { disc: discovery({ candidates: [CLIENT] }) }, render: () => <HomeAccountCards active /> },
   "setup-step": { title: "Setup: Your accounts with what Khipu found", fake: { disc: discovery({ candidates: [CLIENT, OLD] }) }, render: () => <div className="onboard welcome accounts"><SetupAccountsStep active onBack={() => {}} onNext={() => {}} /></div> },
   "setup-nothing-found": { title: "Setup: nothing installed", fake: { disc: discovery({ candidates: [], clis: CLIS_NONE }), usage: { accounts: [] } }, render: () => <div className="onboard welcome accounts"><SetupAccountsStep active onBack={() => {}} onNext={() => {}} /></div> },
+  // The whole window (sidebar, toolbar, old screens): `#app` opens on Today,
+  // `#app-welcome` on first run, `#app-quiet` with nothing needing you.
+  // Move around with the sidebar. Answers come from fakes/shell.ts.
+  app: { title: "The whole window", render: () => <App /> },
+  "app-quiet": { title: "The whole window, nothing needs you", fake: { quiet: true }, render: () => <App /> },
+  "app-welcome": { title: "The whole window, first run", fake: { welcome: true }, render: () => <App /> },
   "setup-signed-out": {
     title: "Setup: a default login that is not signed in",
     fake: { disc: discovery({ candidates: [] }), usage: { accounts: [
@@ -471,7 +478,7 @@ function Page() {
       </main>
     );
   }
-  if (hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst" || hash === "routing-settings-cde" || hash === "routing-settings-cde-worst" || hash.startsWith("routing-overrides")) {
+  if (hash.startsWith("app") || hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst" || hash === "routing-settings-cde" || hash === "routing-settings-cde-worst" || hash.startsWith("routing-overrides")) {
     // The Settings pane at its app width, uncapped by the 960 state frame.
     return <div style={{ height: "100%" }} data-state={hash}>{st.render()}</div>;
   }
@@ -487,6 +494,10 @@ function Page() {
 
 const initial = STATES[window.location.hash.replace(/^#/, "")];
 setFake(initial?.fake ?? {});
+// The whole-window states open past the one-time Welcome, except #app-welcome.
+if (window.location.hash.startsWith("#app") && window.location.hash !== "#app-welcome") {
+  try { window.localStorage.setItem("khipu.welcome.completed", "1"); } catch { /* preview only */ }
+}
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <Page />

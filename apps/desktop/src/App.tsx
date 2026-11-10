@@ -7,16 +7,21 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   CircleMinus,
+  CircleCheck,
+  Gauge,
   Loader2,
   MessageSquare,
   RefreshCw,
   Search,
+  SlidersHorizontal,
   Stethoscope,
   Trash2,
   Waypoints,
   X,
 } from "lucide-react";
 import khipuIcon from "./assets/khipu-icon.png";
+import { Sidebar, TabBar, Toolbar } from "./shell";
+import type { NavItem } from "./shell";
 import {
   Callout,
   Chip,
@@ -2624,22 +2629,15 @@ export default function App() {
     };
   }, [dsnOk, tab, owedStatus, loadOwed]);
 
-  /** Six destinations, one per named job (audit IA). Revisions is reachable
-   *  from Home, not from here; Welcome is a first-run flow with a "Run setup
-   *  again" button in Settings. */
-  const navItems = useMemo(
-    () =>
-      [
-        ["home", "Home", "Is memory working right now?"],
-        ["work", "Work", WORK_LEDE],
-        ["recall", "Recall", "What does the agent remember about this?"],
-        ["activity", "Activity", "Every session Khipu recorded"],
-        ["harnesses", "Harnesses", "Claude Code · Cursor · Aegis · Codex"],
-        ["routing", "Accounts and routing", "Accounts, routing rules and what needs you"],
-        ["settings", "Settings", "Capture, models, data and this Mac"],
-      ] as const,
-    [],
-  );
+  /** The window's places and the old screens still reachable. Ids are Tab
+   *  ids: Today shows the old Home, Accounts the old routing screen, Memory
+   *  the old Recall and Settings the old Settings, until each is replaced.
+   *  Revisions is a drill-in from Home; it is listed under Older screens so
+   *  nothing is unreachable. Welcome is a first-run flow. */
+  const PLACE_TITLES: Partial<Record<Tab, string>> = {
+    home: "Today", routing: "Accounts", recall: "Memory", settings: "Settings",
+    work: "Work", activity: "Activity", harnesses: "Harnesses", guides: "Guides", revisions: "Conflicting edits",
+  };
 
   const [dataDir, setDataDir] = useState("");
   const [dataFiles, setDataFiles] = useState<
@@ -3851,104 +3849,80 @@ export default function App() {
     </div>
   );
 
+  const goTab = (id: string) => setTab(id as Tab);
+  // This Mac's name is not in any answer the app reads yet (the plan adds
+  // `this_mac` to the routing record), so the sidebar says "On this Mac".
+  const thisMac: string | null = null;
+  const placeItem = (id: Tab, icon: ReactNode, hint: string, extra: Partial<NavItem> = {}): NavItem => ({
+    id, label: PLACE_TITLES[id] ?? id, icon, hint, busy: tabBusy(id), ...extra,
+  });
+  const places: NavItem[] = [
+    placeItem("home", <CircleCheck size={18} aria-hidden />, "What needs you, and whether Khipu is working", {
+      count: owedOpenCount,
+      countLabel: owedOpenCount === 1 ? "1 needs you" : `${owedOpenCount ?? 0} need you`,
+    }),
+    placeItem("routing", <Gauge size={18} aria-hidden />, "Which AI has room, and who gets what work"),
+    placeItem("recall", <Search size={18} aria-hidden />, "Find what you said"),
+  ];
+  const settingsItem = placeItem("settings", <SlidersHorizontal size={18} aria-hidden />, "Capture, models, data and this Mac");
+  const workWaiting = work.data?.counts.waiting ?? 0;
+  const workBlocking = work.data?.counts.blocking ?? 0;
+  const workQuiet = work.data?.counts.quiet ?? 0;
+  const harnessBadge = harnessesBadge(liveness, claudeHomes, t3Gap);
+  const olderItems: NavItem[] = [
+    placeItem("work", NAV_ICONS.work, WORK_LEDE, {
+      badge: workWaiting + workQuiet > 0 ? (
+        <span className={workWaiting ? "nav-badge" : "nav-badge quiet"}
+          aria-label={badgeLabel(workWaiting, workBlocking, workQuiet)} title={badgeLabel(workWaiting, workBlocking, workQuiet)}>
+          {workBlocking > 0 ? <span className="bdot" aria-hidden /> : null}
+          {(workWaiting + workQuiet).toLocaleString()}
+        </span>
+      ) : undefined,
+    }),
+    placeItem("activity", NAV_ICONS.activity, "Every session Khipu recorded"),
+    placeItem("harnesses", NAV_ICONS.harnesses, "Claude Code · Cursor · Aegis · Codex", {
+      badge: harnessBadge ? <span className={harnessBadge.quiet ? "nav-count quiet" : "nav-count"}>{harnessBadge.n}</span> : undefined,
+    }),
+    placeItem("guides", NAV_ICONS.guides, "Step-by-step help for setting up Khipu and each tool it works with", {
+      badge: guidesBadge > 0 ? (
+        <span className="nav-count" aria-label={guidesBadge === 1 ? "1 setup left" : `${guidesBadge} setups left`}>{guidesBadge}</span>
+      ) : undefined,
+    }),
+    placeItem("revisions", <RailIcon d={<path d="M4 3v10M12 3v10M4 8h8" />} />, "Edits to the same memory made in two places"),
+  ];
+  // What the old rail's foot carried; each moves out as its new home lands.
+  const olderExtra = (
+    <>
+      <div className="rail-health">
+        <span className={`hdot ${railHealth.tone}`} aria-hidden />
+        <span>{railHealth.text}</span>
+        {anyLoading ? <Loader2 size={12} className="spin rail-spin" aria-hidden /> : null}
+      </div>
+      <div className="rail-meta">
+        <button ref={feedbackButtonRef} type="button" className="rail-feedback" onClick={() => setFeedbackOpen(true)}>
+          <MessageSquare size={14} aria-hidden />
+          Feedback
+        </button>
+        <span className="version-chip">v{appVersion}</span>
+      </div>
+    </>
+  );
+  const toolbarTitle = PLACE_TITLES[tab];
+
   return (
-    <div className="shell">
-      <nav className="rail" aria-label="Primary" data-tauri-drag-region>
-        <div className="rail-drag" data-tauri-drag-region />
-        <div className="brand" data-tauri-drag-region>
-          <BrandMark />
-          <span className="brand-name" data-tauri-drag-region>
-            Khipu
-          </span>
-        </div>
-        <div className="rail-nav" data-tauri-drag-region>
-          <div className="nav-group" data-tauri-drag-region>
-            {navItems.map(([id, label, hint]) => {
-              const waitingN = work.data?.counts.waiting ?? 0;
-              const blockingN = work.data?.counts.blocking ?? 0;
-              const quietN = work.data?.counts.quiet ?? 0;
-              const badge =
-                id === "harnesses"
-                    ? harnessesBadge(liveness, claudeHomes, t3Gap)
-                    : null;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  className={tab === id ? "nav active" : "nav"}
-                  title={hint}
-                  aria-current={tab === id ? "page" : undefined}
-                  onClick={() => setTab(id)}
-                >
-                  {NAV_ICONS[id]}
-                  <span className="nav-label">{label}</span>
-                  {id === "work" && waitingN + quietN > 0 ? (
-                    <span className={waitingN ? "nav-badge" : "nav-badge quiet"}
-                      aria-label={badgeLabel(waitingN, blockingN, quietN)} title={badgeLabel(waitingN, blockingN, quietN)}>
-                      {blockingN > 0 ? <span className="bdot" aria-hidden /> : null}
-                      {(waitingN + quietN).toLocaleString()}
-                    </span>
-                  ) : null}
-                  {badge ? (
-                    <span
-                      className={badge.quiet ? "nav-count quiet" : "nav-count"}
-                    >
-                      {badge.n}
-                    </span>
-                  ) : null}
-                  {tabBusy(id) ? (
-                    <Loader2 size={12} className="spin nav-spin" aria-hidden />
-                  ) : null}
-                </button>
-              );
-            })}
-          </div>
-          <div className="nav-group" data-tauri-drag-region>
-            <div className="nav-divider" role="separator" />
-            <button
-              type="button"
-              className={tab === "guides" ? "nav active" : "nav"}
-              title="Step-by-step help for setting up Khipu and each tool it works with"
-              aria-current={tab === "guides" ? "page" : undefined}
-              onClick={() => setTab("guides")}
-            >
-              {NAV_ICONS.guides}
-              <span className="nav-label">Guides</span>
-              {guidesBadge > 0 ? (
-                <span
-                  className="nav-count"
-                  aria-label={guidesBadge === 1 ? "1 setup left" : `${guidesBadge} setups left`}
-                >
-                  {guidesBadge}
-                </span>
-              ) : null}
-            </button>
-          </div>
-        </div>
-        <div className="rail-foot" data-tauri-drag-region>
-          <div className="rail-health">
-            <span className={`hdot ${railHealth.tone}`} aria-hidden />
-            <span>{railHealth.text}</span>
-            {anyLoading ? (
-              <Loader2 size={12} className="spin rail-spin" aria-hidden />
-            ) : null}
-          </div>
-          <div className="rail-meta">
-            <button
-              ref={feedbackButtonRef}
-              type="button"
-              className="rail-feedback"
-              onClick={() => setFeedbackOpen(true)}
-            >
-              <MessageSquare size={14} aria-hidden />
-              Feedback
-            </button>
-            <span className="version-chip">v{appVersion}</span>
-          </div>
-        </div>
-      </nav>
+    <div className="shell sh-window">
+      <Sidebar
+        brand={<BrandMark />}
+        items={places}
+        current={tab}
+        onGo={goTab}
+        settings={settingsItem}
+        macName={thisMac}
+        older={{ items: olderItems, extra: olderExtra }}
+      />
 
       <main className="main" aria-busy={workingLabel != null}>
+        {toolbarTitle ? <Toolbar title={toolbarTitle} heading={false} /> : null}
         <WorkingBanner label={workingLabel} />
         <div className="main-content">
         <section className={panelClass("first-run")}>
@@ -6398,6 +6372,7 @@ export default function App() {
         </section>
         </div>
       </main>
+      <TabBar items={places} current={tab} onGo={goTab} />
 
       <FeedbackForm
         open={feedbackOpen}

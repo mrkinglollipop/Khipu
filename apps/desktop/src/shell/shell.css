@@ -1,0 +1,586 @@
+/* The window frame: sidebar, toolbar, list + detail, docked inspector, and
+   the two narrow shapes. Tokens come from App.css; names here start "sh-" so
+   nothing collides with the old screens' classes. Breakpoints are window
+   widths (media queries, not container queries, so they also work on the
+   older macOS web views the app still supports). */
+
+:root {
+  --select: #efe2da;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --select: rgba(224, 112, 63, 0.18);
+  }
+}
+
+/* ---------- the frame ---------- */
+.shell.sh-window {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  height: 100%;
+}
+
+/* ---------- sidebar (900 px and wider) ---------- */
+.sh-side {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--rail);
+  border-right: 1px solid var(--border);
+  user-select: none;
+  -webkit-user-select: none;
+}
+/* The Mac draws the window buttons over this strip (overlay title bar). */
+.sh-lights {
+  flex: none;
+  height: 52px;
+}
+.sh-brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 20px 18px;
+  font-size: 16px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.sh-snav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 10px;
+}
+.sh-snav button,
+.sh-tabs button {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 14.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.sh-snav button svg,
+.sh-tabs button svg {
+  flex: none;
+}
+.sh-snav button[aria-current="page"],
+.sh-tabs button[aria-current="page"] {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+.sh-snav button[aria-current="page"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.sh-snav button:focus-visible,
+.sh-tabs button:focus-visible,
+.sh-older-btn:focus-visible,
+.sh-seg button:focus-visible,
+.sh-insp-close:focus-visible,
+.sh-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+@media (hover: hover) and (pointer: fine) {
+  .sh-snav button:hover:not([aria-current]),
+  .sh-older-btn:hover {
+    background: var(--surface-2);
+    color: var(--text);
+  }
+  .sh-row:hover:not([aria-current="true"]) {
+    background: var(--surface-2);
+  }
+}
+.sh-count {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+.sh-count.quiet {
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.sh-spin {
+  margin-left: auto;
+  color: var(--muted);
+}
+.sh-side-foot {
+  margin-top: auto;
+  padding: 12px 0 14px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.sh-onmac {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 32px;
+  margin: 0 10px;
+  padding: 0 10px;
+  color: var(--muted);
+  font-size: 13.5px;
+  white-space: nowrap;
+}
+
+/* Older screens: a quiet group that holds what the new places replace. */
+.sh-older {
+  position: relative;
+  margin: 0 10px 8px;
+}
+.sh-older-btn {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  width: 100%;
+  height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.sh-older-chev {
+  margin-left: auto;
+  transition: transform 140ms ease;
+}
+.sh-older[data-open="true"] .sh-older-chev {
+  transform: rotate(180deg);
+}
+.sh-older-list {
+  display: none;
+}
+.sh-older[data-open="true"] .sh-older-list {
+  display: block;
+}
+.sh-older-list .sh-snav {
+  padding: 4px 0 0;
+}
+.sh-older-list .sh-snav button {
+  height: 30px;
+  font-size: 13.5px;
+}
+.sh-older-extra {
+  margin-top: 8px;
+  padding: 10px 10px 2px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* ---------- toolbar and body ---------- */
+.sh-toolbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  height: 52px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  user-select: none;
+  -webkit-user-select: none;
+}
+.sh-toolbar h1,
+.sh-toolbar .sh-title {
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.2;
+  font-weight: 650;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+.sh-seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.sh-seg button {
+  height: 32px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 14.5px;
+  cursor: pointer;
+}
+.sh-seg button[aria-pressed="true"] {
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.sh-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* ---------- list + detail ---------- */
+.sh-split {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+.sh-listpane {
+  flex: none;
+  width: clamp(300px, 36%, 460px);
+  overflow: auto;
+  border-right: 1px solid var(--border);
+  padding: 16px 12px 32px;
+}
+.sh-detail {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  background: var(--surface);
+}
+.sh-detail-in {
+  max-width: 720px;
+  padding: 32px 40px 56px;
+}
+.sh-detail-in.wide {
+  max-width: 1080px;
+}
+/* A selectable row in a list. The selected one carries aria-current="true". */
+.sh-row {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 12px;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.sh-row + .sh-row {
+  margin-top: 2px;
+}
+.sh-row[aria-current="true"] {
+  background: var(--select);
+}
+
+/* ---------- docked inspector ---------- */
+.sh-insp {
+  flex: none;
+  width: 380px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+}
+.sh-insp-h {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 52px;
+  padding: 0 12px 0 24px;
+  border-bottom: 1px solid var(--border);
+}
+.sh-insp-h h2 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+}
+.sh-insp-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.sh-insp-b {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 20px 24px 40px;
+}
+
+/* ---------- tab bar (only under 640 px) ---------- */
+.sh-tabs {
+  display: none;
+}
+
+/* ---------- 900 px and narrower: one column, the sidebar becomes a top bar ---------- */
+@media (max-width: 899px) {
+  .shell.sh-window {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .sh-side {
+    position: relative;
+    z-index: 30;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    height: 52px;
+    padding-right: 8px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  /* Room for the window buttons the Mac draws at the top left. */
+  .sh-lights {
+    width: 68px;
+    height: 100%;
+  }
+  .sh-brand {
+    padding: 0;
+  }
+  .sh-places {
+    flex-direction: row;
+    padding: 0;
+    gap: 4px;
+  }
+  .sh-places button {
+    width: auto;
+    height: 38px;
+    padding: 0 10px;
+  }
+  .sh-places button[aria-current="page"]::before {
+    display: none;
+  }
+  .sh-side-foot {
+    margin: 0 0 0 auto;
+    padding: 0;
+    border-top: 0;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+  }
+  .sh-onmac {
+    order: 1;
+    height: 32px;
+    margin: 0;
+    padding: 0 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 16px;
+    background: var(--surface);
+    color: var(--text-2);
+    font-size: 14px;
+  }
+  .sh-settings {
+    order: 2;
+    padding: 0;
+  }
+  .sh-settings button {
+    width: auto;
+    height: 38px;
+    padding: 0 10px;
+  }
+  .sh-settings button[aria-current="page"]::before {
+    display: none;
+  }
+  .sh-older {
+    order: 3;
+    margin: 0;
+  }
+  .sh-older-btn {
+    width: 38px;
+    height: 38px;
+    padding: 0;
+    justify-content: center;
+  }
+  .sh-older-btn .sh-label,
+  .sh-older-chev {
+    display: none;
+  }
+  /* The list drops from the top bar as a popover. */
+  .sh-older-list {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    width: 260px;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    box-shadow: var(--shadow-md);
+  }
+  .sh-older-list .sh-snav {
+    padding: 0;
+  }
+  .sh-older-list .sh-snav button {
+    width: 100%;
+    padding: 0 10px;
+  }
+
+  .sh-toolbar {
+    padding: 0 16px;
+    gap: 16px;
+  }
+  /* A toolbar with only a title repeats the top bar; it goes. */
+  .sh-toolbar.bare {
+    display: none;
+  }
+  .sh-seg {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .sh-split {
+    display: block;
+    overflow: auto;
+  }
+  .sh-listpane {
+    width: auto;
+    overflow: visible;
+    border-right: 0;
+  }
+  .sh-detail {
+    overflow: visible;
+  }
+  .sh-split[data-detail="open"] .sh-listpane,
+  .sh-split[data-detail="closed"] .sh-detail {
+    display: none;
+  }
+  .sh-detail-in,
+  .sh-detail-in.wide {
+    max-width: none;
+    padding: 24px 16px 40px;
+  }
+  /* The inspector covers the window as a sheet. */
+  .sh-insp {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    width: auto;
+    border-left: 0;
+  }
+  .sh-insp-h {
+    padding-left: 16px;
+  }
+}
+
+/* ---------- under 640 px: the places move to a bottom tab bar ---------- */
+@media (max-width: 639px) {
+  .shell.sh-window {
+    grid-template-rows: auto minmax(0, 1fr) auto;
+  }
+  .sh-places {
+    display: none;
+  }
+  .sh-side {
+    gap: 8px;
+    padding-right: 8px;
+  }
+  .sh-settings .sh-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .sh-settings button {
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    justify-content: center;
+  }
+  .sh-onmac {
+    height: 36px;
+  }
+  .sh-older-btn {
+    width: 44px;
+    height: 44px;
+  }
+  .sh-older-list .sh-snav button {
+    height: 44px;
+  }
+  .sh-insp-close {
+    width: 44px;
+    height: 44px;
+  }
+  .sh-tabs {
+    display: flex;
+    height: 68px;
+    padding-bottom: 6px;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+  }
+  .sh-tabs button {
+    flex: 1;
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+    width: auto;
+    height: auto;
+    padding: 0;
+    border-radius: 0;
+    background: none;
+    color: var(--muted);
+    font-size: 12.5px;
+    text-align: center;
+  }
+  .sh-tabs button[aria-current="page"] {
+    background: none;
+    color: var(--accent-text);
+    font-weight: 650;
+  }
+  .sh-tabs .sh-count {
+    position: absolute;
+    top: 6px;
+    left: calc(50% + 6px);
+    margin: 0;
+    min-width: 18px;
+    height: 18px;
+    font-size: 11px;
+  }
+  .sh-toolbar {
+    padding: 0 12px;
+  }
+}

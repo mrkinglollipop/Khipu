@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
 import type { WaitItem, WorkView } from "../work";
+import { openScreen } from "./nav";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
@@ -55,8 +56,7 @@ it.each([
     return JSON.stringify({ ok: true });
   });
   render(<App />);
-  const nav = await screen.findByRole("button", { name: /^Work/ });
-  fireEvent.click(nav);
+  const nav = await openScreen(/^Work/);
   const label = `${waiting} waiting on you${blocking ? `, ${blocking} blocking` : ""}, 1 quiet`;
   const badge = await within(nav).findByLabelText(label);
   expect(badge.textContent).toBe(String(items.length));

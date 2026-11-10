@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
+import { openScreen } from "./nav";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
@@ -95,7 +96,7 @@ const callsOf = (cmd: string) => invokeMock.mock.calls.filter(([c]) => c === cmd
 
 async function openWork() {
   render(<App />);
-  fireEvent.click(await screen.findByRole("button", { name: /^Work/ }));
+  await openScreen(/^Work/);
 }
 
 function group(name: RegExp) {

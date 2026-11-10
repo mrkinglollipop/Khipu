@@ -6,6 +6,7 @@ import App from "../App";
 import { readFileSync } from "node:fs";
 import { WELCOME_DONE_KEY } from "../Welcome";
 import { parseStatusRows } from "../IntegrationsPanel";
+import { openScreen } from "./nav";
 
 const appCss: string = readFileSync(
   `${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/App.css`,
@@ -126,10 +127,10 @@ function visiblePanel() {
 function assertPane(heading: string) {
   expect(within(visiblePanel()).getByRole("heading", { name: heading })).toBeVisible();
   expect(visiblePanel().textContent!.trim().length).toBeGreaterThan(heading.length);
-  expect(screen.getByRole("navigation", { name: "Primary" })).toBeVisible();
+  expect(screen.getByRole("navigation", { name: "Main" })).toBeVisible();
 }
 async function select(label: typeof primaryViews[number]) {
-  fireEvent.click(screen.getByRole("button", { name: label }));
+  await openScreen(label);
   await waitFor(() => assertPane(label));
 }
 async function everyPane(mode: Mode) {

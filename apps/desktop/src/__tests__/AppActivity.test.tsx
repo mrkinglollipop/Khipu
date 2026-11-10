@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
+import { openScreen } from "./nav";
 
 const invokeMock = vi.fn();
 
@@ -82,7 +83,7 @@ describe("App — Activity", () => {
       return "{}";
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Activity" }));
+    await openScreen("Activity");
     await screen.findByText("Episode 1");
     fireEvent.click(activityRow("Episode 1"));
     await waitFor(() => expect(detailReleases[1]).toBeTypeOf("function"));
@@ -112,7 +113,7 @@ describe("App — Activity", () => {
       return "{}";
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Activity" }));
+    await openScreen("Activity");
     await screen.findByText("Episode 1");
     fireEvent.click(activityRow("Episode 1"));
     await screen.findByRole("button", { name: "Forget" });
@@ -146,7 +147,7 @@ describe("App — Activity", () => {
     });
     render(<App />);
     await waitFor(() => expect(releases).toHaveLength(1));
-    fireEvent.click(screen.getByRole("button", { name: "Activity" }));
+    await openScreen("Activity");
     await waitFor(() => expect(releases.length).toBeGreaterThanOrEqual(2));
     const old40 = releases[0];
     const new40 = releases[releases.length - 1];

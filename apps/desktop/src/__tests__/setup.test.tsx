@@ -10,6 +10,7 @@ import { act, render, screen, fireEvent, waitFor, cleanup, within } from "@testi
 import { Welcome } from "../Welcome";
 import App from "../App";
 import { IntegrationsPanel, verifiedLine } from "../IntegrationsPanel";
+import { openScreen } from "./nav";
 
 const invokeMock = vi.fn();
 
@@ -344,7 +345,7 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
 
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    await openScreen("Settings");
     fireEvent.click(screen.getByRole("tab", { name: "Another Mac" }));
 
     await waitFor(() =>
@@ -365,7 +366,7 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
     invokeMock.mockImplementation(async (cmd: string) => defaultInvoke(cmd));
 
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    await openScreen("Settings");
     fireEvent.click(screen.getByRole("tab", { name: "Another Mac" }));
 
     await waitFor(() =>

@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
+import { openScreen } from "./nav";
 
 const invokeMock = vi.fn();
 
@@ -43,7 +44,7 @@ function bootstrap(run: (args: string[]) => Promise<string> | string) {
 }
 
 async function openRecall() {
-  fireEvent.click(screen.getByRole("button", { name: "Recall" }));
+  await openScreen("Recall");
   return screen.findByRole("textbox", { name: "Search" });
 }
 
@@ -188,7 +189,7 @@ describe("App — Recall audit", () => {
       return "{}";
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Activity" }));
+    await openScreen("Activity");
     fireEvent.click((await screen.findByText("Activity source")).closest("button") as HTMLButtonElement);
     await screen.findByText("Exact episode detail");
     fireEvent.click(screen.getByRole("button", { name: "Open in Recall" }));
@@ -235,14 +236,14 @@ describe("App — Recall audit", () => {
     await screen.findByText("Cached episode");
     search("old");
     await waitFor(() => expect(releaseOld).toBeTypeOf("function"));
-    fireEvent.click(screen.getByRole("button", { name: "Activity" }));
+    await openScreen("Activity");
     fireEvent.click((await screen.findByText("Activity 7")).closest("button") as HTMLButtonElement);
     await screen.findByText("Cached episode");
     fireEvent.click(screen.getByRole("button", { name: "Forget" }));
     fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Forget" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     await act(async () => { releaseOld?.(JSON.stringify(result(7, "Forgotten again"))); });
-    fireEvent.click(screen.getByRole("button", { name: "Recall" }));
+    await openScreen("Recall");
     await waitFor(() => expect(screen.queryByText("Forgotten again")).not.toBeInTheDocument());
     expect(screen.queryByText("Cached episode")).not.toBeInTheDocument();
   });

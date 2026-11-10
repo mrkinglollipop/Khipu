@@ -6,6 +6,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
 import { clockTime, isHubUnreachable, OfflineBanner, parseOwedAnswer } from "../OfflineBanner";
+import { openScreen } from "./nav";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
@@ -60,7 +61,7 @@ function script(owed: (args: string[]) => unknown, write?: (args: string[]) => u
 
 async function openOwed() {
   render(<App />);
-  fireEvent.click(await screen.findByRole("button", { name: /^Work/ }));
+  await openScreen(/^Work/);
 }
 
 describe("the Owed tab with the hub away", () => {
