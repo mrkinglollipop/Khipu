@@ -62,7 +62,7 @@ describe("App in the new window", () => {
     store.set("khipu.welcome.completed", "1");
     answers(true);
     render(<App />);
-    for (const name of ["Work", "Activity", "Harnesses", "Guides"]) {
+    for (const name of ["Work", "Recall", "Activity", "Harnesses", "Guides"]) {
       const button = await openScreen(name);
       await waitFor(() => expect(button).toHaveAttribute("aria-current", "page"));
     }

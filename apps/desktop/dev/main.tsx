@@ -444,6 +444,8 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   // Move around with the sidebar. Answers come from fakes/shell.ts.
   app: { title: "The whole window", render: () => <App /> },
   "app-quiet": { title: "The whole window, nothing needs you", fake: { quiet: true }, render: () => <App /> },
+  // Memory: open the window, then pick Memory in the sidebar. Answers from fakes/memory.ts.
+  "app-memory-offline": { title: "The whole window, Only my words refused", fake: { memOffline: true }, render: () => <App /> },
   "app-welcome": { title: "The whole window, first run", fake: { welcome: true }, render: () => <App /> },
   "setup-signed-out": {
     title: "Setup: a default login that is not signed in",
