@@ -15,8 +15,12 @@ Fields added to an episode row (appended after the existing keys):
   for a row from the gateway.
 * ``project`` ``COALESCE(project, scope)``, else ``None``.
 
-The owner's own lines are ``episodes.verbatim.quotes`` (the user turns of the
-window). Errors, commands, paths and the capture note are not the owner's words.
+The owner's own lines are ``episodes.verbatim.quotes`` (up to three user turns
+of the window) and, for conversations captured since ``owner_lines`` existed,
+``episodes.verbatim.owner_lines`` (every typed user turn of the window). Only
+"only my words" reads ``owner_lines``; the quote shown without it, the title
+and ``activity`` read ``quotes`` alone, as before. Errors, commands, paths and
+the capture note are not the owner's words.
 """
 from __future__ import annotations
 
@@ -39,20 +43,38 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def quotes_of(verbatim: Any) -> list[str]:
-    """The owner's lines out of a stored ``verbatim`` value (dict or JSON text)."""
+def _strings(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [q for q in value if isinstance(q, str) and q.strip()]
+
+
+def _verbatim_dict(verbatim: Any) -> Any:
     if isinstance(verbatim, str):
         try:
             import json
 
-            verbatim = json.loads(verbatim)
+            return json.loads(verbatim)
         except ValueError:
-            return []
+            return None
+    return verbatim
+
+
+def quotes_of(verbatim: Any) -> list[str]:
+    """The owner's lines out of a stored ``verbatim`` value (dict or JSON text)."""
+    verbatim = _verbatim_dict(verbatim)
     if isinstance(verbatim, dict):
         verbatim = verbatim.get("quotes")
-    if not isinstance(verbatim, list):
+    return _strings(verbatim)
+
+
+def owner_lines_of(verbatim: Any) -> list[str]:
+    """Every stored owner line, for "only my words": ``quotes`` first (an old
+    row has only those), then ``owner_lines``."""
+    verbatim = _verbatim_dict(verbatim)
+    if not isinstance(verbatim, dict):
         return []
-    return [q for q in verbatim if isinstance(q, str) and q.strip()]
+    return list(dict.fromkeys(_strings(verbatim.get("quotes")) + _strings(verbatim.get("owner_lines"))))
 
 
 def typed_quotes(quotes: list[str]) -> list[str]:
@@ -166,8 +188,9 @@ def _columns(cur) -> dict[str, bool]:
             for c in ("verbatim", "origin", "harness", "project", "scope", "raw")}
 
 
-def episode_facts(cur, ids: list[Any]) -> dict[str, dict[str, Any]]:
-    """One query for the rows' summary, owner lines, origin, tool and project."""
+def episode_facts(cur, ids: list[Any], *, owner_lines: bool = False) -> dict[str, dict[str, Any]]:
+    """One query for the rows' summary, owner lines, origin, tool and project.
+    ``owner_lines`` (only my words): also read ``verbatim.owner_lines``."""
     numbers = sorted({int(i) for i in ids if str(i).isdigit()})
     if not numbers:
         return {}
@@ -180,12 +203,18 @@ def episode_facts(cur, ids: list[Any]) -> dict[str, dict[str, Any]]:
         + ", " + ("harness" if have["harness"] else "NULL")
         + ", session_id, " + project + ", "
         + ("raw->>'summary_kind'" if have["raw"] else "NULL")
+        + (", verbatim->'owner_lines'" if owner_lines and have["verbatim"] else "")
         + " FROM episodes WHERE id = ANY(%s)",
         (numbers,),
     )
-    return {str(r[0]): {"summary": r[1], "quotes": quotes_of(r[2]), "origin": r[3], "harness": r[4],
-                        "session_id": r[5], "project": r[6], "summary_kind": r[7]}
-            for r in cur.fetchall()}
+    out = {}
+    for r in cur.fetchall():
+        out[str(r[0])] = {"summary": r[1], "quotes": quotes_of(r[2]), "origin": r[3], "harness": r[4],
+                          "session_id": r[5], "project": r[6], "summary_kind": r[7]}
+        if owner_lines:
+            out[str(r[0])]["owner_lines"] = owner_lines_of(
+                {"quotes": r[2], "owner_lines": r[8] if len(r) > 8 else None})
+    return out
 
 
 def _fill(row: dict, facts: dict, resolve, quote: str | None) -> None:
@@ -201,12 +230,12 @@ def keep_owner_matches(cur, rows: list[dict], query: str) -> list[dict]:
     """With "only my words" on: keep only episode rows with an owner line that
     holds the phrase or every query word, and set that line as ``quote``."""
     phrase, tokens = query_terms(query)
-    facts = episode_facts(cur, [r.get("id") for r in rows if r.get("kind") == "episode"])
+    facts = episode_facts(cur, [r.get("id") for r in rows if r.get("kind") == "episode"], owner_lines=True)
     kept = []
     for r in rows:
         if r.get("kind") != "episode":
             continue
-        line = owner_line((facts.get(str(r.get("id"))) or {}).get("quotes") or [], phrase, tokens)
+        line = owner_line((facts.get(str(r.get("id"))) or {}).get("owner_lines") or [], phrase, tokens)
         if line is not None:
             r["quote"] = _clip_around(line, phrase, tokens)
             kept.append(r)
@@ -247,11 +276,18 @@ def annotate_activity_rows(cur, rows: list[dict]) -> list[dict]:
     return rows
 
 
+def _owner_array(verbatim: str, key: str) -> str:
+    """``verbatim -> key`` when it is a JSON array, else an empty one."""
+    return (f"(CASE WHEN jsonb_typeof({verbatim}->'{key}') = 'array' "
+            f"THEN {verbatim}->'{key}' ELSE '[]'::jsonb END)")
+
+
 def owner_candidates(cur, term: str, limit: int, filters=None) -> list[dict]:
     # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Episodes with an owner line holding the phrase or every query word, newest
     first, in the shape ``cli._literal_candidates`` returns. The index from 0051
-    narrows by the words in any verbatim string; the quotes check is exact."""
+    narrows by the words in any verbatim string (``owner_lines`` included);
+    the check on ``quotes`` and ``owner_lines`` is exact."""
     from khipu import cli
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
 
@@ -281,9 +317,9 @@ def owner_candidates(cur, term: str, limit: int, filters=None) -> list[dict]:
         f"SELECT id::text, summary, topics, decisions, preferences, people, ts, {verbatim} AS verbatim "
         f"FROM episodes WHERE {cli._episode_live_clause(cur)}"
         + (" AND ".join(index_tests) + " AND " if indexed else "")
-        + "CASE WHEN jsonb_typeof(" + verbatim + "->'quotes') = 'array' THEN EXISTS ("
-        "SELECT 1 FROM jsonb_array_elements_text(" + verbatim + "->'quotes') AS q WHERE "
-        + " AND ".join(line_tests) + ") ELSE false END "
+        + "EXISTS (SELECT 1 FROM jsonb_array_elements_text("
+        + _owner_array(verbatim, "quotes") + " || " + _owner_array(verbatim, "owner_lines")
+        + ") AS q WHERE " + " AND ".join(line_tests) + ") "
         f"AND ({ep_filter}) ORDER BY ts DESC NULLS LAST, id DESC LIMIT %(lim)s OFFSET %(off)s"
     )
     # A scheduled prompt that quotes the owner matches in SQL but is not his
@@ -296,7 +332,7 @@ def owner_candidates(cur, term: str, limit: int, filters=None) -> list[dict]:
         cur.execute(sql, params)
         rows = cur.fetchall()
         for eid, summary, topics, decisions, preferences, people, ts, vb in rows:
-            line = owner_line(quotes_of(vb), phrase, tokens)
+            line = owner_line(owner_lines_of(vb), phrase, tokens)
             if line is None:
                 continue
             out.append({

@@ -174,6 +174,13 @@ class VerbatimExtractionTest(unittest.TestCase):
     def test_empty_window_returns_empty_dict(self):
         self.assertEqual(extract.extract_verbatim(""), {})
 
+    def test_owner_lines_are_every_typed_user_message_in_order(self):
+        out = extract.extract_verbatim(self.FIXTURE)
+        self.assertEqual([q[:25] for q in out["owner_lines"]],
+                         ["the build is failing, fir", "run:\n$ pytest tests/test_", "thanks, last message"])
+        window = self.FIXTURE + "\n\nUSER: <task-notification>done</task-notification>"
+        self.assertEqual(extract.extract_verbatim(window)["owner_lines"], out["owner_lines"])
+
 
 class VerbatimRedactionTest(unittest.TestCase):
     def test_a_fake_key_inside_a_verbatim_quote_is_redacted(self):
