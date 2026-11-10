@@ -721,6 +721,15 @@ placeholder on the other Mac. Confirm on the source Mac, where the words are
 visible; the confirmation carries those now-confirmed words. Owner words and
 local history are not rewritten. Missing or rejected event IDs never upload.
 
+The owner check is made once, on the Mac where the owner made the change, and
+its verdict travels with the line: a line that passed carries how it was
+authorised (`auth`: the app, a terminal's typed yes, or his direction in a
+conversation), and a line that Mac reads as unchecked goes as unchecked. Every
+other Mac reads that verdict as the owner's own record from his other Mac, so
+doctor's owner-check warnings name the same lines on every Mac. A line sent by
+an earlier build carries no verdict; it is read as written, as lines from before
+the owner check are, and the Mac that wrote it still judges it.
+
 Pace readings cross as one history, so both Macs compute one pace for a shared
 allowance from the one reader, `routing_pace.compute_pace`. To keep that small a
 Mac sends only the newest `usage_sample` of each closed pace bucket (a bucket

@@ -653,3 +653,113 @@ def test_a_poll_syncs_only_when_the_last_exchange_is_old(monkeypatch):
     last(-120)  # a clock moved back must not stop the copy
     rr.sync_if_due(now)
     assert len(calls) == 3
+
+
+# ---- the owner check travels with the line ---------------------------------------------
+# The owner's change is checked on the Mac where he made it; the other Macs read
+# that Mac's verdict from the line itself (``routing._mark_unchecked``).
+
+_UNCHECKED = "did not pass Khipu's owner check"
+_OUTSIDE = "written by something other than the app"
+
+
+@pytest.fixture
+def owner_checked():
+    """Write as a checked owner command does (``routing._owner_via``)."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def checked(auth="direction"):
+        token = routing._OWNER_AUTH.set({"auth": auth})
+        try:
+            yield
+        finally:
+            routing._OWNER_AUTH.reset(token)
+    return checked
+
+
+def _doctor(mac):
+    mac.activate()
+    return routing.doctor_block(now=mac.now)["warnings"]
+
+
+def _rule_n(entity):
+    return next(r["n"] for r in routing.read_view()["rules"] if r["entity"] == entity)
+
+
+def test_a_change_checked_on_one_mac_reads_checked_on_the_other(pair, owner_checked):
+    a, b, hub = pair
+    a.activate()
+    with owner_checked():
+        routing.add_rule("owner's own rule", via="direction")
+        routing.set_priority([{"account": "Codex"}], via="direction", expect=routing.priority_version())
+        routing.pause("Codex", via="direction")
+    with owner_checked("app"):
+        routing.set_note("owner's own note", via="app")
+    assert a.view()["unchecked"] == [] and a.view()["outside_app"] == []
+    assert sync(a, hub)["ok"] and sync(b, hub)["ok"]
+    sent = [c for c in hub.calls if c["type"] in ("rule_add", "priority_set", "pause", "note_set")]
+    assert {c["auth"] for c in sent} == {"direction", "app"}
+    view = b.view()
+    assert len(view["rules"]) == 1 and view["priority"]["entries"] and view["note"]
+    assert view["unchecked"] == [] and view["outside_app"] == []
+    assert not any(_UNCHECKED in w or _OUTSIDE in w for w in _doctor(b))
+
+
+def test_a_change_that_failed_the_check_warns_on_both_macs(pair, owner_checked):
+    a, b, hub = pair
+    a.activate()
+    with owner_checked():
+        routing.add_rule("checked first", via="direction")
+    # Imported and called directly, as a conversation could: no check ran.
+    forged = routing.add_rule("never checked", via="direction")
+    assert len(a.view()["unchecked"]) == 1
+    # The hub numbers the rule; both Macs then call it by that number.
+    assert sync(a, hub)["ok"] and sync(b, hub)["ok"] and sync(a, hub)["ok"]
+    a.activate()
+    n = _rule_n(forged["entity"])
+    assert n is not None and a.view()["unchecked"] == [f"rule {n}"]
+    (sent,) = [c for c in hub.calls if c.get("entity") == forged["entity"]]
+    assert sent["via"] == "direction-unchecked" and "auth" not in sent
+    b.activate()
+    view = b.view()
+    assert view["unchecked"] == [f"rule {n}"] and view["outside_app"] == [f"rule {n}"]
+    for mac in (a, b):
+        warnings = _doctor(mac)
+        assert any(_UNCHECKED in w and f"rule {n}" in w for w in warnings)
+        assert any(_OUTSIDE in w for w in warnings)
+
+
+def test_an_unconfirmed_proposal_still_waits_on_both_macs(pair, owner_checked):
+    a, b, hub = pair
+    a.activate()
+    with owner_checked():
+        routing.add_rule("checked", via="direction")
+    proposal = routing.request_rule("a conversation's proposal", author=AUTHOR)
+    assert sync(a, hub)["ok"] and sync(b, hub)["ok"]
+    for mac in (a, b):
+        mac.activate()
+        rule = next(r for r in mac.view()["rules"] if r["entity"] == proposal["entity"])
+        assert rule["pending"] and not rule["confirmed"]
+        assert any("still need confirmation" in w for w in _doctor(mac))
+
+
+def test_a_line_from_a_build_that_sent_no_verdict_reads_as_written(pair, owner_checked, monkeypatch):
+    a, b, hub = pair
+    a.activate()
+    with owner_checked():
+        routing.add_rule("checked before the verdict travelled", via="direction")
+    # The build before this one: no ``auth`` on the wire and no unchecked mark.
+    with monkeypatch.context() as old:
+        old.delitem(routing._COMMON_FIELDS, "auth")
+        old.setattr(routing, "unchecked_local", lambda: {})
+        assert sync(a, hub)["ok"]
+    (sent,) = [c for c in hub.calls if c["type"] == "rule_add"]
+    assert "auth" not in sent and sent["via"] == "direction"
+    with owner_checked():
+        routing.add_rule("checked after", via="direction")
+    assert sync(a, hub)["ok"] and sync(b, hub)["ok"]
+    b.activate()
+    view = b.view()
+    assert [r["via"] for r in view["rules"]] == ["direction", "direction"]
+    assert view["unchecked"] == [] and view["outside_app"] == []

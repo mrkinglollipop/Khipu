@@ -70,9 +70,21 @@ def _names(blob: str, tok: str) -> bool:
     # The pattern matches ``tok`` literally, so a blob without it as a plain
     # substring cannot match; skipping the lookaround scan there keeps the
     # push lane's per-row counting inside its deadline.
-    if tok not in blob:
-        return False
-    return re.search(_WORD_BOUNDARY.format(tok=re.escape(tok)), blob) is not None
+    # Each place ``tok`` occurs, checked for a word character on either side:
+    # exactly ``_WORD_BOUNDARY``'s match (``[^\W_]`` is ``str.isalnum``), but
+    # found with ``str.find``. The pattern's leading lookbehind kept the regex
+    # engine from searching for the literal, so it tried every position of
+    # every row's text for every prompt term: about 0.3 s of one CPU per
+    # prompt, a quarter of the push lane's budget (2026-11-09).
+    size = len(tok)
+    end = len(blob)
+    at = blob.find(tok)
+    while at >= 0:
+        after = at + size
+        if (at == 0 or not blob[at - 1].isalnum()) and (after >= end or not blob[after].isalnum()):
+            return True
+        at = blob.find(tok, at + 1)
+    return False
 
 
 def text_words(text: str) -> list[str]:

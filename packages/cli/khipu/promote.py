@@ -55,6 +55,9 @@ OVERRIDE_TTL_S = 24 * 60 * 60
 _DOCTOR_NOT_GATED = ("jobs_ok", "synth_provider_ok")
 # launchd starts a job with this PATH and nothing else (no plist sets one).
 LAUNCHD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+# recall_prompt.TIMEOUT_S: the gate replays the one-shot hook with no client
+# deadline, which the busy-Mac limit (recall_prompt.BUSY_TIMEOUT_S, the warm
+# service's client on a loaded Mac only) never lengthens.
 RECALL_BUDGET_MS = 1200.0
 # A replayed run over the budget fails only when it is also this much slower
 # than the run it is compared with (live's, or its own routing-off run).

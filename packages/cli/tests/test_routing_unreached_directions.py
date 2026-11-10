@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 
 import pytest
 
@@ -38,8 +39,8 @@ def directions(replay):
                      routing_cloud_copy_hold_words=True, routing_child_chars=400)
     rows = [
         {"id": "rd-synthetic-open", "status": "open", "words": WORDS,
-         "session": SESSION, "project": PROJECT, "join": "unjoined",
-         "reason": "occurrence mismatch", "path": PRIVATE_PATH,
+         "session": SESSION, "project": PROJECT, "join": "joined", "typed": True,
+         "seen_at": time.time(), "reason": None, "path": PRIVATE_PATH,
          "prompt_sha256": "synthetic-hash", "target": {"entity": "Codex"}},
         {"id": "rd-synthetic-dismissed", "status": "dismissed", "words": "DismissedSentinel",
          "session": SESSION},

@@ -30,6 +30,11 @@ import time
 
 CONNECT_TIMEOUT_S = 0.15
 ANSWER_TIMEOUT_S = 1.6
+# A busy Mac (load average at or over its core count) waits longer, so the
+# search can finish (khipu.recall_prompt.BUSY_TIMEOUT_S, this less 0.4 s for
+# the answer to come back). The harness stops the hook at 3 s.
+BUSY_ANSWER_TIMEOUT_S = 2.2
+BUSY_LOAD_PER_CORE = 1.0
 NO_CONNECTION = 3
 NO_BUDGET = 4
 MAX_ANSWER_BYTES = 8 * 1024 * 1024
@@ -102,6 +107,16 @@ def hook_stdout(out):
     return json.dumps(out)
 
 
+def answer_timeout():
+    """BUSY_ANSWER_TIMEOUT_S while the 1-minute load average is at or over
+    BUSY_LOAD_PER_CORE per core, else ANSWER_TIMEOUT_S."""
+    try:
+        busy = os.getloadavg()[0] >= BUSY_LOAD_PER_CORE * (os.cpu_count() or 1)
+    except (OSError, AttributeError):
+        busy = False
+    return BUSY_ANSWER_TIMEOUT_S if busy else ANSWER_TIMEOUT_S
+
+
 def socket_path():
     isolated = os.environ.get("KHIPU_ISOLATED_DIR")
     if isolated:
@@ -172,7 +187,7 @@ def main(argv):
     raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
     shape = output_shape(raw, argv)
     started = time.monotonic()
-    deadline = started + ANSWER_TIMEOUT_S
+    deadline = started + answer_timeout()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(CONNECT_TIMEOUT_S)
     try:

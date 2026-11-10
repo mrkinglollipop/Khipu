@@ -234,7 +234,9 @@ def test_a_search_with_rerank_on_and_no_model_records_the_skip(monkeypatch):
     with _fake_hub(rows), mock.patch.object(rerank, "_call_model", side_effect=rerank._Unavailable("no key")):
         staged = _search()
     assert staged["results"] == baseline["results"]
-    assert staged["degraded_legs"] == ["rerank"]
+    # Switched on with nothing to run on is not a degraded search: the stage
+    # simply did not apply, and doctor says so once.
+    assert "degraded_legs" not in staged
     block = staged["rerank"]
     assert block["applied"] is False and block["reason"] == "no-provider" and block["skipped"] is True
     assert staged["timing"]["rerank_skipped"] == "no-provider"
@@ -248,6 +250,7 @@ def test_doctor_shows_a_rerank_switch_with_no_model_plainly(monkeypatch):
         block, warnings = cli._doctor_rerank()
     assert block["enabled"] is True and block["usable"] is False
     assert len(warnings) == 1 and "rerank" in warnings[0] and "no rerank model" in warnings[0]
+    assert "khipu features --set rerank off" in warnings[0] and "degraded_legs" not in warnings[0]
     monkeypatch.setenv("KHIPU_FEATURE_RERANK", "0")
     block, warnings = cli._doctor_rerank()
     assert block["enabled"] is False and warnings == []
