@@ -2760,6 +2760,46 @@ async fn khipu_route_cap(action: String, account: String, cap: RouteCapArgs, op:
     run_khipu_cli_async(route_operation_argv(route_cap_argv(&action, &account, &cap)?, op.as_deref())?).await
 }
 
+/// The most characters of "say a change" words the app hands over (the CLI refuses longer).
+const ROUTE_SAY_WORDS_MAX: usize = 500;
+
+/// A "say a change" token as Khipu makes it (`secrets.token_hex`): letters and digits only, so
+/// it can never be read as a flag.
+fn checked_route_say_token(raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    let ok = (16..=64).contains(&v.len()) && v.chars().all(|c| c.is_ascii_alphanumeric());
+    if ok {
+        Ok(v.to_string())
+    } else {
+        Err("that is not a preview Khipu made".to_string())
+    }
+}
+
+/// `route say --from-app --preview=WORDS` or `--apply=TOKEN` (slice B6). The `=` form keeps
+/// words that start with a dash from being read as a flag; both modes are fixed here.
+fn route_say_argv(mode: &str, value: &str) -> Result<Vec<String>, String> {
+    let mut argv = route_base("say");
+    match mode {
+        "preview" => {
+            let words = checked_route_words(value, false)?;
+            if words.chars().count() > ROUTE_SAY_WORDS_MAX {
+                return Err(format!("keep it to a sentence or two (at most {ROUTE_SAY_WORDS_MAX} characters)"));
+            }
+            argv.push(format!("--preview={words}"));
+        }
+        "apply" => argv.push(format!("--apply={}", checked_route_say_token(value)?)),
+        _ => return Err(format!("not a way to say a change: {mode:?}")),
+    }
+    Ok(argv)
+}
+
+/// Say a change to the order or the rules: `preview` returns what Khipu understood, how it is now,
+/// how it would be and a token; `apply` saves exactly the change that token names.
+#[tauri::command]
+async fn khipu_route_say(mode: String, value: String) -> Result<String, String> {
+    run_khipu_cli_async(route_say_argv(&mode, &value)?).await
+}
+
 #[tauri::command]
 async fn khipu_route_hold_end(id: String, op: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(route_operation_argv(route_hold_end_argv(&id)?, op.as_deref())?).await
@@ -5363,6 +5403,7 @@ pub fn run() {
             khipu_route_cleanup_walk,
             khipu_route_exception_end,
             khipu_route_cap,
+            khipu_route_say,
             khipu_route_priority,
             khipu_route_definition,
             khipu_work_view,
@@ -8062,6 +8103,49 @@ esac
         assert!(bad_id.is_err(), "an id that reads as a flag never reaches the CLI");
     }
 
+    /// "Say a change" (`khipu_route_say`) through the real CLI against a fictional data folder. A test
+    /// binary is not the installed app, so both the preview and the apply are refused `owner_only`: that
+    /// proves the argv, the spawn and that a refusal comes back as JSON. An accepted preview or apply is
+    /// the CLI's own tests (the app as the caller); it is not a click.
+    #[cfg(unix)]
+    #[test]
+    fn the_say_a_change_command_reaches_the_real_cli_and_a_refusal_comes_back() {
+        let python = std::path::Path::new("/opt/homebrew/bin/python3.11");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap();
+        if !python.is_file() || !root.join(".python_libs").is_dir() {
+            eprintln!("skipped: needs python3.11 and the checkout's .python_libs");
+            return;
+        }
+        let _env = CLI_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("khipu-route-say-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        let keys = ["KHIPU_ROOT", "KHIPU_PYTHON", "KHIPU_DATA_DIR", "KHIPU_CAPTURE_HOME", "KHIPU_KEYCHAIN", "HOME"];
+        let saved: Vec<_> = keys.iter().map(|k| std::env::var_os(k)).collect();
+        std::env::set_var("KHIPU_ROOT", &root);
+        std::env::set_var("KHIPU_PYTHON", python);
+        std::env::set_var("KHIPU_DATA_DIR", dir.join("data"));
+        std::env::set_var("KHIPU_CAPTURE_HOME", dir.join("capture"));
+        std::env::set_var("KHIPU_KEYCHAIN", "0");
+        std::env::set_var("HOME", dir.join("home"));
+        let preview = tauri::async_runtime::block_on(khipu_route_say("preview".to_string(), "put Codex first".to_string()));
+        let apply = tauri::async_runtime::block_on(khipu_route_say("apply".to_string(), "AbCdEfGh12345678".to_string()));
+        let bad = tauri::async_runtime::block_on(khipu_route_say("apply".to_string(), "--yes".to_string()));
+        for (key, value) in keys.iter().zip(saved) {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        for out in [preview, apply] {
+            let out = out.expect("a refusal is JSON the page reads, not a failed invoke");
+            let parsed: serde_json::Value = serde_json::from_str(&out).expect("the CLI answered in JSON");
+            assert_eq!(parsed["ok"], false, "{out}");
+            assert_eq!(parsed["code"], "owner_only", "{out}");
+        }
+        assert!(bad.is_err(), "a token that is not one never reaches the CLI");
+    }
+
     #[test]
     fn new_folder_name_rules() {
         assert_eq!(
@@ -8213,6 +8297,31 @@ mod work_command_tests {
 
     fn change() -> LedgerChange {
         LedgerChange::default()
+    }
+
+    #[test]
+    fn route_say_has_two_fixed_modes_and_checked_values() {
+        assert_eq!(
+            route_say_argv("preview", "  Put Codex first until Friday ").unwrap(),
+            vec!["route", "say", "--from-app", "--preview=Put Codex first until Friday"]
+        );
+        // words that start with a dash stay one value, never a flag
+        assert_eq!(
+            route_say_argv("preview", "--owner-direction pause Grok").unwrap().last().unwrap(),
+            "--preview=--owner-direction pause Grok"
+        );
+        assert_eq!(
+            route_say_argv("apply", "0123456789abcdef0123456789abcdef").unwrap(),
+            vec!["route", "say", "--from-app", "--apply=0123456789abcdef0123456789abcdef"]
+        );
+        assert!(route_say_argv("preview", "   ").is_err());
+        assert!(route_say_argv("preview", "line\nbreak").is_err());
+        assert!(route_say_argv("preview", &"x".repeat(501)).is_err());
+        assert!(route_say_argv("preview", &"x".repeat(500)).is_ok());
+        assert!(route_say_argv("apply", "short").is_err());
+        assert!(route_say_argv("apply", "--owner-direction-12345678").is_err());
+        assert!(route_say_argv("apply", "abc def ghi jkl mno pqr").is_err());
+        assert!(route_say_argv("save", "AbCdEfGh12345678").is_err());
     }
 
     #[test]
