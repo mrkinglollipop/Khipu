@@ -8457,19 +8457,14 @@ def _snapshot_filters_dropped(*, session_id: str | None, harness: str | None) ->
 
 def _graph_candidates_snapshot(con, results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
     # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
-    """Switch-gated graph-candidate leg shared by both ``search_stale_
+    """Graph-candidate leg shared by both ``search_stale_
     payload`` branches (Phase 3, session A: "the replica [backend] serves
     the local prompt lane and the stale-replica payload"). ``results`` is
     used as-is for seeding (it is the caller's own already-ranked list, no
     fusion has happened yet on this path the way ``embed.hybrid_search``
     fuses several candidate lists — a single ranked list is still one valid
     input to ``fuse_ranked_lists``). Returns ``(results, degraded_legs)``;
-    ``degraded_legs`` is ``[]`` unless the switch is on and the leg missed
-    or errored."""
-    from khipu import features as _features
-
-    if not _features.enabled("graph_candidates"):
-        return results, []
+    ``degraded_legs`` is ``[]`` unless the leg missed or errored."""
     try:
         import time as _time
 
@@ -8611,8 +8606,7 @@ def search_stale_payload(
         try:
             from khipu import relevance as _relevance
             from khipu.search_text import search_tokens
-            if _relevance.enabled():
-                results, _floor = _relevance.gate(results, len(search_tokens(query)))
+            results, _floor = _relevance.gate(results, len(search_tokens(query)))
         except Exception:
             results = []
         results, degraded_legs = _graph_candidates_snapshot(con, results)

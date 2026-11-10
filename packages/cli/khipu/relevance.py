@@ -41,17 +41,6 @@ from typing import Any, Sequence
 COSINE_FLOOR = 0.65
 
 
-def enabled() -> bool:
-    """The ``relevance_floor`` switch. Fails open to off: a broken config read
-    must never cost a caller its search."""
-    try:
-        from khipu import features
-
-        return features.enabled("relevance_floor")
-    except Exception:  # noqa: BLE001 — a switch lookup must not sink a search
-        return False
-
-
 def cosine_floor() -> float:
     """``relevance.cosine_floor`` from config.json when it is a number in
     (0, 1], else ``COSINE_FLOOR``. A bool, a string or an out-of-range value

@@ -470,8 +470,8 @@ def test_hub_modes_use_thread_filters_on_each_candidate_leg(mode):
          mock.patch.object(embed,'_episode_schema_flags',return_value={'project':False,'harness':False,'deleted_at':False}), \
          mock.patch('khipu.topic_graph.enrich_search_results',side_effect=lambda c,rows:rows), \
          mock.patch('khipu.decisions.enrich_search_results',side_effect=lambda c,rows:rows), \
-         mock.patch('khipu.features.enabled',return_value=False), \
-         mock.patch('khipu.relevance.enabled',return_value=False):
+         mock.patch('khipu.graph_candidates.hub_candidates',return_value=([],False)), \
+         mock.patch('khipu.relevance.gate',side_effect=lambda rows,n:(rows,None)):
         out=embed.hybrid_search('recall budget',mode=mode,t3_thread=THREAD,via='t3')
     assert [r['id'] for r in out['results']] == ['1']
     assert len(filters_seen) == (2 if mode == 'hybrid' else 1)

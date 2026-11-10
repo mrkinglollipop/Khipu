@@ -2070,7 +2070,7 @@ def _relevance_gate(rows: list[dict[str, Any]], tokens: list[str]) -> list[dict[
     try:
         from khipu import relevance
 
-        if not rows or not tokens or not relevance.enabled():
+        if not rows or not tokens:
             return rows
         from khipu.search_text import token_hit_count
 
@@ -2506,9 +2506,7 @@ def _fuse_and_annotate(
     # Seeds are the top 5 rows of `fused` as fused above, before any of the
     # metadata/validity passes below touch it.
     degraded_legs: list[str] = []
-    from khipu import features as _features
-
-    if graph and _features.enabled("graph_candidates"):
+    if graph:
         try:
             from khipu import graph_candidates as _gc
 
@@ -2572,19 +2570,18 @@ def _fuse_and_annotate(
 
     # Time interpretation (Phase 3, session A): switch-gated. This lane never
     # receives an explicit since/until from its caller (the per-prompt hook
-    # has no such input), so the only gate needed here is the switch itself.
+    # has no such input), so no gate is needed here.
     # A preference (apply_time_boost), never a filter — nothing is excluded.
     interpretation: dict[str, Any] | None = None
-    if _features.enabled("time_interpretation"):
-        try:
-            from khipu import timeparse as _timeparse
+    try:
+        from khipu import timeparse as _timeparse
 
-            interpretation = _timeparse.interpret(prompt, datetime.now(timezone.utc), tz)
-            if interpretation:
-                fused = _timeparse.apply_time_boost(fused, interpretation)
-        except Exception as exc:  # noqa: BLE001 — additive, never a search failure
-            _log(f"snapshot time interpretation skipped: {type(exc).__name__}")
-            interpretation = None
+        interpretation = _timeparse.interpret(prompt, datetime.now(timezone.utc), tz)
+        if interpretation:
+            fused = _timeparse.apply_time_boost(fused, interpretation)
+    except Exception as exc:  # noqa: BLE001 — additive, never a search failure
+        _log(f"snapshot time interpretation skipped: {type(exc).__name__}")
+        interpretation = None
 
     # Validity annotation (Phase 2, session B): ONE indexed sqlite query
     # (decision_counts_snapshot, idx_snapshot_decisions_episode_id), bounded

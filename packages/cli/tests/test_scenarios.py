@@ -44,8 +44,12 @@ def test_explicit_reversal_marks_the_earlier_decision_superseded(tmp_path):
             "widget-batching endpoint rollout deployment strategy blue-green rolling",
             cwd=None,
         )
-    hit = next(h for h in result["hits"] if h["id"] == "2")
-    assert hit["validity"]["state"] == "superseded"
+    # Validity ranking is always on: the reversal comes first and is current,
+    # and the decision it reversed is ranked down below the relevance cut.
+    ids = [h["id"] for h in result["hits"]]
+    assert ids[0] == "3"
+    assert result["hits"][0]["validity"]["state"] == "current"
+    assert "2" not in ids
 
 
 # ---- 3. historical / as-of question ------------------------------------------
