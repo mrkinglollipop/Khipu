@@ -18,6 +18,13 @@
 .pl-title { font-size: var(--t-lg); overflow-wrap: anywhere; }
 .pl-note { color: var(--text-2); font-size: var(--t-md); text-align: right; }
 .pl-act { height: auto; padding: 4px 10px; min-height: 28px; border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--surface); color: var(--text); font: inherit; font-size: var(--t-md); cursor: pointer; }
+/* The button is quiet until the line is hovered, focused or picked; it keeps its
+   place (opacity, not display) so nothing jumps and it stays in the tab order
+   and the accessibility tree. */
+.pl-act { opacity: 0; }
+.pl-line:focus-within .pl-act, .pl-line[data-picked="true"] .pl-act, .pl-act:focus-visible { opacity: 1; }
+@media (hover: hover) and (pointer: fine) { .pl-line:hover .pl-act { opacity: 1; } }
+@media (hover: none) { .pl-act { opacity: 1; } }
 .pl-act:disabled { opacity: 0.55; cursor: default; }
 .pl-act:focus-visible, .pl-link:focus-visible, .pl-back:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 @media (hover: hover) and (pointer: fine) {
@@ -34,6 +41,7 @@
   .pl-page .pl-back { display: inline-flex; }
 }
 @media (max-width: 639px) {
+  .pl-act { opacity: 1; }
   .pl-line { grid-template-columns: 1fr auto; row-gap: 4px; }
   .pl-note { grid-column: 1; text-align: left; grid-row: 2; }
   .pl-act { grid-column: 2; grid-row: 1 / span 2; align-self: center; min-height: 44px; }

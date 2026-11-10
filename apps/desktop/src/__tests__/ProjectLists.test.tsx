@@ -3,7 +3,7 @@
 // old ledger page uses.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { ProjectLists } from "../memory/ProjectLists";
+import { ProjectLists, doneDay } from "../memory/ProjectLists";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
@@ -45,6 +45,16 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   invokeMock.mockReset();
+});
+
+describe("doneDay", () => {
+  const now = new Date(2026, 10, 10, 15, 0);
+  it("says today and yesterday, else day and date", () => {
+    expect(doneDay(new Date(2026, 10, 10, 1, 0).toISOString(), now)).toBe("today");
+    expect(doneDay(new Date(2026, 10, 9, 23, 0).toISOString(), now)).toBe("yesterday");
+    expect(doneDay(new Date(2026, 10, 5, 21, 16).toISOString(), now)).toBe("Thu 5 Nov");
+    expect(doneDay(new Date(2025, 9, 28, 9, 0).toISOString(), now)).toBe("Tue 28 Oct 2025");
+  });
 });
 
 describe("ProjectLists", () => {

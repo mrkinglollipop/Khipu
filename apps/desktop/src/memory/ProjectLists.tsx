@@ -45,12 +45,25 @@ function byYou(row: LedgerRow): boolean {
   return /^you\b/i.test(by);
 }
 
+/** "today", "yesterday", else the day and date: "Wed 5 Nov" (with the year when it isn't this one). */
+export function doneDay(iso: string, now: Date): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const midnight = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((midnight(now) - midnight(d)) / 86400000);
+  if (days === 0) return "today";
+  if (days === 1) return "yesterday";
+  const wd = d.toLocaleDateString("en-GB", { weekday: "short" });
+  const md = d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  return `${wd} ${md}${d.getFullYear() !== now.getFullYear() ? ` ${d.getFullYear()}` : ""}`;
+}
+
 function lineNote(row: LedgerRow, vocab: Vocab | null, now: Date, marked: "done" | "open" | undefined): string {
   const m = meaningOf(vocab, row.state);
   const finished = m === "done" || m === "dropped";
   if (marked === "done" || (finished && byYou(row))) return m === "dropped" ? "Dropped by you" : "Marked done by you";
   if (marked === "open" || (!finished && byYou(row) && row.history?.[0]?.to === row.state)) return "Marked not done by you";
-  if (finished) return changedWords(row.updated, now);
+  if (finished) return doneDay(row.updated, now);
   const owner = (row.owner ?? "").trim();
   const hasOwner = owner && !["none", "unassigned", "unowned", "-", "n/a"].includes(owner.toLowerCase());
   if (m === "needs") return "Waiting for your yes";
@@ -152,6 +165,7 @@ function ProjectPage({
   const [marked, setMarked] = useState<Record<string, "done" | "open">>({});
   const [refusal, setRefusal] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [picked, setPicked] = useState<string | null>(null);
   const latest = useRef(0);
 
   const read = useCallback(async () => {
@@ -211,7 +225,7 @@ function ProjectPage({
   };
 
   const line = (r: LedgerRow, kind: "open" | "done") => (
-    <li key={r.id} className="pl-line">
+    <li key={r.id} className="pl-line" data-picked={picked === r.id ? "true" : undefined} onClick={() => setPicked(r.id)}>
       <span className="pl-title">{r.title}</span>
       <span className="pl-note">{lineNote(r, vocab, now, marked[r.id])}</span>
       {kind === "open" ? (
