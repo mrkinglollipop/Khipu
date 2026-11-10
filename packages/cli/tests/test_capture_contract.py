@@ -174,12 +174,12 @@ class VerbatimExtractionTest(unittest.TestCase):
     def test_empty_window_returns_empty_dict(self):
         self.assertEqual(extract.extract_verbatim(""), {})
 
-    def test_owner_lines_are_every_typed_user_message_in_order(self):
-        out = extract.extract_verbatim(self.FIXTURE)
-        self.assertEqual([q[:25] for q in out["owner_lines"]],
-                         ["the build is failing, fir", "run:\n$ pytest tests/test_", "thanks, last message"])
-        window = self.FIXTURE + "\n\nUSER: <task-notification>done</task-notification>"
-        self.assertEqual(extract.extract_verbatim(window)["owner_lines"], out["owner_lines"])
+    def test_owner_lines_never_come_from_the_rendered_window(self):
+        # Which turns were typed is decided by read_window on the original
+        # messages; a rendered window cannot tell a relayed body from a typed line.
+        self.assertNotIn("owner_lines", extract.extract_verbatim(self.FIXTURE))
+        self.assertEqual(extract.owner_lines([" typed one ", "typed one", "typed two"]),
+                         ["typed one", "typed two"])
 
 
 class VerbatimRedactionTest(unittest.TestCase):

@@ -92,6 +92,16 @@ class MachineUserMessageTest(unittest.TestCase):
         self.assertNotIn("system-reminder", text)
         self.assertNotIn("hook context", text)
 
+    def test_read_window_lists_only_typed_user_text(self):
+        # The relayed body stays in the window (above) but is never typed:
+        # verbatim.owner_lines come from this list only.
+        with tempfile.TemporaryDirectory() as td:
+            stats: dict = {}
+            msgs, _, _ = sc.read_window(self._fixture(td), 0, stats=stats)
+        self.assertEqual(stats["typed"], ["first real question about the drain", "second real question",
+                                          "third real question"])
+        self.assertTrue(any(TEAMMATE in m for _, m in msgs))
+
     def test_stand_in_lines_and_real_text(self):
         self.assertIsNone(sc._machine_user_message("x" * 10))
         self.assertIsNone(sc._machine_user_message("see <task-notification> in docs"))
