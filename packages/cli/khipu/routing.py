@@ -6698,28 +6698,6 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
     return out
 
 
-def cap_line_for(view: dict, entry: dict, now: datetime) -> str | None:
-    """DeepSeek measured spend, or a cap that needs attention, or None."""
-    for status in cap_statuses(view, entry, now):
-        if status["kind"] == "spend" and entry.get("harness") == "deepseek":
-            if status["verdict"] == "unknown":
-                return f"{entry['label']}: spend unknown; {status.get('why') or 'no balance history'}"
-            notes = []
-            if status.get("partial"):
-                notes.append(f"since {status['since']} while history fills")
-            notes.append(f"top-ups seen: {status.get('topups_seen') or 0}")
-            if status.get("topups_seen"):
-                notes.append(f"possible missed spend within {status['possible_miss_seconds']:g} seconds")
-            return (f"{entry['label']}: ${status['usd']:g} spent in the last {status['days']:g} days "
-                    f"of ${status['cap_usd']:g} ({'; '.join(notes)})")
-        if status["kind"] == "spend" and status["verdict"] in ("over", "reached", "near"):
-            return (f"{entry['label']} spend: ${status['usd']:g} of ${status['cap_usd']:g} "
-                    f"in {status['days']:g} d ({status['verdict']})")
-        if status["kind"] == "concurrency" and status["verdict"] == "full":
-            return f"{entry['label']} concurrency: {status['jobs']:g} of {status['cap_n']:g} jobs (full)"
-    return None
-
-
 def _lane_account_key(lane: str, view: dict) -> str:
     """The account key a lane name resolves to, or a refusal naming its
     candidates. A lane is never guessed: an ambiguous name stays unmatched."""
@@ -7464,15 +7442,6 @@ def check_rule_count(now: datetime | None = None, via: str | None = None) -> Non
                "Tell the owner; do not drop or merge his rules yourself.")
         raise RuleCapError(f"There are already {count:,} standing rules; the limit is {limit:,} "
                            f"(setting routing_rules_max). {ask}", "too_many")
-
-
-def first_sentence(text: str, most: int) -> str | None:
-    """The first whole sentence of ``text`` on one line when it is within
-    ``most`` characters, else None (never cut inside a sentence)."""
-    words = _one_line(text)
-    found = re.search(r"[.!?](?=\s|$)", words)
-    sentence = words[:found.end()] if found else words
-    return sentence if sentence and len(sentence) <= most else None
 
 
 def set_note(text: str, *, via: str, now: datetime | None = None, enforce_caps: bool = True) -> dict:
@@ -9132,30 +9101,6 @@ def table_line(table: dict | None, now: datetime) -> str:
     return "The routing table's NOW block changed" + (f" at {_clock(at, now)}" if at else "") + f"{stamp}."
 
 
-def table_precedence(table: dict | None, now: datetime) -> str | None:
-    """Until the cutover: these account lines are newer than the table's."""
-    if not table or table.get("error") or not table.get("hash"):
-        return None
-    at = _parse(table.get("stamped_at")) or _parse(table.get("changed_at"))
-    when = f" was last stamped {_clock(at, now)}, {_ago(at, now)}" if at else " has no stamp"
-    return f"These account lines are newer than the routing table's account rows; the table's NOW block{when}."
-
-
-def _compact_opening(text: str, width: int = 64) -> str:
-    words = " ".join(str(text or "").split())
-    if len(words) <= width:
-        return words
-    cut = words[:max(1, width - 3)].rsplit(" ", 1)[0]
-    return (cut or words[:max(1, width - 3)]).rstrip(" ,;:.") + "..."
-
-
-def _push_clip(text: str, width: int, view: dict) -> str:
-    text = _for_agents(text, view)
-    if width and len(text) > width:
-        return text[:max(0, width - 3)].rstrip() + "." * min(width, 3)
-    return text
-
-
 def _named_account_labels(text: str, view: dict | None) -> list[str]:
     labels = [entry["label"] for entry in (view or {}).get("accounts") or [] if entry.get("label")]
     if not labels:
@@ -9240,45 +9185,9 @@ def rule_line(rule: dict, *, view: dict | None = None, facts: dict | None = None
 _TOO_LONG = "the owner has not confirmed it yet. It is too long to show here: read it with `khipu_route`."
 
 
-def rule_pointer(rule: dict, view: dict | None = None, *, facts: dict | None = None) -> str:
-    """An identifying opening and current level markers for a pending rule."""
-    names = _named_account_labels(rule.get("text"), view)
-    named = f" for {', '.join(names)}" if names else ""
-    markers = "".join(_level_claim_marker(rule.get("text") or "", entry["key"], facts,
-                                         label=entry["label"], labels=names)
-                      for entry in (view or {}).get("accounts") or [] if entry["label"] in names)
-    return (f"Standing rule {rule['n'] if rule['n'] is not None else 'new rule (number pending)'} {rule.get('pending_kind') or 'added'}{named}: "
-            f"\"{their_words(_compact_opening(_for_agents(rule.get('text') or '', view), 32))}\"{markers}; unconfirmed; khipu_route.")
-
-
 PRIORITY_POINTER = "Your priority was set by a conversation at the owner's request; " + _TOO_LONG
 OWNER_PRIORITY_POINTER = "Your priority is too long to show here: read it with `khipu_route`."
 _TOO_LONG_SHORT = "Some lines are too long to show here: read them with `khipu_route`."
-
-
-def priority_pointer(priority: dict, view: dict | None = None, *, width: int = 24,
-                     facts: dict | None = None) -> str:
-    entries = priority.get("entries") or []
-    parts = []
-    for item in entries:
-        held = _account_holds(view, item.get("account"))
-        opening = _compact_opening(_for_agents(item.get("role") or "", view), max(width, 24) if held else width)
-        part = item["label"] + (f': "{their_words(opening)}"' if opening else "")
-        part += _level_claim_marker(item.get("role") or "", item["account"], facts)
-        if held:
-            part += f" [contradicts active hold {held[0]['id']}]"
-        parts.append(part)
-    return f"Your priority change: {'; '.join(parts)}; unconfirmed; khipu_route."
-
-
-def _priority_pointers(priority: dict, view: dict | None = None, *, facts: dict | None = None) -> tuple[str, ...]:
-    return tuple(priority_pointer(priority, view, width=width, facts=facts) for width in (24, 16, 8, 4))
-
-
-def _ended_words(n: int) -> str:
-    """How many priority entries ended, in fixed words: a pointer never
-    lists their labels, so it stays the same size however many end."""
-    return "One priority entry ended." if n == 1 else f"{n} priority entries ended."
 
 
 def _fit_theirs(items, limit: int, room: int | None = None) -> tuple[list[str], int]:
@@ -9301,10 +9210,6 @@ def _fit_theirs(items, limit: int, room: int | None = None) -> tuple[list[str], 
         out.append(chosen)
         used += len(chosen) + 1 if chosen else 0
     return out, used
-
-
-def _pending_overflow(count: int) -> str:
-    return f"{count} more pending changes: read `khipu_route`."
 
 
 def note_line(note: dict, now: datetime) -> str:
@@ -9534,13 +9439,6 @@ def pace_line_for(entry: dict, now: datetime) -> str | None:
     return routing_pace.pace_line(entry["label"], routing_pace.at(pace, now), now) if pace else None
 
 
-def _pace_of(fact: dict | None) -> float:
-    """A fact's pace for ordering; one with none (unreadable, or figures
-    that may be out of date) goes last."""
-    pace = (fact or {}).get("pace_pct_per_hour")
-    return pace if isinstance(pace, (int, float)) and not isinstance(pace, bool) else -1.0
-
-
 def _rate_words(pace: float) -> str:
     if pace >= 10:
         return f"{pace:.0f}"
@@ -9705,46 +9603,6 @@ def priority_line(priority: dict, now: datetime, *, view: dict | None = None, fa
 _SHORT_ROLE_WIDTHS = (80, 60, 44, 32, 20)
 
 
-def _short_words(text: str, width: int) -> str:
-    """The owner's words cut at a word to at most ``width`` characters, with
-    an ellipsis when cut."""
-    text = " ".join(str(text).split())
-    if len(text) <= width:
-        return text
-    cut = text[:width - 1]
-    if " " not in cut:
-        # One word longer than the width: never cut a word in half.
-        return ""
-    cut = cut[:cut.rindex(" ")]
-    return cut.rstrip(" ,;:.-(") + "…"
-
-
-def priority_short_lines(priority: dict, now: datetime, *, relative: bool = True) -> list[str]:
-    """The owner's priority shortened to fit a push, longest first: his order
-    and each account with its role cut short (``_SHORT_ROLE_WIDTHS``), then
-    the order alone. Each points at ``khipu_route`` for the full words."""
-    until = _parse(priority.get("until"))
-    whole = (f"; until {_clock(until, now)}" + (f", {_remaining(until, now)}" if relative else "")) if until else ""
-    entries = priority["entries"]
-    out: list[str] = []
-    if any(e.get("role") for e in entries):
-        for width in _SHORT_ROLE_WIDTHS:
-            items = []
-            for i, item in enumerate(entries, 1):
-                text = f"{i}. {item['label']}"
-                short = _short_words(item["role"], width) if item.get("role") else ""
-                if short:
-                    text += f": {short}"
-                items.append(text)
-            line = ("Your priority (your words, shortened; the full words: `khipu_route`; guidance, not a gate"
-                    f"{whole}): " + "; ".join(items) + ".")
-            if line not in out:
-                out.append(line)
-    out.append(f"Your priority order (guidance, not a gate{whole}; roles: `khipu_route`): "
-               + "; ".join(f"{i}. {item['label']}" for i, item in enumerate(entries, 1)) + ".")
-    return out
-
-
 def priority_change_line(view: dict, now: datetime, *, facts: dict | None = None, relative: bool = True) -> str:
     """What changed in the priority: each entry whose end has passed, then
     the priority as it stands, or "No priority set"."""
@@ -9901,255 +9759,8 @@ def _replacement_notices(view: dict, now: datetime, session: str | None) -> list
     return items
 
 
-def _live_exception_sentences(priority: dict | None, now: datetime) -> list[str]:
-    """The short sentence for each live exception, as the delivery plan
-    counts it (``routing_delivery.plan``)."""
-    out = []
-    for entry in (priority or {}).get("entries") or []:
-        for exc in entry.get("exceptions") or []:
-            ends = _parse(exc.get("until"))
-            if (ends is not None and ends <= now) or not isinstance(exc.get("id"), str) or not exc.get("text"):
-                continue
-            out.append(exception_change_sentence(entry.get("label") or entry.get("account") or "account", exc))
-    return out
-
-
 LEAN_POINTER = ("Your standing rules, note and priority are left out of this summary to keep the account "
                 "state: read them with `khipu_route`.")
-
-
-def _fit_owner_words(whole: list[str], owners: list, slots: dict, budget: int, view: dict,
-                     now: datetime) -> tuple[list, int]:
-    """Keep the owner's rules, note and priority within ``budget`` characters
-    (``routing_rules_chars``; 0 is no limit), changing ``whole`` in place:
-    the note and the priority first, each at most half the budget (a longer
-    one is a pointer, the note with its first sentence), then the rules in
-    the owner's order, cut at a whole rule, with one line saying how many
-    were left out and where to read them. Returns (the entities now only
-    pointed to, how many rules were left out)."""
-    heading, note, prio, rules = slots["heading"], slots["note"], slots["priority"], slots["rules"]
-    mine = [i for i in (heading, note, prio, *rules) if i is not None]
-    if not budget or sum(len(whole[i]) + 1 for i in mine) <= budget:
-        return [], 0
-    covered: list = []
-    half = budget // 2
-    if prio is not None and len(whole[prio]) + 1 > half:
-        # Not covered: the priority stays owed and the delivery ledger pages
-        # it whole. Each live exception's short sentence goes ahead of the
-        # pointer so a new exception still arrives at once.
-        sentences = _live_exception_sentences(view.get("priority"), now)
-        whole[prio] = "\n".join([*sentences, OWNER_PRIORITY_POINTER])
-    if note is not None and len(whole[note]) + 1 > half:
-        head = note_line({**view["note"], "text": ""}, now)
-        pointer = "(the rest is too long to show here: read it with `khipu_route`)"
-        sentence = first_sentence(view["note"]["text"], max(0, half - len(head) - len(pointer) - 2))
-        whole[note] = f"{head}{sentence} {pointer}" if sentence else f"{head}{pointer}"
-        covered.append("note")
-
-    def pointer(k: int) -> str:
-        return f"{k} of {len(view['rules'])} standing rules left out to keep this short: read them all with `khipu_route`."
-
-    room = budget - sum(len(whole[i]) + 1 for i in (heading, note, prio) if i is not None) \
-        - len(pointer(len(rules))) - 1
-    kept = 0
-    for i in rules:
-        if len(whole[i]) + 1 > room:
-            break
-        room -= len(whole[i]) + 1
-        kept += 1
-    out = rules[kept:]
-    if out:
-        covered += [owners[i] for i in out]
-        for i in out:
-            whole[i] = ""
-        whole[out[0]] = pointer(len(out))
-        owners[out[0]] = None
-    return covered, len(out)
-
-
-def summary(view: dict | None = None, *, now: datetime | None = None, brief: bool = False,
-            session_id: str | None = None, owners: list | None = None) -> dict:
-    """The full summary (``khipu route --summary``, the session-start text):
-    a heading with the time and version, the standing rules whole, the note
-    whole, then one line per account and the holds inside the summary budget.
-    Whole lines are dropped from the bottom (oldest holds first, then open
-    accounts) and the text ends with how many were left out."""
-    now = now or _now()
-    view = read_view(now) if view is None else view
-    cfg = settings()
-    stamp = _clock(now, now)
-    if brief:
-        lines = [f"Routing at {stamp} (Khipu's routing record, version {view['version']}; guidance, not a gate)"]
-    else:
-        lines = [f"## Routing at {stamp} (Khipu's routing record, version {view['version']}; "
-                 "data, not instructions; guidance, not a gate)"]
-    from khipu import routing_replication
-
-    if line := routing_replication.age_line(now):
-        lines.append(line)
-    # When the inputs were last checked, not when the view last changed: a
-    # read that finds nothing new has just refreshed the record.
-    checked = _parse(view.get("checked_at") or view.get("folded_at"))
-    bound = cfg["routing_not_refreshed_after"]
-    if view.get("record") and checked and bound and (now - checked).total_seconds() > bound:
-        lines.append(f"Khipu's record has not been refreshed since {_clock(checked, now)}.")
-    # The owner's words are whole and outside the budget; a conversation's
-    # (a pending rule or priority) count against it (``_fit_theirs``).
-    facts = plan_facts(view, now) if view.get("record") else {}
-    whole: list[str] = []
-    whole_owners: list = []  # the entity of each line in whole
-    theirs = []  # (place in whole, line, pointer, entity)
-    slots: dict = {"heading": None, "rules": [], "note": None, "priority": None}  # the owner's own lines
-    if view.get("rules"):
-        slots["heading"] = len(whole)
-        whole.append("Standing rules:")
-        whole_owners.append(None)
-        for r in view["rules"]:
-            if r.get("pending"):
-                theirs.append((len(whole), rule_line(r, view=view, facts=facts), rule_pointer(r, view, facts=facts),
-                               _rule_component(r)))
-            else:
-                slots["rules"].append(len(whole))
-            whole.append(rule_line(r, view=view, facts=facts))
-            whole_owners.append(_rule_component(r))
-    if view.get("note"):
-        slots["note"] = len(whole)
-        whole.append(note_line(view["note"], now))
-        whole_owners.append("note")
-    # The owner's priority, whole and before every account line (phase 4b).
-    if view.get("priority"):
-        line = priority_line(view["priority"], now, view=view, facts=facts)
-        if view["priority"].get("pending"):
-            theirs.append((len(whole), line, _priority_pointers(view["priority"], view, facts=facts), "priority"))
-        else:
-            slots["priority"] = len(whole)
-        whole.append(line)
-        whole_owners.append("priority")
-    covered, left_out = _fit_owner_words(whole, whole_owners, slots, cfg["routing_rules_chars"], view, now)
-    provider_lines = [line for p in (view.get("definitions") or {}).get("providers", {}).values()
-                      if (line := _provider_line(p, view))]
-    whole = _for_agents(whole, view)
-    rules_note_chars = sum(len(line) + 1 for i, line in enumerate(whole) if i not in {t[0] for t in theirs})
-    requests = [
-        (_for_agents(line, view), tuple(_for_agents(p, view) for p in pointer)
-         if isinstance(pointer, tuple) else _for_agents(pointer, view))
-        for _i, line, pointer, _entity in theirs]
-    limit = cfg["routing_summary_chars"]
-    fitted, theirs_chars = _fit_theirs(requests, limit)
-    if limit and any(not line for line in fitted):
-        room = max(0, limit // 2 - len(_pending_overflow(len(theirs))) - 1)
-        fitted, theirs_chars = _fit_theirs(requests, limit, room=room)
-    omitted = sum(not line for line in fitted)
-    if omitted:
-        theirs_chars += len(_pending_overflow(omitted)) + 1
-    for (i, _line, _pointer, _entity), chosen in zip(theirs, fitted):
-        whole[i] = chosen
-    pairs = [(None, line) for line in lines]
-    pairs += [(entity, line) for entity, line in zip(whole_owners, whole) if line]
-    owner_slots = {i for i in (slots["heading"], slots["note"], slots["priority"], *slots["rules"]) if i is not None}
-    owner_at = {len(lines) + n for n, i in enumerate(i for i, line in enumerate(whole) if line) if i in owner_slots}
-    lines += [line for line in whole if line]
-    receiver = conversation_author().get("session") if session_id is None else session_id
-    notices = _replacement_notices(view, now, receiver)
-    shown_notices = []
-    dropped = 0
-    if not view.get("record"):
-        lines.append("No routing record on this Mac.")
-        pairs.append((None, lines[-1]))
-    else:
-        width = cfg["routing_line_chars"]
-        sources = view.get("sources") or {}
-        # Lines after the rules and the note that are never dropped: they
-        # count against the budget like any other (only rules and note don't).
-        fixed = [line for line in (table_precedence(sources.get("table"), now),) if line]
-        accounts_in_order = list(view["accounts"])
-        if not view.get("priority") and cfg["routing_pace_order"] and any(
-                f.get("readable") and not f.get("stale") for f in facts.values()):
-            # Arithmetic, not a choice: the account whose allowance would run
-            # out unused soonest first; the owner's priority, when he sets
-            # one, comes first instead and is never reordered.
-            fixed.append("Accounts by how soon their allowance runs out unused (Khipu's arithmetic, not your "
-                         "priority):")
-            accounts_in_order.sort(key=lambda e: -_pace_of(facts.get(e["key"])))
-        fixed = _for_agents(fixed, view)
-        lines += fixed
-        pairs += [(None, line) for line in fixed]
-        items: list[tuple[str, str, str]] = list(notices)  # (kind, line, at or notice id)
-        items += [("provider", line, "") for line in provider_lines]
-        items += [("account", _clip(runner_line(r, now), width), "") for r in sources.get("runners") or []
-                  if r.get("silent") or r.get("unreadable")]
-        # The entity each item's line belongs to, by the item's own identity.
-        owner = {id(item): "notice:" + item[2] for item in items if item[0] == "notice"}
-        for entry in accounts_in_order:
-            # The pace is Khipu's own fixed words, added after the clip so a
-            # long account line never cuts it off.
-            line = _clip(account_line(entry, now, view=view), width)
-            fact = facts.get(entry["key"])
-            if fact is not None and entry.get("configured", True):
-                line += f"; {pace_words(fact, now)}"
-            pace_text = pace_line_for(entry, now)
-            if pace_text:
-                line += f"; {pace_text}"
-            cap_text = cap_line_for(view, entry, now)
-            if cap_text:
-                line += f"; {cap_text}"
-            items.append(("open" if entry["state"] == OPEN else "account", line, ""))
-            owner[id(items[-1])] = "account:" + entry["key"]
-        for u in view.get("unmatched") or []:
-            items.append(("lane", _clip(lane_line(u, now), width), ""))
-            owner[id(items[-1])] = f"lane:{u['runner']}/{u['lane']}"
-        for h in view.get("holds") or []:
-            items.append(("hold", _push_clip(hold_line(h, now, view=view), width, view), h["at"]))
-            owner[id(items[-1])] = "hold:" + h["id"]
-        # Replacing private names with account IDs can expand a line.
-        entities = [owner.get(id(item)) for item in items]
-        items = [(kind, line, at) for (kind, _raw, at), line in
-                 zip(items, _for_agents([item[1] for item in items], view))]
-        owner = {id(item): entity for item, entity in zip(items, entities)}
-        limit = cfg["routing_summary_chars"]
-
-        def size(kept: list, n_dropped: int) -> int:
-            total = theirs_chars + sum(len(line) + 1 for line in fixed) + sum(len(item[1]) + 1 for item in kept)
-            if n_dropped:
-                total += len(f"{n_dropped} more lines: run `khipu route`") + 1
-            return total
-
-        kept = list(items)
-        if limit:
-            victims = sorted((i for i in kept if i[0] == "hold"), key=lambda i: i[2])
-            victims += [i for i in reversed(kept) if i[0] == "open"]
-            victims += [i for i in reversed(kept) if i[0] not in ("hold", "open")]
-            for victim in victims:
-                if size(kept, dropped) <= limit:
-                    break
-                kept.remove(victim)
-                dropped += 1
-        lines += [item[1] for item in kept]
-        pairs += [(owner.get(id(item)), item[1]) for item in kept]
-        shown_notices = [item[2] for item in kept if item[0] == "notice"]
-        if dropped:
-            lines.append(f"{dropped} more lines: run `khipu route`")
-            pairs.append((None, lines[-1]))
-    if omitted:
-        lines.append(_pending_overflow(omitted))
-        pairs.append((None, lines[-1]))
-    if owners is not None:
-        owners[:] = line_owners(pairs)
-    # Read by conversations (the pushes, khipu_status) and printed by
-    # `khipu route --summary`: scrubbed, the owner's words kept whole.
-    # The same summary without the owner's rules, note and priority, for a
-    # session start too short for them: the account and state lines stay.
-    lean = None
-    if owner_at:
-        first = min(owner_at)
-        kept = [line for n, line in enumerate(lines) if n not in owner_at]
-        kept.insert(first, LEAN_POINTER)
-        lean = _for_agents("\n".join(kept), view)
-    return {"text": _for_agents("\n".join(lines), view), "dropped": dropped, "rules_note_chars": rules_note_chars,
-            "version": view["version"], "epoch": view.get("epoch"), "notices": shown_notices,
-            "owed_entities": [entity for _i, _line, _pointer, entity in theirs],
-            "shown_entities": [item[3] for item, chosen in zip(theirs, fitted) if chosen],
-            "covered_entities": covered, "rules_left_out": left_out, "lean_text": lean}
 
 
 def page(view: dict, now: datetime, conversation: dict | None = None, readings: dict | None = None) -> str:
@@ -11741,7 +11352,7 @@ def _child_page_push_inline(session_id: str, agent_id: str, now: datetime | None
 
     session = routing_delivery.hook_session(session_id)
     marker = routing_delivery.Marker({}, session=session, component=f"agent:{agent_id}")
-    out = page_push(marker, budget=prompt_budget(), now=now, kick=kick)
+    out = page_push(marker, budget=prompt_budget(), now=now, kick=kick, resend=False)
     if not out.get("routing_changes"):
         return None
     return dict(out, session=session)
@@ -11758,8 +11369,10 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
     ``routing_prompt_budget_ms``: a slow read returns nothing on time instead
     of blocking the subagent's tool call. The child reserves the page as the
     parent's prompt child does; an answer that came back too late stays in
-    flight for the lease and is handed, byte for byte, to the next tool
-    call, so nothing is reserved for nobody for longer than the lease."""
+    flight for the lease and is offered again to the next tool call after
+    the lease runs out, so nothing is reserved for nobody for longer
+    than the lease. While a page is leased, a parallel tool call gets
+    nothing: the same page is never printed twice."""
     if not session_id or not agent_id or push_off("delegation"):
         return None
     budget = prompt_budget()
@@ -11888,13 +11501,11 @@ def start_push(budget: float | None = None, moment: str = "start", *,
 # The per-prompt hook (``recall_prompt.hook_main``) runs this in a child
 # process with its own time budget (``routing_prompt_budget_ms``), never on a
 # thread of the hook or of the recall daemon: a refold is CPU-bound Python
-# and would hold the GIL that the search needs. It sends what changed since
-# the conversation last saw the record, each entity in its current state, or
-# the full summary when the conversation has no usable last-seen version.
-# The text is built from the same projection as the session-start summary
-# (``summary``, ``since``): labels, names and the owner's words, never a
-# conversation's own words, a model name only a conversation gave, a key or
-# a path.
+# and would hold the GIL that the search needs. It sends the routing page
+# (``page_push``) when this conversation has not acknowledged its current
+# signature: the page is built from labels, names and the owner's words,
+# never a conversation's own words, a model name only a conversation gave, a
+# key or a path.
 
 # Whatever the setting says, the prompt never waits longer than this for routing.
 PROMPT_BUDGET_MOST_MS = 1000
@@ -12049,25 +11660,6 @@ def _owner_change_since(folded: list | None) -> bool:
     return False
 
 
-def _stale_notice(out: dict, view: dict | None, now: datetime | None = None) -> dict:
-    """One line when a prompt was answered from a saved view older than
-    ``routing_stale_view_cap`` with an owner's change newer than it: the
-    change arrives with the next prompt, once the refold has saved it."""
-    held = (view or {}).get("stale_view")
-    if not held:
-        return out
-    cap = settings()["routing_stale_view_cap"]
-    if not cap or held["age"] <= cap or not _owner_change_since(held.get("events")):
-        return out
-    since = _parse(held.get("since"))
-    line = ("Routing is updating: this is Khipu's record as of "
-            f"{_clock(since, now or _now()) if since else 'a while ago'}; your newer change arrives with the next prompt.")
-    out = dict(out, text="\n".join(filter(None, [out.get("text"), line])))
-    if out.get("kind") == "none":
-        out["kind"] = "changes"
-    return out
-
-
 def _prompt_view(now: datetime, on_fold=None, clock: dict | None = None, kick=None) -> dict:
     """The view for a prompt. With ``kick`` (the per-prompt child's), the
     prompt never does work that grows with what is stored: it stats the
@@ -12158,48 +11750,6 @@ def _generation(view: dict, cfg: dict) -> list[list]:
     return files
 
 
-def _full_reason(marker: dict | None, view: dict, now: datetime, cfg: dict) -> str | None:
-    """Why this prompt gets the full summary instead of the changes, or None."""
-    marker = marker if isinstance(marker, dict) else {}
-    seen = marker.get("version")
-    if not isinstance(seen, int) or isinstance(seen, bool) or seen < 0:
-        return "no last-seen version"
-    if marker.get("epoch") != view.get("epoch") or seen > view["version"]:
-        return "the record's count started again"
-    behind = cfg["routing_resend_after_versions"]
-    if behind and view["version"] - seen > behind:
-        return "too far behind"
-    resend = cfg["routing_resend_after"]
-    full_at = _parse(marker.get("full_at"))
-    if resend and (full_at is None or (now - full_at).total_seconds() > resend):
-        return "last full summary too old"
-    return None
-
-
-def _change_group(entity: str, view: dict) -> int:
-    """Where a changed entity's line goes: rules and the note first (0), then
-    limited, paused, down and unknown accounts, unmatched lanes' limits and
-    sources gone dark (1), then reopenings (2), then holds (3), then the
-    table pointer (4)."""
-    kind, _, ident = entity.partition(":")
-    if kind == "rule" or entity in ("note", "priority"):
-        return 0
-    if kind == "account":
-        entry = next((a for a in view["accounts"] if a["key"] == ident), None)
-        if entry and (entry["state"] in (LIMITED, PAUSED, DOWN, UNKNOWN) or entry.get("models")):
-            return 1
-        return 2
-    if kind == "lane":
-        runner, _, lane = ident.partition("/")
-        return 1 if any(u["runner"] == runner and u["lane"] == lane for u in view.get("unmatched") or []) else 2
-    if kind == "runner":
-        item = next((r for r in (view.get("sources") or {}).get("runners") or [] if r["name"] == ident), None)
-        return 1 if item and (item.get("silent") or item.get("unreadable")) else 2
-    if kind == "hold":
-        return 3
-    return 4
-
-
 def _not_refreshed(view: dict, now: datetime, cfg: dict) -> str | None:
     checked = _parse(view.get("checked_at") or view.get("folded_at"))
     bound = cfg["routing_not_refreshed_after"]
@@ -12216,414 +11766,15 @@ def _not_refreshed(view: dict, now: datetime, cfg: dict) -> str | None:
 OWNERS, THEIRS, PRIORITY = "owner", "theirs", "priority"
 
 
-def _priority_push(view: dict, now: datetime, *, changed: bool = False,
-                   changed_lines: dict | None = None) -> list[tuple[str, str | tuple[str, ...], str]]:
-    """The priority's line in a change push, before the account lines, as
-    (line, fallback, whose): in every push while a priority is set (with what
-    Khipu read about each account), and its end when it changed to none. A
-    conversation's has one pointer; the owner's has the line without the
-    facts, then shortened (``priority_short_lines``: roles cut short, then
-    the order alone), then a pointer. A pointer is fixed words of a bounded
-    size, however many entries ended."""
-    ended = len(view.get("priority_ended") or []) if changed else 0
-    lead = [_ended_words(ended)] if ended else []
-    if view.get("priority"):
-        facts = plan_facts(view, now)
-        line = priority_change_line(view, now, facts=facts) if changed else \
-            priority_line(view["priority"], now, view=view, facts=facts)
-        if not view["priority"].get("pending"):
-            plain = priority_change_line(view, now) if changed else priority_line(view["priority"], now)
-            short = [" ".join([*lead, x]) for x in priority_short_lines(view["priority"], now)]
-            return [(line, (plain, *short, " ".join([*lead, OWNER_PRIORITY_POINTER])), PRIORITY)]
-        return [(line, tuple(" ".join([*lead, p]) for p in _priority_pointers(view["priority"], view, facts=facts)), THEIRS)]
-    if changed and changed_lines is not None:
-        return [(line, (" ".join([*lead, "No priority set."]),), PRIORITY)
-                for e, line in zip(changed_lines["entities"], changed_lines["lines"]) if e == "priority"]
-    return []
-
-
-def line_owners(pairs) -> list:
-    """The entity each physical line of a block belongs to (None: no
-    entity), from the (entity, line) pairs its producer joined. The
-    delivery renderer filters a block's lines by this, never by their words.
-    Each owner is a token (``routing_delivery.line_token``), never the
-    entity id: an account's id can name a login folder."""
-    from khipu.routing_delivery import line_token
-
-    return [line_token(entity) if entity else None for entity, line in pairs for _ in (line or "").split("\n")]
-
-
-def _fit_push(head, others, limit: int, *, stale: str | None = None, overflow=None,
-              first_entities=(), owners: list | None = None) -> tuple[list[str], list[str]]:
-    """Fit budgeted lines while retaining the identity of every selected entity.
-
-    Owner rules and notes stay whole, outside the budget. Owed entities take
-    room before new requests, even when both share one record version.
-    """
-    tagged = [(None, line) if isinstance(line, str) else line for line in others]
-    headed = [(*item, None) if len(item) == 3 else item for item in head]
-    first_entities = set(first_entities)
-    headed.sort(key=lambda item: 0 if item[3] in first_entities else 1)
-    used = 0
-    selected = []
-    if stale and (not limit or len(stale) + 1 <= limit):
-        selected.append((None, stale))
-        used += len(stale) + 1
-    owner_flags = [(i, line[len(fallback):]) for i, (line, fallback, whose, _entity) in enumerate(headed)
-                   if whose == OWNERS and isinstance(fallback, str) and line.startswith(fallback) and line != fallback]
-    flag_cost = sum(len(suffix) for _i, suffix in owner_flags)
-    tail = len(overflow(len(tagged) + len(headed))) + 1 if overflow and (tagged or any(
-        whose != OWNERS for _line, _fallback, whose, _entity in headed)) else 0
-    shared_flags = bool(limit and flag_cost > max(0, limit - used - tail))
-    flag_note = None
-    if shared_flags:
-        note = "Rule flags: see `khipu_route`."
-        if len(note) + 1 <= limit - used - tail:
-            flag_note = note
-            used += len(note) + 1
-    else:
-        used += flag_cost
-    reserve = sum(len(line) + 1 for entity, line in tagged if entity in first_entities)
-    room = max(0, min(limit // 2, limit - used - reserve - (tail if flag_cost else 0))) if limit else 0
-    theirs = [(line, pointer) for line, pointer, whose, _ in headed if whose == THEIRS]
-    fitted, taken = _fit_theirs(theirs, limit, room=room)
-    used += taken
-    fitted = iter(fitted)
-    chosen = {}
-    for i, (line, fallback, whose, entity) in enumerate(headed):
-        if whose == OWNERS:
-            chosen[i] = fallback if shared_flags and isinstance(fallback, str) else line
-        elif whose == THEIRS:
-            chosen[i] = next(fitted)
-        else:
-            missing = sum(not text for text in chosen.values())
-            tail = len(overflow(len(tagged) + missing)) + 1 if (tagged or missing) and overflow and limit else 0
-            first = len(tagged[0][1]) + 1 + (tail if len(tagged) > 1 else 0) if tagged else 0
-            keeps = (reserve,) if first_entities else (first, tail, 0)
-            ladder = [(text, keep) for keep in keeps for text in (line, *fallback[:-1])]
-            ladder += [(fallback[-1], keep) for keep in keeps]
-            pick = next((text for text, keep in ladder
-                         if not limit or used + len(text) + 1 + keep <= limit), "")
-            chosen[i] = pick
-            used += len(pick) + 1 if pick else 0
-    missing_head = sum(1 for i, item in enumerate(headed) if item[3] is not None and not chosen[i])
-    selected += [(item[3], chosen[i]) for i, item in enumerate(headed) if chosen[i]]
-    if flag_note:
-        selected.append((None, flag_note))
-    kept = list(tagged)
-    if limit:
-        while kept:
-            dropped = len(tagged) - len(kept) + missing_head
-            size = sum(len(line) + 1 for _, line in kept)
-            size += len(overflow(dropped)) + 1 if dropped and overflow else 0
-            if used + size <= limit:
-                break
-            kept.pop()
-    selected += kept
-    if first_entities:
-        selected.sort(key=lambda item: 0 if item[0] in first_entities else 1)
-    lines = [line for _, line in selected]
-    pairs = list(selected)
-    dropped = len(tagged) - len(kept) + missing_head
-    if dropped and overflow:
-        tail = overflow(dropped)
-        if not limit or used + sum(len(line) + 1 for _, line in kept) + len(tail) + 1 <= limit:
-            lines.append(tail)
-            pairs.append((None, tail))
-    if owners is not None:
-        owners[:] = pairs
-    return lines, [entity for entity, _ in selected if entity is not None]
-
-
-def _owner_words_pointers(head: list, view: dict, now: datetime, limit: int) -> list:
-    """A changed rule or note longer than the prompt's room is named, with
-    its first whole sentence when that fits, instead of arriving whole in
-    one update. The words themselves stay owed: the delivery ledger pages
-    them whole over the next prompts (an owner line the ledger does not
-    track is the pointer, never a cut). ``limit`` is ``routing_prompt_chars``
-    (0: no limit)."""
-    if not limit:
-        return head
-    rules = {_rule_component(r): r for r in view.get("rules") or []}
-    out, spent = [], 0
-    for item in head:
-        line, fallback, whose, entity = item
-        if whose != OWNERS or len(fallback if isinstance(fallback, str) else line) <= limit:
-            out.append(item)
-            continue
-        if entity in rules:
-            name, words = f"Standing rule {rules[entity]['n']}", rules[entity].get("text") or ""
-        elif entity == "note" and view.get("note"):
-            name, words = "Note from the owner", view["note"].get("text") or ""
-        else:
-            out.append(item)
-            continue
-        short = f"{name} changed ({len(words):,} characters, too long for one update): `khipu_route`."
-        sentence = first_sentence(words, limit)
-        pointer = f"{name} changed ({len(words):,} characters, too long for one update). It begins: " \
-                  f"{sentence} Read it whole with `khipu_route`." if sentence else short
-        if spent + len(pointer) + 1 > limit:
-            pointer = short
-        spent += len(pointer) + 1
-        out.append((pointer, pointer, whose, entity))
-    return out
-
-
-def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = None,
-                 stale: str | None = None, owners: list | None = None) -> tuple[str, int]:
-    """(the block, how many changes it names) for ``since``'s answer
-    ``changed``. Rules and the note come first and whole; every other line is
-    clipped to ``routing_line_chars``, and together they fit
-    ``routing_prompt_chars``: whole lines are dropped from the bottom and the
-    block ends with how many, and where to read them."""
-    cfg = cfg or settings()
-    lines = [CHANGES_HEADING.format(at=_clock(now, now))]
-    width, limit = cfg["routing_line_chars"], cfg["routing_prompt_chars"]
-    owed = [entity for entity in changed.get("owed_entities") or [] if entity in changed["entities"]]
-    owed_set = set(owed)
-    ranked = sorted(((_change_group(e, view), i, line) for i, (e, line)
-                     in enumerate(zip(changed["entities"], changed["lines"]))),
-                    key=lambda t: (0 if changed["entities"][t[1]] in owed_set else 1, t[0], t[1]))
-    changed_rules = {e for e in changed["entities"] if e.startswith("rule:")}
-    pending = {_rule_component(r): r for r in view.get("rules") or [] if r.get("pending")}
-    # Pending conversation requests remain explicit in every change push
-    # until their owner resolves them, even when this version changes an
-    # unrelated account. Every part but the owner's rules and note counts
-    # against the budget, together (``_fit_push``).
-    facts = plan_facts(view, now)
-    head = [(rule_line(r, view=view, facts=facts), rule_pointer(r, view, facts=facts), THEIRS, e)
-            for e, r in pending.items() if e not in changed_rules]
-    rules = {_rule_component(r): r for r in view.get("rules") or []}
-    for group, e, line in ranked:
-        entity = changed["entities"][e]
-        if group == 0 and entity != "priority":
-            plain = "Standing rule " + rule_line(rules[entity]) if entity in rules else line
-            head.append((line, rule_pointer(pending[entity], view, facts=facts), THEIRS, entity)
-                        if entity in pending else (line, plain, OWNERS, entity))
-    priority_head = [(*item, "priority" if "priority" in changed["entities"] or item[2] == THEIRS else None)
-                     for item in _priority_push(view, now, changed="priority" in changed["entities"], changed_lines=changed)]
-    conflicting = any(_account_holds(view, item.get("account"))
-                      for item in (view.get("priority") or {}).get("entries") or [])
-    # An unacknowledged priority change goes ahead of older owed rules and
-    # notes (account lines stay in ``others`` and keep same-version precedence).
-    priority_first = conflicting or "priority" in changed["entities"] or "priority" in owed_set
-    head = priority_head + head if priority_first else head + priority_head
-    # What the owner did since (by direction, in the app, on a terminal),
-    # each named once and first among the budgeted lines: Khipu's fixed words (``direction_line``).
-    others = [(None, _push_clip(line, width, view)) for line in changed.get("directions") or []]
-    others += [(changed["entities"][index], _push_clip(line, width, view))
-               for group, index, line in ranked if group != 0]
-
-    def overflow(n: int) -> str:
-        return f"{n} more change{'s' if n != 1 else ''}: `khipu_route` since {changed['since']}"
-
-    if conflicting:
-        current_holds = {entity for entity, _ in others}
-        context = [(None, _push_clip(hold_line(hold, now, view=view), min(width, 150) if width else 150, view))
-                   for hold in view.get("holds") or []
-                   if f"hold:{hold['id']}" not in current_holds and
-                   any(item.get("account") == (hold.get("scope") or {}).get("account")
-                       for item in (view.get("priority") or {}).get("entries") or [])]
-        others = context + others
-    others.sort(key=lambda item: 0 if item[0] in owed_set else 1)
-    head = _owner_words_pointers(head, view, now, limit)
-    head = [(_for_agents(line, view),
-             tuple(_for_agents(p, view) for p in fallback) if isinstance(fallback, tuple)
-             else _for_agents(fallback, view) if fallback else fallback, whose, entity)
-            for line, fallback, whose, entity in head]
-    pairs: list = []
-    rendered, shown = _fit_push(head, others, limit, stale=stale, overflow=overflow,
-                                first_entities=owed_set, owners=pairs)
-    changed["shown_entities"] = shown
-    changed["delivery_entities"] = list(dict.fromkeys([
-        *changed["entities"], *[item[3] for item in head if item[3] is not None]]))
-    lines += rendered
-    if owners is not None:
-        owners[:] = line_owners([(None, lines[0]), *pairs])
-    return "\n".join(lines), len(changed["entities"])
-
-
-def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None,
-                on_fold=None, session_id: str | None = None, fold_wait: float | None = None,
-                kick=None) -> dict:
-    """What the per-prompt hook adds for a conversation whose last-seen
-    marker is ``marker`` (``recall_prompt.routing_marker``):
-    ``{"kind": "none" | "changes" | "full", "text", "version", "epoch",
-    "count", "unrefreshed"}``. ``none`` means nothing changed and nothing is
-    sent. Waits for the routing lock at most half of ``budget``; the caller
-    bounds the whole call. ``on_fold`` is called when this prompt starts to
-    refold the record (``_prompt_view``). Raises when the view cannot be
-    read (the caller sends nothing), and raises ``PushUnsaved`` when the
-    view changed but could not be saved and the session would get changes:
-    its version is still the saved one's, so the version check would say
-    nothing changed (fix round 5). ``fold_wait`` (seconds) is how long it
-    may wait for another fold's ``prompt-fold.lock`` (at least half of
-    ``budget``): that fold saves the view this prompt then answers from, so
-    the per-prompt child waits for it up to its hook's own deadline rather
-    than skip (2026-10-27: a 25 ms wait beside 170-330 ms folds skipped
-    about a fifth of prompts as fold-busy). An answer finished after the
-    hook stopped taking it is still the hook's ``skipped:budget``. ``kick``:
-    as for ``_prompt_view``: a view that is out of date is answered at once
-    and ``kick(reason)`` asks for its refold off the prompt path."""
-    with lock_budget(budget / 2, fold=budget / 2 if fold_wait is None else max(budget / 2, fold_wait)):
-        clock = None if now is not None else {}
-        now = now or _now()
-        _view_seen.stat = None
-        view = _prompt_view(now, on_fold=on_fold, clock=clock, kick=kick)
-        now = (clock or {}).get("now", now)
-    cfg = settings()
-    session = getattr(marker, "session", None)
-    if session:
-        from khipu import agent_view, routing_delivery
-
-        keys = [a.get("key") for a in view.get("accounts") or []]
-        with agent_view.routing_projection(keys):
-            out = _prompt_text(marker, view, now, cfg, session_id=session_id)
-            if not out.pop("_reserved", False):
-                out = _pace_push_adjust(out, view, now, session, marker.component)
-                out = _advice_push_adjust(out, view, now, session, marker.component)
-                out = routing_delivery.offer(routing_delivery.plan(out, view, now, cfg, session=session),
-                                             session=session, component=marker.component, deferred=True)
-            return dict(out, _delivery_view=view, _reserved=True)
-    return _prompt_text(marker, view, now, cfg, session_id=session_id)
-
-
-def _pace_push_adjust(out: dict, view: dict, now: datetime, session: str, component: str) -> dict:
-    """Offer a pace forecast when it changed enough against the last one
-    this conversation acknowledged, even when nothing else changed."""
-    from khipu import routing_delivery, routing_pace
-
-    forecasts: dict[str, dict] = {}
-    lines: dict[str, str] = {}
-    for entry in view.get("accounts") or []:
-        pace = headline_pace(entry)
-        if pace is None:
-            continue
-        entity = f"pace:{entry['key']}:{pace['window']}"
-        forecasts[entity] = routing_pace.forecast(pace, entry["key"], entry["label"], now)
-        lines[entity] = pace_line_for(entry, now)
-    if not forecasts:
-        return out
-    acked = routing_delivery.snapshot(session, component).get("pace_acked") or {}
-    effective = {e: routing_pace.effective_forecast(acked.get(e), f, now) for e, f in forecasts.items()}
-    pushes = {e: f for e, f in effective.items() if routing_pace.should_push(acked.get(e), f, now)}
-    if out.get("kind") == "full":
-        return dict(out, pace_forecasts=effective)
-    if not pushes:
-        return out
-    out = dict(out, pace_forecasts=pushes)
-    if out.get("kind") == "none":
-        text = CHANGES_HEADING.format(at=_clock(now, now)) + "\n" + "\n".join(lines[e] for e in pushes)
-        out.update(kind="changes", text=_for_agents(text, view), count=len(pushes),
-                   owed_entities=list(pushes), shown_entities=list(pushes),
-                   line_entities=line_owners([(None, text.split("\n", 1)[0]), *((e, lines[e]) for e in pushes)]))
-    return out
-
-
-def _advice_push_adjust(out: dict, view: dict, now: datetime, session: str, component: str) -> dict:
-    """Offer an advice line when the advice for an account in this
-    conversation's priority changed since the last acknowledged advice,
-    under the same acknowledged-forecast discipline as pace pushes."""
-    from khipu import routing_advice, routing_delivery
-
-    priority_keys = {e.get("account") for e in (view.get("priority") or {}).get("entries") or []}
-    if not priority_keys:
-        return out
-    acked = routing_delivery.snapshot(session, component).get("advice_acked") or {}
-    current: dict[str, dict] = {}
-    for entry in view.get("accounts") or []:
-        if entry["key"] in priority_keys:
-            current[f"advice:{entry['key']}"] = routing_advice.account_advice(view, entry, now)
-            check_id = f"advice:check:{entry['key']}"
-            if check_id in acked or any(c.get("kind") == "pace_target" and c.get("purpose") == "check"
-                                        for c in entry.get("caps") or []):
-                current[check_id] = routing_advice.check_advice(view, entry, now)
-    if not current:
-        return out
-
-    def sig(item):
-        return (item.get("verdict"), item.get("reason"), item.get("evidence"),
-                item.get("tier"), item.get("sensitive")) if item else None
-
-    pushes = {e: a for e, a in current.items() if sig(acked.get(e)) != sig(a)}
-    if out.get("kind") == "full":
-        return dict(out, advice_forecasts=current)
-    if not pushes:
-        return out
-    lines = [routing_advice.advice_line(pushes[e]) for e in pushes]
-    added = list(zip(pushes, lines))
-    out = dict(out, advice_forecasts=pushes)
-    if out.get("kind") == "none":
-        text = CHANGES_HEADING.format(at=_clock(now, now)) + "\n" + "\n".join(lines)
-        out.update(kind="changes", text=_for_agents(text, view), count=len(pushes),
-                   owed_entities=list(pushes), shown_entities=list(pushes),
-                   line_entities=line_owners([(None, text.split("\n", 1)[0]), *added]))
-    elif out.get("kind") == "changes" and out.get("text"):
-        if isinstance(out.get("line_entities"), list):
-            out["line_entities"] = [*out["line_entities"], *line_owners(added)]
-        out.update(text=out["text"] + "\n" + "\n".join(lines),
-                   shown_entities=list(dict.fromkeys([*(out.get("shown_entities") or []), *pushes])),
-                   owed_entities=list(dict.fromkeys([*(out.get("owed_entities") or []), *pushes])))
-    return out
-
-
-def _prompt_text(marker, view, now, cfg, *, session_id=None):
-    base = {"version": view["version"], "epoch": view.get("epoch"), "generation": _generation(view, cfg), "_delivery_view": view}
-    why = _full_reason(marker, view, now, cfg)
-    if why is None and view.get("unsaved_change"):
-        raise PushUnsaved("the routing view changed and could not be saved")
-    session_id = conversation_author().get("session") if session_id is None else session_id
-    if why is None and _replacement_notices(view, now, session_id):
-        why = "proposal notices are due"
-    if why is None:
-        seen = marker["version"]
-        stale = _not_refreshed(view, now, cfg)
-        said = stale is not None and marker.get("unrefreshed") == view.get("checked_at")
-        owed = marker.get("owed") if marker.get("epoch") == view.get("epoch") and isinstance(marker.get("owed"), list) else []
-        # Notice debt belongs to the delivery ledger, never to since()'s entities.
-        owed = [entity for entity in owed if not entity.startswith("notice:")]
-        if seen == view["version"] and not owed:
-            if stale and not said:
-                # Nothing changed, but the record has not been refreshed past its bound: one line, once,
-                # under the same budget as any change push.
-                nothing = {"entities": [], "lines": [], "since": seen}
-                owners: list = []
-                text, _count = changes_text(nothing, view, now, cfg, stale=stale, owners=owners)
-                return dict(base, kind="changes", text=_for_agents(text, view), count=0,
-                            unrefreshed=view.get("checked_at"), line_entities=owners)
-            return dict(base, kind="none", text=None, count=0)
-        changed = since(seen, view, now=now, epoch=marker.get("epoch"))
-        if owed:
-            current = {entity: line for entity, line in zip(changed["entities"], changed["lines"])}
-            for entity in owed:
-                current.setdefault(entity, _current_line(entity, view, now))
-            ordered = [*owed, *[entity for entity in changed["entities"] if entity not in owed]]
-            changed["entities"] = ordered
-            changed["lines"] = [current[entity] for entity in ordered]
-            changed["owed_entities"] = owed
-        if changed["complete"]:
-            owners = []
-            text, count = changes_text(changed, view, now, cfg, stale=stale, owners=owners)
-            return dict(base, kind="changes", text=_for_agents(text, view), count=count, line_entities=owners,
-                        owed_entities=changed["delivery_entities"], shown_entities=changed.get("shown_entities") or [],
-                        unrefreshed=view.get("checked_at") if stale else None)
-        why = "the changes are no longer kept"
-    owners = []
-    out = summary(view, now=now, session_id=session_id, owners=owners)
-    return dict(base, kind="full", text=out["text"], count=0, why=why, notices=out["notices"], line_entities=owners,
-                owed_entities=out["owed_entities"], shown_entities=out["shown_entities"],
-                covered_entities=out["covered_entities"])
-
-
 def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None,
                 on_fold=None, session_id: str | None = None, fold_wait: float | None = None,
                 kick=None) -> dict:
     """What the per-prompt hook adds: the routing page (``page_push``),
     offered as a leased batch when the marker carries a hook delivery
-    identity. ``kick(reason)``: as for ``page_push``. ``on_fold`` and
-    ``fold_wait`` are accepted for the prompt child and the recall daemon,
-    and unused: a prompt never folds when a page exists."""
-    return page_push(marker, budget=budget, now=now, session_id=session_id, kick=kick)
+    identity. ``kick(reason)``: as for ``page_push``. ``fold_wait`` is the
+    fold lock's wait when there is no page yet (a prompt never folds when
+    one exists); ``on_fold`` is accepted for the prompt child and unused."""
+    return page_push(marker, budget=budget, now=now, session_id=session_id, kick=kick, fold_wait=fold_wait)
 
 
 # ---- the page as what routing delivers (slice 6) ------------------------------------------
@@ -12672,7 +11823,8 @@ def _page_answer(page: dict, now: datetime, cfg: dict) -> dict:
 
 
 def page_push(marker: dict | None, *, budget: float, now: datetime | None = None,
-              session_id: str | None = None, kick=None) -> dict:
+              session_id: str | None = None, kick=None, resend: bool = True,
+              fold_wait: float | None = None) -> dict:
     """What the per-prompt hook adds (``prompt_push``'s answer) with the page
     as what routing delivers: the page whole when this conversation has not
     yet acknowledged its current signature, else ``kind: none``. Reads
@@ -12687,7 +11839,7 @@ def page_push(marker: dict | None, *, budget: float, now: datetime | None = None
     cfg = settings()
     page = routing_page_file.read()
     if page is None:
-        with lock_budget(budget / 2, fold=budget / 2):
+        with lock_budget(budget / 2, fold=budget / 2 if fold_wait is None else fold_wait):
             _view_seen.stat = None
             view = _prompt_view(now, kick=kick)
         text, meta = routing_page_file.render(view, now)
@@ -12703,7 +11855,7 @@ def page_push(marker: dict | None, *, budget: float, now: datetime | None = None
         return {k: v for k, v in out.items() if k not in ("page", "sig")}
     component = getattr(marker, "component", "main")
     planned = routing_delivery.page_plan(out, now, cfg)
-    answer = routing_delivery.offer(planned, session=session, component=component, deferred=True)
+    answer = routing_delivery.offer(planned, session=session, component=component, deferred=True, resend=resend)
     if not answer.get("routing_changes"):
         return {"kind": "none", "text": None, "version": out["version"], "epoch": out["epoch"],
                 "generation": [], "count": 0}
@@ -12744,42 +11896,6 @@ def _start_page(view: dict, now: datetime, *, component: str | None = None,
             for key in ("routing_changes", "delivery_reservation", "delivery_plan"):
                 answer.pop(key, None)
     return {k: v for k, v in answer.items() if k not in ("page", "sig")}
-
-
-def _prompt_push_scoped(marker: dict | None, *, budget: float, now: datetime | None = None,
-                        on_fold=None, session_id: str | None = None, fold_wait: float | None = None,
-                        kick=None) -> dict:
-    if session_id is not None:
-        from khipu.routing_delivery import Marker
-
-        marker = Marker(marker or {}, session=session_id, component=getattr(marker, "component", "main"))
-    else:
-        session_id = getattr(marker, "session", None)
-    out = _prompt_push(marker, budget=budget, now=now, on_fold=on_fold, session_id=session_id,
-                       fold_wait=fold_wait, kick=kick)
-    view = out.pop("_delivery_view")
-    session = getattr(marker, "session", None)
-    if not session:
-        out.pop("line_entities", None)
-    if not session or out.pop("_reserved", False):
-        return _replication_push_age(_stale_notice(out, view, now), now)
-    from khipu import routing_delivery
-
-    now = now or _now()
-    out = routing_delivery.plan(out, view, now, settings(), session=session)
-    return _replication_push_age(_stale_notice(routing_delivery.offer(
-        out, session=session, component=marker.component, deferred=True), view, now), now)
-
-
-def _replication_push_age(out: dict, now=None) -> dict:
-    from khipu import routing_replication
-
-    line = routing_replication.age_line(now)
-    if line and line not in (out.get("text") or ""):
-        out = dict(out, text="\n".join(filter(None, [out.get("text"), line])))
-        if out.get("kind") == "none":
-            out["kind"] = "changes"
-    return out
 
 
 # ---- the recall daemon's poll (phase 3c) --------------------------------------------------

@@ -425,8 +425,8 @@ TOOLS: list[dict] = [
             "When `prompt` is given and `full` is not set, the schema "
             "narrows to a LIGHT payload — {hub_ok, prior_work, "
             "prior_work_text, prior_work_meta, notes_freshness, contract, "
-            "routing} only (`routing` is the routing summary a conversation "
-            "gets at its start: `khipu_route` has the rest), no counts/drift/recent_captures — so this call costs roughly what `prior_work` "
+            "routing} only (`routing` is the routing page every conversation "
+            "and subagent gets: `khipu_route` has the rest), no counts/drift/recent_captures — so this call costs roughly what `prior_work` "
             "alone costs (the heavy status queries run concurrently with "
             "the prior_work lane on a background thread, never sequentially "
             "in front of it; measured live: the full payload used to add "
@@ -1471,8 +1471,8 @@ ROUTING_GATEWAY_REASON = (
 
 
 def _routing_light() -> dict:
-    """The light payload's ``routing`` field: the summary a conversation
-    gets at its start. Optional: a failure here costs only this field."""
+    """The light payload's ``routing`` field: the routing page every
+    conversation and subagent gets (``routing.light_status``). Optional: a failure here costs only this field."""
     if _via_https_gateway():
         return {"available": False, "reason": ROUTING_GATEWAY_REASON}
     try:

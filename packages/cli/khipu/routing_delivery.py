@@ -920,11 +920,8 @@ def _page_width(state, width, floor):
     state["page_widths"] = [*recent[-31:], max(floor, width)]
 
 
-def _budget_debt(state, plan, point, child=None):
-    """Price the queue at its realised capacity, crediting each new revision once.
-
-    ``child`` ("start" or "page"): an agent component, paged one entity per
-    delivery point in child order, so its debt is counted in pages."""
+def _budget_debt(state, plan, point):
+    """Price the queue at its realised capacity, crediting each new revision once."""
     import math
 
     # The configured cap, not the delivered one: a cap too small for a header
@@ -956,37 +953,9 @@ def _budget_debt(state, plan, point, child=None):
         payload = max(0, budget - _size("More routing owed.") - 2 - _size(prefix) - 24)
         entry["budget"] = min(payload, narrowest) if narrowest else payload
         entry["bound"] = max(1, math.ceil(entry["owed_chars"] / entry["budget"])) if entry["budget"] else None
-    if child:
-        _child_page_debt(state, child)
 
 
-def _child_page_debt(state, child):
-    """A child's page carries one entity, however short, and entities go in
-    ``_child_sorted`` order: each owed entry's bound is the pages queued up
-    to and including its own. Only what ``child_page`` will page counts; at
-    the start block every line may yet be deferred."""
-    import math
-
-    owed = [e for e in _child_sorted(state.get("entries", {}).values())
-            if not e.get("acked") and (child == "start" or e.get("whole") or e.get("child_owed"))]
-    ahead = new_ahead = 0
-    for entry in owed:
-        if entry.get("whole"):
-            if not entry.get("budget"):
-                continue
-            pages = max(1, math.ceil(_size(entry["text"][entry.get("offset", 0):]) / entry["budget"]))
-        else:
-            pages = 1
-        ahead += pages
-        if "owed_pages" not in entry:
-            entry["owed_pages"] = ahead
-            new_ahead += pages
-        else:
-            entry["owed_pages"] = max(ahead, entry["owed_pages"] + new_ahead)
-        entry["bound"] = entry["owed_pages"]
-
-
-def _delivery_point(state, out, now, *, count=True, child=None):
+def _delivery_point(state, out, now, *, count=True):
     """Date new debt at the next taken answer; discarded offers do not age it."""
     if count:
         point = state["delivery_points"] = state.get("delivery_points", 0) + 1
@@ -996,7 +965,7 @@ def _delivery_point(state, out, now, *, count=True, child=None):
     plan = out["delivery_plan"]
     state["harness"] = health_harness(plan.get("harness"))
     state["slack"] = plan.get("slack", 2)
-    _budget_debt(state, plan, point, child)
+    _budget_debt(state, plan, point)
 
 
 def _expire(state, flight):
@@ -1007,7 +976,7 @@ def _expire(state, flight):
             entry["expired"] = entry.get("expired", 0) + 1
 
 
-def _render(state, out, now, component, *, delivery_point=True, deferred=False):
+def _render(state, out, now, component, *, delivery_point=True, deferred=False, resend=True):
     entries = _merge(state, out)
     if entries is None:
         return {"kind": "none", "text": None, "version": state.get("source_version"),
@@ -1028,6 +997,10 @@ def _render(state, out, now, component, *, delivery_point=True, deferred=False):
     flight = state.get("flight")
     if flight and _parse(flight["until"]) > now:
         if flight["out"].get("generation") == out.get("generation"):
+            if not resend:
+                # Leased to a call that has not confirmed it yet: a parallel
+                # call gets nothing rather than the same batch printed twice.
+                return {"kind": "none", "text": None, "version": out.get("version"), "epoch": out.get("epoch")}
             return copy.deepcopy(flight["out"])
         # A refold can rewrite the view without changing its version. The
         # old payload's stat receipt is then stale and cannot pass the hook's
@@ -1392,11 +1365,13 @@ def _take_point(state, now):
     _delivery_point(state, {"delivery_plan": plan}, now)
 
 
-def offer(out, *, session=None, component="main", deferred=False):
+def offer(out, *, session=None, component="main", deferred=False, resend=True):
     """Reserve one component's batch under its independent delivery lock.
     ``deferred``: the per-prompt hook's offer, which it may discard; its
     delivery point is counted when the hook takes it (``take_point``, or
-    ``acknowledge(take=True)``)."""
+    ``acknowledge(take=True)``). ``resend=False``: while a batch is leased
+    and unconfirmed, offer nothing instead of that batch again (a
+    subagent's parallel tool calls)."""
     now = _parse(out["delivery_plan"]["at"])
     if not session:
         state = {}
@@ -1410,7 +1385,7 @@ def offer(out, *, session=None, component="main", deferred=False):
         if component == "main":
             _attachment(data, session, "main", now, out["delivery_plan"].get("harness"))
         state = data.setdefault(component, {})
-        answer = _render(state, out, now, component, deferred=deferred)
+        answer = _render(state, out, now, component, deferred=deferred, resend=resend)
         _prune_agent_components(data, now, keep=component)
         return answer
 
@@ -1432,6 +1407,11 @@ def refit(session, changes, body_limit):
         state.pop("flight")
         answer = _render(state, out, _clock(), component, delivery_point=False)
         _prune_agent_components(data, _clock(), keep=component)
+        if any(item.get("entity") == "page" for item in (answer.get("routing_changes") or {}).get("items", [])):
+            # As ``routing.page_push``: the ledger keeps what is owed, and the
+            # session marker never gets a ``page`` entity an earlier Khipu
+            # would not know.
+            answer.update(owed_entities=[], shown_entities=[])
         return answer
 
 def _t3_pin_path(bare):
@@ -1907,272 +1887,6 @@ def _projected_pages(changes):
     for item in changes["items"]:
         item["text"] = RoutingPage(item["text"])
     return changes
-
-
-_CHILD_GROUPS = {"account": 0, "hold": 1, "rule": 2, "note": 3, "priority": 4, "lane": 5}
-
-
-def _child_sorted(entries):
-    indexed = list(enumerate(entries))
-    return [entry for _i, entry in sorted(
-        indexed, key=lambda pair: (_CHILD_GROUPS.get(pair[1]["entity"].split(":", 1)[0]
-                                                    if ":" in pair[1]["entity"] else pair[1]["entity"], 6), pair[0]))]
-
-
-def _child_opening(entry):
-    from khipu import routing as r
-
-    label = {"note": "Owner note", "priority": "Owner priority"}.get(entry["entity"], entry["label"])
-    return f"{label}: \"{r._compact_opening(entry['text'], 64)}\""
-
-
-def _child_header_base(entry):
-    if entry["entity"] == "note":
-        return "Owner note"
-    if entry["entity"] == "priority":
-        return "Owner priority"
-    match = re.match(r"Standing rule (\S+)", entry["label"] or "")
-    return f"Rule {match.group(1)}" if match else entry["label"]
-
-
-def child_offer(planned, *, session=None, component, now=None, cfg=None):
-    """The bounded block a subagent gets at its start (slice 8a).
-
-    Account states and holds first, then each standing rule and the note:
-    whole when it fits under ``routing_child_chars``, otherwise its number,
-    kind, accounts and opening, with the whole text left owed in this
-    component's ledger for its own tool results. Shown entities are
-    reserved as one batch, exactly as a hook offer reserves them; the
-    caller acknowledges it only once the block was printed.
-    """
-    from khipu import recall_rule, routing as r
-
-    cfg = cfg or {}
-    now = now or _parse(planned["delivery_plan"]["at"])
-    # The harness will not keep a larger hook block whole, whatever the
-    # owner set: routing_child_chars=0 means no routing limit, not no cap.
-    limit = min(cfg.get("routing_child_chars", 4000) or 10 ** 9,
-                recall_rule._HOOK_CONTEXT_BUDGET)
-    width = cfg.get("routing_line_chars", 200)
-
-    def build(state):
-        entries = _merge(state, planned)
-        if entries is None:
-            return {"text": "", "owed_entities": [], "shown_entities": []}
-        state["touched"] = _iso(now)
-        _delivery_point(state, planned, now, child="start")
-        ordered = _child_sorted(entries.values())
-        heading = planned["delivery_plan"]["heading"]
-        if _size(heading) > limit:
-            # The heading itself counts: a limit it alone exceeds gets
-            # nothing, with everything left owed for later pages.
-            return {"text": "", "owed_entities": [e["entity"] for e in ordered],
-                    "shown_entities": []}
-        lines, shown, deferred, visible = [heading], {}, [], {}
-        used = _size(heading)
-        candidates = [e for e in ordered if e.get("whole")]
-        for entry in ordered:
-            entity = entry["entity"]
-            if not entry.get("whole"):
-                rendered = r._clip(entry["text"], width) if width else entry["text"]
-                if used + _size(rendered) + 1 <= limit:
-                    lines.append(rendered)
-                    shown[entity] = len(entry["text"])
-                    visible[entity] = rendered
-                    entry.pop("child_owed", None)
-                    used += _size(rendered) + 1
-                else:
-                    # Only a line this block actually dropped is owed as a
-                    # later page; a line first seen on a tool call is not.
-                    entry["child_owed"] = True
-                    deferred.append(entity)
-                continue
-            opening = _child_opening(entry)
-            at = next((i for i, e in enumerate(candidates) if e is entry), len(candidates))
-            reserve = sum(_size(_child_opening(e)) + 1 for e in candidates[at + 1:])
-            whole = entry["text"]
-            header = _size("Standing rules:") + 1 if entity.startswith("rule:") \
-                and not any(line == "Standing rules:" for line in lines) else 0
-            if (not entry.get("offset") or entry.get("acked")) and \
-                    used + header + _size(whole) + 1 + reserve <= limit:
-                if header:
-                    lines.append("Standing rules:")
-                    used += header
-                lines.append(whole)
-                shown[entity] = len(whole)
-                visible[entity] = whole
-                used += _size(whole) + 1
-            elif used + header + _size(opening) + 1 <= limit:
-                if header:
-                    lines.append("Standing rules:")
-                    used += header
-                lines.append(opening)
-                deferred.append(entity)
-                used += _size(opening) + 1
-            else:
-                deferred.append(entity)
-        answer = {"text": "\n".join(lines), "owed_entities": deferred,
-                  "shown_entities": list(shown)}
-        if session and shown:
-            changes = {"batch": str(uuid.uuid4()), "component": component,
-                       "items": [dict(change=e + "@" + entries[e]["revision"], entity=e,
-                                      revision=entries[e]["revision"]) for e in shown]}
-            answer["routing_changes"] = changes
-            state["flight"] = {"until": _iso(now + timedelta(seconds=planned["delivery_plan"]["lease"])),
-                               "out": {"routing_changes": copy.deepcopy(changes),
-                                       "version": planned.get("version")},
-                               "progress": dict(shown),
-                               "shown": _rendered_receipt(entries, shown, answer["text"], visible=visible),
-                               "plan": copy.deepcopy(planned["delivery_plan"])}
-        return answer
-
-    if not session:
-        return build({})
-    with _transaction(session) as data:
-        answer = build(data.setdefault(component, {}))
-        _prune_agent_components(data, now, keep=component)
-        return answer
-
-
-def child_page(planned, *, session=None, component, now=None, cfg=None, lease=True):
-    """The next deferred page for one agent component, or None.
-
-    One entity at a time, in child order, one page per delivery point.
-    The page is leased as a batch before the hook prints it; while that
-    lease is live no second call hands the same page out again, and only
-    after it expires unacknowledged is the page offered anew. Acknowledging
-    it (the hook's delivered callback) advances the ledger's offset, and a
-    revision change restarts it.
-
-    ``lease=False``: the read runs in a process whose answer the hook may
-    no longer be waiting for, so it leases nothing and returns the lease
-    under ``"lease"`` for the hook to take (``lease_page``) once it has the
-    page in hand.
-    """
-    from khipu import routing as r
-
-    cfg = cfg or {}
-    now = now or _parse(planned["delivery_plan"]["at"])
-    if not session:
-        return None
-    with _transaction(session) as data:
-        state = data.setdefault(component, {})
-        entries = _merge(state, planned)
-        if entries is None:
-            return None
-        state["touched"] = _iso(now)
-        _delivery_point(state, planned, now, child="page")
-        flight = state.get("flight")
-        if flight and _parse(flight["until"]) > now:
-            # Leased to a call that has not recorded delivery yet (the
-            # start block or a page): never print the same page twice.
-            _prune_agent_components(data, now, keep=component)
-            return None
-        if flight:
-            _expire(state, flight)
-            state.pop("flight", None)
-        _drop_absent_forecasts(state, {i["entity"] for i in planned["delivery_plan"]["items"]},
-                               planned["delivery_plan"].get("at"))
-        due = [e for e in _child_sorted(entries.values())
-               if not e.get("acked") and e.get("offset", 0) < len(e["text"])
-               and (e.get("whole") or e.get("child_owed"))]
-        if not due:
-            _prune_agent_components(data, now, keep=component)
-            return None
-        entry = due[0]
-        if not entry.get("whole"):
-            # Account and hold lines the start block could not fit are
-            # owed like any rule: their identifying line is the page.
-            width = cfg.get("routing_line_chars", 200)
-            rendered = r._clip(entry["text"], width) if width else entry["text"]
-            end = len(entry["text"])
-            item = dict(change=entry["entity"] + "@" + entry["revision"], entity=entry["entity"],
-                        revision=entry["revision"])
-            changes = {"batch": str(uuid.uuid4()), "component": component, "items": [item]}
-            flight = {"until": _iso(now + timedelta(seconds=planned["delivery_plan"]["lease"])),
-                      "out": {"routing_changes": copy.deepcopy(changes),
-                              "version": planned.get("version"), "text": rendered},
-                      "progress": {entry["entity"]: end},
-                      "shown": _rendered_receipt(state["entries"], {entry["entity"]: end}, rendered,
-                                                  visible={entry["entity"]: rendered}),
-                      "plan": copy.deepcopy(planned["delivery_plan"])}
-            _prune_agent_components(data, now, keep=component)
-            return _child_leased(state, flight, entry, lease,
-                                 {"text": rendered, "routing_changes": changes, "version": planned.get("version"),
-                                  "epoch": planned.get("epoch"),
-                                  "owed_entities": [e["entity"] for e in due],
-                                  "shown_entities": [entry["entity"]]})
-        page_limit = planned["delivery_plan"].get("page_limit") or cfg.get("routing_prompt_chars") or 2000
-        base = _child_header_base(entry)
-        start = entry.get("offset", 0)
-        n = entry.get("pages", 0) + 1
-        m, end = n, start
-        for _ in range(4):
-            header = f"{base} page {n}/{m}"
-            width = max(2, page_limit - _size(header) - 1)
-            end = _cut(entry["text"], start, width)
-            if end == start:
-                return None
-            remaining = _pages_left(entry["text"], end, width)
-            if remaining is None:
-                return None
-            if n + remaining == m:
-                break
-            m = n + remaining
-        header = f"{base} page {n}/{m}"
-        rendered = header + "\n" + entry["text"][start:end]
-        if entry.get("restarted"):
-            rendered = f"{base} changed while being shown.\n" + rendered
-        item = dict(change=entry["entity"] + "@" + entry["revision"], entity=entry["entity"],
-                    revision=entry["revision"], page={"n": n, "m": m})
-        changes = {"batch": str(uuid.uuid4()), "component": component, "items": [item]}
-        flight = {"until": _iso(now + timedelta(seconds=planned["delivery_plan"]["lease"])),
-                  "out": {"routing_changes": copy.deepcopy(changes),
-                          "version": planned.get("version"), "text": rendered},
-                  "progress": {entry["entity"]: end},
-                  "shown": _rendered_receipt(state["entries"], {entry["entity"]: end}, rendered),
-                  "plan": copy.deepcopy(planned["delivery_plan"])}
-        _prune_agent_components(data, now, keep=component)
-        return _child_leased(state, flight, entry, lease,
-                             {"text": rendered, "routing_changes": changes, "version": planned.get("version"),
-                              "epoch": planned.get("epoch"),
-                              "owed_entities": [e["entity"] for e in due],
-                              "shown_entities": [entry["entity"]] if end == len(entry["text"]) else []})
-
-
-def _child_leased(state, flight, entry, lease, page):
-    if lease:
-        state["flight"] = flight
-    else:
-        page["lease"] = {"flight": flight, "from": {entry["entity"]: entry.get("offset", 0)}}
-    return page
-
-
-def lease_page(session, component, lease, *, now=None):
-    """Take the lease on a page ``child_page(lease=False)`` built, from the
-    hook that is about to print it. False (print nothing) when another hook
-    holds a live lease on this component or the entry moved since the read."""
-    now = now or _clock()
-    try:
-        with _transaction(session) as data:
-            state = data.get(component)
-            if not isinstance(state, dict) or not isinstance(state.get("entries"), dict):
-                return False
-            flight = state.get("flight")
-            if flight:
-                if _parse(flight["until"]) > now:
-                    return False
-                _expire(state, flight)
-                state.pop("flight", None)
-            for item in lease["flight"]["out"]["routing_changes"]["items"]:
-                entry = state["entries"].get(item["entity"])
-                if (entry is None or entry["revision"] != item["revision"] or entry.get("acked")
-                        or entry.get("offset", 0) != lease["from"].get(item["entity"])):
-                    return False
-            state["flight"] = lease["flight"]
-            return True
-    except (OSError, ValueError, TypeError, KeyError):
-        return False
 
 
 def _batch_in_state(state, batch):

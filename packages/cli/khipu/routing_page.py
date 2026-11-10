@@ -285,12 +285,20 @@ def _account_text(label: str, entry: dict, item: dict | None, *, number, holds: 
 def _rules(view: dict) -> list[tuple[str, str]]:
     """The owner's confirmed rules as (heading, text), in the page's order:
     the named headings first, every other rule last under RULES. A rule
-    awaiting the owner's yes is not shown."""
+    awaiting the owner's yes is not shown; under a pending edit, the owner's
+    last confirmed wording still is (as the gateway copy does)."""
     found: dict[str, list[str]] = {name: [] for name in (*SECTIONS, "RULES")}
     for rule in view.get("rules") or []:
-        if rule.get("pending") or rule.get("confirmed") is False:
+        words = rule.get("text")
+        if rule.get("pending"):
+            prior = rule.get("prior_confirmed")
+            if not (rule.get("pending_kind") == "changed" and isinstance(rule.get("prior_text"), str)
+                    and (prior if isinstance(prior, bool) else not rule.get("seeded"))):
+                continue
+            words = rule["prior_text"]
+        elif rule.get("confirmed") is False:
             continue
-        text = _one_line(rule.get("text"))
+        text = _one_line(words)
         head = _HEAD.match(text)
         found[head.group(1).upper() if head else "RULES"].append(text[head.end():] if head else text)
     return [(name, text) for name, texts in found.items() for text in texts]

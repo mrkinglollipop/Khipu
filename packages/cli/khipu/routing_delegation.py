@@ -464,7 +464,7 @@ def _subagent_start(payload: dict, environ=None) -> tuple[dict, dict | None, str
 
 
 def subagent_start(payload: dict, environ=None) -> dict:
-    """The bounded child block for a child agent at its start."""
+    """The routing page for a child agent at its start."""
     return _subagent_start(payload, environ)[0]
 
 
