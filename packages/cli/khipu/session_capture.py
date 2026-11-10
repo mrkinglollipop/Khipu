@@ -2876,7 +2876,7 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
                     capture_request_id: str = "", typed: list[str] | None = None) -> list[str]:
     """Queue every part before advancing the shared capture offset. ``typed``
     (``read_window``'s typed user messages, redacted) becomes each part's
-    ``owner_lines``."""
+    ``owner_lines``, except in a job's capture, which keeps none."""
     off_before = int(st.get("offset", 0))
     # W1.2/W1.3: resolve identity from the cwd, not the model. Never
     # raises (identity.resolve_repo_root is itself fail-open); this
@@ -2921,12 +2921,15 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
         window_id = hashlib.sha256(
             f"capture-request:{harness}:{sid}:{capture_request_id}".encode("utf-8")
         ).hexdigest()
-    owner_lines = _owner_lines_by_part(parts, typed)
     queued_names: list[str] = []
     thread = cache_thread(st, sid)
     # A T3 delegated child thread is a job: T3 names it by this prefix, so no
     # read of T3's database is needed (owner_turns treats it the same way).
     delegated = str(thread or "").startswith(_t3.DELEGATED_THREAD_PREFIX)
+    # Decided once, here: the job label below and the owner-lines skip use it.
+    # Nobody types into a job, so its user turns are briefs and relays.
+    is_job = bool(job_parent or st.get("origin") == "job" or delegated)
+    owner_lines = [[] for _ in parts] if is_job else _owner_lines_by_part(parts, typed)
     for i, part in enumerate(parts, start=1):
         job = {"harness": harness, "session_id": sid, "cwd": cwd, "event": event,
                "ts": _mint_ts(), "turns": turns, "transcript": part["text"],
@@ -2936,7 +2939,7 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
                "parent_session_id": job_parent,
                "transcript_range": f"{off_before}:{new_off}",
                "truncated_chars": part["truncated_chars"]}
-        if (st.get("origin") == "job" or delegated) and not job_parent:
+        if is_job and not job_parent:
             # KHIPU_JOB=1 or a T3 delegated thread with no lineage; lineage
             # alone already marks a job.
             job["origin"] = "job"
@@ -3526,9 +3529,10 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
 
         verbatim = extract_verbatim(job.get("transcript", ""))
         # The person's typed lines, decided by read_window on the original
-        # messages and queued with the job; never re-derived from the rendered
-        # window, where a rewritten machine message reads as typed. A job
-        # queued before this existed has none.
+        # messages and queued with the job (none for a job's capture, decided
+        # at enqueue); never re-derived from the rendered window, where a
+        # rewritten machine message reads as typed. A job queued before this
+        # existed has none.
         if isinstance(job.get("owner_lines"), list):
             from khipu.extract import owner_lines as _owner_lines
 
