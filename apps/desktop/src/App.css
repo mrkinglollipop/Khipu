@@ -76,7 +76,7 @@
     --border-strong: #453d33;
     --text: #ede8e1;
     --text-2: #b8b0a5;
-    --muted: #857d72;
+    --muted: #968d81;
     --accent: #e0703f;
     --accent-hover: #ea8153;
     --accent-text: #ed9067;
@@ -94,6 +94,72 @@
     --backdrop: rgba(0, 0, 0, 0.55);
   }
 }
+
+/* Settings › Look. With no choice stored, the two media blocks above follow
+   the Mac. A stored choice sets data-theme on the root; the rules below carry
+   the same values (and win on specificity over the media blocks), so Light
+   holds even while the Mac is dark. Keep them in step with the tokens above. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #16130f;
+  --surface: #1f1b17;
+  --surface-2: #262119;
+  --rail: #1a1713;
+  --select: rgba(224, 112, 63, 0.18);
+  --border: #332d26;
+  --border-strong: #453d33;
+  --text: #ede8e1;
+  --text-2: #b8b0a5;
+  --muted: #968d81;
+  --accent: #e0703f;
+  --accent-hover: #ea8153;
+  --accent-text: #ed9067;
+  --accent-soft: rgba(224, 112, 63, 0.14);
+  --on-accent: #1f0e06;
+  --ok: #63c982;
+  --ok-soft: rgba(99, 201, 130, 0.12);
+  --warn: #e3b241;
+  --warn-soft: rgba(227, 178, 65, 0.12);
+  --err: #f27059;
+  --err-soft: rgba(242, 112, 89, 0.12);
+  --ring: rgba(224, 112, 63, 0.4);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 6px 24px rgba(0, 0, 0, 0.5);
+  --backdrop: rgba(0, 0, 0, 0.55);
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #faf9f7;
+  --surface: #ffffff;
+  --surface-2: #f5f3f0;
+  --rail: #f3f1ed;
+  --select: #efe2da;
+  --border: #e5e1db;
+  --border-strong: #d5d0c8;
+  --text: #201d1a;
+  --text-2: #55504a;
+  --muted: #6e6860;
+  --accent: #a63a1e;
+  --accent-hover: #8f2f16;
+  --accent-text: #8c2d14;
+  --accent-soft: #f6e9e3;
+  --on-accent: #ffffff;
+  --ok: #2e7d43;
+  --ok-soft: #eaf5ec;
+  --warn: #96660a;
+  --warn-soft: #fbf3e0;
+  --err: #b3261e;
+  --err-soft: #fbebea;
+  --ring: rgba(166, 58, 30, 0.35);
+  --shadow-sm: 0 1px 2px rgba(32, 29, 26, 0.06);
+  --shadow-md: 0 4px 16px rgba(32, 29, 26, 0.08);
+  --backdrop: rgba(32, 29, 26, 0.45);
+}
+/* The places that set a colour of their own inside a dark media block. */
+:root[data-theme="dark"] .emb-row, :root[data-theme="dark"] .emb-job, :root[data-theme="dark"] .plans-card, :root[data-theme="dark"] .plan-block { --bar-track: color-mix(in srgb, var(--text-2) 55%, var(--surface-2)); }
+:root[data-theme="light"] .emb-row, :root[data-theme="light"] .emb-job, :root[data-theme="light"] .plans-card, :root[data-theme="light"] .plan-block { --bar-track: color-mix(in srgb, var(--text-2) 68%, var(--surface-2)); }
+:root[data-theme="dark"] .emb-dialog::backdrop { background: rgba(0, 0, 0, 0.75); }
+:root[data-theme="light"] .emb-dialog::backdrop { background: rgba(32, 29, 26, 0.72); }
 
 /* --------------------------------------------------------------------------
    Base
@@ -3734,3 +3800,6 @@ dialog.sheet-dialog { position: fixed; inset: 0 0 0 auto; z-index: 50; margin: 0
 .undo { display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s3); margin-top: var(--s2); border-radius: var(--r-sm); background: var(--surface-2); border: 1px solid var(--border-strong); font-size: var(--t-sm); }
 .undo span { flex: 1; min-width: 0; }
 .undo.err { background: var(--err-soft); border-color: color-mix(in srgb, var(--err) 35%, var(--border)); }
+
+/* Settings › Look: the two cards sit apart. */
+.look-page { display: flex; flex-direction: column; gap: var(--s4); }

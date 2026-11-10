@@ -30,6 +30,7 @@ import {
 } from "../src/FoundAccounts";
 import type { AccountRefs } from "../src/FoundAccounts";
 import App from "../src/App";
+import { applyStoredLook } from "../src/settings/lookModel";
 import { RoutingSettings } from "../src/RoutingSettings";
 import { OfflineBanner, SavedOnThisMac, WaitingToSync } from "../src/OfflineBanner";
 import { OfflineWaitsCard } from "../src/SettingsControls";
@@ -69,6 +70,8 @@ import type { Fake } from "./fakeTauri";
 
 const READING: Support = { state: "reading" };
 const HERE: Support = { state: "here", status: status9B() };
+
+applyStoredLook();
 
 function setFake(f: Fake) {
   (window as unknown as { __khipuFake?: Fake }).__khipuFake = f;

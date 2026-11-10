@@ -1,3 +1,4 @@
+import { LookPage } from "./settings/pages/Look";
 import { Component, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -619,6 +620,7 @@ type SettingsSection =
   | "another-mac"
   | "components"
   | "updates"
+  | "look"
   | "advanced";
 
 const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
@@ -633,6 +635,7 @@ const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
   ["another-mac", "Another Mac"],
   ["components", "Components"],
   ["updates", "Updates"],
+  ["look", "Look"],
   ["advanced", "Advanced"],
 ] as const;
 
@@ -5804,6 +5807,7 @@ export default function App() {
               </div>
 
               <div className="settings-pane">
+                {settingsSection === "look" ? <LookPage /> : null}
                 {settingsSection === "database" ? (
                   <>
                     <div className="section-card">

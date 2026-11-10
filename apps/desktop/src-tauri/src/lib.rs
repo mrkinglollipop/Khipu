@@ -5298,10 +5298,18 @@ async fn check_for_update_at_launch(app: AppHandle) {
     }
 }
 
+/// The "Open Khipu when this Mac starts" plugin. Building it registers
+/// nothing: a login item is made only when the page calls `enable`, from
+/// Settings › Look. The default macOS launcher is a LaunchAgent.
+fn autostart_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri_plugin_autostart::Builder::new().build()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(autostart_plugin())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
@@ -8464,5 +8472,29 @@ mod work_command_tests {
         let many: Vec<String> = (0..65).map(|i| format!(r#"{{"project":"p{i}","file":"/w{i}.json"}}"#)).collect();
         assert!(config_set_argv("work_projects", &format!("[{}]", many.join(","))).is_err());
         assert!(config_unset_argv("work_projects").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod autostart_wiring_tests {
+    // Wiring only: nothing here asks the system to add a login item.
+    #[test]
+    fn plugin_builds_without_touching_the_system() {
+        let plugin = super::autostart_plugin::<tauri::Wry>();
+        assert_eq!(tauri::plugin::Plugin::name(&plugin), "autostart");
+    }
+
+    #[test]
+    fn main_window_may_call_the_autostart_commands() {
+        let caps: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let perms = caps["permissions"].as_array().unwrap();
+        assert!(perms.iter().any(|p| p == "autostart:default"));
+    }
+
+    #[test]
+    fn run_registers_the_plugin() {
+        let src = include_str!("lib.rs");
+        assert!(src.contains(".plugin(autostart_plugin())"));
     }
 }
