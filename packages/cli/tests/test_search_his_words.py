@@ -251,3 +251,254 @@ def test_title_uses_the_first_typed_line_when_there_is_no_summary():
     assert mr.title_of("anything", [auto, "what the owner typed"], verbatim_only=True) == "what the owner typed"
     assert mr.title_of("", [auto]) == auto
     assert mr.title_of("Work.", [auto, "what the owner typed"]) == "Work."
+
+
+# ---- owner_lines: every typed line of the window is kept ---------------------
+
+from copy import deepcopy  # noqa: E402
+
+from khipu import capture, extract, forget, hub_snapshot, session_capture  # noqa: E402
+from tests.test_capture_replay_duplicate import at_the_key, pg  # noqa: E402,F401
+
+FAKE_KEY = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd'
+TYPED_ONE = f'we have to test everything ourselves, token {FAKE_KEY}\n\nand then report back'
+TYPED_TWO = 'dont stop until we are done with the purple harbour'
+ORCHESTRATOR_WINDOW = '\n\n'.join([
+    'USER: This session is being continued from a previous conversation that ran out of context. '
+    'Summary: the owner wants the lanes checked.',
+    'ASSISTANT: Picking up where we left off.',
+    'USER: Lane check (scheduled, not Matt). Quick and quiet; read every lane and report. ' + 'detail ' * 400,
+    'ASSISTANT: Lanes read.',
+    'USER: ' + TYPED_ONE,
+    '[tool] Bash',
+    'ASSISTANT: Running it.',
+    'USER: ' + TYPED_TWO,
+    'ASSISTANT: On it.',
+    'USER: <task-notification><summary>job finished: test everything ourselves</summary></task-notification>',
+])
+
+
+def _drain(transcript, *, owner_lines=True):
+    """Run the real drain over one queued job; return (capture payload, the
+    summariser's input)."""
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        job = Path(tmp) / 'job.json'
+        job.write_text(json.dumps(dict(harness='claude_code', session_id='11111111-2222-3333-4444-555555555555',
+                                       transcript=transcript, event='Stop', ts='2026-11-10T12:00:00Z')))
+        with mock.patch.object(session_capture, 'queued_jobs', return_value=[job]), \
+                mock.patch.object(session_capture, '_claim', side_effect=lambda p: p), \
+                mock.patch.object(session_capture, '_reclaim_stale', return_value=0), \
+                mock.patch.object(session_capture, '_record_drain'), \
+                mock.patch.object(hub_snapshot, 'sync_decision_changes', return_value={}), \
+                mock.patch('khipu.t3.thread_for_session', return_value=None), \
+                mock.patch.object(extract, '_generate', return_value='{"summary":"Checked the lanes."}') as gen, \
+                (mock.patch.object(extract, '_owner_lines', return_value=[]) if not owner_lines
+                 else __import__('contextlib').nullcontext()), \
+                mock.patch.object(capture, 'capture', return_value=0) as cap:
+            assert session_capture.drain()['captured'] == 1
+        return cap.call_args.args[0], [c.args for c in gen.call_args_list]
+
+
+def _land(payload):
+    return str(capture.write_pg(deepcopy(payload))['episode_id'])
+
+
+def test_orchestrator_window_keeps_both_typed_lines_and_finds_each(at_the_key, monkeypatch):
+    configure_hub(monkeypatch, at_the_key)
+    monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: [])
+    payload, _ = _drain(ORCHESTRATOR_WINDOW)
+    vb = payload['verbatim']
+    # quotes are exactly what they were: first, longest, last (all automated here)
+    assert vb['quotes'] == extract._verbatim_quotes(extract._verbatim_user_messages(ORCHESTRATOR_WINDOW))
+    assert not any(TYPED_TWO in q for q in vb['quotes'])
+    # owner_lines hold the two typed lines, whole, in order; no automated one
+    assert len(vb['owner_lines']) == 2
+    assert vb['owner_lines'][0].startswith('we have to test everything ourselves')
+    assert 'and then report back' in vb['owner_lines'][0]
+    assert vb['owner_lines'][1] == TYPED_TWO
+    eid = _land(payload)
+    with at_the_key.connect() as conn:
+        stored = conn.execute('SELECT verbatim, raw FROM episodes WHERE id = %s', (int(eid),)).fetchone()
+    # the key was redacted on the way in, same as a quote's would be
+    assert FAKE_KEY not in json.dumps(stored[0]) and FAKE_KEY not in json.dumps(stored[1])
+    assert '[REDACTED]' in stored[0]['owner_lines'][0]
+    assert stored[1]['verbatim']['owner_lines'] == stored[0]['owner_lines']
+    for mode in ('literal', 'hybrid'):
+        for query, quoted in (('test everything ourselves', 'we have to test everything ourselves'),
+                              ('purple harbour', TYPED_TWO)):
+            out = embed.hybrid_search(query, mode=mode, owner_words_only=True)['results']
+            assert [r['id'] for r in out] == [eid], (mode, query)
+            assert out[0]['quote'].startswith(quoted), (mode, query)
+            assert FAKE_KEY not in out[0]['quote']
+
+
+def test_a_forgotten_conversation_is_neither_matched_nor_quoted(at_the_key, monkeypatch):
+    configure_hub(monkeypatch, at_the_key)
+    monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: [])
+    payload, _ = _drain(ORCHESTRATOR_WINDOW)
+    eid = _land(payload)
+    assert embed.hybrid_search('purple harbour', mode='literal', owner_words_only=True)['results']
+    with at_the_key.connect() as conn, conn.cursor() as cur:
+        assert forget.forget_episode(cur, int(eid))['ok']
+        conn.commit()
+    for mode in ('literal', 'hybrid'):
+        out = embed.hybrid_search('purple harbour', mode=mode, owner_words_only=True)['results']
+        assert eid not in [r['id'] for r in out], mode
+        assert not any(TYPED_TWO in (r.get('quote') or '') for r in out)
+
+
+def test_summariser_input_is_unchanged(at_the_key):
+    with_lines, prompts = _drain(ORCHESTRATOR_WINDOW)
+    without, prompts_before = _drain(ORCHESTRATOR_WINDOW, owner_lines=False)
+    assert prompts == prompts_before                       # the model saw the same text
+    assert 'owner_lines' in with_lines['verbatim'] and 'owner_lines' not in without['verbatim']
+    assert {k: v for k, v in with_lines['verbatim'].items() if k != 'owner_lines'} == without['verbatim']
+    assert {k: v for k, v in with_lines.items() if k != 'verbatim'} == \
+           {k: v for k, v in without.items() if k != 'verbatim'}
+
+
+def test_embedded_and_ranked_text_ignore_owner_lines():
+    row = {'summary': 'Checked the lanes.', 'topics': ['lanes'], 'verbatim': {'quotes': ['q one'], 'paths': ['/a/b.py']}}
+    with_lines = deepcopy(row)
+    with_lines['verbatim']['owner_lines'] = ['dont stop until we are done with the purple harbour']
+    assert embed.episode_text(with_lines) == embed.episode_text(row)
+    assert cli._episode_rank_text('s', [], [], [], [], with_lines['verbatim']) == \
+           cli._episode_rank_text('s', [], [], [], [], row['verbatim'])
+
+
+def test_without_the_flag_owner_lines_change_nothing(hub, monkeypatch, tmp_path):
+    """Plain search (and so per-prompt recall) reads the same rows, keys and
+    text whether or not a row holds owner_lines."""
+    from tests.test_search_indexed_words import install_words
+    configure_hub(monkeypatch, hub)
+    install_words(hub, tmp_path)
+    monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: [])
+    eid = _insert(hub, 'claude_code:00000000-0000-0000-0000-000000000801', ['first owner line about lanes'])
+    queries = ('purple harbour', 'dont stop until we are done', 'owner line', 'lanes')
+
+    def every_leg():
+        out = {}
+        with hub.connect() as conn, conn.cursor() as cur:
+            for q in queries:
+                for fast in (False, True):
+                    out[(q, 'literal', fast)] = cli._literal_candidates(cur, q, 50, fast=fast)
+                out[(q, 'phrase')] = cli._literal_candidates(cur, q, 50, fast=True, owner_words=True)
+        for q in queries:
+            for mode in ('literal', 'hybrid'):
+                res = embed.hybrid_search(q, mode=mode)['results']
+                out[(q, mode)] = [{k: v for k, v in r.items() if k not in ('timing',)} for r in res]
+                out[(q, mode, 'memory')] = embed.hybrid_search(q, mode=mode, memory_fields=True)['results']
+        return out
+
+    before = every_leg()
+    with hub.connect() as conn:
+        conn.execute("UPDATE episodes SET verbatim = verbatim || %s::jsonb WHERE id = %s",
+                     (json.dumps({'owner_lines': ['dont stop until we are done with the purple harbour']}), int(eid)))
+        conn.commit()
+    after = every_leg()
+    assert after == before
+    assert not before[('purple harbour', 'hybrid')]
+    # ...while "only my words" finds it
+    out = embed.hybrid_search('purple harbour', mode='literal', owner_words_only=True)['results']
+    assert [r['id'] for r in out] == [eid]
+
+
+def test_old_row_without_the_key_still_matches_through_its_typed_quotes(hub, monkeypatch, tmp_path):
+    from tests.test_search_indexed_words import install_words
+    configure_hub(monkeypatch, hub)
+    install_words(hub, tmp_path)
+    monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: [])
+    old = _insert(hub, 'claude_code:00000000-0000-0000-0000-000000000901', ['please test everything ourselves'])
+    new = _insert(hub, 'claude_code:00000000-0000-0000-0000-000000000902', [AUTOMATED['scheduled']])
+    with hub.connect() as conn:
+        conn.execute("UPDATE episodes SET verbatim = verbatim || %s::jsonb WHERE id = %s",
+                     (json.dumps({'owner_lines': ['we should test everything ourselves again']}), int(new)))
+        conn.commit()
+    for mode in ('literal', 'hybrid'):
+        got = {r['id']: r['quote'] for r in embed.hybrid_search(
+            'test everything ourselves', mode=mode, owner_words_only=True)['results']}
+        assert got == {old: 'please test everything ourselves',
+                       new: 'we should test everything ourselves again'}, mode
+
+
+def test_owner_words_function_and_index_cover_owner_lines_and_old_rows_are_unchanged(hub, tmp_path):
+    """0051's function reads every string in verbatim, so owner_lines are in
+    the index with no new migration, and a row without the key gives the same
+    value it always did (its index entry stays valid)."""
+    from tests.test_search_indexed_words import install_words
+    install_words(hub, tmp_path)
+    old = {'quotes': ['Keep It'], 'paths': ['/A/b.py'], 'note': 'N'}
+    with hub.connect() as conn:
+        same = conn.execute(
+            "SELECT public.khipu_owner_words(%s::jsonb), "
+            "lower(COALESCE((SELECT string_agg(v #>> '{}', chr(10)) FROM "
+            "jsonb_path_query(%s::jsonb, 'strict $.** ? (@.type() == \"string\")') AS v), ''))",
+            (json.dumps(old), json.dumps(old))).fetchone()
+        assert same[0] == same[1] and sorted(same[0].split('\n')) == ['/a/b.py', 'keep it', 'n']
+        assert 'purple harbour' in conn.execute(
+            'SELECT public.khipu_owner_words(%s::jsonb)',
+            (json.dumps({**old, 'owner_lines': ['the Purple Harbour']}),)).fetchone()[0]
+        names = [r[0] for r in conn.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'episodes' AND indexdef LIKE '%khipu_owner_words%'")]
+        assert names == ['idx_episodes_owner_words_trgm']
+
+
+def test_owner_lines_caps_keep_the_oldest_and_the_newest():
+    msgs = [f'typed line {i:03d} ' + 'w' * 20 for i in range(100)]
+    window = '\n\n'.join(f'USER: {m}\n\nASSISTANT: ok' for m in msgs)
+    lines = extract.extract_verbatim(window)['owner_lines']
+    assert len(lines) == extract.OWNER_LINES_MAX
+    half = extract.OWNER_LINES_MAX // 2
+    assert lines[:half] == msgs[:half] and lines[half:] == msgs[-half:]
+    long = ['L%02d ' % i + 'x' * 3000 for i in range(30)]
+    lines = extract.extract_verbatim('\n\n'.join(f'USER: {m}' for m in long))['owner_lines']
+    assert all(len(x) == extract.OWNER_LINE_CHARS for x in lines)
+    assert sum(len(x) for x in lines) <= extract.OWNER_LINES_TOTAL_CHARS
+    assert lines[0].startswith('L00') and lines[-1].startswith('L29')
+    # duplicates kept once; automated turns and capture-now's stand-in never
+    window = '\n\n'.join(['USER: same line', 'USER: same line', 'USER: ' + AUTOMATED['job brief'],
+                          'USER: Capture note: remember this', 'USER: ' + AUTOMATED['compaction summary']])
+    assert extract.extract_verbatim(window)['owner_lines'] == ['same line']
+    assert 'owner_lines' not in extract.extract_verbatim('USER: ' + AUTOMATED['scheduled'])
+
+
+def test_owner_lines_never_fail_a_capture():
+    with mock.patch('khipu.turn_text.is_automated', side_effect=RuntimeError('boom')):
+        out = extract.extract_verbatim('USER: hello there')
+    assert out['quotes'] == ['hello there'] and 'owner_lines' not in out
+
+
+def test_redact_payload_treats_owner_lines_as_quotes():
+    from khipu import redact
+    payload = {'summary': 's', 'verbatim': {'quotes': [f'q {FAKE_KEY}'], 'owner_lines': [f'o {FAKE_KEY}']}}
+    redact.redact_payload(payload)
+    assert payload['verbatim'] == {'quotes': ['q [REDACTED]'], 'owner_lines': ['o [REDACTED]']}
+    stored = capture._redact_capture_values({'verbatim': {'quotes': [FAKE_KEY], 'owner_lines': [FAKE_KEY]}})
+    assert stored['verbatim']['quotes'] == stored['verbatim']['owner_lines'] == ['[REDACTED]']
+
+
+def test_offline_replica_search_ignores_owner_lines_and_owner_words_needs_the_hub(monkeypatch, tmp_path, capsys):
+    """The replica copies raw (owner_lines ride inside it, as quotes do) but
+    its offline search reads summary/topics/decisions/preferences/people only,
+    and "only my words" is refused offline, as before."""
+    import argparse
+    from tests.test_audit_recall_search import snapshot
+    con = snapshot(monkeypatch, tmp_path)
+    raw = json.dumps({'verbatim': {'quotes': ['q'], 'owner_lines': ['the purple harbour line']}})
+    con.execute("INSERT INTO episodes (id,ts,summary,session_id,raw) VALUES (1,'2026-11-10','lanes checked','codex:x',?)",
+                (raw,))
+    con.commit()
+    assert not hub_snapshot.search_stale_payload('purple harbour', 12)['results']
+    assert [r['id'] for r in hub_snapshot.search_stale_payload('lanes checked', 12)['results']] == ['1']
+
+    def offline(**kw):
+        raise __import__('psycopg').OperationalError('connection refused')
+    monkeypatch.setattr(embed, 'hybrid_search', offline)
+    monkeypatch.setattr(hub_snapshot, 'hub_connection_failed', lambda exc: True)
+    args = argparse.Namespace(query='purple harbour', limit=5, mode='literal', owner_words=True)
+    rc = cli.cmd_search(args)
+    out = capsys.readouterr().out
+    assert rc == 2 and 'needs the hub' in out

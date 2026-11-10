@@ -197,7 +197,7 @@ def redact_payload(payload: dict[str, Any]) -> int:
             total += n
     verbatim = payload.get("verbatim")
     if isinstance(verbatim, dict):
-        for k in ("errors", "commands", "paths", "quotes"):
+        for k in ("errors", "commands", "paths", "quotes", "owner_lines"):
             if k in verbatim:
                 verbatim[k], n = _redact_free_text(verbatim[k])
                 total += n

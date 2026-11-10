@@ -111,8 +111,12 @@ class RedactSecretsTest(unittest.TestCase):
             "preferences": [],
             "open_loops": [{"kind": "followup", "text": "rotate xoxb-1234567890-abcdefghij"}],
             "topic_pages": [{"slug": "a", "body": "dsn=postgres://u:pw12345678@h/db"}],
+            "verbatim": {"quotes": ["key ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd"],
+                         "owner_lines": ["key ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd"]},
         }
         n = redact.redact_payload(payload)
+        self.assertEqual(payload["verbatim"]["owner_lines"], payload["verbatim"]["quotes"])
+        self.assertNotIn("ghp_", payload["verbatim"]["owner_lines"][0])
         self.assertGreaterEqual(n, 4)
         self.assertNotIn("AIzaSy", payload["summary"])
         self.assertNotIn("ghp_", payload["decisions"][0])
