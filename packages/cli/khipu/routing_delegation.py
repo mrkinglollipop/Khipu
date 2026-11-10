@@ -51,6 +51,14 @@ from khipu import hook_shape, wire
 # Claude Code's subagent tool (``Task`` in older versions) and Codex's native
 # one (``spawn_agent``).
 AGENT_TOOLS = frozenset({"Agent", "Task", "spawn_agent"})
+# The Claude desktop app's tools that start another conversation from this
+# one (``start_session``) or hand this one's work over to a new one
+# (``hand_off_to_session``): the new conversation's first turn is this call's
+# brief, delivered with no wrapper, so every text field of the call
+# (``prompt``, ``background``, ``remaining_plan``, ``title``) is noted
+# (``note_brief``); no routing push goes with it. Claude Code only
+# (``integrations.CLAUDE_DELEGATION_MATCHER``).
+START_SESSION_TOOLS = frozenset({"mcp__ccd_session__start_session", "mcp__ccd_session__hand_off_to_session"})
 
 
 def _aegis(environ) -> bool:
@@ -73,7 +81,7 @@ def might_delegate(payload: dict) -> bool:
     """Whether this call's tool can hand work on at all, from its name
     alone: no file, setting or module is read."""
     name = _tool_name(payload)
-    return name is not None and (name in AGENT_TOOLS or _is_delegate_task(name))
+    return name is not None and (name in AGENT_TOOLS or name in START_SESSION_TOOLS or _is_delegate_task(name))
 
 
 def delegation_kind(payload: dict) -> str | None:
@@ -510,7 +518,7 @@ def briefs_of(payload: dict) -> list[str]:
     tool_input = payload.get("tool_input") or payload.get("toolInput")
     if name is None or not isinstance(tool_input, dict):
         return []
-    if _is_delegate_task(name):
+    if _is_delegate_task(name) or name in START_SESSION_TOOLS:
         return _texts(tool_input)
     if name in _BRIEF_FIELDS:
         for field in _BRIEF_FIELDS[name]:
