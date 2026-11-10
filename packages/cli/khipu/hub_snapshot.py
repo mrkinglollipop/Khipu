@@ -842,6 +842,38 @@ def _snapshot_table_columns(con: sqlite3.Connection, table: str) -> set[str]:
         return set()
 
 
+def _text_key_in(con: sqlite3.Connection, table: str, column: str, ids: Sequence[Any]) -> tuple[str, list[Any]]:
+    """SQL for ``CAST(<column> AS TEXT) IN (<ids as text>)`` and its
+    parameters, answering the same rows. On a column with INTEGER affinity
+    (``episodes.id``, ``decisions.episode_id``) a stored value is an integer,
+    so its text is a canonical decimal: the clause becomes ``<column> IN
+    (<those ids as integers>)``, which SQLite answers from the column's index.
+    The CAST form scanned the whole table (41,000 episodes, 145,000
+    decisions) on every call, four to six calls per prompt (2026-11-09)."""
+    affinity = ""
+    try:
+        for row in con.execute(f"PRAGMA table_info({table})"):
+            if row[1] == column:
+                affinity = str(row[2] or "").upper()
+                break
+    except Exception:  # noqa: BLE001 — the CAST form below still answers
+        affinity = ""
+    if "INT" in affinity:
+        numbers: list[Any] = []
+        for raw in ids:
+            text = str(raw)
+            try:
+                number = int(text)
+            except ValueError:
+                continue
+            # "007", " 7", "7_0" and anything past 64 bits name no stored integer.
+            if str(number) == text and -(2 ** 63) <= number < 2 ** 63:
+                numbers.append(number)
+        return f"{column} IN ({','.join('?' for _ in numbers)})", numbers
+    texts = [str(raw) for raw in ids]
+    return f"CAST({column} AS TEXT) IN ({','.join('?' for _ in texts)})", texts
+
+
 def decision_counts_snapshot(
     con: sqlite3.Connection, episode_ids: Sequence[Any]
 ) -> dict[str, tuple[int, int, int]] | None:
@@ -862,7 +894,7 @@ def decision_counts_snapshot(
     try:
         has_retract = "retracted_at" in cols
         retract_expr = "retracted_at IS NOT NULL" if has_retract else "0"
-        placeholders = ",".join("?" for _ in episode_ids)
+        key_in, key_params = _text_key_in(con, "decisions", "episode_id", episode_ids)
         fence = forget_fence_sql(con, "decisions", "episode_id")
         rows = con.execute(
             f"""
@@ -871,10 +903,10 @@ def decision_counts_snapshot(
                    SUM(CASE WHEN NOT ({retract_expr}) AND superseded_by IS NOT NULL THEN 1 ELSE 0 END),
                    SUM(CASE WHEN ({retract_expr}) THEN 1 ELSE 0 END)
             FROM decisions
-            WHERE CAST(episode_id AS TEXT) IN ({placeholders}){fence}
+            WHERE {key_in}{fence}
             GROUP BY episode_id
             """,
-            [str(e) for e in episode_ids],
+            key_params,
         ).fetchall()
         return {eid: (int(c or 0), int(s or 0), int(r or 0)) for eid, c, s, r in rows}
     except Exception:  # noqa: BLE001 — validity is best-effort metadata, never a search failure
@@ -8295,9 +8327,9 @@ def snapshot_filter_live_sources(
         if key not in columns:
             continue
         predicate = " AND deleted_at IS NULL" if "deleted_at" in columns else ""
+        key_in, key_params = _text_key_in(con, table, key, ids)
         live[knd] = {str(r[0]) for r in con.execute(
-            f"SELECT {key} FROM {table} WHERE CAST({key} AS TEXT) IN "
-            f"({','.join('?' for _ in ids)}){predicate}", ids,
+            f"SELECT {key} FROM {table} WHERE {key_in}{predicate}", key_params,
         )}
     return [r for r in rows if r.get("kind") not in live
             or str(r["id"]) in live[r["kind"]]]
@@ -8321,7 +8353,7 @@ def snapshot_row_metadata(
     if episode_ids:
         episode_cols = _snapshot_table_columns(con, "episodes")
         if "id" in episode_cols:
-            placeholders = ",".join("?" for _ in episode_ids)
+            key_in, key_params = _text_key_in(con, "episodes", "id", episode_ids)
             ts_expr = "ts" if "ts" in episode_cols else "NULL"
             if {"project", "scope"} <= episode_cols:
                 project_expr = "COALESCE(project, scope)"
@@ -8338,8 +8370,8 @@ def snapshot_row_metadata(
             for eid, ts, proj, deleted, placeholder in con.execute(
                 f"SELECT CAST(id AS TEXT), {ts_expr}, {project_expr}, {deleted_expr}, "
                 f"{placeholder_expr} "
-                f"FROM episodes WHERE CAST(id AS TEXT) IN ({placeholders})",
-                ([PLACEHOLDER_SUMMARY] if "summary" in episode_cols else []) + episode_ids,
+                f"FROM episodes WHERE {key_in}",
+                ([PLACEHOLDER_SUMMARY] if "summary" in episode_cols else []) + key_params,
             ).fetchall():
                 meta[("episode", eid)] = {
                     "ts": ts, "project": proj, "deleted": deleted is not None,

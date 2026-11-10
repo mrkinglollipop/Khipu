@@ -66,6 +66,19 @@ from khipu.t3 import handoff_thread, is_helper_session, strip_handoff
 # single prompt is not something a session can afford. Fail open on timeout.
 TIMEOUT_S = 1.2
 
+# On a busy Mac (a load average at or over its core count) the warm recall
+# service's client waits longer for its answer (bin/khipu-recall-client.py,
+# BUSY_ANSWER_TIMEOUT_S 2.2 s against 1.6 s), and the search may use that
+# time up to BUSY_TIMEOUT_S, keeping ANSWER_MARGIN_S for the answer to reach
+# the client (1.6 - 0.4 is TIMEOUT_S). The owner would rather a prompt wait a
+# second longer and get its memory: on the M5 at load 60 to 400, 72 of 100
+# searched prompts got nothing back by 1.2 s (2026-11-09). The harness stops
+# the hook at 3 s, so 0.8 s stays for the shell, the client's start and the
+# output. A search with no deadline from the client (the one-shot hook with
+# the service down, and so the promotion gate's replays) keeps TIMEOUT_S.
+BUSY_TIMEOUT_S = 1.8
+ANSWER_MARGIN_S = 0.4
+
 # Phase 0 session C (finding B10, docs/research/hindsight-plan-review-
 # 2026-09-28.md): how long `_snapshot_search_hits` waits for the query-
 # embedding leg specifically, inside the outer TIMEOUT_S. The gap between
@@ -2283,7 +2296,7 @@ def _wake_replica_job() -> None:
 def _snapshot_search_hits(
     prompt: str, *, project: str | None, tz: str | None = None,
     started: float | None = None, progress: dict[str, Any] | None = None,
-    deadline: float | None = None,
+    deadline: float | None = None, stretch_s: float = 0.0,
 ) -> dict[str, Any]:
     # forget-fence source: prior_work_for_prompt fences the push
     """Lexical + cosine, RRF-fused, entirely against the local sqlite
@@ -2306,7 +2319,8 @@ def _snapshot_search_hits(
     releases the GIL for the bulk of its own work — overlapping the legs is
     a clear win now instead of contention. Only the cosine leg waits, and
     only until ``LOCAL_LANE_DEADLINE_S``: past that, this returns the
-    lexical-only result immediately. The cosine thread keeps running in the
+    lexical-only result immediately (plus ``stretch_s``, the time a busy
+    Mac's search was given past TIMEOUT_S). The cosine thread keeps running in the
     background regardless (daemon — never blocks process exit) and still
     warms the query-embedding cache on completion, the same posture as
     ``_hub_hits_budgeted``'s legs.
@@ -2336,7 +2350,7 @@ def _snapshot_search_hits(
     # here instead let the project lookup before this call eat the margin
     # between the two limits, and a late embedding then cost the keyword
     # rows too (2026-09-29: 25 of 28 real prompts under heavy machine load).
-    local_deadline = (started if started is not None else time.monotonic()) + LOCAL_LANE_DEADLINE_S
+    local_deadline = (started if started is not None else time.monotonic()) + LOCAL_LANE_DEADLINE_S + stretch_s
     deadline = min(deadline, local_deadline) if deadline is not None else local_deadline
 
     profile = hub_snapshot.active_snapshot_profile()
@@ -2676,7 +2690,7 @@ def _hub_known_down() -> dict[str, Any] | None:
 def _search_hits(
     prompt: str, *, cwd: str | None, limit: int = TOP_N, tz: str | None = None,
     progress: dict[str, Any] | None = None,
-    deadline: float | None = None,
+    deadline: float | None = None, stretch_s: float = 0.0,
 ) -> dict[str, Any]:
     # forget-fence source: prior_work_for_prompt fences the push
     """The gated search itself (no timeout, no dedup — those wrap this).
@@ -2704,7 +2718,8 @@ def _search_hits(
     try:
         _enter_stage(progress, "keyword")
         result = _snapshot_search_hits(
-            prompt, project=project, tz=tz, started=started, progress=progress, deadline=deadline
+            prompt, project=project, tz=tz, started=started, progress=progress, deadline=deadline,
+            stretch_s=stretch_s,
         )
         return _trim_result(result, limit)
     except _SnapshotUnusable as exc:
@@ -3347,6 +3362,13 @@ def prior_work_for_prompt(
     progress: dict[str, Any] = {}
     search_deadline = t0 + (max(0.05, budget_ms / 1000.0) + _BUDGET_SAFETY_SLACK_S
                             if budget_ms is not None else TIMEOUT_S)
+    # A caller that waits longer (the recall service's client on a busy Mac)
+    # gives the search that time, up to BUSY_TIMEOUT_S; a client waiting the
+    # usual 1.6 s gives none, so an idle Mac's limits are what they were.
+    stretch_s = 0.0
+    if budget_ms is None and deadline is not None:
+        stretch_s = max(0.0, min(t0 + BUSY_TIMEOUT_S, deadline - ANSWER_MARGIN_S) - search_deadline)
+        search_deadline += stretch_s
     deadline = min(deadline, search_deadline) if deadline is not None else search_deadline
     thread_box: dict[str, Any] = {}
     thread_worker = None
@@ -3378,7 +3400,7 @@ def prior_work_for_prompt(
         else:
             result = _run_with_timeout(
                 _search_hits, max(0, deadline - time.monotonic()), prompt, cwd=cwd, limit=limit, tz=tz,
-                progress=progress, deadline=deadline,
+                progress=progress, deadline=deadline, stretch_s=stretch_s,
             )
             hits = result.get("hits") or []
             legs = result.get("legs") or []
@@ -3400,7 +3422,7 @@ def prior_work_for_prompt(
             degraded_legs = result.get("degraded_legs") or []
             interpretation = result.get("time_interpretation")
         else:
-            budget_s = (budget_ms / 1000.0) if budget_ms is not None else TIMEOUT_S
+            budget_s = (budget_ms / 1000.0) if budget_ms is not None else round(TIMEOUT_S + stretch_s, 1)
             reason = f"timeout>{budget_s}s"
             degraded = degraded or "timeout"
             hits = []

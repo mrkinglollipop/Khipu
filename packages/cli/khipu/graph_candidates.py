@@ -551,10 +551,11 @@ def _replica_topic_recent_episodes(con, slug: str, *, seed_rank: int, seed_key: 
         # holds, or the forgotten episode's summary comes back as a candidate.
         live: set[str] = set()
         if cached:
-            ids = [str(eid) for _ts, eid, _summary in cached]
+            from khipu.hub_snapshot import _text_key_in
+
+            key_in, key_params = _text_key_in(con, "episodes", "id", [str(eid) for _ts, eid, _summary in cached])
             live = {str(row[0]) for row in con.execute(
-                f"SELECT CAST(id AS TEXT) FROM episodes WHERE CAST(id AS TEXT) IN "
-                f"({', '.join('?' * len(ids))})", ids).fetchall()}
+                f"SELECT CAST(id AS TEXT) FROM episodes WHERE {key_in}", key_params).fetchall()}
         return [
             _recent_episode_row(eid, ts, summary, seed_rank=seed_rank, seed_key=seed_key)
             for ts, eid, summary in cached if str(eid) in live

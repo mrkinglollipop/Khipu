@@ -984,6 +984,55 @@ class PromptRecallSnapshotStatusTest(unittest.TestCase):
         self.assertEqual(_replica_schema_warnings({"prompt_recall_snapshot": out}), [])
 
 
+class TextKeyInUsesTheIndexTest(unittest.TestCase):
+    """The replica's id lookups ask for ids as text. ``CAST(id AS TEXT) IN``
+    scanned all 41,000 episodes and 145,000 decisions on every call (four to
+    six calls per prompt); ``_text_key_in`` must answer the same rows from the
+    index."""
+
+    IDS = ["1", "2", "3", "007", " 2", "2_0", "-1", "abc", "\u0663", str(10 ** 30), str(2 ** 63), str(-(2 ** 63))]
+
+    def _con(self) -> sqlite3.Connection:
+        con = sqlite3.connect(":memory:")
+        hs._create_schema(con)
+        for i in (1, 2, 3, 7, -1):
+            con.execute("INSERT INTO episodes (id, ts, summary) VALUES (?, '2026-09-01T00:00:00Z', 'x')", (i,))
+        for i, ep in ((1, 1), (2, 1), (3, 3), (4, None), (5, 7)):
+            con.execute("INSERT INTO decisions (id, text, episode_id) VALUES (?, 'd', ?)", (i, ep))
+        con.execute("INSERT INTO topics (slug, title, body) VALUES ('7', 'seven', 'b')")
+        con.execute("INSERT INTO topics (slug, title, body) VALUES ('t1', 'one', 'b')")
+        return con
+
+    def test_the_same_rows_as_the_cast_form(self) -> None:
+        con = self._con()
+        for table, column in (("episodes", "id"), ("decisions", "episode_id"), ("topics", "slug")):
+            old = set(con.execute(
+                f"SELECT rowid FROM {table} WHERE CAST({column} AS TEXT) IN ({','.join('?' for _ in self.IDS)})",
+                self.IDS).fetchall())
+            sql, params = hs._text_key_in(con, table, column, self.IDS)
+            new = set(con.execute(f"SELECT rowid FROM {table} WHERE {sql}", params).fetchall())
+            self.assertEqual(new, old, table)
+            self.assertTrue(old or table == "topics", table)
+
+    def test_integer_columns_are_searched_by_index(self) -> None:
+        con = self._con()
+        for table, column in (("episodes", "id"), ("decisions", "episode_id")):
+            sql, params = hs._text_key_in(con, table, column, ["1", "3"])
+            plan = " ".join(str(r[-1]) for r in con.execute(f"EXPLAIN QUERY PLAN SELECT 1 FROM {table} WHERE {sql}",
+                                                            params))
+            self.assertIn("SEARCH", plan, table)
+            self.assertNotIn("SCAN", plan, table)
+
+    def test_no_usable_id_matches_nothing(self) -> None:
+        con = self._con()
+        sql, params = hs._text_key_in(con, "episodes", "id", ["abc", "007"])
+        self.assertEqual(con.execute(f"SELECT COUNT(*) FROM episodes WHERE {sql}", params).fetchone(), (0,))
+
+    def test_a_missing_table_falls_back_to_the_cast_form(self) -> None:
+        sql, params = hs._text_key_in(sqlite3.connect(":memory:"), "episodes", "id", [1, "2"])
+        self.assertEqual((sql, params), ("CAST(id AS TEXT) IN (?,?)", ["1", "2"]))
+
+
 def _make_decisions_snapshot(data: Path) -> Path:
     """A version-2 replica with two decisions on episode 1 (one current, one
     superseded) and a topic carrying ``superseded_by``."""
