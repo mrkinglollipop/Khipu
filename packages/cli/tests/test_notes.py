@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import tempfile
 import textwrap
 import unittest
@@ -613,13 +614,65 @@ class WatcherPathTest(unittest.TestCase):
             self.assertEqual(got["folders_not_listed"], [str(memory)])
             self.assertEqual(len(self._live()), 3)
             self.assertTrue(any("could not be listed" in str(c) for c in log.call_args_list))
-            # the same folder missing outright is treated the same way
-            shutil_target = memory.parent / "gone"
-            memory.rename(shutil_target)
-            got = notes.reconcile(dry_run=False, changed_only=True)
-            self.assertEqual((got["deleted"], len(self._live())), (0, 3))
-
         self._run(body)
+
+    def _with_second_project(self, body):
+        def wrapped(memory, connect):
+            root = memory.parent.parent
+            for name in ("b1",):
+                _write(root / "-repo-b" / "memory" / f"{name}.md", _sample_note_text().replace("khipu-state-of-play", name))
+            notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual(len(self._live()), 4)
+            body(root, connect)
+
+        self._run(wrapped)
+
+    def test_a_deleted_project_folder_with_a_listable_parent_retires_its_notes(self):
+        def body(root, _connect):
+            shutil.rmtree(root / "-repo-b" / "memory")
+            got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual((got["deleted"], got["tombstone"]["tombstoned"]), (1, 1))
+            self.assertEqual(len(self._live()), 3)
+            self.assertEqual(notes.reconcile(dry_run=False, changed_only=True)["deleted"], 0)
+
+        self._with_second_project(body)
+
+    def test_a_deleted_project_folder_respects_the_per_pass_limit(self):
+        def body(root, _connect):
+            shutil.rmtree(root / "-repo-a" / "memory")  # 3 of 4 live notes: looks like a blip
+            got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertTrue(got["tombstone"]["skipped"])
+            self.assertEqual(len(self._live()), 4)
+
+        self._with_second_project(body)
+
+    def test_a_folder_whose_parent_is_missing_too_retires_nothing(self):
+        def body(root, _connect):
+            shutil.rmtree(root / "-repo-b")
+            got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual(got["deleted"], 0)
+            self.assertEqual(got["folders_not_listed"], [str(root / "-repo-b" / "memory")])
+            self.assertEqual(len(self._live()), 4)
+
+        self._with_second_project(body)
+
+    def test_a_folder_that_exists_but_is_unreadable_retires_nothing(self):
+        def body(root, _connect):
+            target = root / "-repo-b" / "memory"
+            for f in target.glob("*.md"):
+                f.unlink()
+            real = notes.os.listdir
+
+            def unreadable(path):
+                if Path(path) == target:
+                    raise PermissionError("not today")
+                return real(path)
+
+            with mock.patch.object(notes.os, "listdir", unreadable):
+                got = notes.reconcile(dry_run=False, changed_only=True)
+            self.assertEqual((got["deleted"], len(self._live())), (0, 4))
+
+        self._with_second_project(body)
 
     def test_the_stop_hook_and_nightly_no_longer_scan_notes(self):
         self.assertFalse(hasattr(notes, "hook_reconcile"))

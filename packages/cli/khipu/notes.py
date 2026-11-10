@@ -616,12 +616,27 @@ def _any_memory_root_exists() -> bool:
     return bool(cursor_memory_roots()) or bool(aegis_memory_roots())
 
 
+def _absent_from_listable_parent(folder: str) -> set[str] | None:
+    """An empty listing (every note in it is gone) when ``folder`` does not
+    exist but its parent can be listed and does not hold it; ``None`` (cannot
+    tell, tombstone nothing) when the parent is missing or unreadable too."""
+    parent = os.path.dirname(folder)
+    try:
+        names = set(os.listdir(parent))
+    except OSError:
+        return None
+    return set() if os.path.basename(folder) not in names else None
+
+
 def _deleted_indexed_notes(files_state: dict, present_paths: set[str]) -> tuple[dict[str, str], list[str]]:
     """Indexed notes (from the state file) whose file is gone, found by listing
     each note's folder only: no note is opened. Returns ``({path: slug}, folders
     that could not be listed)``. A folder that is missing or unreadable at this
     moment (an unmounted volume, a permission error) contributes nothing to the
-    first result, so a blip cannot tombstone its notes."""
+    first result, so a blip cannot tombstone its notes. A folder that does not
+    exist counts as deleted only when its parent folder can be listed and no
+    longer holds it (the volume is there); a missing parent, or a folder that
+    exists but cannot be read, tombstones nothing."""
     listings: dict[str, set[str] | None] = {}
     gone: dict[str, str] = {}
     for path, entry in files_state.items():
@@ -631,6 +646,10 @@ def _deleted_indexed_notes(files_state: dict, present_paths: set[str]) -> tuple[
         if parent not in listings:
             try:
                 listings[parent] = set(os.listdir(parent))
+            except FileNotFoundError:
+                # Gone, or the volume is not there? Only a folder that is
+                # absent from a parent we can list right now counts as deleted.
+                listings[parent] = _absent_from_listable_parent(parent)
             except OSError:
                 listings[parent] = None
         names = listings[parent]
