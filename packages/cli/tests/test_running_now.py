@@ -1,0 +1,206 @@
+"""Running now (`khipu running --json`, app slice B4): the work view's jobs joined with the runners' heartbeat,
+shared between Macs through the B3 status row."""
+from __future__ import annotations
+
+import json
+from datetime import timedelta
+
+import pytest
+
+from khipu import db, macs, running_now, work
+from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests.test_macs import ME, YOU, put_other, world  # noqa: F401
+from tests.test_work import ACCT_ID, NOW, _t, entry, job, put, summary, view_for
+
+BEAT = "2026-10-15T19:59:50Z"
+
+
+def status(name="lanes", **over):
+    base = {"name": name, "heartbeat_at": BEAT, "silent": False, "unreadable": False}
+    base.update(over)
+    return base
+
+
+def runners_for(tmp_path, jobs, statuses, runner="lanes", **cfg_over):
+    path = put(tmp_path, summary(jobs=jobs, prs=[], trains=[], runner={"name": runner, "interval_s": 20}))
+    view = view_for(path, work_job_quiet_after=300, work_finished_for=600, **cfg_over)
+    return running_now.build_runners(view, statuses, NOW), view
+
+
+def test_one_mac_with_jobs_joined_to_its_runner_heartbeat(tmp_path):
+    runners, view = runners_for(tmp_path, [job("a", model="Sonnet 5.5"),
+                                           job("b", state="waiting", summary="Waiting for a review", now=[])],
+                                [status()])
+    assert [r["name"] for r in runners] == ["lanes"]
+    [r] = runners
+    assert r["heartbeat_at"] == BEAT and r["silent"] is False and r["silent_since"] is None
+    first, second = r["jobs"]
+    assert first == {"summary": "Fixing the two review findings", "now_line": "Running the full test suite",
+                     "now_at": _t(30), "state": "running", "quiet": False, "quiet_for_s": None, "account_key": ACCT_ID,
+                     "account_label": "Claude second", "model": "Sonnet 5.5", "started_at": _t(600),
+                     "updated_at": _t(30), "ended_at": None}
+    assert second["state"] == "waiting" and second["now_line"] is None and second["now_at"] is None
+    assert list(first) == list(running_now.JOB_FIELDS) and list(r) == list(running_now.RUNNER_FIELDS)
+    # not pull requests, trains or the ledger
+    assert "prs" not in json.dumps(runners) and view["counts"]["running"] == 1
+
+
+def test_a_runner_with_no_heartbeat_match_shows_no_report_yet(tmp_path):
+    runners, _ = runners_for(tmp_path, [job()], [status("someone-else")], runner="lanes")
+    r = next(x for x in runners if x["name"] == "lanes")
+    assert [x["name"] for x in runners] == ["lanes", "someone-else"] and r["heartbeat_at"] is None and r["silent"] is False
+    assert r["jobs"][0]["state"] == "running"
+    names = [x["name"] for x in running_now.build_runners({"projects": [], "live": []}, [status("someone-else")], NOW)]
+    assert names == ["someone-else"]  # a runner that reports but has no jobs is still listed, empty
+
+
+def test_a_silent_runner_shows_its_jobs_as_unknown_with_what_it_last_said(tmp_path):
+    silent = status(heartbeat_at="2026-10-15T19:40:00Z", silent=True)
+    [r], _ = runners_for(tmp_path, [job("a"), job("b", state="done", ended_at=_t(60), updated_at=_t(60))], [silent])
+    assert r["silent"] is True and r["silent_since"] == "2026-10-15T19:40:00Z"
+    live, ended = r["jobs"]
+    assert live["state"] == "unknown" and live["now_line"] == "Running the full test suite" and live["now_at"] == _t(30)
+    assert live["quiet"] is False
+    assert ended["state"] == "done"  # a finished job is still finished
+    assert r["last_finished_at"] == _t(60)
+    unreadable = status(unreadable=True)
+    [u], _ = runners_for(tmp_path, [job()], [unreadable])
+    assert u["jobs"][0]["state"] == "unknown"
+
+
+def test_a_quiet_job_says_how_long(tmp_path):
+    [r], _ = runners_for(tmp_path, [job("a", updated_at=_t(900), now=[{"at": _t(900), "text": "Still compiling"}])],
+                         [status()])
+    [j] = r["jobs"]
+    assert j["state"] == "running" and j["quiet"] is True and j["quiet_for_s"] == 900 and j["now_line"] == "Still compiling"
+    counts = running_now._counts([{"stale": False, "runners": [r]}])
+    assert counts == {"running": 1, "waiting": 0}
+
+
+def test_an_ended_job_is_kept_for_work_finished_for_then_goes(tmp_path):
+    fresh = job("a", state="done", ended_at=_t(300), updated_at=_t(300))
+    old = job("b", state="failed", ended_at=_t(1200), updated_at=_t(1200))
+    [r], _ = runners_for(tmp_path, [fresh, old], [status()])
+    assert [j["state"] for j in r["jobs"]] == ["done"] and r["jobs"][0]["ended_at"] == _t(300)
+    assert r["last_finished_at"] == _t(300)
+    [gone], _ = runners_for(tmp_path, [old], [status()])
+    assert gone["jobs"] == [] and gone["last_finished_at"] is None
+
+
+def test_the_projection_keeps_only_the_listed_fields_and_no_path():
+    dirty = [{"name": "lanes", "heartbeat_at": BEAT, "silent": False, "home": "/Users/matt", "transcript": "secret words",
+              "jobs": [{"summary": "Fix the thing in /Users/matt/Code/x/secret.py now", "now_line": "x" * 300,
+                        "now_at": "2026-10-15T19:59:00Z", "state": "running", "prompt": "do the private thing",
+                        "account_key": "claude|/Users/matt/.claude", "account_label": "/Users/matt",
+                        "model": "Opus", "cwd": "/Users/matt"},
+                       {"summary": "bad state", "state": "exploding"}, {"state": "running"}, "nonsense"]},
+             {"name": "/Users/matt/runner", "jobs": []}, "nonsense"]
+    [runner] = running_now.project_runners(dirty)
+    assert list(runner) == list(running_now.RUNNER_FIELDS)
+    [j] = runner["jobs"]
+    assert list(j) == list(running_now.JOB_FIELDS)
+    assert len(j["now_line"]) <= running_now.NOW_CHARS and j["account_key"] is None and j["account_label"] is None
+    blob = json.dumps(runner)
+    for leak in ("/Users", "secret", "private", "transcript", "cwd", "home", "claude|"):
+        assert leak not in blob
+    assert running_now.project_runners("nonsense") is None and running_now.project_runners([]) == []
+
+
+def test_the_row_carries_the_running_part_as_a_closed_list(world):  # noqa: F811
+    runners = [{"name": "lanes", "heartbeat_at": BEAT, "silent": False, "silent_since": None, "last_finished_at": None,
+                "jobs": [{k: None for k in running_now.JOB_FIELDS} | {"summary": "Fixing", "state": "running"}]}]
+    row = macs.project({"name": "M1", "running": {"count": 1, "silent": [], "runners": runners, "extra": "x"}})
+    assert list(row["running"]) == list(macs.RUNNING_FIELDS) and row["running"]["runners"][0]["jobs"][0]["summary"] == "Fixing"
+    assert macs.project({"running": {"count": 1, "silent": []}})["running"]["runners"] is None
+    macs.publish({"name": "M1", "running": {"count": 1, "silent": [], "runners": runners}})
+    world.execute("UPDATE mac_status SET running = jsonb_set(running, '{runners,0,jobs,0,summary}', "
+                  "'\"Fix /Users/matt/x/y.py\"'::jsonb) || '{\"cwd\": \"/Users/matt\"}'::jsonb WHERE mac = %s", (ME,))
+    world.commit()
+    [back], how = macs.read_rows()
+    assert how == "ok" and "/Users" not in json.dumps(back) and "cwd" not in back["running"]
+
+
+def test_this_macs_row_publishes_its_running_jobs(world, monkeypatch):  # noqa: F811
+    runners = [{"name": "lanes", "heartbeat_at": BEAT, "silent": False, "silent_since": None, "last_finished_at": None,
+                "jobs": []}]
+    monkeypatch.setattr(running_now, "this_mac_runners", lambda *a, **k: runners)
+    assert macs.publish()["ok"]
+    [mine] = [r for r in macs.read_rows()[0] if r["mac"] == ME]
+    assert mine["running"]["runners"][0]["name"] == "lanes"
+    assert macs.local_row()["running"] is None or macs.local_row()["running"].get("runners") is None  # a live read stays light
+
+
+def other_runners():
+    return [{"name": "codex", "heartbeat_at": "2026-11-10T12:00:00Z", "silent": False, "silent_since": None,
+             "last_finished_at": None,
+             "jobs": [{"summary": "Reviewing the pull request", "now_line": "Reading the diff", "now_at": "2026-11-10T12:00:00Z",
+                       "state": "running", "quiet": False, "quiet_for_s": None, "account_key": "acct-aaaaaaaaaaaa",
+                       "account_label": "Codex", "model": "gpt-6.1-sol", "started_at": "2026-11-10T11:00:00Z",
+                       "updated_at": "2026-11-10T12:00:00Z", "ended_at": None}]}]
+
+
+def mine_runners(*a, **k):
+    return running_now.build_runners(
+        {"projects": [{"jobs": [dict(job("a"), project="atlas", runner="lanes",
+                                      account_ref={"id": ACCT_ID, "label": "Claude second", "matched": True})]}],
+         "live": [{"project": "atlas", "id": "a"}]}, [status()], NOW)
+
+
+def test_two_macs_are_merged_this_one_first(world, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(macs, "mac_label", lambda: "M1")
+    monkeypatch.setattr(running_now, "this_mac_runners", mine_runners)
+    assert put_other(running={"count": 1, "silent": [], "runners": other_runners()})["ok"]
+    out = running_now.view(now=NOW)
+    assert [m["name"] for m in out["macs"]] == ["M1", "M5"] and [m["this_mac"] for m in out["macs"]] == [True, False]
+    me, other = out["macs"]
+    assert me["mac"] == ME and me["stale"] is False and me["as_of"] == "2026-10-15T20:00:00Z"
+    assert other["mac"] == YOU and other["stale"] is False and other["runners"][0]["jobs"][0]["model"] == "gpt-6.1-sol"
+    assert out["counts"] == {"running": 2, "waiting": 0} and out["shared"] is True and "note" not in out
+    assert set(out) == {"updated_at", "macs", "counts", "shared"}
+    # a stale row is shown, flagged, and not counted as running now
+    world.execute("UPDATE mac_status SET seen_at = clock_timestamp() - interval '20 minutes' WHERE mac = %s", (YOU,))
+    world.commit()
+    stale = running_now.view(now=NOW)
+    assert stale["macs"][1]["stale"] is True and stale["counts"] == {"running": 1, "waiting": 0}
+
+
+def test_without_the_other_macs_part_this_mac_is_shown_alone_labelled(world, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(running_now, "this_mac_runners", mine_runners)
+    # no other row at all
+    out = running_now.view(now=NOW)
+    assert len(out["macs"]) == 1 and out["shared"] is False and "No other Mac has reported yet" in out["note"]
+    # an older build's row: running without the runners part
+    put_other(running={"count": 2, "silent": []})
+    old = running_now.view(now=NOW)
+    assert len(old["macs"]) == 1 and "older Khipu" in old["note"] and old["counts"]["running"] == 1
+    # a row with no running at all
+    put_other(running=None)
+    assert len(running_now.view(now=NOW)["macs"]) == 1
+    # the table missing
+    world.execute("DROP TABLE mac_status")
+    world.commit()
+    gone = running_now.view(now=NOW)
+    assert len(gone["macs"]) == 1 and "not on the hub yet" in gone["note"]
+
+
+def test_the_command_always_exits_zero_even_with_no_hub_and_a_broken_work_view(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("KHIPU_KEYCHAIN", "0")
+
+    def down(**kw):
+        raise OSError("hub down")
+
+    monkeypatch.setattr(db, "connect", down)
+    monkeypatch.setattr(work, "build_view", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("nope")))
+    assert running_now.cmd_running(None) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["macs"][0]["runners"] == [] and out["macs"][0]["this_mac"] is True and out["shared"] is False
+    assert "could not be read" in out["note"]
+    monkeypatch.setattr(running_now, "view", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert running_now.cmd_running(None) == 0
+    assert json.loads(capsys.readouterr().out)["macs"] == []
+
+
+def test_a_job_with_no_runner_name_is_grouped_under_an_unnamed_runner(tmp_path):
+    runners, _ = runners_for(tmp_path, [job()], [], runner=None)
+    assert [r["name"] for r in runners] == [running_now.UNNAMED] and runners[0]["heartbeat_at"] is None
