@@ -313,6 +313,7 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
     });
 
     render(<App />);
+    await openScreen("Settings");
 
     fireEvent.click(screen.getByRole("button", { name: /Move this memory to another database/ }));
     fireEvent.change(screen.getByLabelText("Target connection string"), {

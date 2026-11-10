@@ -447,6 +447,10 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   // Move around with the sidebar. Answers come from fakes/shell.ts.
   app: { title: "The whole window", render: () => <App /> },
   "app-quiet": { title: "The whole window, nothing needs you", fake: { quiet: true }, render: () => <App /> },
+  "app-settings": { title: "The whole window; open Settings from the sidebar", render: () => <App /> },
+  "app-settings-stale": { title: "Settings, the other Mac quiet for 40 minutes", fake: { settings: "stale" }, render: () => <App /> },
+  "app-settings-one": { title: "Settings, no other Mac", fake: { settings: "one" }, render: () => <App /> },
+  "app-settings-problem": { title: "Settings, a sign-in and the database need a look", fake: { settings: "problem" }, render: () => <App /> },
   "app-welcome": { title: "The whole window, first run", fake: { welcome: true }, render: () => <App /> },
   "setup-signed-out": {
     title: "Setup: a default login that is not signed in",

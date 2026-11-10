@@ -12,7 +12,8 @@ const OPTIONS = [
   { value: "system", label: "Follow this Mac" },
 ] as const;
 
-export function LookPage({ macName = null }: { macName?: string | null }) {
+/** `part` lets Settings show each card as its own row (Look; Open at login). */
+export function LookPage({ macName = null, part = "both" }: { macName?: string | null; part?: "both" | "look" | "opening" }) {
   const [look, setLook] = useState<Look>(readLook);
   const macDark = useMacIsDark();
   const mac = macName ?? "this Mac";
@@ -53,7 +54,7 @@ export function LookPage({ macName = null }: { macName?: string | null }) {
 
   return (
     <div className="look-page">
-      <div className="section-card">
+      {part !== "opening" ? <div className="section-card">
         <div className="section-head">Look</div>
         <div className="section-body">
           <Segmented ariaLabel="Colours" options={OPTIONS} value={look} onChange={choose} />
@@ -63,8 +64,8 @@ export function LookPage({ macName = null }: { macName?: string | null }) {
               : `Always ${look}. Only on ${mac}.`}
           </p>
         </div>
-      </div>
-      <div className="section-card">
+      </div> : null}
+      {part !== "look" ? <div className="section-card">
         <div className="section-head">Opening</div>
         <div className="section-body">
           <div className="opt-row">
@@ -95,7 +96,7 @@ export function LookPage({ macName = null }: { macName?: string | null }) {
             </p>
           ) : null}
         </div>
-      </div>
+      </div> : null}
     </div>
   );
 }
