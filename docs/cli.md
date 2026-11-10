@@ -259,6 +259,7 @@ Job names: `nightly`, `monthly`, `notes_watch`, `queue_drain`, `recall_daemon`, 
 - `--rollback`: flip back to the previous slot.
 - `--status`: show the live commit, main, how far behind, and queued promotion.
 - `--retry-queued`: retry the queued attempt once the hub answers. A promotion blocked only by an unreachable hub stays queued and retries when the hub returns.
+- `--apply-migrations`: before the gate runs, list the pending database migrations with the new code, apply them with that code, and print each one applied. Without it nothing is applied, and a gate that is red only for pending migrations names them and says to use this flag. If a migration fails, the promotion stops, live is unchanged, and the output names the failed migration and says the database may be partly ahead.
 - `--gate-only STEP`: run one gate step (`doctor`, `recall`, `capture`, `version`). It never flips the link.
 - `--json`: machine-readable output.
 
