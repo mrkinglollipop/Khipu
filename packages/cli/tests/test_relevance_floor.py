@@ -186,7 +186,7 @@ def test_the_local_lane_abstains_on_an_unrelated_prompt_with_the_switch_on(tmp_p
         result = rp.prior_work_for_prompt(UNRELATED, cwd=None)
     assert result["hits"] == []
     assert result["context"] == ""
-    assert result["legs"] == ["lexical", "cosine", "graph_candidates"]
+    assert result["legs"] == ["lexical", "cosine"]
 
 
 def test_the_budgeted_snapshot_lane_reports_no_match_when_the_gate_empties_the_list(tmp_path, monkeypatch):

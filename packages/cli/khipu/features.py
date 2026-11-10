@@ -62,7 +62,6 @@ _CAPABILITIES = (
     # Phase 2, session C.
     # Phase 3, session A.
     "search.time_interpretation",
-    "search.graph_candidates",
     # Phase 3, session B.
     "replica.deliverables",
     "search.relevance_floor",

@@ -3119,26 +3119,7 @@ def hybrid_search(
 
             floor_info: dict[str, Any] | None = None
 
-            # Graph candidates (Phase 3, session A): switch-gated, own 400ms
-            # deadline, dropped entirely (never partially) on a miss — named
-            # in `degraded_legs`. Seeds are the top 5 rows of `fused` exactly
-            # as fused above, before any filter/enrichment pass touches it.
-            try:
-                from khipu import graph_candidates as _gc
-
-                gc_deadline = time.monotonic() + _gc.HUB_LEG_DEADLINE_S
-                cand_rows, missed = _gc.hub_candidates(cur, fused, deadline=gc_deadline)
-                if missed:
-                    degraded_legs.append("graph_candidates")
-                elif cand_rows:
-                    # One more ranked list beside the original ones, not
-                    # a second fusion over `fused`: that replaced every
-                    # row's summed vote with its bare rank and tied the
-                    # first candidate with the first hit.
-                    fused = fuse_ranked_lists([*lists, cand_rows], limit=oversample)
-            except Exception as exc:  # noqa: BLE001 — a candidate-leg failure must not sink the search
-                degraded_legs.append("graph_candidates")
-                timing["graph_candidates_error"] = str(exc)[:120]
+            # graph candidates are not called here: with them on, the prompt and status paths found 84 of 120 golden hits against 96 with them off (jobs/2026-11-10/b2-switch-measure.md). The module is kept, unreachable.
 
             fused = _apply_search_filters(
                 cur, fused, project=project, since=since, until=until,

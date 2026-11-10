@@ -307,9 +307,3 @@ class ProvisionalSkipsGraphCandidatesTest(unittest.TestCase):
         self.assertEqual(progress["provisional"]["legs"], ["lexical"])
         self.assertEqual([h["id"] for h in out["hits"]], ["5"])
 
-    def test_the_full_pass_still_expands_the_graph_once(self) -> None:
-        with _lane(), self._graph_on(), \
-                mock.patch("khipu.graph_candidates.replica_candidates", return_value=([], False)) as gc_call:
-            out = rp._snapshot_search_hits(PROMPT, project=None, started=time.monotonic(), progress={})
-        self.assertEqual(gc_call.call_count, 1)
-        self.assertIn("cosine", out["legs"])

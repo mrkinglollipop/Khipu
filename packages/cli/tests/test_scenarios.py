@@ -83,16 +83,6 @@ def test_same_wording_ranks_the_matching_project_first(tmp_path):
 
 # ---- 5. indirect graph relationship -------------------------------------------
 
-def test_an_indirect_wiki_linked_topic_surfaces_as_a_graph_candidate(tmp_path):
-    with corpus.installed_corpus(tmp_path), \
-         mock.patch("khipu.features.enabled", side_effect=lambda name: name == "graph_candidates"):
-        result = rp.prior_work_for_prompt(
-            "billing-service module dependencies", cwd=None
-        )
-    assert any(
-        h["kind"] == "topic" and h["id"] == "rate-limits" and h.get("via") == "topic:billing-service"
-        for h in result["hits"]
-    )
 
 
 # ---- 6. exact command, error text and path ----------------------------------

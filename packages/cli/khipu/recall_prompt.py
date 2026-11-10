@@ -2499,60 +2499,8 @@ def _fuse_and_annotate(
 
     fused = fuse_ranked_lists(lists, limit=_REPLICA_DEPTH)
 
-    # Graph candidates (Phase 3, session A): switch-gated, own 150ms
-    # deadline, dropped entirely (never partially) on a miss — named in
-    # `degraded_legs`, not silently absorbed into `degraded` above (that
-    # field is already owned by the lexical/cosine legs' own vocabulary).
-    # Seeds are the top 5 rows of `fused` as fused above, before any of the
-    # metadata/validity passes below touch it.
+    # graph candidates are not called here: with them on, the prompt and status paths found 84 of 120 golden hits against 96 with them off (jobs/2026-11-10/b2-switch-measure.md). The module is kept, unreachable.
     degraded_legs: list[str] = []
-    if graph:
-        try:
-            from khipu import graph_candidates as _gc
-
-            gc_deadline = time.monotonic() + _gc.REPLICA_LEG_DEADLINE_S
-            # Only the head of the fused list is excluded from candidacy: at
-            # _REPLICA_DEPTH an indirectly linked row usually sits somewhere
-            # in the tail, and excluding it there dropped the graph's vote
-            # for it (and its `via`) entirely.
-            cand_rows, missed = _gc.replica_candidates(
-                con, fused[:_CANDIDATE_LIMIT], deadline=gc_deadline
-            )
-            if missed:
-                degraded_legs.append("graph_candidates")
-            elif cand_rows:
-                # This lane's `via` is the bare seed id (e.g.
-                # "topic:billing-service"), not graph_candidates' own
-                # {seed, relation} dict — the compact per-prompt block has
-                # no room for the relation detail the hub leg keeps.
-                for r in cand_rows:
-                    via = r.get("via")
-                    if isinstance(via, dict):
-                        r["via"] = via.get("seed")
-                cand_rows = hub_snapshot.snapshot_filter_live_sources(con, cand_rows)
-                # A candidate from the tail votes once, as a candidate (as it
-                # did when the fused list was _CANDIDATE_LIMIT long): keeping
-                # its tail vote too let linked notes outrank direct hits.
-                # Its retrieval evidence (cosine, profile, lexical and
-                # prompt-term hits) stays on the candidate row, so the
-                # relevance gate and push ranking still see it; the candidate's
-                # own fields, `via` included, win.
-                tail_by_key = {(r.get("kind"), str(r.get("id"))): r for r in fused}
-                cand_keys = set()
-                for r in cand_rows:
-                    k = (r.get("kind"), str(r.get("id")))
-                    cand_keys.add(k)
-                    orig = tail_by_key.get(k)
-                    if orig:
-                        for f, v in orig.items():
-                            if f not in ("via", "score") and r.get(f) is None:
-                                r[f] = v
-                fused = [r for r in fused if (r.get("kind"), str(r.get("id"))) not in cand_keys]
-                fused = fuse_ranked_lists([fused, cand_rows], limit=_REPLICA_DEPTH)
-                legs.append("graph_candidates")
-        except Exception as exc:  # noqa: BLE001 — a candidate-leg failure must not sink the search
-            degraded_legs.append("graph_candidates")
-            _log(f"snapshot graph-candidates leg skipped: {type(exc).__name__}")
 
     # Once, after fusion and graph expansion: candidate rows carry no signal,
     # so they can never make an otherwise empty list pass.

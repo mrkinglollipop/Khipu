@@ -8455,33 +8455,6 @@ def _snapshot_filters_dropped(*, session_id: str | None, harness: str | None) ->
     return dropped
 
 
-def _graph_candidates_snapshot(con, results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
-    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
-    """Graph-candidate leg shared by both ``search_stale_
-    payload`` branches (Phase 3, session A: "the replica [backend] serves
-    the local prompt lane and the stale-replica payload"). ``results`` is
-    used as-is for seeding (it is the caller's own already-ranked list, no
-    fusion has happened yet on this path the way ``embed.hybrid_search``
-    fuses several candidate lists — a single ranked list is still one valid
-    input to ``fuse_ranked_lists``). Returns ``(results, degraded_legs)``;
-    ``degraded_legs`` is ``[]`` unless the leg missed or errored."""
-    try:
-        import time as _time
-
-        from khipu import graph_candidates as _gc
-        from khipu.search_text import fuse_ranked_lists
-
-        deadline = _time.monotonic() + _gc.REPLICA_LEG_DEADLINE_S
-        cand_rows, missed = _gc.replica_candidates(con, results, deadline=deadline)
-        if missed:
-            return results, ["graph_candidates"]
-        if cand_rows:
-            results = fuse_ranked_lists([results, cand_rows], limit=max(len(results), 1) + len(cand_rows))
-        return results, []
-    except Exception:  # noqa: BLE001 — a candidate-leg failure must not sink the search
-        return results, ["graph_candidates"]
-
-
 def _filter_expanded_snapshot_rows(
     con, rows, *, kind=None, since=None, until=None, project=None,
     session_id=None, harness=None, t3_thread=None, via=None,
@@ -8609,7 +8582,7 @@ def search_stale_payload(
             results, _floor = _relevance.gate(results, len(search_tokens(query)))
         except Exception:
             results = []
-        results, degraded_legs = _graph_candidates_snapshot(con, results)
+        degraded_legs: list[str] = []
         results = _filter_expanded_snapshot_rows(
             con, results, kind=kind, since=since, until=until, project=project,
             session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
@@ -8638,7 +8611,7 @@ def search_stale_payload(
         project=project, session_id=session_id, harness=harness,
         t3_thread=t3_thread, via=via,
     )
-    results, degraded_legs = _graph_candidates_snapshot(con, results)
+    degraded_legs: list[str] = []
     results = _filter_expanded_snapshot_rows(
         con, results, kind=kind, since=since, until=until, project=project,
         session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
