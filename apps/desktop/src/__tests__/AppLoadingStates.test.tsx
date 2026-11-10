@@ -161,6 +161,7 @@ describe("App loading and recovery", () => {
   it.each(["late", "reject", "native-timeout", "empty"] as const)("keeps all eight top-level panes visible for %s reads", async (mode) => {
     script(mode);
     render(<App />);
+    await openScreen("Home"); // Today opens first; these reads belong to the older Home
     if (mode === "late") {
       const failed = await within(visiblePanel()).findByText("Couldn't read recent captures");
       fireEvent.click(within(failed.closest<HTMLElement>(".callout")!).getByRole("button", { name: "Retry" }));
@@ -174,6 +175,7 @@ describe("App loading and recovery", () => {
     let retryReady = false;
     script("ok", { status: () => retryReady ? status : Promise.race([raw.promise, deadline.promise]) });
     render(<App />);
+    await openScreen("Home");
     await waitFor(() => expect(document.querySelector(".working-banner")).toHaveTextContent("counts"));
     await act(async () => { deadline.reject(new Error("Khipu CLI timed out after 60 seconds")); });
     const failure = await within(visiblePanel()).findByText("Couldn't read recent captures");

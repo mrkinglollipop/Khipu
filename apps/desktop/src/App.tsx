@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import khipuIcon from "./assets/khipu-icon.png";
 import { Sidebar, TabBar, Toolbar } from "./shell";
+import { Today } from "./today/Today";
 import type { NavItem } from "./shell";
 import {
   Callout,
@@ -1212,6 +1213,8 @@ const OwedRow = memo(function OwedRow({
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("home");
+  // Today is the new place on tab "home"; the old Home sits under Older screens.
+  const [showOldHome, setShowOldHome] = useState(false);
   const [paneRetryKeys, setPaneRetryKeys] = useState<Record<Tab, number>>({
     "first-run": 0, home: 0, activity: 0, recall: 0, revisions: 0, work: 0, harnesses: 0, routing: 0, settings: 0, guides: 0,
   });
@@ -3849,7 +3852,15 @@ export default function App() {
     </div>
   );
 
-  const goTab = (id: string) => setTab(id as Tab);
+  const goTab = (id: string) => {
+    if (id === "oldhome") {
+      setShowOldHome(true);
+      setTab("home");
+      return;
+    }
+    setShowOldHome(false);
+    setTab(id as Tab);
+  };
   // This Mac's name is not in any answer the app reads yet (the plan adds
   // `this_mac` to the routing record), so the sidebar says "On this Mac".
   const thisMac: string | null = null;
@@ -3870,6 +3881,7 @@ export default function App() {
   const workQuiet = work.data?.counts.quiet ?? 0;
   const harnessBadge = harnessesBadge(liveness, claudeHomes, t3Gap);
   const olderItems: NavItem[] = [
+    placeItem("home", <CircleCheck size={18} aria-hidden />, "The home screen from before Today", { id: "oldhome", label: "Home" }),
     placeItem("work", NAV_ICONS.work, WORK_LEDE, {
       badge: workWaiting + workQuiet > 0 ? (
         <span className={workWaiting ? "nav-badge" : "nav-badge quiet"}
@@ -3907,14 +3919,14 @@ export default function App() {
       </div>
     </>
   );
-  const toolbarTitle = PLACE_TITLES[tab];
+  const toolbarTitle = tab === "home" && showOldHome ? "Home" : PLACE_TITLES[tab];
 
   return (
     <div className="shell sh-window">
       <Sidebar
         brand={<BrandMark />}
         items={places}
-        current={tab}
+        current={tab === "home" && showOldHome ? "oldhome" : tab}
         onGo={goTab}
         settings={settingsItem}
         macName={thisMac}
@@ -3945,7 +3957,22 @@ export default function App() {
           </PaneBoundary>
         </section>
 
-        <section className={panelClass("home")}>
+        <section className={tab === "home" && !showOldHome ? "panel fill today-panel" : "panel is-hidden"}>
+          <PaneBoundary key={paneRetryKeys["home"]} title="Today" onRetry={retryActivePane}>
+            <Today
+              active={tab === "home" && !showOldHome}
+              onOlderHome={() => setShowOldHome(true)}
+              onOpen={(link) => {
+                if (link === "running-now") setTab("work"); // until slice A5 lands Running now
+                else if (link === "accounts") setTab("routing");
+                else if (link === "search") setTab("recall");
+                else setTab("settings");
+              }}
+            />
+          </PaneBoundary>
+        </section>
+
+        <section className={tab === "home" && showOldHome ? "panel" : "panel is-hidden"}>
           <PaneBoundary key={paneRetryKeys["home"]} title={PANE_TITLES["home"]} onRetry={retryActivePane}>
           <PanelHeader title="Home" lede="Is memory working right now?">
             {loading.status || loading.doctor ? <Spinner /> : null}
