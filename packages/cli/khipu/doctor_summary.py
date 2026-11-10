@@ -111,20 +111,25 @@ WORDS = {
 }
 
 
-def failing(report: dict) -> list[tuple[int, str, str]]:
-    """(area, what is wrong, fix) for every gate of overall ``ok`` that is False, plus routing delivery
-    and a capture at risk."""
+def failing_keyed(report: dict, *, skip: tuple[str, ...] = ()) -> list[tuple[str, int, str, str]]:
+    """(check key, area, what is wrong, fix) for every failing gate; ``skip`` leaves named keys unread."""
     from khipu.cli import OK_GATES
 
-    keys = [k for k in (*OK_GATES, "routing_delivery_ok") if k in report and not report[k]]
+    keys = [k for k in (*OK_GATES, "routing_delivery_ok") if k not in skip and k in report and not report[k]]
     out = []
     for key in keys:
         area, what, fix = WORDS.get(key, (OTHER, f"{key.removesuffix('_ok').replace('_', ' ')} is failing", None))
-        out.append((area, what(report) if callable(what) else what,
+        out.append((key, area, what(report) if callable(what) else what,
                     fix(report) if callable(fix) else fix or f"see {key.removesuffix('_ok')} in the report"))
-    if (report.get("outbox") or {}).get("at_risk") and "outbox_ok" not in keys:
-        out.append((0, _outbox(report), _outbox_fix(report)))
-    return list(dict.fromkeys(out))
+    if (report.get("outbox") or {}).get("at_risk") and "outbox_ok" not in keys and "outbox_ok" not in skip:
+        out.append(("outbox_ok", 0, _outbox(report), _outbox_fix(report)))
+    return out
+
+
+def failing(report: dict) -> list[tuple[int, str, str]]:
+    """(area, what is wrong, fix) for every gate of overall ``ok`` that is False, plus routing delivery
+    and a capture at risk."""
+    return list(dict.fromkeys((a, w, f) for _k, a, w, f in failing_keyed(report)))
 
 
 def health_summary(report: dict) -> list[str]:
