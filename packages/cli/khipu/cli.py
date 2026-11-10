@@ -5147,6 +5147,7 @@ def build_parser() -> argparse.ArgumentParser:
     choose.add_argument("--no", metavar="KEY_OR_NUMBER", help="Decline or undo the displayed item after a terminal yes")
     choose.add_argument("--answer", nargs=2, metavar=("KEY", "YES_OR_NO"), help=argparse.SUPPRESS)
     ny.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    ny.add_argument("--expect", metavar="PIN", help=argparse.SUPPRESS)
     ny.set_defaults(func=cmd_needs_you)
 
     storage_p = sub.add_parser("storage", help="Free disk space and what Khipu holds, as JSON (read-only)")

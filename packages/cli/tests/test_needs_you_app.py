@@ -16,12 +16,14 @@ from datetime import datetime, timezone
 import pytest
 
 from khipu import cli, needs_you, needs_you_app, owner_act, owner_direction, routing, usage
-from tests.test_owner_needs_you import _held_pause, _priority_request, _rule_added, _setting_request
+from tests.test_owner_needs_you import (OTHER, _held_pause, _priority_request, _rule_added, _rule_changed,
+                                        _setting_request)
+from tests.test_t3_owner_confirm import _be
 from tests.test_owner_priority_pending import _ask_in_t3
 from tests.test_t3_owner_confirm import _ENV_VARS, world
 
 assert world  # the fixture, imported for pytest
-APP_FIELDS = {"from_words", "mac", "ago"}
+APP_FIELDS = {"from_words", "mac", "ago", "expect"}
 RECEIPT = {"text", "action_id", "undoable", "saved_on", "not_reached"}
 
 
@@ -38,8 +40,18 @@ def _cli(capsys, *argv: str) -> tuple[int, dict]:
     return code, json.loads(capsys.readouterr().out)
 
 
-def _answer(capsys, key: str, said: str) -> tuple[int, dict]:
-    return _cli(capsys, "--from-app", "--json", "--answer", key, said)
+_READ = object()
+
+
+def _shown_pin(key: str):
+    """The pin the app's read gives the item, as the app would send it back."""
+    items = needs_you_app.read(key).get("items") or []
+    return items[0]["expect"] if items else None
+
+
+def _answer(capsys, key: str, said: str, expect=_READ) -> tuple[int, dict]:
+    pin = _shown_pin(key) if expect is _READ else expect
+    return _cli(capsys, "--from-app", "--json", "--answer", key, said, *([f"--expect={pin}"] if pin is not None else []))
 
 
 def _request(request_id: str) -> dict:
@@ -304,3 +316,72 @@ def test_an_item_that_is_gone_is_refused(world, khipu_app, capsys):
     assert code == 2 and out["code"] == "not_found"
     code, out = _answer(capsys, "priority", "maybe")
     assert code == 2 and out["code"] == "bad_args"
+
+
+# ---- the pin the app read ---------------------------------------------------------------------
+
+
+def test_the_read_gives_each_item_the_pin_its_own_actions_carry(world, khipu_app, capsys, monkeypatch):
+    _setting_request(world)
+    first = _held_pause(world)
+    monkeypatch.setattr(usage, "_load_cache", lambda: {"claude|": {"ok": False, "error": "not_signed_in"}})
+    _app(world, khipu_app)
+    code, out = _cli(capsys, "--json", "--from-app")
+    by = {i["key"]: i for i in out["items"]}
+    setting = by["setting:routing_replication_live"]
+    assert setting["expect"] == setting["settle"]["confirm"]["args"]["expect"]
+    assert setting["expect"].startswith("sr-")
+    assert by[f"held:{first}"]["expect"] is None and by["plan:Claude"]["expect"] is None
+
+
+def test_a_matching_pin_settles(world, khipu_app, capsys):
+    _setting_request(world)
+    pin = _shown_pin("setting:routing_replication_live")
+    _app(world, khipu_app)
+    code, out = _answer(capsys, "setting:routing_replication_live", "yes", expect=pin)
+    assert code == 0, out
+    assert routing.settings_status()["routing_replication_live"]["value"] is True
+
+
+def test_a_stale_pin_changes_nothing_and_says_changed(world, khipu_app, capsys):
+    n = _rule_changed(world)
+    key = next(i["key"] for i in needs_you.waiting(kind="rule", record_read=False)["items"])
+    shown = _shown_pin(key)
+    # A conversation proposes newer words after the app showed the first proposal.
+    _be(world, OTHER)
+    rule = next(r for r in routing.conversation_view()["rules"] if r["n"] == n)
+    routing.request_rule("Docs go to Opus", n=n, owner_request="again", author=routing.conversation_author(), via="mcp",
+                         base=rule["owner_revision"])
+    assert _shown_pin(key) != shown
+    log = len(owner_direction.actions())
+    _app(world, khipu_app)
+    for said in ("yes", "no"):
+        code, out = _answer(capsys, key, said, expect=shown)
+        assert code == 2 and out["code"] == "changed" and "changed since you saw it" in out["error"]
+    rule = next(r for r in routing.read_view()["rules"] if r["n"] == n)
+    assert rule["pending"] is True and rule["text"] == "Docs go to Opus"
+    assert len(owner_direction.actions()) == log
+
+
+def test_a_missing_pin_changes_nothing_and_says_changed(world, khipu_app, capsys):
+    _rule_added(world)
+    (key,) = [i["key"] for i in needs_you.waiting(kind="rule", record_read=False)["items"]]
+    _app(world, khipu_app)
+    code, out = _answer(capsys, key, "yes", expect=None)
+    assert code == 2 and out["code"] == "changed"
+    assert any(r.get("pending") for r in routing.read_view()["rules"])
+
+
+def test_an_item_with_no_pin_still_answers_without_one(world, khipu_app, capsys):
+    first = _held_pause(world)
+    assert _shown_pin(f"held:{first}") is None
+    _app(world, khipu_app)
+    code, out = _answer(capsys, f"held:{first}", "no", expect=None)
+    assert code == 0, out
+    assert _request(first)["state"] == "declined"
+
+
+def test_the_terminal_path_and_the_mcp_list_have_no_pin_field(world):
+    _setting_request(world)
+    item = needs_you.waiting(record_read=False)["items"][0]
+    assert "expect" not in item

@@ -712,7 +712,7 @@ def _finished(item: dict, caller: str, now: datetime) -> dict:
         # The app's three fields (``needs_you_app``); the MCP answer never has them.
         from khipu import needs_you_app
 
-        out.update(needs_you_app.item_fields(by, asked, out["asked_by"]["when"]))
+        out.update(needs_you_app.item_fields(by, asked, out["asked_by"]["when"], out.get("settle")))
     return out
 
 

@@ -2,8 +2,9 @@
 
 The read is ``needs_you.waiting`` as the MCP tool gives it, never recorded as
 a conversation's read, with three fields more on each item: ``from_words``
-(who asked and on which Mac, in words), ``mac`` and ``ago``. The MCP answer
-never carries them.
+(who asked and on which Mac, in words), ``mac`` and ``ago``, and ``expect``:
+the pin the item's own confirm or undo already carries (``expect`` in its
+args), or null when its actions carry none. The MCP answer never carries them.
 
 An answer is one item by its key, Yes or No, from the app. The CLI first
 proves the app itself started the process (``routing._caller``, the check
@@ -11,6 +12,9 @@ every ``--from-app`` write makes); then the item's own settle runs through
 ``owner_act.settle_from_app``, the hold and replay the terminal's typed yes
 uses. Nothing here decides who may settle what. One key per answer, so an
 item that can't be taken back (``permanent``) is always answered on its own.
+The answer sends back the item's ``expect``: when the item has a pin and the
+one sent is missing or no longer the item's, nothing changes and the answer
+is ``changed``, so the app shows the item again before the owner answers.
 
 The answer is a receipt the app shows: ``{text, action_id, undoable,
 saved_on, not_reached}``. ``action_id`` is the owner-actions line the app's
@@ -40,15 +44,26 @@ def this_mac() -> str:
     return name.strip() if isinstance(name, str) and name.strip() else THIS_MAC
 
 
-def item_fields(by, who: str, ago: str | None) -> dict:
-    """``from_words``, ``mac`` and ``ago`` for one item (``needs_you._finished``)."""
+def pin_of(settle) -> str | None:
+    """The pin an item's own confirm or undo carries (``expect``), or None."""
+    for side in ("confirm", "undo"):
+        offered = (settle or {}).get(side) if isinstance(settle, dict) else None
+        pin = ((offered or {}).get("args") or {}).get("expect") if isinstance(offered, dict) else None
+        if pin is not None:
+            return str(pin)
+    return None
+
+
+def item_fields(by, who: str, ago: str | None, settle=None) -> dict:
+    """``from_words``, ``mac``, ``ago`` and ``expect`` for one item (``needs_you._finished``)."""
+    pin = pin_of(settle)
     if isinstance(by, dict) and by.get("kind") == "other_mac":
         mac = by.get("mac") or "your other Mac"
-        return {"from_words": f"From {who}.", "mac": mac, "ago": ago}
+        return {"from_words": f"From {who}.", "mac": mac, "ago": ago, "expect": pin}
     mac = this_mac()
     if by is None:
-        return {"from_words": f"Khipu noticed this on {mac}.", "mac": mac, "ago": ago}
-    return {"from_words": f"From {who} on {mac}.", "mac": mac, "ago": ago}
+        return {"from_words": f"Khipu noticed this on {mac}.", "mac": mac, "ago": ago, "expect": pin}
+    return {"from_words": f"From {who} on {mac}.", "mac": mac, "ago": ago, "expect": pin}
 
 
 def _undoable(line: dict | None) -> bool:
@@ -144,9 +159,13 @@ def _no(code: str, error: str, **extra) -> tuple[int, dict]:
     return 2, {"ok": False, "code": code, "error": error, **extra}
 
 
-def answer(key: str, said: str) -> tuple[int, dict]:
-    """(exit code, JSON) for the app's Yes or No on the item ``key``. The
-    caller has already proved the app started this process."""
+CHANGED = "This changed since you saw it, so nothing was changed. Look at it again, then answer."
+
+
+def answer(key: str, said: str, expect: str | None = None) -> tuple[int, dict]:
+    """(exit code, JSON) for the app's Yes or No on the item ``key``, with
+    the ``expect`` pin the app read. The caller has already proved the app
+    started this process."""
     if said not in ("yes", "no"):
         return _no("bad_args", "The answer is yes or no.")
     yes = said == "yes"
@@ -155,6 +174,9 @@ def answer(key: str, said: str) -> tuple[int, dict]:
     if not items or len(items) != 1 or items[0].get("key") != key:
         return _no("not_found", "That item is no longer waiting. Nothing was changed; read the list again.")
     item = items[0]
+    pin = pin_of(item.get("settle"))
+    if pin is not None and expect != pin:
+        return _no("changed", CHANGED, key=key)
     if item["kind"] == "signin":
         if not yes:
             return _no("no_action", "Nothing to say no to: the account stays signed out until you sign in.")
@@ -204,7 +226,7 @@ def run_cli(args) -> int:
         if not routing._caller()["app"]:
             return say(*_no("owner_only", ONLY_THE_APP))
         key, said = args.answer
-        return say(*answer(key, said))
+        return say(*answer(key, said, getattr(args, "expect", None)))
     if args.yes or args.no:
         return say(*_no("bad_args", "The app answers with --answer KEY yes or no."))
     return say(0, read(args.item))
