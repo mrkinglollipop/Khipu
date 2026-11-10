@@ -1,7 +1,8 @@
 """One status row per Mac, shared through the hub (``khipu macs --json``).
 
-Each Mac writes only its own row of ``mac_status`` (migration 0052): when ``khipu health`` runs and on the
-five-minute snapshot heal timer. A reader gets this Mac live plus every other Mac's row; a row the hub last
+Each Mac writes only its own row of ``mac_status`` (migration 0052): when ``khipu health`` runs and as the last
+stage of the five-minute snapshot heal timer. Neither builds the work view: the running part of the row is the one
+``khipu running`` last kept on this Mac (``remember_runners``), published while it is under ``STALE_AFTER_S`` old. A reader gets this Mac live plus every other Mac's row; a row the hub last
 heard from more than ``STALE_AFTER_S`` ago is marked ``stale``, never shown as current.
 
 The row is a closed list of fields (``project``), built the way the routing copy builds its payload: only the
@@ -13,8 +14,9 @@ Nothing here raises to a caller. The other Mac may run an older build: no table,
 "this Mac only", labelled. A write that fails (hub down) is reported in the result and never fails ``health``
 or the heal timer.
 
-Older Mac-name helpers to fold into ``mac_label`` / ``name_of`` later (their files are being rewritten, so this
-slice leaves them alone): ``routing_replication.mac_label`` and ``health_five``'s old own copy.
+``mac_label`` / ``name_of`` are the one place a Mac gets a name: search and activity rows (``memory_rows``), the
+health document and ``khipu macs`` all call them. (``routing_replication.mac_label`` belongs to the routing
+pages and is left alone.)
 """
 from __future__ import annotations
 
@@ -137,30 +139,30 @@ def project(raw) -> dict:
 # ---- this Mac's names and identity ------------------------------------------------------------------------------
 
 
-def mac_label() -> str:
-    """The name the owner gave this Mac, else its host name."""
-    try:
-        from khipu import routing
-
-        given = (routing.settings().get("routing_mac_names") or {}).get(routing._local_mac())
-        if isinstance(given, str) and given.strip():
-            return given.strip()
-    except Exception:  # noqa: BLE001 - a label is never worth failing a report
-        pass
-    return socket.gethostname().split(".")[0] or "This Mac"
-
-
-def name_of(mac: str | None, row_name: str | None = None) -> str:
-    """What the owner calls another Mac: their own name for it, else the name its row carries, else 'Your other Mac'."""
+def _given_name(mac: Any) -> str | None:
+    """The owner's name for Mac id ``mac`` (routing_mac_names), else None."""
     try:
         from khipu import routing
 
         given = (routing.settings().get("routing_mac_names") or {}).get(mac) if isinstance(mac, str) else None
-        if isinstance(given, str) and given.strip():
-            return given.strip()
-    except Exception:  # noqa: BLE001
-        pass
-    return row_name or OTHER_MAC
+        return given.strip() if isinstance(given, str) and given.strip() else None
+    except Exception:  # noqa: BLE001 - a label is never worth failing a report
+        return None
+
+
+def mac_label() -> str:
+    """This Mac's name: the one the owner gave it, else its host name (else 'This Mac'). The one place any
+    screen or search row gets a name for this Mac."""
+    return _given_name(local_mac_id()) or socket.gethostname().split(".")[0] or "This Mac"
+
+
+def name_of(mac: str | None, row_name: str | None = None) -> str:
+    """What the owner calls the Mac with id ``mac``: this Mac's name when it is this Mac; else their own name for
+    that Mac, else the name its status row carries, else 'Your other Mac'. ``mac`` None is a Mac whose id is not
+    known (a search row carries a hardware origin, not a Mac id): the fallback."""
+    if isinstance(mac, str) and mac == local_mac_id():
+        return mac_label()
+    return _given_name(mac) or row_name or OTHER_MAC
 
 
 def local_mac_id() -> str | None:
@@ -243,18 +245,15 @@ def _from_health(doc: dict) -> dict:
             "running": {"count": doc.get("jobs_running"), "silent": silent}}
 
 
-def remember_health(doc: dict) -> dict:
-    """Keep the closed part of the latest health document on this Mac for the timer; returns it."""
-    kept = project(_from_health(doc))
+def _write_cache(data: dict) -> None:
     try:
         path = _cache_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({k: kept[k] for k in ("saving", "health", "running")}), encoding="utf-8")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
         tmp.replace(path)
     except OSError:
         pass
-    return kept
 
 
 def _remembered() -> dict:
@@ -265,20 +264,51 @@ def _remembered() -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
-def local_row(doc: dict | None = None, *, share: bool = False) -> dict:
-    """This Mac's closed row now. With a health document, that is what it reports; without one (the timer), the
-    last health this Mac kept; with neither, saving, health and running are ``None`` (not known). ``share`` adds
-    this Mac's running jobs (a hub read) for the row it publishes; a live ``khipu macs`` read leaves them out."""
-    base = _from_health(doc) if doc else _remembered()
-    if share:
-        try:
-            from khipu import running_now
+def remember_health(doc: dict) -> dict:
+    """Keep the closed part of the latest health document on this Mac for the timer; returns it. The runners
+    ``khipu running`` kept (and when) stay."""
+    kept = project(_from_health(doc))
+    old = _remembered()
+    data = {k: kept[k] for k in ("saving", "health", "running")}
+    runners = (old.get("running") or {}).get("runners") if isinstance(old.get("running"), dict) else None
+    if isinstance(runners, list) and old.get("runners_at"):
+        data["running"] = dict(data["running"] or {"count": None, "silent": []}, runners=runners)
+        data["runners_at"] = old["runners_at"]
+    _write_cache(data)
+    return kept
 
-            runners = running_now.this_mac_runners()
-        except Exception:  # noqa: BLE001 - no running part is "not known", never a failure of the row
-            runners = None
-        if runners is not None:
-            base = dict(base, running=dict(base.get("running") or {"count": None, "silent": []}, runners=runners))
+
+def remember_runners(runners: list | None, *, now: datetime | None = None) -> None:
+    """Keep this Mac's running jobs as ``khipu running`` just read them, for the row the timer and health publish.
+    ``None`` (the work view could not be read) keeps what was there."""
+    if not isinstance(runners, list):
+        return
+    old = _remembered()
+    running = old.get("running") if isinstance(old.get("running"), dict) else {"count": None, "silent": []}
+    _write_cache(dict(old, running=dict(running, runners=runners), runners_at=_iso(now or datetime.now(timezone.utc))))
+
+
+def _kept_runners(now: datetime | None = None) -> list | None:
+    """The runners ``khipu running`` kept, while they are fresh enough to publish; else ``None``."""
+    old = _remembered()
+    at = _parse(old.get("runners_at"))
+    runners = (old.get("running") or {}).get("runners") if isinstance(old.get("running"), dict) else None
+    if at is None or not isinstance(runners, list):
+        return None
+    age = ((now or datetime.now(timezone.utc)) - at).total_seconds()
+    return runners if 0 <= age <= STALE_AFTER_S else None
+
+
+def local_row(doc: dict | None = None) -> dict:
+    """This Mac's closed row now. With a health document, that is what it reports; without one (the timer), the
+    last health this Mac kept; with neither, saving, health and running are ``None`` (not known). The running jobs
+    are the ones ``khipu running`` last kept, when that was under 15 minutes ago. Reads no hub and builds no work
+    view."""
+    base = _from_health(doc) if doc else _remembered()
+    runners = _kept_runners()
+    if base.get("running") is not None or runners is not None:
+        running = {k: v for k, v in (base.get("running") or {"count": None, "silent": []}).items() if k != "runners"}
+        base = dict(base, running=dict(running, runners=runners) if runners is not None else running)
     row = project(dict(base, name=mac_label(), version=version_stamp(), signins=sign_ins()))
     if row["health"] is not None and not doc:
         row["health"]["routing_version"] = routing_version()
@@ -298,7 +328,7 @@ def publish(row: dict | None = None, *, mac: str | None = None) -> dict:
 
         if hub_reach.known_unreachable():
             return {"ok": False, "why": "hub_unreachable"}
-        row = project(row if row is not None else local_row(share=True))
+        row = project(row if row is not None else local_row())
         from khipu import db
 
         with db.connect(statement_timeout_s=HUB_TIMEOUT_S) as conn:

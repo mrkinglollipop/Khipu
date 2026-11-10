@@ -13,7 +13,7 @@ python3 -m khipu <command>
 
 Most commands need the Python dependencies on `PYTHONPATH` first; [packages/cli/README.md](../packages/cli/README.md) shows the one-time setup. To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
 
-There are 56 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
+There are 59 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
 
 ## Health and status
 
@@ -23,6 +23,9 @@ There are 56 top-level commands; the reference below includes storage, ledger, w
 | `status` | Row counts in Postgres. `--sample N` (default 0, which skips the file walk), `--drift` adds drift samples. |
 | `doctor` | The single health command. Exits 0 only when `ok` is true, otherwise 2. |
 | `activity` | Recent capture episodes. `--limit`, `--show ID`. |
+| `health` | The five checks the app shows (saving, finding, routing, database, jobs) as plain rows, with a line each for what Khipu is doing and what you do. A view over `doctor`; `--json` is the only form, and it exits 0 whatever the checks say. Also shares this Mac's status row through the hub. |
+| `macs` | One status row per Mac, shared through the hub: this Mac live, every other Mac as last reported (marked stale after 15 minutes). A Mac on an older build, a hub that is down or a missing table gives this Mac only, with a note. `--json` is the only form. |
+| `running` | Which jobs are running, on which Mac, and which have gone quiet. This Mac live, the other as last reported; it also refreshes this Mac's remembered running part. `--json` is the only form. |
 | `revisions` | Topic revisions, including edits that lost a last-write-wins conflict. `--slug`, `--show ID`. |
 | `secrets` | Shows whether the database address and model keys are present (Keychain, environment or file). Never prints values. |
 | `git-sync` | Reports whether the memory-tree git auto-sync is alive. Exits 2 if red. |

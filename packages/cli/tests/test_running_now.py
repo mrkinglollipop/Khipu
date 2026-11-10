@@ -120,14 +120,61 @@ def test_the_row_carries_the_running_part_as_a_closed_list(world):  # noqa: F811
     assert how == "ok" and "/Users" not in json.dumps(back) and "cwd" not in back["running"]
 
 
-def test_this_macs_row_publishes_its_running_jobs(world, monkeypatch):  # noqa: F811
+def test_this_macs_row_publishes_the_running_jobs_khipu_running_last_kept(world, monkeypatch):  # noqa: F811
+    """G7: the timer and health publish what `khipu running` kept; they never build the work view themselves."""
+    runners = [{"name": "lanes", "heartbeat_at": BEAT, "silent": False, "silent_since": None, "last_finished_at": None,
+                "jobs": []}]
+    built = []
+    # nobody has looked yet: the row has no running jobs, and nothing built the view to find some
+    monkeypatch.setattr(running_now, "this_mac_runners", lambda *a, **k: built.append("runners") or runners)
+    monkeypatch.setattr(work, "build_view", lambda *a, **k: built.append("view") or {"projects": [], "live": []})
+    assert macs.publish()["ok"]
+    [mine] = [r for r in macs.read_rows()[0] if r["mac"] == ME]
+    assert (mine["running"] or {}).get("runners") is None and built == []
+    # someone looks (`khipu running`): the runners are kept ...
+    out = running_now.view()
+    assert out["macs"][0]["runners"][0]["name"] == "lanes"
+    built.clear()
+    # ... and the next publish carries them, still without building anything
+    assert macs.publish()["ok"]
+    [mine] = [r for r in macs.read_rows()[0] if r["mac"] == ME]
+    assert mine["running"]["runners"][0]["name"] == "lanes" and built == []
+    assert macs.local_row()["running"]["runners"][0]["name"] == "lanes"
+    # runners kept more than 15 minutes ago are not published as if current
+    kept = macs._remembered()
+    macs._write_cache(dict(kept, runners_at="2026-01-01T00:00:00Z"))
+    assert macs.publish()["ok"]
+    [mine] = [r for r in macs.read_rows()[0] if r["mac"] == ME]
+    assert (mine["running"] or {}).get("runners") is None and built == []
+
+
+def test_health_publishes_the_kept_running_part_and_builds_no_work_view(world, monkeypatch, capsys):  # noqa: F811
+    from khipu import cli, health_five
+    from tests.test_health_five import report
+
     runners = [{"name": "lanes", "heartbeat_at": BEAT, "silent": False, "silent_since": None, "last_finished_at": None,
                 "jobs": []}]
     monkeypatch.setattr(running_now, "this_mac_runners", lambda *a, **k: runners)
-    assert macs.publish()["ok"]
+    running_now.view()
+    built = []
+    monkeypatch.setattr(running_now, "this_mac_runners", lambda *a, **k: built.append("runners") or runners)
+    monkeypatch.setattr(work, "build_view", lambda *a, **k: built.append("view") or {"projects": [], "live": []})
+    monkeypatch.setattr(health_five, "run_doctor", lambda: (report(), ""))
+    assert cli.main(["health", "--json"]) == 0
+    capsys.readouterr()
     [mine] = [r for r in macs.read_rows()[0] if r["mac"] == ME]
-    assert mine["running"]["runners"][0]["name"] == "lanes"
-    assert macs.local_row()["running"] is None or macs.local_row()["running"].get("runners") is None  # a live read stays light
+    assert mine["running"]["runners"][0]["name"] == "lanes" and built == []
+    # health's own count/silent part is refreshed, the kept runners stay (and survive remember_health)
+    assert mine["running"]["count"] == 2 and macs._remembered()["running"]["runners"][0]["name"] == "lanes"
+
+
+def test_a_publish_with_the_hub_known_down_builds_nothing(world, monkeypatch):  # noqa: F811
+    called = []
+    monkeypatch.setattr("khipu.hub_reach.known_unreachable", lambda: {"since": "x"})
+    monkeypatch.setattr(macs, "local_row", lambda *a, **k: called.append("row") or {})
+    monkeypatch.setattr(running_now, "this_mac_runners", lambda *a, **k: called.append("runners"))
+    monkeypatch.setattr(db, "connect", lambda **kw: called.append("connect"))
+    assert macs.publish() == {"ok": False, "why": "hub_unreachable"} and called == []
 
 
 def other_runners():

@@ -209,13 +209,19 @@ def view(*, now: datetime | None = None) -> dict:
     if runners is None:
         runners = []
         notes.append("This Mac's running jobs could not be read right now.")
+    else:
+        # Someone looked: keep what was seen for the row health and the timer publish (they never build the work view).
+        try:
+            macs.remember_runners(runners, now=now)
+        except Exception:  # noqa: BLE001 - keeping it is never worth failing the answer
+            pass
     entries = [{"mac": mine, "name": macs.mac_label(), "this_mac": True, "as_of": _iso(now), "stale": False,
                 "runners": runners}]
     rest, how = macs.others(mine=mine)
     for other in rest:
         part = (other.get("running") or {}).get("runners")
         if part is None:
-            notes.append(f"{other['name']} runs an older Khipu that does not share its running jobs yet.")
+            notes.append(f"{other['name']} has not shared its running jobs: it runs an older Khipu, or nobody has looked at them there lately.")
             continue
         entries.append({"mac": other["mac"], "name": other["name"], "this_mac": False, "as_of": other["seen_at"],
                         "stale": other["stale"], "runners": part})

@@ -5,8 +5,9 @@ feeds doctor's overall ``ok`` (``cli.OK_GATES``) lands in exactly one of five ar
 wrote words for lands in the fifth, named. ``you_do`` is plain words and never names a command; commands and
 check keys go into ``agent_note``, which passes through ``redact``.
 
-The Routing row does not read the delivery ledger or the old subagent summary (pull request #534 deletes
-them): it reads whether this Mac's routing record exists and was folded recently.
+The Routing row reads whether this Mac's routing record exists and was folded recently. The routing-delivery
+check (``routing_delivery_ok``) is evidence, not part of doctor's overall pass or fail: when it is false the
+Routing row is a warning (never red by itself) that routing changes may not be reaching every conversation.
 """
 from __future__ import annotations
 
@@ -16,8 +17,10 @@ from khipu.doctor_summary import AREAS, OTHER, WORDS, failing_keyed
 
 KEYS = ("saving", "finding", "routing", "database", "jobs")
 LINKS = ("where-memory-is-kept", "search", "accounts", "backups", "running-now")
-# Not read: routing delivery is evidence that #534 removes. It still has an area so no check key is homeless.
-UNREAD = ("routing_delivery_ok",)
+# Evidence, not a gate of doctor's overall ok: read, but only ever a warning on the Routing row.
+EVIDENCE = ("routing_delivery_ok",)
+DELIVERY_LINE = "Routing changes may not be reaching every conversation."
+DELIVERY_DOING = "Khipu sends routing changes again on later prompts and keeps checking."
 # A failure of these is an error (red); every other failing check is a warning (amber).
 SEVERE = {"hub_ok", "outbox_ok", "ledger_outbox_ok", "disk_space_ok"}
 ROUTING_STALE = timedelta(hours=24)
@@ -45,6 +48,7 @@ YOU_DO = {
     "disk_space_ok": "Free up some space on this Mac.",
     "hub_ok": "Check this Mac's internet connection. If it is fine, there is nothing more to do.",
     "outbox_ok": LATER, "launchers_ok": LATER, "bundle_seal_ok": LATER, "backup_ok": LATER,
+    "routing_delivery_ok": LATER,
 }
 UNNAMED_YOU_DO = "Nothing yet. If it is still here tomorrow, give the note below to an agent."
 
@@ -57,7 +61,7 @@ def area_of(key: str) -> int:
 def every_key() -> tuple[str, ...]:
     from khipu.cli import OK_GATES
 
-    return (*OK_GATES, *UNREAD)
+    return (*OK_GATES, *EVIDENCE)
 
 
 def _cap(text: str) -> str:
@@ -168,10 +172,16 @@ def build(report: dict, *, now: datetime | None = None, mac: str | None = None, 
     problems: list[list[tuple[str, str, str, str]]] = [[] for _ in range(5)]  # (state, line, doing, you_do)
     silent: list[dict] = []
     if ran:
-        for key, area, what, fix in failing_keyed(report, skip=UNREAD):
-            problems[area].append(("err" if key in SEVERE else "warn", _cap(what), DOING[area],
+        for key, area, what, fix in failing_keyed(report):
+            delivery = key == "routing_delivery_ok"
+            problems[area].append(("err" if key in SEVERE else "warn", DELIVERY_LINE if delivery else _cap(what),
+                                   DELIVERY_DOING if delivery else DOING[area],
                                    YOU_DO.get(key, NOTHING) if key in WORDS else UNNAMED_YOU_DO))
             notes.append(f"[{AREAS[area]}] {key}: {what}. Fix: {fix}")
+            if delivery:
+                block = report.get("routing_delivery") if isinstance(report.get("routing_delivery"), dict) else {}
+                notes.append(f"[{AREAS[area]}] routing_delivery status={block.get('status')} "
+                             f"reasons={list(block.get('reasons') or [])} missing={list(block.get('missing') or [])}")
         found = _routing_problem(report, now)
         if found:
             problems[2].append((found[0], found[1], DOING[2], NOTHING))
@@ -247,7 +257,11 @@ def cmd_health(args) -> int:
     doc = build(report, why=why, peers=peers)
     print(json.dumps(doc, indent=2, ensure_ascii=False))
     if report:
-        # Tell the hub how this Mac is, after the report is out; a write that fails changes nothing above.
-        macs.publish(macs.local_row(doc, share=True))
-        macs.remember_health(doc)
+        # Tell the hub how this Mac is, after the report is out. The running part is the one `khipu running` last
+        # kept: health never builds the work view. Nothing here changes what was printed or the exit code.
+        try:
+            macs.remember_health(doc)
+            macs.publish(macs.local_row(doc))
+        except Exception:  # noqa: BLE001 - a status row is never worth failing the report
+            pass
     return 0

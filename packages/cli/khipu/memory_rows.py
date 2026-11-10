@@ -11,7 +11,8 @@ Fields added to an episode row (appended after the existing keys):
 * ``title``   first sentence of the summary (or of the owner's first line when
   the episode has no summary). Episodes have no title column.
 * ``tool``    the agent tool that captured it ("Claude Code", "Codex", ...).
-* ``mac``     the owner's name for the Mac that wrote it, else ``None``.
+* ``mac``     the name of the Mac that wrote it (``macs.mac_label`` / ``macs.name_of``), else ``None``
+  for a row from the gateway.
 * ``project`` ``COALESCE(project, scope)``, else ``None``.
 
 The owner's own lines are ``episodes.verbatim.quotes`` (the user turns of the
@@ -123,39 +124,27 @@ def tool_of(harness: Any, session_id: Any) -> str | None:
     return TOOL_NAMES.get(key, key)
 
 
-def _mac_names() -> tuple[str | None, dict]:
-    try:
-        from khipu import routing
-
-        names = routing.settings().get("routing_mac_names") or {}
-        return routing._local_mac(), names if isinstance(names, dict) else {}
-    except Exception:  # noqa: BLE001 — a name is decoration, never a failed read
-        return None, {}
-
-
 def mac_resolver():
-    """origin -> the owner's name for that Mac, or None. ``local:<hash>`` equal
-    to this Mac's origin is this Mac (its name, else "This Mac"); any other
-    ``local:`` origin is the other Mac, named when the owner has named exactly
-    one other. A gateway origin or none is not a Mac."""
+    """origin -> the name of the Mac that wrote the row, from ``macs`` (the one
+    place a Mac gets a name). ``local:<hash>`` equal to this Mac's origin is
+    this Mac; any other ``local:`` origin is another Mac (a hardware origin is
+    not a Mac id, so it gets the shared fallback). A gateway origin or none is
+    not a Mac: ``None``."""
+    from khipu import macs
+
     try:
         from khipu.machine_identity import local_origin
 
         mine = local_origin()
     except Exception:  # noqa: BLE001
         mine = None
-    local_id, names = _mac_names()
-    clean = {k: v.strip() for k, v in names.items() if isinstance(v, str) and v.strip()}
-    this_name = clean.get(local_id) if local_id else None
-    others = [v for k, v in clean.items() if k != local_id]
+    this_name, other_name = macs.mac_label(), macs.name_of(None)
 
     def resolve(origin: Any) -> str | None:
         origin = str(origin or "")
         if not origin.startswith("local:"):
             return None
-        if mine and origin == mine:
-            return this_name or "This Mac"
-        return others[0] if len(others) == 1 else "Your other Mac"
+        return this_name if mine and origin == mine else other_name
 
     return resolve
 

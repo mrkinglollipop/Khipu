@@ -49,10 +49,7 @@ def test_every_gate_lands_in_exactly_one_area_and_every_area_is_reachable():
     assert len(set(keys)) == len(keys)
     for key in keys:
         assert health_five.area_of(key) in range(5)
-        d = doc(**{key: False}) if key != "routing_delivery_ok" else doc(routing_delivery_ok=False)
-        if key == "routing_delivery_ok":
-            assert {a["state"] for a in d["areas"]} == {"ok"}  # not read
-            continue
+        d = doc(**{key: False})
         bad = [i for i, a in enumerate(d["areas"]) if a["state"] != "ok"]
         assert bad == [health_five.area_of(key)], key
     assert {health_five.area_of(k) for k in keys} == set(range(5))
@@ -88,10 +85,27 @@ def test_a_failing_check_with_no_wording_lands_in_the_fifth_area_named(monkeypat
     assert "agent" in d["areas"][4]["you_do"] and "`" not in d["areas"][4]["you_do"]
 
 
-def test_routing_reads_the_record_not_the_delivery_ledger():
-    d = doc(routing_delivery_ok=False, routing_delivery={"status": "red", "reasons": ["prompt-skips"]})
-    assert d["areas"][2]["state"] == "ok"
-    assert "routing_delivery" not in json.dumps(d)
+def test_a_failed_routing_delivery_check_is_a_warning_on_the_routing_row_never_red_alone():
+    d = doc(routing_delivery_ok=False,
+            routing_delivery={"status": "red", "reasons": ["prompt-skips"], "missing": ["recent hook outcomes"],
+                              "prompts": {"out_of_time": 4, "count": 10}})
+    row = d["areas"][2]
+    assert row["key"] == "routing" and row["state"] == "warn"  # "Needs a look", not red
+    assert [a["state"] for a in d["areas"]].count("warn") == 1 and "err" not in {a["state"] for a in d["areas"]}
+    assert row["line"] == "Routing changes may not be reaching every conversation."
+    assert row["khipu_doing"] and row["khipu_doing"] != health_five.DOING[2]
+    assert row["you_do"] == health_five.LATER and "`" not in row["you_do"]
+    assert d["headline"].startswith("Routing: Routing changes may not be reaching every conversation.")
+    note = d["agent_note"]
+    assert "routing_delivery_ok" in note and "prompt-skips" in note and "recent hook outcomes" in note
+    # evidence only: with the rest healthy the failure is that one warning; with a red record it adds, never hides
+    red = doc(routing_delivery_ok=False, routing={"error": "OSError: nope"})["areas"][2]
+    assert red["state"] == "err" and "Routing changes may not be reaching every conversation." in red["line"]
+
+
+def test_routing_reads_the_record_and_a_good_delivery_check_changes_nothing():
+    d = doc(routing_delivery_ok=True, routing_delivery={"status": "green", "reasons": []})
+    assert d["areas"][2]["state"] == "ok" and d["headline"] == "Everything is working."
     assert doc(routing={"record": False, "sources": {}})["areas"][2]["state"] == "warn"
     old = doc(routing={"record": True, "folded_at": "2026-11-08T00:00:00Z", "sources": {"runners": []}})
     assert old["areas"][2]["state"] == "warn" and "out of date" in old["areas"][2]["line"]

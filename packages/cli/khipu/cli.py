@@ -4331,6 +4331,7 @@ def cmd_jobs(args: argparse.Namespace) -> int:
 
 
 ROUTING_COPY_MAX_S = 230
+MAC_STATUS_MAX_S = 15
 
 
 def cmd_snapshot(args: argparse.Namespace) -> int:
@@ -4373,16 +4374,8 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
             out["job_state"] = {"ok": True}
         except Exception as exc:  # noqa: BLE001 — no timer stage starves the next
             out["job_state"] = timer_error(exc)
-        # This Mac's own status row for "Your Macs". A hub that is down or an older hub without the table is a
-        # note in the receipt, never a failure of the timer.
-        try:
-            from khipu import macs
-
-            out["mac_status"] = macs.publish()
-        except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
-            out["mac_status"] = timer_error(exc)
         # The routing copy between Macs must not depend on a prompt helper
-        # being alive. Last, so a slow hub cannot delay the stages above.
+        # being alive. After every local stage, so a slow hub cannot delay them.
         try:
             from khipu import deadline, routing
 
@@ -4391,6 +4384,16 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
                 out["routing_copy"] = routing.poll_refold()
         except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
             out["routing_copy"] = timer_error(exc)
+        # This Mac's own status row for "Your Macs": the last stage, so nothing above waits on it. Skipped when the
+        # hub is already known to be down; it builds no work view (the running part is the one `khipu running`
+        # kept). A hub that is down or an older hub without the table is a note in the receipt, never a failure.
+        try:
+            from khipu import deadline, macs
+
+            with deadline.limit(MAC_STATUS_MAX_S, "the Mac status row"):
+                out["mac_status"] = macs.publish()
+        except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
+            out["mac_status"] = timer_error(exc)
         print(json.dumps(out, indent=2))
         return rc
     if args.snapshot_cmd == "status":
