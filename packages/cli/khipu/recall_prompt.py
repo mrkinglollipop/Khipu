@@ -2433,7 +2433,7 @@ def _fuse_and_annotate(
     legs: list[str], degraded: str | None, graph: bool = True,
 ) -> dict[str, Any]:
     # forget-fence source: prior_work_for_prompt fences the push
-    """Everything after the legs finish: fusion, graph candidates, the
+    """Everything after the legs finish: fusion, the
     relevance gate, row metadata, project/status ranking, time boost and
     validity. One function for the keyword-only result and the full one, so
     the two cannot drift apart. It rewrites the rows it is given and appends
@@ -2499,10 +2499,9 @@ def _fuse_and_annotate(
 
     fused = fuse_ranked_lists(lists, limit=_REPLICA_DEPTH)
 
-    # graph candidates are not called here: with them on, the prompt and status paths found 84 of 120 golden hits against 96 with them off (jobs/2026-11-10/b2-switch-measure.md). The module is kept, unreachable.
     degraded_legs: list[str] = []
 
-    # Once, after fusion and graph expansion: candidate rows carry no signal,
+    # Once, after fusion: candidate rows carry no signal,
     # so they can never make an otherwise empty list pass.
     fused = hub_snapshot.snapshot_row_metadata(con, fused)
     from khipu.summary_kind import without_verbatim_only
