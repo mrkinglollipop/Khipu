@@ -1,9 +1,11 @@
 import { IntegrationsPanel } from "../../IntegrationsPanel";
+import { OwnerActions } from "../../OwnerActions";
 import type { SettingsCtx } from "../context";
 
 /** The existing apps panel, with the same data and the same buttons. */
-export function AppsPage({ ctx, active }: { ctx: SettingsCtx; active: boolean }) {
+export function AppsPage({ ctx, active, onAnotherMac }: { ctx: SettingsCtx; active: boolean; onAnotherMac: () => void }) {
   return (
+    <>
     <IntegrationsPanel
       runKhipu={ctx.runKhipu}
       onToast={ctx.onToast}
@@ -14,7 +16,13 @@ export function AppsPage({ ctx, active }: { ctx: SettingsCtx; active: boolean })
       refreshHealth={ctx.refreshHealth}
       onSearchT3Captures={ctx.onSearchT3Captures}
       onOpenGuide={ctx.onOpenGuide}
-      onAnotherMac={() => ctx.onOpenOldSettings("another-mac")}
+      onAnotherMac={onAnotherMac}
     />
+    {/* The older Settings' "Owner actions" section, unchanged: whether agents may make
+        the changes you ask them for, and which apps they may do it from. */}
+    <section className="st-group" aria-label="Changes agents make for you">
+      <OwnerActions active={active} />
+    </section>
+    </>
   );
 }

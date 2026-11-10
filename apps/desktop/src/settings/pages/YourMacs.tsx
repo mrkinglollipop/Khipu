@@ -1,17 +1,34 @@
+import type { ReactNode } from "react";
 import { Tag } from "../../ui";
+import { MacSettings } from "./MacSettings";
 import type { Loaded, MacsDoc } from "../data";
 import { macName } from "../data";
 import { macLine } from "../words";
 
 /** One line per Mac. A Mac that has gone quiet is shown as quiet, in words;
  *  a Mac that has not reported yet is said to be absent, not an error. */
-export function YourMacsPage({ macs }: { macs: Loaded<MacsDoc> }) {
-  if (macs.loading && !macs.data) return <p className="st-muted" role="status">Reading your Macs…</p>;
+export function YourMacsPage({ macs, active = true, onNamed, anotherMac }: {
+  macs: Loaded<MacsDoc>;
+  active?: boolean;
+  /** Read the list again after a Mac is named. */
+  onNamed?: () => Promise<unknown> | void;
+  /** Setting up another Mac (App's join kit, moved here from the older Settings). */
+  anotherMac?: ReactNode;
+}) {
+  const another = anotherMac ? (
+    <section className="st-group" aria-labelledby="st-another-h" id="st-another">
+      <h3 id="st-another-h">Add another Mac</h3>
+      {anotherMac}
+    </section>
+  ) : null;
   if (!macs.data) {
     return (
-      <p className="st-muted" role="status">
-        Khipu could not read the list of Macs just now{macs.error ? `: ${macs.error}` : "."}
-      </p>
+      <>
+        <p className="st-muted" role="status">
+          {macs.loading ? "Reading your Macs…" : `Khipu could not read the list of Macs just now${macs.error ? `: ${macs.error}` : "."}`}
+        </p>
+        {another}
+      </>
     );
   }
   const doc = macs.data;
@@ -38,6 +55,8 @@ export function YourMacsPage({ macs }: { macs: Loaded<MacsDoc> }) {
       ) : doc.macs.length > 1 && versions.size > 1 ? (
         <p className="st-muted">The Macs run different versions.</p>
       ) : null}
+      <MacSettings macs={doc.macs} active={active} onNamed={() => onNamed?.()} />
+      {another}
     </>
   );
 }

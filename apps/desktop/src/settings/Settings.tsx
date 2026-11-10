@@ -1,7 +1,8 @@
 // Settings: 13 rows on the left, one short page on the right. Same on both
-// Macs unless a row says "Only on <this Mac>". The old Settings stays reachable
-// under Older screens until a later slice deletes it.
-import { useState } from "react";
+// Macs unless a row says "Only on <this Mac>".
+
+
+import { useEffect, useState } from "react";
 import { ChevronLeft } from "lucide-react";
 import { Body, Split, useListKeys } from "../shell";
 import { synthProviderInfo } from "../SynthProvider";
@@ -33,7 +34,15 @@ export const ROW_IDS: RowId[] = ["macs", "updates", "signins", "apps", "summarie
 export function Settings({ ctx, active }: { ctx: SettingsCtx; active: boolean }) {
   const [sel, setSel] = useState<RowId>("macs");
   const [open, setOpen] = useState(false);
-  const { macs, health } = useSettingsData(active);
+  // A deep link from a notice, a guide or another page opens that row.
+  const openRow = ctx.openRow;
+  useEffect(() => {
+    if (openRow && (ROW_IDS as string[]).includes(openRow.id)) {
+      setSel(openRow.id as RowId);
+      setOpen(true);
+    }
+  }, [openRow]);
+  const { macs, health, reloadMacs } = useSettingsData(active);
   const keys = useListKeys();
   const mac = ctx.thisMac ?? "this Mac";
 
@@ -82,10 +91,10 @@ export function Settings({ ctx, active }: { ctx: SettingsCtx; active: boolean })
   const pageActive = active;
   const page = (() => {
     switch (cur.id) {
-      case "macs": return <YourMacsPage macs={macs} />;
-      case "updates": return <UpdatesPage appVersion={ctx.appVersion} thisMac={ctx.thisMac} />;
+      case "macs": return <YourMacsPage macs={macs} active={pageActive} onNamed={reloadMacs} anotherMac={ctx.anotherMac} />;
+      case "updates": return <UpdatesPage appVersion={ctx.appVersion} thisMac={ctx.thisMac} whatsNew={ctx.whatsNew} />;
       case "signins": return <SignInsPage macs={macs} active={pageActive} />;
-      case "apps": return <AppsPage ctx={ctx} active={pageActive} />;
+      case "apps": return <AppsPage ctx={ctx} active={pageActive} onAnotherMac={() => { setSel("macs"); setOpen(true); }} />;
       case "summaries": return <SummariesPage ctx={ctx} active={pageActive} />;
       case "meaning": return <SearchByMeaningPage active={pageActive} />;
       case "books": return <BooksPage active={pageActive} />;

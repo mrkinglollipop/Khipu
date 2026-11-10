@@ -1,6 +1,6 @@
 // All reads are faked. Visibility uses the shipped CSS, including hidden panes.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import App from "../App";
 // @ts-expect-error node:fs has no types here
 import { readFileSync } from "node:fs";
@@ -36,13 +36,6 @@ vi.mock("../ComponentsPanel", async () => {
 });
 
 type Mode = "ok" | "reject" | "native-timeout" | "empty" | "late";
-type Deferred = { promise: Promise<string>; resolve: (value: string) => void; reject: (error: Error) => void };
-function deferred(): Deferred {
-  let resolve!: (value: string) => void;
-  let reject!: (error: Error) => void;
-  const promise = new Promise<string>((done, fail) => { resolve = done; reject = fail; });
-  return { promise, resolve, reject };
-}
 const doctor = JSON.stringify({ ok: true, capture_liveness: { ok: true, red: [], harnesses: {} }, claude_homes: { homes: [] } });
 const status = JSON.stringify({ counts: {}, recent_captures: [] });
 const integrations = JSON.stringify([{ harness: "codex", detected: false, mcp: false, hook_stop: false, hook_precompact: false, recall_rule: "missing" }]);
@@ -117,140 +110,40 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-const primaryViews = ["Home", "Work", "Recall", "Activity", "Harnesses", "Settings"] as const;
+const places = ["Today", "Accounts", "Memory", "Settings"] as const;
 function visiblePanel() {
   const panels = [...document.querySelectorAll<HTMLElement>("main section.panel")].filter((pane) => !pane.classList.contains("is-hidden"));
   expect(panels).toHaveLength(1);
   expect(panels[0]).toBeVisible();
   return panels[0];
 }
-function assertPane(heading: string) {
-  expect(within(visiblePanel()).getByRole("heading", { name: heading })).toBeVisible();
-  expect(visiblePanel().textContent!.trim().length).toBeGreaterThan(heading.length);
+function assertPlace() {
+  expect(visiblePanel().textContent!.trim().length).toBeGreaterThan(0);
   expect(screen.getByRole("navigation", { name: "Main" })).toBeVisible();
-}
-async function select(label: typeof primaryViews[number]) {
-  await openScreen(label);
-  await waitFor(() => assertPane(label));
-}
-async function everyPane(mode: Mode) {
-  for (const label of primaryViews) {
-    await select(label);
-    if (mode === "late") await settleLateReads();
-    assertPane(label);
-    if (mode === "late") expect(document.querySelector("main > .working-banner")).not.toBeInTheDocument();
-  }
-  await select("Home");
-  const summary = [...visiblePanel().querySelectorAll("summary")].find((el) => el.textContent?.includes("Full health report"))!;
-  expect(summary).toBeInTheDocument();
-  fireEvent.click(summary);
-  fireEvent.click(within(visiblePanel()).getByRole("button", { name: /^Conflicting edits/ }));
-  await waitFor(() => assertPane("Conflicting edits"));
-  if (mode === "late") await settleLateReads();
-  assertPane("Conflicting edits");
-
-  cleanup();
-  store.clear();
-  render(<App />);
-  await waitFor(() => assertPane("Welcome to Khipu"));
-  if (mode === "late") await settleLateReads();
-  assertPane("Welcome to Khipu");
 }
 
 describe("App loading and recovery", () => {
-  it.each(["late", "reject", "native-timeout", "empty"] as const)("keeps all eight top-level panes visible for %s reads", async (mode) => {
+  // After A11 the window has three places and Settings. Whatever the reads do
+  // (answer late, fail, time out, come back empty), each place still draws,
+  // and so do the sidebar and the first-run Welcome.
+  it.each(["late", "reject", "native-timeout", "empty"] as const)("keeps every place and Welcome on screen for %s reads", async (mode) => {
     script(mode);
     render(<App />);
-    await openScreen("Home"); // Today opens first; these reads belong to the older Home
-    if (mode === "late") {
-      const failed = await within(visiblePanel()).findByText("Couldn't read recent captures");
-      fireEvent.click(within(failed.closest<HTMLElement>(".callout")!).getByRole("button", { name: "Retry" }));
+    for (const name of places) {
+      await openScreen(new RegExp(`^${name}`));
+      if (mode === "late") await settleLateReads();
+      await waitFor(() => assertPlace());
     }
-    await everyPane(mode);
-  });
-
-  it("keeps the timeout error when the same underlying read resolves late, then recovers with retry", async () => {
-    const raw = deferred();
-    const deadline = deferred();
-    let retryReady = false;
-    script("ok", { status: () => retryReady ? status : Promise.race([raw.promise, deadline.promise]) });
+    cleanup();
+    store.clear();
     render(<App />);
-    await openScreen("Home");
-    await waitFor(() => expect(document.querySelector(".working-banner")).toHaveTextContent("counts"));
-    await act(async () => { deadline.reject(new Error("Khipu CLI timed out after 60 seconds")); });
-    const failure = await within(visiblePanel()).findByText("Couldn't read recent captures");
-    await act(async () => { raw.resolve(status); });
-    expect(failure).toBeVisible();
-    assertPane("Home");
-    retryReady = true;
-    fireEvent.click(within(failure.closest<HTMLElement>(".callout")!).getByRole("button", { name: "Retry" }));
-    expect(await within(visiblePanel()).findByText("No captures yet")).toBeVisible();
-    await waitFor(() => expect(document.querySelector("main > .working-banner")).not.toBeInTheDocument());
-    assertPane("Home");
+    await waitFor(() => expect(within(visiblePanel()).getByRole("heading", { name: "Welcome to Khipu" })).toBeVisible());
+    if (mode === "late") await settleLateReads();
+    assertPlace();
   });
+});
 
-  it("keeps Settings and the rail when a hidden Harnesses read returns a malformed envelope", async () => {
-    const malformed = deferred();
-    let reads = 0;
-    script("ok", { integrations: () => ++reads === 1 ? integrations : reads === 2 ? malformed.promise : integrations });
-    render(<App />);
-    await select("Harnesses");
-    await waitFor(() => expect(within(visiblePanel()).getByRole("button", { name: "Refresh" })).toBeEnabled());
-    fireEvent.click(within(visiblePanel()).getByRole("button", { name: "Refresh" }));
-    await waitFor(() => expect(reads).toBe(2));
-    await select("Settings");
-    await act(async () => { malformed.resolve('{"ok":false,"error":"unreadable response"}'); });
-    assertPane("Settings");
-    const hiddenHarnesses = [...document.querySelectorAll<HTMLElement>("main section.panel")].find((pane) => pane.querySelector("h1")?.textContent === "Harnesses")!;
-    await waitFor(() => expect(hiddenHarnesses).toHaveTextContent("Khipu returned an unreadable harness status."));
-    expect(hiddenHarnesses).toHaveClass("is-hidden");
-    const retry = [...hiddenHarnesses.querySelectorAll<HTMLButtonElement>("button")]
-      .find((button) => button.textContent?.trim() === "Retry");
-    expect(retry).toBeDefined();
-    if (!retry) throw new Error("Harnesses retry button was missing");
-    expect(retry).toBeEnabled();
-    fireEvent.click(retry);
-    await waitFor(() => expect(reads).toBe(3));
-    await waitFor(() => expect(hiddenHarnesses).not.toHaveTextContent("Khipu returned an unreadable harness status."));
-    assertPane("Settings");
-    expect(hiddenHarnesses).toHaveClass("is-hidden");
-  });
-
-  it("provides a working retry for a failed first Work read", async () => {
-    script("reject");
-    render(<App />);
-    await select("Work");
-    const failure = await within(visiblePanel()).findByText("Could not read the work view");
-    expect(failure).toBeVisible();
-    script("ok");
-    fireEvent.click(within(failure.closest<HTMLElement>(".card")!).getByRole("button", { name: "Retry" }));
-    await waitFor(() => expect(within(visiblePanel()).queryByText("Could not read the work view")).not.toBeInTheDocument());
-    assertPane("Work");
-  });
-
-  it("isolates a pane render failure, recovers on retry, and preserves sibling state across navigation", async () => {
-    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
-    script("ok");
-    render(<App />);
-    await select("Settings");
-    fireEvent.click(within(visiblePanel()).getByRole("tab", { name: "Components" }));
-    fireEvent.change(within(visiblePanel()).getByRole("textbox", { name: "Component draft" }), { target: { value: "retained draft" } });
-    await select("Home");
-    await select("Settings");
-    expect(within(visiblePanel()).getByRole("textbox", { name: "Component draft" })).toHaveValue("retained draft");
-    boundaryFault.enabled = true;
-    await select("Home");
-    await select("Settings");
-    expect(await within(visiblePanel()).findByRole("alert")).toHaveTextContent("Could not render Settings");
-    expect(errorLog).toHaveBeenCalled();
-    await select("Home");
-    assertPane("Home");
-    boundaryFault.enabled = false;
-    await select("Settings");
-    fireEvent.click(within(visiblePanel()).getByRole("button", { name: "Retry" }));
-    expect(await within(visiblePanel()).findByRole("textbox", { name: "Component draft" })).toBeVisible();
-  });
-
+describe("integrations status", () => {
   it.each(["", "null", "{}", '{"ok":false}', "[null]", "[{}]"])("rejects an unreadable integrations status: %s", (raw) => {
     expect(parseStatusRows(raw)).toBeNull();
   });
@@ -261,9 +154,11 @@ describe("App loading and recovery", () => {
 });
 
 
-it("keeps Home's loading banner outside the content scroll area", async () => {
+it("keeps the loading banner outside the content scroll area", async () => {
   script("late");
   render(<App />);
+  // Settings reads the health check, which shows the banner while it runs.
+  await openScreen("Settings");
   const main = screen.getByRole("main");
   await waitFor(() => expect(main.querySelector(".working-banner")).not.toBeNull());
   const banner = main.querySelector<HTMLElement>(".working-banner")!;

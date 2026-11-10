@@ -20,6 +20,8 @@ import type { RowModel } from "./accountsModel";
 import { useAccountWrites } from "./useAccountWrites";
 import { RunningHere } from "./RunningNow";
 import type { RunningHook } from "./running";
+import { AccountMore } from "./AccountMore";
+import { AutoTrackSwitch, CliSettingsRows, FinderTop, NotOfferedAgain, useAccountsFinder } from "../FoundAccounts";
 import "./accounts-new.css";
 
 function Meter({ row }: { row: RowModel }) {
@@ -56,14 +58,13 @@ function AccountRow({ row, selected, onSelect }: { row: RowModel; selected: bool
   );
 }
 
-export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp, onOpenOlder, running }: {
+export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp, running }: {
   routing: RoutingState;
   plans: UsageReport | null | undefined;
   thisMac: string | null;
   onReloadPlans?: () => Promise<unknown> | void;
   /** Tests pin the clock; the app uses the real one. */
   now?: Date;
-  onOpenOlder?: () => void;
   /** What job runners report (slice A5), for "Running here now" on the account page. */
   running?: RunningHook;
 }) {
@@ -92,6 +93,29 @@ export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp,
     await Promise.all([routing.load(true), loadOverrides()]);
   }, [routing, loadOverrides]);
   const writes = useAccountWrites(reread);
+  // Adding, finding, renaming and no longer tracking accounts: the older
+  // Accounts screen's finder, unchanged (its own commands and dialogs).
+  const finder = useAccountsFinder(true, {
+    view: routing.data,
+    onChanged: () => {
+      void routing.load(true);
+      void onReloadPlans?.();
+    },
+  });
+  const finderPanel = (
+    <section className="ac-finder" aria-labelledby="ac-finder-h">
+      <h2 id="ac-finder-h">Add or find accounts</h2>
+      <FinderTop finder={finder} rows={plans?.accounts ?? []} />
+      <details className="ac-finder-more">
+        <summary>How Khipu finds accounts on this Mac</summary>
+        <NotOfferedAgain support={finder.support} onOfferAgain={(e) => void finder.offerAgain(e)} />
+        <AutoTrackSwitch support={finder.support} onChange={(on) => void finder.setAutoTrack(on)} />
+        <CliSettingsRows clis={finder.disc.data?.clis} settings={finder.cfg?.cli_settings} checking={finder.disc.running}
+          onSet={(k, v, o) => void finder.setCliPath(k, v, o)} onCheckAgain={() => void finder.disc.run(false)} />
+      </details>
+      {finder.dialogs}
+    </section>
+  );
 
   const view = routing.data;
   const accounts = useMemo(() => orderedAccounts(view), [view]);
@@ -127,8 +151,8 @@ export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp,
       <Body>
         <div className="ac-empty">
           <p>Khipu isn't tracking any accounts yet.</p>
-          {onOpenOlder ? <button type="button" className="ac-btn" onClick={onOpenOlder}>Open the older Accounts screen to add one</button> : null}
         </div>
+        {finderPanel}
       </Body>
     );
   }
@@ -153,9 +177,16 @@ export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp,
         ))}
       </div>
       <p className="ac-cap ac-foot">{routing.error ? `${routing.error} ` : ""}{readLine(view, now) ?? ""}</p>
+      {finderPanel}
     </div>
   );
   const row = rows.find((r) => r.key === selectedKey) ?? rows[0];
+  const keyHome = selected ? selected.key.slice(selected.key.indexOf("|") + 1) : "";
+  const managed = selected
+    ? { key: selected.key, label: selected.label, harness: selected.harness, home: selected.key.includes("|") && keyHome ? keyHome : null }
+    : null;
+  // Rename and Stop tracking wait, as they did on the older screen, for the account list to be read.
+  const manageable = managed != null && finder.support.state === "here" && selected?.configured !== false;
   const detail = selected ? (
     <>
       <button type="button" className="ac-back" onClick={() => setDetailOpen(false)}>
@@ -163,7 +194,10 @@ export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp,
       </button>
       <AccountPage a={selected} row={row} view={view} plans={plans} now={now} writes={writes} overrides={overrides}
         thisMac={thisMacName} onSignedIn={async () => { await Promise.all([reread(), onReloadPlans?.()]); }}
-        runningHere={running ? <RunningHere accountKey={selected.key} accountLabel={selected.label} hook={running} now={nowProp} /> : undefined} />
+        runningHere={running ? <RunningHere accountKey={selected.key} accountLabel={selected.label} hook={running} now={nowProp} /> : undefined}
+        more={<AccountMore a={selected} view={view} now={now} reread={reread}
+          onRename={manageable ? () => finder.openRename(managed!) : undefined}
+          onStop={manageable ? () => finder.openStop(managed!) : undefined} />} />
     </>
   ) : null;
   return (

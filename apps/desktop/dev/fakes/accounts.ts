@@ -6,6 +6,7 @@
 //   accountsProblem: true  Claude is out of room until the next reset; Claude second needs signing in
 //   accountsAhead: true    one conversation is already running ahead on Claude
 //   accountsRefuse: true   a pause is refused
+//   accountsProblem also keeps one rule-set stop on Claude (A11: "More for this account" ends it)
 import type { RouteAccount, RouteView } from "../../src/routing";
 import type { UsageReport } from "../../src/PlansCard";
 import type { FakeHandler } from "./index";
@@ -26,6 +27,7 @@ type State = {
   undo: Array<{ id: string; accounts: RouteAccount[]; overrides: Array<Record<string, unknown>> }>;
   n: number;
   problem: boolean;
+  holdEnded?: boolean;
 };
 
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
@@ -91,7 +93,11 @@ const view = (s: State): RouteView => ({
     version: "p1",
   },
   priority_version: "p1",
-  holds: [], rules: [],
+  holds: s.problem && !s.holdEnded
+    ? [{ id: "h1", scope: { kind: "account", account: s.accounts[0]?.key }, scope_label: s.accounts[0]?.label ?? "Claude",
+        reason: "owner", text: "No long batch jobs until Friday", until: at(60 * 24 * 3), owner: true, by: "you" }]
+    : [],
+  rules: [],
 });
 
 const usage = (s: State): UsageReport => ({
@@ -155,6 +161,14 @@ export const accountsFakes: FakeHandler = (cmd, args, flags) => {
       const id = snapshot(s);
       if (a) { a.state = "paused"; a.until = (args?.until as string | null) ?? null; }
       return { ok: true, owner_action: id };
+    }
+    case "khipu_route_hold_end":
+      s.holdEnded = true;
+      return { ok: true };
+    case "khipu_route_clear": {
+      const a = find(args?.account);
+      if (a && (a.state === "limited" || a.state === "down")) a.state = "open";
+      return { ok: true };
     }
     case "khipu_route_lift": {
       const a = find(args?.account);

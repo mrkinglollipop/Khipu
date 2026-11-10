@@ -33,7 +33,8 @@ function fakeRun(over: (args: Call) => unknown | undefined = () => undefined) {
 }
 
 const searchCalls = (calls: Call[]) => calls.filter((c) => c[0] === "search");
-const forgetCalls = (calls: Call[]) => calls.filter((c) => c[0] === "episode");
+// The pending-forgets list (moved here in A11) reads `episode forget-pending`; it forgets nothing.
+const forgetCalls = (calls: Call[]) => calls.filter((c) => c[0] === "episode" && c[1] !== "forget-pending");
 
 async function searchFor(text: string) {
   const box = await screen.findByRole("searchbox", { name: "Search what you and your agents said" });
@@ -56,7 +57,7 @@ describe("Memory: recent conversations", () => {
     expect(await screen.findByRole("heading", { name: "Recent conversations" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Today" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Yesterday" })).toBeVisible();
-    expect(calls[0]).toEqual(["activity", "--limit", "40"]);
+    expect(calls.filter((c) => c[1] !== "forget-pending")[0]).toEqual(["activity", "--limit", "40"]);
     fireEvent.click(screen.getByRole("button", { name: /Making the app simpler/ }));
     expect(await screen.findByRole("heading", { name: "What you said" })).toBeVisible();
     expect(calls).toContainEqual(["activity", "--show=11"]);
@@ -277,5 +278,37 @@ describe("Memory: Copy a link", () => {
     expect(writeText.mock.calls[0][0]).toContain("11");
     expect(await screen.findByText(/Copied\. Paste it into any conversation/)).toBeVisible();
     vi.unstubAllGlobals();
+  });
+});
+
+describe("Memory: correct what a conversation was about (moved from the older Activity screen)", () => {
+  const editCalls = (calls: Call[]) => calls.filter((c) => c[0] === "episode" && c[1] === "edit");
+
+  it("saves the corrected summary with the old call, only on Save, then reads the conversation again", async () => {
+    const { run, calls } = fakeRun((a) => (a[0] === "episode" && a[1] === "edit" ? { ok: true, reembedded: false } : undefined));
+    render(<Memory run={run} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Making the app simpler/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Correct what it was about…" }));
+    const box = screen.getByRole("textbox", { name: "What this conversation was about" });
+    expect(box).toHaveValue("About one.");
+    fireEvent.change(box, { target: { value: "-- about two" } });
+    expect(editCalls(calls)).toEqual([]);
+    const shows = calls.filter((c) => c[1] === "--show=11").length;
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(editCalls(calls)).toEqual([["episode", "edit", "11", "--summary=-- about two"]]));
+    expect(await screen.findByText("Saved. Search by meaning picks it up at the next nightly.")).toBeInTheDocument();
+    await waitFor(() => expect(calls.filter((c) => c[1] === "--show=11").length).toBe(shows + 1));
+  });
+
+  it("a refusal is shown and Cancel changes nothing", async () => {
+    const { run, calls } = fakeRun((a) => (a[0] === "episode" && a[1] === "edit" ? { ok: false, error: "summary too long" } : undefined));
+    render(<Memory run={run} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Making the app simpler/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Correct what it was about…" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "What this conversation was about" }), { target: { value: "New" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("summary too long");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(editCalls(calls)).toHaveLength(1);
   });
 });

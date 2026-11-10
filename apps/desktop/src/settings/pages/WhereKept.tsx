@@ -17,6 +17,8 @@ export function WhereKeptPage({ ctx, health }: { ctx: SettingsCtx; health: Healt
       <CheckedLine health={health} />
       <div className="st-actions">
         <button type="button" onClick={ctx.onMoveMemory}>Move this memory to another database…</button>
+        <button type="button" onClick={ctx.onDatabaseStep}>Connect to a different database…</button>
+        <button type="button" onClick={ctx.onRunSetup}>Run setup again</button>
       </div>
     </>
   );

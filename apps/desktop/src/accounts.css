@@ -19,7 +19,7 @@
 .aa-opt.off b { color: var(--text-2); }
 .aa-opt .tag { white-space: nowrap; }
 .aa-opt-end { display: inline-flex; align-items: center; gap: var(--s2); flex-wrap: wrap; justify-content: flex-end; }
-.aa-opt .aa-sub { grid-column: 2 / -1; margin-top: var(--s1); }
+
 .aa-mono { font-family: var(--mono); font-size: var(--t-sm); color: var(--text); overflow-wrap: anywhere; }
 
 .aa-ways { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s2); }

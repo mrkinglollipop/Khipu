@@ -10,7 +10,7 @@ import { act, render, screen, fireEvent, waitFor, cleanup, within } from "@testi
 import { Welcome } from "../Welcome";
 import App from "../App";
 import { IntegrationsPanel, verifiedLine } from "../IntegrationsPanel";
-import { openScreen } from "./nav";
+import { openSettingsRow } from "./nav";
 
 const invokeMock = vi.fn();
 
@@ -313,7 +313,7 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
     });
 
     render(<App />);
-    await openScreen("Settings");
+    await openSettingsRow("Where memory is kept");
 
     fireEvent.click(screen.getByRole("button", { name: /Move this memory to another database/ }));
     fireEvent.change(screen.getByLabelText("Target connection string"), {
@@ -346,8 +346,7 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
 
     render(<App />);
 
-    await openScreen("Settings");
-    fireEvent.click(screen.getByRole("tab", { name: "Another Mac" }));
+    await openSettingsRow("Your Macs");
 
     await waitFor(() =>
       expect(
@@ -367,8 +366,7 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
     invokeMock.mockImplementation(async (cmd: string) => defaultInvoke(cmd));
 
     render(<App />);
-    await openScreen("Settings");
-    fireEvent.click(screen.getByRole("tab", { name: "Another Mac" }));
+    await openSettingsRow("Your Macs");
 
     await waitFor(() =>
       expect(screen.getByText("Set up another Mac")).toBeInTheDocument(),

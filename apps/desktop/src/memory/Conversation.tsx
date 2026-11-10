@@ -2,6 +2,7 @@
 // and the two things you can do with it. "Forget" opens the confirmation (the
 // owner types "forget"); it never forgets by itself.
 import { useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { ArrowLeft, Check, Loader2 } from "lucide-react";
 import { Marked } from "./Results";
 import type { Searched } from "./Results";
@@ -22,12 +23,15 @@ export function ConversationPage({
   searched,
   onBack,
   onForget,
+  correct,
 }: {
   row: MemoryRow;
   page: { state: "busy" | "done" | "error"; data: Conversation | null };
   searched: Searched | null;
   onBack: () => void;
   onForget: () => void;
+  /** "Correct what it was about…" (moved from the older Activity screen). */
+  correct?: ReactNode;
 }) {
   const [copied, setCopied] = useState<"yes" | "no" | null>(null);
   const [all, setAll] = useState(false);
@@ -103,6 +107,7 @@ export function ConversationPage({
           <button type="button" onClick={onForget}>
             Forget this conversation
           </button>
+          {correct}
         </div>
         <p className="mem-copied" role="status">
           {copied === "yes" ? (

@@ -1055,6 +1055,8 @@ const ROUTING_SWITCH_KEYS: &[&str] = &[
 const ROUTING_RETRIES_KEY: &str = "routing_reset_check_retries";
 const ROUTING_SOURCES_KEY: &str = "routing_sources";
 const ROUTING_LANE_MAP_KEY: &str = "routing_lane_map";
+/// The names the owner gives the Macs, by Mac id (Settings › Your Macs).
+const ROUTING_MAC_NAMES_KEY: &str = "routing_mac_names";
 /// The routing table file: a full path, read only (fix round 2, R2-1).
 const ROUTING_TABLE_KEY: &str = "routing_table";
 const ROUTING_SOURCES_MAX: usize = 32;
@@ -1276,6 +1278,7 @@ fn routing_key(key: &str) -> bool {
         || key == ROUTING_RETRIES_KEY
         || key == ROUTING_SOURCES_KEY
         || key == ROUTING_LANE_MAP_KEY
+        || key == ROUTING_MAC_NAMES_KEY
         || key == ROUTING_TABLE_KEY
 }
 
@@ -1355,6 +1358,26 @@ fn checked_routing_lane_map(raw: &str) -> Result<String, String> {
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
+/// The Mac names, parsed and re-printed: an object of at most 32 Mac ids (32
+/// lower-case hex characters) to one-line names, the shape `khipu config`
+/// itself checks (`routing._coerce`, kind `mac_names`).
+fn checked_routing_mac_names(raw: &str) -> Result<String, String> {
+    let bad = || "the Mac names must be JSON like {\"<mac id>\": \"M5\"}".to_string();
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|_| bad())?;
+    let macs = value.as_object().ok_or_else(bad)?;
+    if macs.len() > 32 {
+        return Err("at most 32 Mac names".to_string());
+    }
+    let mut out = serde_json::Map::new();
+    for (mac, name) in macs {
+        if mac.len() != 32 || !mac.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+            return Err(format!("{mac:?} is not a Mac id"));
+        }
+        out.insert(mac.clone(), serde_json::Value::String(routing_json_text("a Mac name", name, 64)?));
+    }
+    serde_json::to_string(&out).map_err(|e| e.to_string())
+}
+
 /// A routing setting's value as argv takes it, re-printed from the parsed
 /// value: whole seconds, a whole number, on or off, or checked JSON.
 fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
@@ -1370,6 +1393,9 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     }
     if key == ROUTING_LANE_MAP_KEY {
         return checked_routing_lane_map(v);
+    }
+    if key == ROUTING_MAC_NAMES_KEY {
+        return checked_routing_mac_names(v);
     }
     if key == ROUTING_TABLE_KEY {
         return checked_routing_path("the routing table file", v);
@@ -6604,6 +6630,15 @@ mod settings_command_tests {
         assert_eq!(map[4], r#"{"Project B":{"opus-batch":"Claude main"}}"#);
         for bad in [r#"{"B": {"lane": 3}}"#, r#"{"B": ["lane"]}"#, r#"{"B": {"la\nne": "x"}}"#, "[]"] {
             assert!(config_set_argv("routing_lane_map", bad).is_err(), "{bad}");
+        }
+        // Settings › Your Macs: the owner's names for the Macs, as the CLI checks them.
+        let id = "0123456789abcdef0123456789abcdef";
+        let names = config_set_argv("routing_mac_names", &format!(r#"{{"{id}": " M5 "}}"#)).unwrap();
+        assert_eq!(names, v(&["config", "--from-app", "--set", "routing_mac_names", &format!(r#"{{"{id}":"M5"}}"#)]));
+        assert_eq!(config_set_argv("routing_mac_names", "{}").unwrap()[4], "{}");
+        for bad in [r#"{"not-an-id": "M5"}"#, &format!(r#"{{"{id}": ""}}"#), &format!(r#"{{"{id}": "M5\n--x"}}"#),
+                    &format!(r#"{{"{id}": 5}}"#), r#"["M5"]"#, "-x", &format!(r#"{{"{}": "M5"}}"#, id.to_uppercase())] {
+            assert!(config_set_argv("routing_mac_names", bad).is_err(), "{bad}");
         }
     }
 

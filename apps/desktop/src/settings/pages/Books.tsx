@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { callCli, useCliState } from "../../settingsCli";
-import type { LibraryRow } from "../../EmbeddingsPanel";
+import type { LibraryRow } from "../searchTypes";
 
 /** One switch over every book library. On: each library is enabled (the same
  *  `library enable` the old screen calls, with the library's own settings). Off:

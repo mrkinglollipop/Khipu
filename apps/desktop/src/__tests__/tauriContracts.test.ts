@@ -89,7 +89,8 @@ describe("Tauri invoke contracts", () => {
       }
     }
     expect(commands.size).toBeGreaterThan(100);
-    expect(checked).toBeGreaterThan(100);
+    // A floor that proves the scan still finds call sites (98 after A11 removed the older screens).
+    expect(checked).toBeGreaterThan(80);
     expect(violations).toEqual([]);
   });
 });

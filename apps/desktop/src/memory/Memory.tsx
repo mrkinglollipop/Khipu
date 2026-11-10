@@ -12,6 +12,8 @@ import type { FormEvent } from "react";
 import { Loader2, Search } from "lucide-react";
 import { Body, Split, Toolbar, ViewSwitch, useListKeys } from "../shell";
 import { ConversationPage } from "./Conversation";
+import { CorrectSummary } from "./CorrectSummary";
+import { PendingForgets } from "../PendingForgets";
 import { ProjectLists } from "./ProjectLists";
 import { ForgetDialog } from "./ForgetDialog";
 import { forgetConversation } from "./forget";
@@ -258,6 +260,7 @@ export function Memory({
         </section>
       ) : (
         <section className="mem-recent" aria-label="Recent conversations">
+          <PendingForgets run={run} />
           <h2>Recent conversations</h2>
           {recent.state === "busy" ? <p className="mem-note" role="status">Loading…</p> : null}
           {recent.state === "error" ? (
@@ -284,6 +287,10 @@ export function Memory({
         setForgetErr(null);
         setForgetting(selected);
       }}
+      correct={page.state === "done" ? (
+        <CorrectSummary key={selected.id} id={selected.id} current={page.data?.about ?? ""} run={run}
+          onSaved={() => void open(selected)} />
+      ) : null}
     />
   ) : (
     <p className="mem-none">No conversation to show.</p>

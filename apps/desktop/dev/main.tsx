@@ -4,9 +4,7 @@
 import { StrictMode, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
-import { ChevronRight } from "lucide-react";
 import "../src/App.css";
-import "../src/routingOverview.css";
 import "../src/accounts.css";
 import { AddAccountDialog } from "../src/AddAccountDialog";
 import type { AddAccountStart } from "../src/AddAccountDialog";
@@ -32,25 +30,8 @@ import type { AccountRefs } from "../src/FoundAccounts";
 import App from "../src/App";
 import { ProjectLists } from "../src/memory/ProjectLists";
 import { applyStoredLook } from "../src/settings/lookModel";
-import { RoutingSettings } from "../src/RoutingSettings";
 import { OrderAndRules } from "../src/accounts/OrderAndRules";
-import { OfflineBanner, SavedOnThisMac, WaitingToSync } from "../src/OfflineBanner";
-import { OfflineWaitsCard } from "../src/SettingsControls";
 import { SetupAccountsStep } from "../src/SetupAccounts";
-import { PlanBlock } from "../src/PlansCard";
-import { ProjectsSettings } from "../src/ProjectsSettings";
-import type { ProjectsList } from "../src/ProjectsSettings";
-import { useCliState } from "../src/settingsCli";
-import { invoke } from "./fakeTauri";
-import { RoutingCard } from "../src/RoutingCard";
-import { useRouting } from "../src/routing";
-import type { UsageReport } from "../src/PlansCard";
-import type { UsageAccount } from "../src/PlansCard";
-import { PaceSection } from "../src/RoutingSettings";
-import { paceModel } from "../src/routingPace";
-import { PACE_NOW, PACE_PLANS, PACE_VIEW } from "./paceFake";
-import { DELIVERY_HEALTH } from "./deliveryFake";
-import type { RouteDeliveryHealth } from "../src/routing";
 import type { DiscoverResult, Support } from "../src/accountsApi";
 import {
   CLIENT,
@@ -101,15 +82,6 @@ const NOT_SIGNED = { ok: false, row: { harness: "claude", ok: false, error: "not
 
 /** One tracked account's fold body as Settings renders it: its extras, then
  *  its plan block (which holds Sign in again and when it was last read). */
-function WholeAccount({ label, home, row }: { label: string; home: string; row: UsageAccount }) {
-  return (
-    <div className="route-settings">
-      <AccountExtras label={label} harness="claude" home={home} row={row} support={HERE} now={NOW} onRename={() => {}} onStop={() => {}} />
-      <PlanBlock row={row} now={NOW} />
-    </div>
-  );
-}
-
 function FinderHost() {
   const finder = useAccountsFinder(true);
   return (
@@ -120,259 +92,7 @@ function FinderHost() {
   );
 }
 
-/** Owed with the hub away (offline slice 6): each banner as the tab shows it,
- *  and a row with a queued change. Fictional data. */
-function OfflineOwedStates() {
-  const refreshed = new Date(2026, 9, 16, 9, 5).toISOString();
-  return (
-    <div className="route-settings">
-      <p className="meta">Answered from this Mac's copy</p>
-      <OfflineBanner state={{ kind: "stale", refreshedAt: refreshed }} />
-      <p className="meta">Answered from this Mac's copy, no time on record</p>
-      <OfflineBanner state={{ kind: "stale", refreshedAt: null }} />
-      <p className="meta">The load timed out</p>
-      <OfflineBanner state={{ kind: "unreachable" }} />
-      <p className="meta">After Done or Snooze while the hub is away</p>
-      <SavedOnThisMac show />
-      <p className="meta">A row with a queued change</p>
-      <div className="card">
-        <div className="card-head owed-head">
-          <span className="w88">Kind</span>
-          <span className="grow">What you owe</span>
-        </div>
-        <div className="owed-row" style={{ display: "flex", gap: 12, padding: "8px 12px", alignItems: "center" }}>
-          <span className="w88">Follow-up</span>
-          <span className="grow owed-text">Send the invoice to Acme</span>
-          <WaitingToSync pending={{ action: "close" }} />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/** The Pace group's body inside the page's own group card, with the dev
- *  fixture shaped like `khipu route --json`. Screenshots only. */
-function PaceGroup() {
-  const model = paceModel(PACE_VIEW, PACE_PLANS, PACE_NOW);
-  const folds = { isOpen: () => false, toggle: () => {}, openKeys: () => {} };
-  return (
-    <div className="route-settings">
-      <div className="fold disclose route-group" data-open="true">
-        <button type="button" className="disclosure fold-btn" aria-expanded="true" data-settings-group="pace">
-          <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
-          <span className="gname">Pace, caps and advice</span>
-          <span className="gline">{model.line}</span>
-          <span className="gtags">
-            {model.tags.map((t) => (
-              <span key={t.text} className={["tag", t.tone === "neutral" ? "" : t.tone].filter(Boolean).join(" ")}>
-                <span className="dot" aria-hidden />{t.text}
-              </span>
-            ))}
-          </span>
-        </button>
-        <div className="fold-body">
-          <div className="disclose-body">
-            <PaceSection data={PACE_VIEW} plans={PACE_PLANS} now={PACE_NOW} folds={folds} />
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/** The delivery preview renders the real Settings composition: fake route and
- * config reads, plus the fictional doctor block App passes as a prop. */
-function RoutingDelivery({ health = DELIVERY_HEALTH, error }: { health?: RouteDeliveryHealth | null; error?: string }) {
-  useState(() => {
-    try {
-      window.localStorage.setItem("khipu.routing.open", JSON.stringify(["telling"]));
-    } catch {
-      // The group can be opened by hand.
-    }
-  });
-  return (
-    <div className="settings-pane" style={{ width: 720, maxWidth: "100%" }}>
-      <RoutingSettings active deliveryHealth={health} deliveryHealthError={error} />
-    </div>
-  );
-}
-
-const PN = (name: string, role: "canonical" | "alias", extra: object = {}) => ({ name, role, open_commitments: 0, standing_decisions: 0, episodes: 0, ...extra });
-const PROJECTS_FIXTURE = {
-  groups: [
-    { canonical: "mrkinglollipop/olivewood", totals: { open_commitments: 9, standing_decisions: 31, episodes: 412 }, names: [
-      PN("mrkinglollipop/olivewood", "canonical", { episodes: 14 }),
-      PN("mrkinglollipop/church-harness", "alias", { source: "github", created_at: new Date().toISOString(), episodes: 398 }),
-    ] },
-    { canonical: "field-notes", totals: { open_commitments: 2, standing_decisions: 4, episodes: 57 }, names: [
-      PN("field-notes", "canonical", { episodes: 50 }),
-      PN("notes-scratch", "alias", { source: "checkout", created_at: "2026-10-12T17:40:00Z", episodes: 7 }),
-    ] },
-  ],
-  pairs: [
-    { a: "lollipop-labs/olivewood", b: "mrkinglollipop/olivewood", state: "asked", created_at: new Date().toISOString() },
-    { a: "mrkinglollipop/khipu-site", b: "mrkinglollipop/site-2025", state: "kept_separate", decided_at: "2026-10-03T16:00:00Z" },
-  ],
-  pair_counts: {
-    "mrkinglollipop/olivewood": { open_commitments: 9, episodes: 412, last_used: new Date().toISOString() },
-    "lollipop-labs/olivewood": { open_commitments: 1, episodes: 14, last_used: "2026-10-17T16:00:00Z" },
-  },
-  sweep: { at: new Date().toISOString(), result: "ok" },
-};
-
-function ProjectsHost({ withQuestion = true }: { withQuestion?: boolean }) {
-  const state = useCliState<ProjectsList>("khipu_projects_list", true);
-  const waiting = withQuestion ? 1 : 0;
-  const tabs = ["Database", "Capture & models", "Accounts and routing", "Owner actions", "Work", "Projects", "Optional features", "Embeddings"];
-  return (
-    <div className="settings-body" style={{ maxWidth: "none" }}>
-      <div className="settings-split">
-        <div className="subnav" role="tablist" aria-label="Settings sections">
-          {tabs.map((t) => (
-            <button key={t} type="button" role="tab" aria-selected={t === "Projects"} className={t === "Projects" ? "on" : undefined}>
-              {t}
-              {t === "Projects" && waiting ? <span className="nav-count">{waiting}</span> : null}
-            </button>
-          ))}
-        </div>
-        <div className="settings-pane"><ProjectsSettings active state={state} /></div>
-      </div>
-    </div>
-  );
-}
-
-/** Settings -> Accounts and routing with Telling conversations open, so the
- *  Mac-to-Mac replication switch and its caught-up status line show. */
-function RoutingReplication() {
-  useState(() => {
-    try {
-      window.localStorage.setItem("khipu.routing.open", JSON.stringify(["telling", "sub:sizes"]));
-    } catch {
-      // The group can be opened by hand.
-    }
-  });
-  return (
-    <div className="settings-pane" style={{ width: 1184, maxWidth: "none", margin: "0 auto" }}>
-      <RoutingSettings
-        active
-        deliveryHealth={{ status: "green", identities: [], replication: { status: "green", age_seconds: 120, caught_up_at: "2026-10-21T18:38:00Z", stale: false }, gateway: { status: "not_applicable" } }}
-      />
-    </div>
-  );
-}
-
- /** Settings -> Accounts and routing, opened on its Your Macs page. */
-function RoutingMacs({ off = false }: { off?: boolean }) {
-  useEffect(() => {
-    const open = () => document.querySelector<HTMLButtonElement>('[data-routing-page-select="macs"]')?.click();
-    const timer = window.setInterval(open, 250);
-    const stop = window.setTimeout(() => window.clearInterval(timer), 5000);
-    return () => { window.clearInterval(timer); window.clearTimeout(stop); };
-  }, []);
-  return (
-    <div className="settings-pane" style={{ width: "100%", maxWidth: 1100, margin: "0 auto" }}>
-      <RoutingSettings active deliveryHealth={{ status: "green", identities: [], replication: off ? { status: "not_applicable" } : { status: "green", age_seconds: 120, caught_up_at: "2026-10-21T18:38:00Z", stale: false }, gateway: { status: "not_applicable" } }} />
-    </div>
-  );
-}
-
- /** Settings -> Accounts and routing with only Proposals and holds open
- *  (slice 15b), against the fictional record in fakeTauri. */
-function RoutingProposals() {
-  useState(() => {
-    try {
-      window.localStorage.setItem("khipu.routing.open", JSON.stringify(["holds"]));
-    } catch {
-      // The group can be opened by hand.
-    }
-  });
-  return (
-    <div className="settings-pane" style={{ width: 1184, maxWidth: "none", margin: "0 auto" }}>
-      <RoutingSettings active />
-    </div>
-  );
-}
-
-/** Needs you with every kind of item in the same Settings split as the app.
- * `?pane=` remains for narrow checks; the default is the full desktop pane so
- * the routing page list is judged at its real available width. */
-function RoutingNeeds() {
-  const requestedPane = Number(new URLSearchParams(window.location.search).get("pane"));
-  const pane = requestedPane > 0 ? requestedPane : null;
-  const [plans, setPlans] = useState<UsageReport | null>(null);
-  useEffect(() => {
-    void invoke<string>("khipu_usage_status").then((text) => setPlans(JSON.parse(text) as UsageReport));
-  }, []);
-  return (
-    <div className="shell">
-      <aside className="rail" aria-label="App navigation">
-        <div className="rail-drag" />
-        <b className="brand"><span className="brand-name">Khipu</span></b>
-        <div className="rail-nav">
-          <div className="nav-group">
-            <button type="button" className="nav">Home</button>
-            <button type="button" className="nav">Work</button>
-            <button type="button" className="nav active">Accounts and routing</button>
-          </div>
-        </div>
-      </aside>
-      <main className="main">
-        <div className="main-content" data-routing-scroll-container>
-          <div className="panel-head"><h1>Accounts and routing</h1><p className="lede">Accounts, routing rules, and what needs your attention.</p></div>
-          <div className="panel-body wide settings-body" style={{ maxWidth: "none", minWidth: 0 }}>
-            <div className="settings-pane" style={{ width: pane ? `${pane}px` : "100%", maxWidth: "100%", minWidth: 0 }}>
-              <RoutingSettings active plansState={{ data: plans, error: null, reread: async () => {} } as never}
-                deliveryHealth={{ status: "red", identities: [
-                  { identity: "codex:fixture", component: "main", status: "green", owed: 0 },
-                  { identity: "claude:fixture", component: "main", status: "red", owed: 3 },
-                  { identity: "claude-helper:fixture", component: "agent:helper", status: "unknown", missing: ["delivery time"] },
-                ] } as never} />
-            </div>
-          </div>
-        </div>
-      </main>
-    </div>
-  );
-}
-
-/** Just the settings pane, no app shell: how it reads when the window is narrow. */
-function RoutingBare() {
-  return (
-    <div className="main-content" style={{ padding: "12px" }}>
-      <div className="panel-body wide settings-body" style={{ maxWidth: "none", minWidth: 0 }}>
-        <RoutingSettings active plansState={{ data: null, error: null, reread: async () => {} } as never} />
-      </div>
-    </div>
-  );
-}
-
-/** Home's routing card with a priority a conversation set. */
-function HomeNeeds() {
-  const route = useRouting(true);
-  return <RoutingCard state={route} />;
-}
-
 const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNode }> = {
-  "routing-settings-cde": { title: "Accounts and routing: CDE pages (fictional fixture)", fake: { routeNeeds: true, nineB: true }, render: () => <RoutingNeeds /> },
-  "routing-settings-cde-worst": { title: "Accounts and routing: CDE long-text fixture", fake: { routeNeeds: true, worst: true, nineB: true }, render: () => <RoutingNeeds /> },
-  "routing-needs": { title: "Needs you: every kind of item (settings reorg slice A)", fake: { routeNeeds: true, nineB: true }, render: () => <RoutingNeeds /> },
-  "routing-overrides": { title: "Conversation overrides and the tidy-up walk", fake: { routeNeeds: true, nineB: true, overrides: true }, render: () => <RoutingNeeds /> },
-  "routing-overrides-bare": { title: "Conversation overrides and the tidy-up walk, pane only", fake: { routeNeeds: true, nineB: true, overrides: true }, render: () => <RoutingBare /> },
-  "routing-needs-worst": { title: "Needs you: the longest words (settings reorg slice A)", fake: { routeNeeds: true, worst: true, nineB: true }, render: () => <RoutingNeeds /> },
-  "home-needs": { title: "Home: Confirm a priority a conversation set", fake: { routeNeeds: true, nineB: true }, render: () => <HomeNeeds /> },
-  pace: { title: "Pace, caps and advice (fictional mock data)", render: () => <PaceGroup /> },
-  "macs-first": { title: "Your Macs: first switch-on, differences to choose", fake: { routeMacs: "first" }, render: () => <RoutingMacs /> },
-  "macs-settled": { title: "Your Macs: all settled", fake: { routeMacs: "settled" }, render: () => <RoutingMacs /> },
-  "macs-off": { title: "Your Macs: copy off", fake: { routeMacs: "off" }, render: () => <RoutingMacs off /> },
-  delivery: { title: "Telling conversations (fictional delivery evidence)", fake: { route15a: true }, render: () => <RoutingDelivery /> },
-  "delivery-unknown": { title: "Telling conversations (missing evidence)", fake: { route15a: true }, render: () => <RoutingDelivery health={{ status: "unknown", identities: [], missing: ["live delivery identities"], replication: { status: "unknown" }, gateway: { status: "unknown" } }} /> },
-  "delivery-error": { title: "Telling conversations (failed delivery read)", fake: { route15a: true }, render: () => <RoutingDelivery error="The delivery report could not be read" /> },
-  "projects": { title: "Settings: Projects", fake: { projects: PROJECTS_FIXTURE }, render: () => <ProjectsHost /> },
-  "projects-empty": { title: "Settings: Projects, none", fake: { projects: { groups: [], pairs: [], sweep: { result: null } } }, render: () => <ProjectsHost withQuestion={false} /> },
-  "routing-proposals": { title: "Proposals and holds (slice 15b)", fake: { route15b: true }, render: () => <RoutingProposals /> },
-  "routing-replication": { title: "Copy routing between your Macs (replication on, caught up)", fake: { routeReplication: true }, render: () => <RoutingReplication /> },
-  "offline-owed": { title: "Owed with the hub away: the banners and a waiting row", render: () => <OfflineOwedStates /> },
-  "offline-settings": { title: "Settings: When the hub is away", render: () => <div className="route-settings"><OfflineWaitsCard active /></div> },
   "dialog-step1": { title: "Dialog, step 1: choose the service", render: () => <Dlg /> },
   "dialog-step1-not-installed": { title: "Dialog, step 1: service not installed", render: () => <Dlg disc={discovery({ clis: CLIS_CODEX_NOT })} start={{ cli: "codex", step: 1 }} /> },
   "dialog-step1-nothing-installed": { title: "Dialog, step 1: nothing installed", render: () => <Dlg disc={discovery({ clis: CLIS_NONE })} tracked={[]} /> },
@@ -422,14 +142,6 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
         settings={{ node_folder: { value: "/home/someone/.nvm/versions/node/v20.11.0/bin", usable: true } }} />
     ),
   },
-  "account-folder-missing": {
-    title: "Account: login folder not found (the whole account, as Settings shows it)",
-    render: () => <WholeAccount label="Claude work" home="~/.claude-work" row={{ harness: "claude", account: "Claude work", home: "~/.claude-work", ok: false, error: "login_folder_missing", last_good_at: "2026-10-14T22:10:00Z", windows: [] }} />,
-  },
-  "account-signed-out": {
-    title: "Account: signed out (the whole account, as Settings shows it)",
-    render: () => <WholeAccount label="Claude second" home="~/.claude-second" row={{ harness: "claude", account: "Claude second", home: "~/.claude-second", ok: false, error: "not_signed_in", last_good_at: "2026-10-13T15:00:00Z", windows: [{ name: "weekly", used_pct: 60, window_mins: 10080, resets_at: "2026-10-19T15:00:00Z" }] }} />,
-  },
   "account-reading": { title: "Account: Rename and Stop tracking while the account list is read", render: () => <AccountExtras label="Claude work" harness="claude" home="~/.claude-work" support={READING} onRename={() => {}} onStop={() => {}} /> },
   rename: { title: "Rename dialog", render: () => <RenameDialog open account={ACCT} refs={REFS} taken={["Claude client", "Claude main", "Codex"]} support={HERE} onClose={() => {}} onRenamed={() => {}} /> },
   stop: { title: "Stop tracking dialog", render: () => <StopTrackingDialog open account={ACCT} refs={REFS} support={HERE} onClose={() => {}} onStopped={() => {}} /> },
@@ -456,12 +168,14 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   "app-needs-changed": { title: "Today: the rule changes after it was read", fake: { needsChanged: true }, render: () => <App /> },
   "app-needs-slow": { title: "Today: answers take four seconds", fake: { needsSlow: true }, render: () => <App /> },
   // Memory: open the window, then pick Memory in the sidebar. Answers from fakes/memory.ts.
+  "app-memory-pending": { title: "Memory, two forgets not yet sent", fake: { memPending: true }, render: () => <App /> },
   "app-memory-offline": { title: "The whole window, Only my words refused", fake: { memOffline: true }, render: () => <App /> },
   // Memory › Project work lists on its own, and with no project holding a list.
   "worklists": { title: "Project work lists", render: () => <ProjectLists /> },
   "worklists-none": { title: "Project work lists, none yet", fake: { noProjects: true }, render: () => <ProjectLists /> },
   "app-settings": { title: "The whole window; open Settings from the sidebar", render: () => <App /> },
   "app-settings-stale": { title: "Settings, the other Mac quiet for 40 minutes", fake: { settings: "stale" }, render: () => <App /> },
+  "app-settings-samename": { title: "Settings, both Macs show the same computer name", fake: { settings: "samename" }, render: () => <App /> },
   "app-settings-one": { title: "Settings, no other Mac", fake: { settings: "one" }, render: () => <App /> },
   "app-settings-problem": { title: "Settings, a sign-in and the database need a look", fake: { settings: "problem" }, render: () => <App /> },
   // Accounts > Order and rules (slice A6): alone, and inside the window (`#app-rules`: open Accounts, then Order and rules). Answers come from fakes/orderRules.ts.

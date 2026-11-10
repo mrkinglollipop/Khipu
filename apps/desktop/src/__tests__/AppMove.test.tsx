@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
-import { openScreen } from "./nav";
+import { openSettingsRow } from "./nav";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
@@ -35,7 +35,7 @@ describe("App — Move", () => {
       return JSON.stringify({ ok: true });
     });
     render(<App />);
-    await openScreen("Settings");
+    await openSettingsRow("Where memory is kept");
     fireEvent.click(screen.getByRole("button", { name: /Move this memory to another database/ }));
     fireEvent.change(screen.getByLabelText("Target connection string"), { target: { value: "postgresql://target" } });
     fireEvent.click(screen.getByRole("button", { name: "Check the target" }));
@@ -50,7 +50,7 @@ describe("App — Move", () => {
   it("UI-20 does not offer an unsupported certificate picker for moves", async () => {
     invokeMock.mockResolvedValue(JSON.stringify({ ok: true, host_kind: "remote" }));
     render(<App />);
-    await openScreen("Settings");
+    await openSettingsRow("Where memory is kept");
     fireEvent.click(screen.getByRole("button", { name: /Move this memory to another database/ }));
     expect(screen.getByText(/Custom certificate files are not supported for moves yet/)).toBeInTheDocument();
     expect(screen.queryByText(/destination already trusts/)).not.toBeInTheDocument();

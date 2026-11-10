@@ -3,6 +3,8 @@
 //   settings: "stale"  the other Mac last reported 40 minutes ago
 //   settings: "one"    no other Mac has reported
 //   settings: "problem" this Mac has an account to sign in again and a database problem
+//   settings: "samename" no Mac has a name, so both show the computer name "MacBook-Pro";
+//                        names saved on Your Macs replace it, and one setting differs between the Macs
 import type { FakeHandler } from "./index";
 
 const iso = (min: number) => new Date(Date.now() - min * 60000).toISOString();
@@ -20,11 +22,17 @@ const row = (name: string, here: boolean, age: number, extra: Record<string, unk
 });
 
 let libsOn = false;
+const macNames: Record<string, string> = {};
+const shown = (id: string) => macNames[id] ?? "MacBook-Pro";
 
 export const settingsFakes: FakeHandler = (cmd, args, flags) => {
   const mode = flags.settings as string | undefined;
   switch (cmd) {
     case "khipu_macs": {
+      if (mode === "samename") {
+        return { checked_at: iso(0), shared: true, stale_after_s: 900,
+          macs: [row(shown("a".repeat(32)), true, 0), row(shown("b".repeat(32)), false, 1)] };
+      }
       const me = row("M5", true, 0, mode === "problem" ? { signins: [{ harness: "claude", label: "Work", signed_in: true }, { harness: "codex", label: "Codex", signed_in: false }] } : {});
       const other = row("M1", false, mode === "stale" ? 40 : 1);
       return { checked_at: iso(0), macs: mode === "one" ? [me] : [me, other], shared: true, stale_after_s: 900, ...(mode === "one" ? { note: "No other Mac has reported yet, so only this Mac is shown." } : {}) };
@@ -50,6 +58,24 @@ export const settingsFakes: FakeHandler = (cmd, args, flags) => {
       return { profiles: [{ id: "gem@768", provider: "gemini", model: "gemini-embedding-2", dim: 768, is_active: true, coverage: { memory: { total: 1000, embedded: 990, missing: 10, stale: 0, pct: 99 } } }] };
     case "khipu_library_list":
       return { libraries: [{ name: "Bible", root: "/x", profile: "gem@768", enabled: libsOn, documents: 3, chunks: 100, embedded: 100, missing: 0, stale: 0, pct: 100 }, { name: "Notes", root: "/y", profile: "gem@768", enabled: libsOn, documents: 3, chunks: 100, embedded: 100, missing: 0, stale: 0, pct: 100 }] };
+    case "khipu_config_show":
+      if (mode !== "samename") return undefined;
+      return {
+        routing: {
+          routing_mac_names: { value: { ...macNames }, kind: "mac_names" },
+          routing_replication_live: { value: true },
+          routing_busy_load: { value: 75, kind: "count" },
+        },
+        settings_sync: { enabled: true, differences: [{ key: "routing_busy_load", name: "Wait while the Mac is busy", local: 75, remote: 90 }] },
+      };
+    case "khipu_config_set":
+      if (mode !== "samename") return undefined;
+      if (args?.key === "routing_mac_names") {
+        const next = JSON.parse(String(args.value)) as Record<string, string>;
+        for (const k of Object.keys(macNames)) delete macNames[k];
+        Object.assign(macNames, next);
+      }
+      return { ok: true };
     case "khipu_library_enable": libsOn = true; return { ok: true };
     case "khipu_library_disable": libsOn = false; return { ok: true };
     case "run_khipu": {

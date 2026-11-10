@@ -1,5 +1,5 @@
 import { useCliState } from "../../settingsCli";
-import type { ProfileRow } from "../../EmbeddingsPanel";
+import type { ProfileRow } from "../searchTypes";
 
 /** Read-only. The old Embeddings screen has no on/off control: it only picks
  *  which model is active and how much is covered. So this page says what is true

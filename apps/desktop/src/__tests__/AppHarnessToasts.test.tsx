@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
-import { openScreen } from "./nav";
+import { openSettingsRow } from "./nav";
 
 const invokeMock = vi.fn();
 
@@ -111,7 +111,7 @@ const doctorCalls = () =>
 
 async function openHarnessesCard(): Promise<HTMLElement> {
   render(<App />);
-  await openScreen(/Harnesses/);
+  await openSettingsRow("Apps that use Khipu");
   const findCard = () =>
     Array.from(document.querySelectorAll<HTMLElement>(".hcard")).find((c) => within(c).queryByText("Claude Code"));
   await waitFor(() => expect(findCard()).toBeTruthy());

@@ -1,11 +1,12 @@
 import { useState } from "react";
+import type { ReactNode } from "react";
 import { Loader2 } from "lucide-react";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
 /** Says only what is true: the version on this Mac, and a button that does what
  *  the old "Check for updates" did (check, then download, install, relaunch). */
-export function UpdatesPage({ appVersion, thisMac }: { appVersion: string; thisMac: string | null }) {
+export function UpdatesPage({ appVersion, thisMac, whatsNew }: { appVersion: string; thisMac: string | null; whatsNew?: ReactNode }) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
 
@@ -43,6 +44,7 @@ export function UpdatesPage({ appVersion, thisMac }: { appVersion: string; thisM
       </div>
       {msg ? <p className="st-muted" role="status">{msg}</p> : null}
       <p className="st-muted">Each update is signed, and Khipu checks the signature before it replaces anything. It installs on this Mac only.</p>
+      {whatsNew}
     </>
   );
 }

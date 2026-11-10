@@ -2,7 +2,7 @@
 //   khipu_macs   -> one entry per Mac (this one live, the other from the shared record)
 //   khipu_health -> the five checks, free space, last backup, and the agent note
 // Shapes are exactly what `khipu macs --json` and `khipu health --json` print.
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useHealth } from "../shared/healthCache";
 import { callCli } from "../settingsCli";
 
@@ -72,17 +72,20 @@ export function useSettingsData(active: boolean) {
   const health: HealthState = { data: h.doc, at: h.at, refreshing: h.refreshing, error: h.error };
   const started = useRef(false);
 
+  const loadMacs = useCallback(async () => {
+    setMacs((p) => ({ ...p, loading: true }));
+    const res = await callCli<MacsDoc>("khipu_macs");
+    if (res.ok && res.data && Array.isArray(res.data.macs)) setMacs({ data: res.data, error: null, loading: false });
+    else setMacs((p) => ({ data: p.data, error: res.ok ? "Khipu gave an unreadable answer." : res.error, loading: false }));
+  }, []);
+
   useEffect(() => {
     if (!active || started.current) return;
     started.current = true;
-    setMacs((p) => ({ ...p, loading: true }));
-    void callCli<MacsDoc>("khipu_macs").then((res) => {
-      if (res.ok && res.data && Array.isArray(res.data.macs)) setMacs({ data: res.data, error: null, loading: false });
-      else setMacs({ data: null, error: res.ok ? "Khipu gave an unreadable answer." : res.error, loading: false });
-    });
-  }, [active]);
+    void loadMacs();
+  }, [active, loadMacs]);
 
-  return { macs, health };
+  return { macs, health, reloadMacs: loadMacs };
 }
 
 export function thisMacRow(doc: MacsDoc | null): MacRow | null {

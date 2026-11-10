@@ -3,7 +3,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
-import { openScreen } from "./nav";
+import { openSettingsRow } from "./nav";
 
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
@@ -46,26 +46,29 @@ describe("App in the new window", () => {
     expect(document.querySelector(".sh-toolbar")).toBeNull();
   });
 
-  it("starts on Today, which is the old Home, and names the places", async () => {
+  it("starts on Today and names the three places and Settings, with no Older screens", async () => {
     store.set("khipu.welcome.completed", "1");
     answers(true);
     render(<App />);
     const main = await screen.findByRole("navigation", { name: "Main" });
     await waitFor(() => expect(within(main).getByRole("button", { name: /^Today/ })).toHaveAttribute("aria-current", "page"));
-    for (const name of ["Accounts", "Memory", "Settings", "Older screens"]) {
+    for (const name of ["Accounts", "Memory", "Settings"]) {
       expect(within(main).getByRole("button", { name })).toBeInTheDocument();
     }
-    expect(screen.getByRole("heading", { name: "Home" })).toBeVisible();
+    // Slice A11: the older screens are gone, and so is the entry that held them.
+    expect(within(main).queryByRole("button", { name: "Older screens" })).toBeNull();
+    for (const name of ["Home", "Work", "Recall", "Activity", "Harnesses", "Conflicting edits", "Accounts and routing", "Settings (older)"]) {
+      expect(within(main).queryByRole("button", { name })).toBeNull();
+    }
   });
 
-  it("keeps every old screen reachable under Older screens", async () => {
+  it("keeps the guides reachable from Settings › Help", async () => {
     store.set("khipu.welcome.completed", "1");
     answers(true);
     render(<App />);
-    for (const name of ["Work", "Recall", "Activity", "Harnesses", "Guides", "Accounts and routing"]) {
-      const button = await openScreen(name);
-      await waitFor(() => expect(button).toHaveAttribute("aria-current", "page"));
-    }
+    await openSettingsRow("Help");
+    fireEvent.click(await screen.findByRole("button", { name: "Guides in this app" }));
+    expect(await screen.findByRole("heading", { name: "Guides" })).toBeVisible();
   });
 
   it("Accounts is the new place, with its view switch; Running now and Order and rules are views of it", async () => {

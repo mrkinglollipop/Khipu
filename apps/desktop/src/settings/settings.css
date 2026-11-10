@@ -25,3 +25,9 @@
 .st-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .st-switch { display: flex; gap: 12px; align-items: center; font-weight: 600; }
 .st-note { margin: 0; padding: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md); font: var(--t-sm) var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 40vh; overflow: auto; }
+/* Your Macs: names, a shared-name warning, and the Mac-to-Mac choices (A11). */
+.st-alert { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; padding: 12px 16px; border: 1px solid var(--warn); border-left-width: 4px; border-radius: var(--r-md); background: var(--surface-2); }
+.st-err { color: var(--err); font-size: var(--t-md); }
+.st-name { display: flex; flex-direction: column; gap: 6px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.st-input { min-width: 0; flex: 1 1 200px; max-width: 320px; height: 32px; padding: 0 10px; border: 1px solid var(--border); border-radius: var(--r-sm, 6px); background: var(--surface); color: var(--text); font: inherit; }
+.st-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }

@@ -353,7 +353,7 @@ function SignInSection({ usage, onSignedIn }: { usage: UsageAccount | undefined;
   );
 }
 
-export function AccountPage({ a, row, view, plans, now, writes, overrides, thisMac, onSignedIn, runningHere }: {
+export function AccountPage({ a, row, view, plans, now, writes, overrides, thisMac, onSignedIn, runningHere, more }: {
   a: RouteAccount;
   row: RowModel;
   view: RouteView;
@@ -365,6 +365,8 @@ export function AccountPage({ a, row, view, plans, now, writes, overrides, thisM
   onSignedIn: () => Promise<unknown>;
   /** Slice A5 fills this with "Running here now". */
   runningHere?: ReactNode;
+  /** More for this account (A11): ending what keeps work off it, clearing a report, rename, stop tracking. */
+  more?: ReactNode;
 }) {
   const usage = (plans?.accounts ?? []).find((r) => r.key === a.key);
   // A reading is shown only while it is a true picture of the account: not when Khipu can't read it
@@ -400,6 +402,7 @@ export function AccountPage({ a, row, view, plans, now, writes, overrides, thisM
           <PauseControl a={a} writes={writes} now={now} />
           <StopAtControl a={a} writes={writes} />
           <RunAhead a={a} writes={writes} now={now} overrides={overrides} thisMac={thisMac} />
+          {more}
         </div>
       </div>
     </article>

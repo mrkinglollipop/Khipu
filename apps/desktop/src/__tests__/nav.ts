@@ -1,24 +1,21 @@
-// Going to a screen in the new window. Tests that used the old rail names
-// ("Home", "Recall", "Accounts and routing", ...) say the old name; this finds
-// the button now carrying it, opening "Older screens" first when the screen
-// has moved there. Slice A11 deletes the older screens and these names with them.
+// Going to a place in the window (Today, Accounts, Memory, Settings) and, in
+// Settings, to one of its rows. The older screens are gone (slice A11).
 import { fireEvent, screen, within } from "@testing-library/react";
 
-// "Settings" in an old test means the old Settings, now "Settings (older)" under Older screens.
-const PLACES: Record<string, string> = { Settings: "Settings (older)" };
-const OLDER = ["Home", "Work", "Recall", "Activity", "Harnesses", "Guides", "Conflicting edits", "Accounts and routing", "Settings (older)"];
-
-export async function openScreen(old: string | RegExp): Promise<HTMLElement> {
+export async function openScreen(place: string | RegExp): Promise<HTMLElement> {
   const main = await screen.findByRole("navigation", { name: "Main" });
-  const label = typeof old === "string" ? PLACES[old] ?? old : OLDER.find((o) => old.test(o));
-  if (label && OLDER.includes(label)) {
-    const toggle = within(main).getByRole("button", { name: "Older screens" });
-    if (toggle.getAttribute("aria-expanded") !== "true") fireEvent.click(toggle);
-    const button = await within(main).findByRole("button", { name: label });
-    fireEvent.click(button);
-    return button;
-  }
-  const button = await within(main).findByRole("button", { name: typeof old === "string" ? PLACES[old] ?? old : old });
+  const button = await within(main).findByRole("button", { name: place });
+  fireEvent.click(button);
+  return button;
+}
+
+/** Settings, then the row whose label starts with `row` ("Your Macs", "Apps that use Khipu", …). */
+export async function openSettingsRow(row: string): Promise<HTMLElement> {
+  await openScreen("Settings");
+  const list = await screen.findByRole("region", { name: "Settings" }).catch(() => null);
+  const scope = list ?? document.body;
+  const esc = row.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const button = await within(scope as HTMLElement).findByRole("button", { name: new RegExp(`^${esc}`) });
   fireEvent.click(button);
   return button;
 }

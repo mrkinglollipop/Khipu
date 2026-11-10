@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 // What App hands Settings: state it already owns (models, key presence, the
 // doctor-derived evidence the apps panel reads) plus a few jumps. Nothing here
 // is new data; the old Settings read the same values.
@@ -39,6 +40,14 @@ export type SettingsCtx = {
   // Help
   onOpenGuides: () => void;
   onFeedback: () => void;
-  // Older screens
-  onOpenOldSettings: (section?: string) => void;
+  /** "Connect to a different database…": the first-run flow at its Database step. */
+  onDatabaseStep: () => void;
+  /** "Run setup again": the first-run flow from the start. */
+  onRunSetup: () => void;
+  // Your Macs: setting up another Mac (the join kit, moved from the older Settings)
+  anotherMac?: ReactNode;
+  // Updates: what's new in this version (the card and its history, moved from the old Home and Settings)
+  whatsNew?: ReactNode;
+  /** A deep link into one row (notices, guides, the Apps page's "another Mac"). */
+  openRow?: { id: string; n: number } | null;
 };

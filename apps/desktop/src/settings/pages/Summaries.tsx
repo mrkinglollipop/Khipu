@@ -1,4 +1,4 @@
-import { SynthFallbackField, SynthProviderChoices } from "../../SynthProvider";
+import { SummariserCalls, SynthFallbackField, SynthProviderChoices } from "../../SynthProvider";
 import { KeysCard } from "../../KeysCard";
 import { Callout } from "../../ui";
 import type { SettingsCtx } from "../context";
@@ -42,6 +42,9 @@ export function SummariesPage({ ctx, active }: { ctx: SettingsCtx; active: boole
         verify={ctx.modelCheck}
         onKeySaved={ctx.onKeySaved}
       />
+      <section className="st-group" aria-label="Summaries written today">
+        <SummariserCalls active={active} />
+      </section>
     </>
   );
 }

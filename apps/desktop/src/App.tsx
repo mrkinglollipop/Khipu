@@ -1,25 +1,22 @@
-import { LookPage } from "./settings/pages/Look";
 import { Settings } from "./settings/Settings";
 import type { SettingsCtx } from "./settings/context";
-import { Component, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Component, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
-import { check } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
-  CircleMinus,
+  
   CircleCheck,
   Gauge,
-  Loader2,
-  MessageSquare,
+  
+  
   RefreshCw,
   Search,
   SlidersHorizontal,
-  Stethoscope,
-  Trash2,
-  Waypoints,
+  
+  
+  
   X,
 } from "lucide-react";
 import khipuIcon from "./assets/khipu-icon.png";
@@ -33,64 +30,38 @@ import { OrderAndRules } from "./accounts/OrderAndRules";
 import type { NavItem } from "./shell";
 import {
   Callout,
-  Chip,
+  
   Dialog,
-  Disclosure,
-  EmptyState,
-  ListRow,
+  
+  
+  
   Segmented,
-  Tag,
-  Tile,
+  
+  
 } from "./ui";
-import { isHubUnreachable, OfflineBanner, parseOwedAnswer, SavedOnThisMac, WaitingToSync } from "./OfflineBanner";
-import type { OwedOffline } from "./OfflineBanner";
-import { ComponentsPanel } from "./ComponentsPanel";
-import { IntegrationsPanel, runInstall } from "./IntegrationsPanel";
 import type { LivenessPayload, RecallProbeStatus, T3Health } from "./IntegrationsPanel";
-import { claudeHomesGap, harnessesBadge, railHealthLine, t3HealthGap, t3WarningReason } from "./railHealth";
-import type { ClaudeHomesReport } from "./railHealth";
-import { RightNowCard } from "./RightNow";
-import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
+import { t3HealthGap, } from "./railHealth";
+import { Welcome, welcomeCompleted } from "./Welcome";
 import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
-import { buildAttention, harnessLabel, promotionAttention, type Attention } from "./doctorAttention";
-import { HealthReportRows, TILE_HEALTH_KEYS, healthKeysForAttention, markHealthRows, snapshotNotTrusted } from "./healthRows";
-import { SummariserCalls, SynthFallbackField, SynthProviderChoices, synthModelError } from "./SynthProvider";
-import { KeysCard } from "./KeysCard";
+import { buildAttention, } from "./doctorAttention";
+import { synthModelError } from "./SynthProvider";
 import { isSecretsPresence, pickSecretsPresence, type SecretsPresence } from "./secretsPresence";
-import { PlansCard, liveWords, usePlanAttention, usePlanUsage } from "./PlansCard";
-import { RoutingCard } from "./RoutingCard";
-import { owedReasonWords, toastWords } from "./humanWords";
-import { RoutingSettings } from "./RoutingSettings";
-import { WorkSettings } from "./WorkSettings";
+import { liveWords, usePlanUsage } from "./PlansCard";
+import { toastWords } from "./humanWords";
 import { useRouting } from "./routing";
-import type { RouteDeliveryHealth } from "./routing";
-import { WorkView } from "./WorkView";
-import { WORK_LEDE, badgeLabel, shortProject, useWork } from "./work";
 import type { DoctorSynthProvider } from "./SynthProvider";
 import { useModelVerify } from "./modelVerify";
 import { WorkingBanner } from "./WorkingBanner";
 import { FeedbackForm } from "./FeedbackForm";
 import { PostUpdateNoticeDialog } from "./PostUpdateNoticeDialog";
-import { StorageReportDialog } from "./StorageReportDialog";
-import { OwedChangeDialog, OwedSelectionBar, owedChange } from "./OwedBulk";
-import type { OwedOwner } from "./OwedBulk";
-import { OptionalFeatures } from "./OptionalFeatures";
-import { OwnerActions } from "./OwnerActions";
-import { PendingForgets } from "./PendingForgets";
 import { Memory } from "./memory/Memory";
-import { ProjectsSettings, askedCount } from "./ProjectsSettings";
-import { requireCliSuccess, requireMigrationSuccess, useCliState } from "./settingsCli";
-import type { ProjectsList } from "./ProjectsSettings";
-import { EmbeddingsPanel } from "./EmbeddingsPanel";
-import { fmtAgo, fmtAgoFromRead, fmtClock } from "./time";
 import {
-  CaptureTuningCard,
+  
   GatewayUrlCard,
-  JobsCard,
-  PathOverridesCard,
-  HubAwayCard,
+  
+  
+  
 } from "./SettingsControls";
-import { type DiskSpace, HealthChecksCard } from "./HealthChecksCard";
 import {
   launchWhatsNew,
   recordVersionOnSetupFinish,
@@ -100,12 +71,10 @@ import {
   type LaunchPlan,
   type NoticeTarget,
 } from "./postUpdateNotices";
-import { WhatsNewCard, WhatsNewHistory, revealSettingsGroup } from "./WhatsNew";
-import { HomeAccountCards } from "./FoundAccounts";
+import { WhatsNewCard, WhatsNewHistory, } from "./WhatsNew";
 import { GuidesPage } from "./GuidesPage";
-import { SetupHint } from "./SetupHint";
 import { useGuideSignals } from "./guideSignals";
-import { guideStates, hintState, railBadge, startItems as buildStartItems } from "./guidesModel";
+import { guideStates, startItems as buildStartItems } from "./guidesModel";
 import type { GuideId } from "./guidesModel";
 import type { GuideTarget } from "./guideOutlines";
 import "./App.css";
@@ -118,16 +87,10 @@ import "./guides.css";
 type Tab =
   | "first-run"
   | "home"
-  | "work"
   | "memory"
-  | "recall"
-  | "activity"
-  | "harnesses"
   | "routing"
-  | "routing-old"
   | "settings"
-  | "guides"
-  | "revisions";
+  | "guides";
 
 type PaneBoundaryProps = {
   title: string;
@@ -158,39 +121,10 @@ class PaneBoundary extends Component<PaneBoundaryProps, { failed: boolean }> {
 }
 
 const PANE_TITLES: Record<Tab, string> = {
-  "first-run": "Setup", home: "Home", activity: "Activity", memory: "Memory", recall: "Recall",
-  revisions: "Revisions", work: "Work", harnesses: "Harnesses", routing: "Accounts", "routing-old": "Accounts and routing", settings: "Settings", guides: "Guides",
+  "first-run": "Setup", home: "Today", memory: "Memory", routing: "Accounts", settings: "Settings", guides: "Guides",
 };
 
 type CacheTab = "status" | "activity" | "revisions" | "doctor" | "rightNow";
-
-type ConflictSummary = {
-  open_file_vs_pg?: number;
-  ok?: boolean;
-  note?: string;
-  file_vs_pg?: Array<{ slug: string; issue: string }>;
-  topics_with_multiple_revisions?: Array<{
-    slug: string;
-    revision_count: number;
-    last_revised_at?: string;
-  }>;
-  revision_row_count?: number;
-  /** How many topics the report actually compared, and the ones it could not
-   * read. Without these on screen a green summary says nothing about its own
-   * coverage — which is how a 40-of-622 sample read as "no drift". */
-  topics_checked?: number;
-  topic_files_unreadable?: string[];
-};
-
-/** One row of `revisions.recent` — what the slug filter actually narrows. */
-type RecentRevision = {
-  id: number;
-  slug: string;
-  revised_at?: string;
-  source?: string;
-  note?: string;
-  preview?: string;
-};
 
 type Counts = {
   episodes?: number;
@@ -225,626 +159,7 @@ const DEFAULT_MODELS: ModelsState = {
   models_error: null,
 };
 
-type SearchResult = {
-  kind?: string;
-  id?: string | number;
-  label?: string;
-  snippet?: string;
-  /** Fused RRF score from `khipu search` — already in the payload, never
-   * rendered before (audit 2026-09-04). Higher is better; the scale is
-   * relative to the other hits in the same response, so it is shown as a
-   * relevance bar rather than a number pretending to be a percentage. */
-  score?: number;
-  paths?: string[];
-  neighbors?: { id: string; type?: string }[];
-  /** Row metadata `khipu search` gained in phase 5 so the footer can read
-   * "date · project · harness" as the mock does. `ts` is an ISO string on
-   * every kind that has one; `project` / `harness` exist on episodes only
-   * (a topic has neither, and inventing one is the bug this replaced). */
-  ts?: string;
-  project?: string;
-  harness?: string;
-  /** Optional per-signal explanation, if the CLI ever attaches one. Rendered
-   * as plain text when present; absent from today's payload. */
-  why?: string;
-  signals?: unknown;
-};
-
-/** Per-leg milliseconds from `hybrid_search` (phase 5 addendum). Every field
- * is optional: an offline/stale payload carries no timing at all. */
-type SearchTiming = {
-  embed_ms?: number;
-  cosine_ms?: number;
-  literal_ms?: number;
-  lexical_ms?: number;
-  fusion_ms?: number;
-  enrich_ms?: number;
-  total_ms?: number;
-  /** "hit" (no embedding call), "miss" (embedded and cached) or "off". */
-  embed_cache?: string;
-  embed_error?: string;
-};
-
-/** Why search by meaning was skipped for this query, in the engine's words
- *  (`degraded` on the search payload): "embed-budget" (today's embedding
- *  budget is spent), "embed-unavailable" (the embedding service did not answer
- *  inside the query budget) or "no-embedding" (no index profile is active). */
-const DEGRADED_COPY: Record<string, { title: string; hint: string }> = {
-  "embed-budget": {
-    title: "Showing exact-word matches only",
-    hint: "Today's embedding ceiling was reached, so this search skipped meaning. It resets at midnight UTC; KHIPU_EMBED_DAILY_CALLS raises the ceiling (0 removes it).",
-  },
-  "embed-unavailable": {
-    title: "Showing exact-word matches only",
-    hint: "The embedding service did not answer in time (rate limit or network), so this search skipped meaning. Try again in a moment.",
-  },
-  "no-embedding": {
-    title: "Showing exact-word matches only",
-    hint: "No search index profile is active, so search by meaning is off. Settings › Embeddings shows the state.",
-  },
-};
-
-const TIMING_LABEL: Record<string, string> = {
-  embed_ms: "Embedding the query",
-  cosine_ms: "Vector scan",
-  literal_ms: "Exact-word scan",
-  lexical_ms: "Word-overlap ranking",
-  fusion_ms: "Fusing and filtering",
-  enrich_ms: "Connections lookup",
-  total_ms: "Engine total",
-};
-
-/** The three `khipu search --mode` values, in the order the toolbar offers
- * them. `hybrid` is the CLI's own default and so is the pane's. */
-type SearchMode = "hybrid" | "semantic" | "literal";
-
-const SEARCH_MODES: {
-  mode: SearchMode;
-  label: string;
-  hint: string;
-  placeholder: string;
-}[] = [
-  {
-    mode: "hybrid",
-    label: "Best match",
-    hint: "Meaning, word overlap and exact text together — the recommended default.",
-    placeholder: "ask in your own words",
-  },
-  {
-    mode: "semantic",
-    label: "By meaning",
-    hint: "Vector similarity and word overlap. The words need not appear in the text.",
-    placeholder: "describe what you are looking for",
-  },
-  {
-    mode: "literal",
-    label: "Exact words",
-    hint: "Substring match only — for ids, hashes and error text.",
-    placeholder: "exact words to match",
-  },
-];
-
-/** A search hit's `why`, when the payload carries one. Kept tolerant: any of
- * a string, a list of strings, or an object of signal → value renders as one
- * readable line, and anything else renders as nothing at all. */
-function whyText(r: SearchResult): string | null {
-  if (typeof r.why === "string" && r.why.trim()) return r.why.trim();
-  const sig = r.signals;
-  if (typeof sig === "string" && sig.trim()) return sig.trim();
-  if (Array.isArray(sig)) {
-    const parts = sig.filter((x) => typeof x === "string" || typeof x === "number");
-    return parts.length ? parts.join(" · ") : null;
-  }
-  if (sig && typeof sig === "object") {
-    const parts = Object.entries(sig as Record<string, unknown>)
-      .filter(([, v]) => typeof v === "string" || typeof v === "number")
-      .map(([k, v]) => `${k} ${typeof v === "number" ? Number(v).toFixed(3) : String(v)}`);
-    return parts.length ? parts.join(" · ") : null;
-  }
-  return null;
-}
-
-type GraphEdge = {
-  src?: string;
-  dst?: string;
-  type?: string;
-};
-
-type GraphWalkRow = {
-  node_id?: string;
-  via?: string;
-  type?: string;
-  hops?: number;
-};
-
-type GraphNeighbor =
-  | {
-      mode: "walk";
-      id: string;
-      type?: string;
-      hops?: number;
-      via?: string;
-    }
-  | {
-      mode: "edge";
-      id: string;
-      type?: string;
-      src?: string;
-      dst?: string;
-    };
-
 const CACHE_TTL_MS = 60_000;
-
-function clampHops(value: number): number {
-  if (!Number.isFinite(value)) return 1;
-  return Math.min(4, Math.max(1, Math.trunc(value)));
-}
-
-/** Rail glyphs, traced from the approved mock (`rail.html`) rather than picked
- *  from an icon set — the six items are the design, not a lucide lookup. */
-function RailIcon({ d }: { d: ReactNode }) {
-  return (
-    <svg
-      viewBox="0 0 16 16"
-      aria-hidden
-      width={16}
-      height={16}
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={1.75}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      {d}
-    </svg>
-  );
-}
-
-const NAV_ICONS: Record<Exclude<Tab, "first-run" | "revisions" | "routing-old" | "memory">, ReactNode> = {
-  home: <RailIcon d={<path d="M3 8.5 8 4l5 4.5V13H3z" />} />,
-  recall: (
-    <RailIcon
-      d={
-        <>
-          <circle cx="7" cy="7" r="4" />
-          <path d="m10 10 3.5 3.5" />
-        </>
-      }
-    />
-  ),
-  work: (
-    <RailIcon
-      d={
-        <>
-          <rect x="2.5" y="3" width="11" height="10" rx="1.5" />
-          <path d="M6 3v10M10 3v10" />
-        </>
-      }
-    />
-  ),
-  activity: (
-    <RailIcon
-      d={
-        <>
-          <circle cx="8" cy="8" r="5.5" />
-          <path d="M8 5v3l2 1.5" />
-        </>
-      }
-    />
-  ),
-  harnesses: (
-    <RailIcon
-      d={
-        <>
-          <path d="M5 3v3M11 3v3M3 6h10v3a5 5 0 0 1-10 0z" />
-          <path d="M8 11v3" />
-        </>
-      }
-    />
-  ),
-  routing: (
-    <RailIcon
-      d={
-        <>
-          <path d="M3 5h10M3 11h10" />
-          <circle cx="6" cy="5" r="1.5" />
-          <circle cx="10" cy="11" r="1.5" />
-        </>
-      }
-    />
-  ),
-  settings: (
-    <RailIcon
-      d={
-        <>
-          <path d="M3 5h10M3 11h10" />
-          <circle cx="6" cy="5" r="1.5" />
-          <circle cx="10" cy="11" r="1.5" />
-        </>
-      }
-    />
-  ),
-  guides: (
-    <RailIcon
-      d={
-        <>
-          <path d="M2 3.5h4a2 2 0 0 1 2 2V13a1.5 1.5 0 0 0-1.5-1.5H2z" />
-          <path d="M14 3.5h-4a2 2 0 0 0-2 2V13a1.5 1.5 0 0 1 1.5-1.5H14z" />
-        </>
-      }
-    />
-  ),
-};
-
-const LOOKED_DONE_REASON = "Looked done: closed by you in the app";
-
-/** One row of `khipu owed --json` (khipu.commitments.list_owed). */
-type Commitment = {
-  id: number;
-  text?: string;
-  project?: string | null;
-  owner?: string | null;
-  kind?: string | null;
-  opened_episode?: number | null;
-  opened_at?: string | null;
-  due_after?: string | null;
-  status?: string | null;
-  /** The close side of the lifecycle — `commitments.list_owed` has always
-   *  returned these; the read-only phase never rendered them. `closed_at` is
-   *  what the "Closed today" callout is built from. */
-  closed_episode?: number | null;
-  closed_at?: string | null;
-  close_reason?: string | null;
-  /** Commitment-quality fields (migrations 0012/0013, resolved in
-   *  `commitments.list_owed`): who owes it, whether it names a future
-   *  trigger, how it sorts, and how often a later capture has re-stated it.
-   *  All optional — a pre-migration hub answers without them. */
-  future_trigger?: boolean;
-  priority?: number;
-  seen_count?: number;
-  last_seen_at?: string | null;
-  /** Seconds old at the read, counted on the hub's own clock (`khipu owed`),
-   *  and when this Mac read the list (set here, on this Mac's clock). An age
-   *  shown is one plus the time since the other, so a hub clock that runs
-   *  ahead of or behind this Mac never moves it. */
-  opened_age_s?: number | null;
-  last_seen_age_s?: number | null;
-  read_at_ms?: number;
-  /** A change queued on this Mac while the hub was away (`khipu owed`). */
-  pending_sync?: unknown;
-  /** Migration 0033: who an `agent` item is for ("orchestrator", "PR
-   *  author"), and whether a conversation or a job opened it. */
-  owner_label?: string | null;
-  origin?: string | null;
-  /** A looser decision match, offered and never applied (design (b)). */
-  looks_settled?: string | null;
-  /** An item of the owner's that a rule would have closed: listed as "Looks
-   *  done" and closed only by him (suggest, don't close). */
-  looks_done?: { rule?: string | null; reason?: string | null; evidence?: unknown } | null;
-  group?: string | null;
-  /** Whole weeks one of the owner's open items has gone unmentioned. His
-   *  items never go stale; the quiet ones list after his active ones. */
-  quiet_weeks?: number | null;
-};
-
-/** How long ago `opened_at` / `last_seen_at` was, from the hub's age at the
- *  read; a hub too old to send ages falls back to this Mac's clock. */
-function owedAgo(c: Commitment, which: "opened" | "last_seen"): string | null {
-  return which === "opened"
-    ? fmtAgoFromRead(c.opened_age_s, c.read_at_ms, c.opened_at)
-    : fmtAgoFromRead(c.last_seen_age_s, c.read_at_ms, c.last_seen_at);
-}
-
-/** The three Owed groups, one per owner (owed and ledger scope, design (a)).
- *  The owner is what the CLI resolves; the app never re-derives it. Only
- *  "Needs you" is the owner's to do. */
-type OwedGroupId = "needs-you" | "yours" | "agents";
-
-const OWED_GROUPS: ReadonlyArray<
-  readonly [OwedGroupId, string, string, OwedOwner]
-> = [
-  [
-    "needs-you",
-    "Needs you",
-    "Questions and blockers first, then the follow-ups and promises you own.",
-    "user",
-  ],
-  [
-    "yours",
-    "Yours (the assistant's)",
-    "Promises and steps the assistant set itself. They close on their own when a later capture says so.",
-    "assistant",
-  ],
-  [
-    "agents",
-    "For agents and jobs",
-    "Items a job left for its orchestrator, a reviewer or a builder. Not yours unless you take one.",
-    "agent",
-  ],
-] as const;
-
-function owedOwnerOf(c: Commitment): OwedOwner {
-  const o = (c.owner ?? "").toLowerCase();
-  return o === "user" ? "user" : o === "agent" ? "agent" : "assistant";
-}
-
-function owedGroupOf(c: Commitment): OwedGroupId {
-  const o = owedOwnerOf(c);
-  return o === "user" ? "needs-you" : o === "agent" ? "agents" : "yours";
-}
-
-type OwedStatus = "open" | "closed" | "stale";
-
-/** How many commitments one read asks for: `owed_page_max`'s default, so a
- *  page is never cut short by the CLI. Show more reads the next page with
- *  the cursor the last one returned (keyset, so nothing repeats or is
- *  skipped while new items arrive). */
-const OWED_PAGE = 200;
-
-/** One list Owed reads by pages: each owner's open items, and the closed
- *  and stale lists across owners. */
-type OwedListKey = "open:user" | "open:assistant" | "open:agent" | "closed" | "stale";
-const OWED_OPEN_KEYS: ReadonlyArray<OwedListKey> = ["open:user", "open:assistant", "open:agent"];
-
-type OwedPage = {
-  rows: Commitment[];
-  /** Every matching item, from the CLI; null from a bare-list answer. */
-  total: number | null;
-  next: string | null;
-  pages: number;
-};
-
-function owedListKeys(status: OwedStatus): ReadonlyArray<OwedListKey> {
-  return status === "open" ? OWED_OPEN_KEYS : [status];
-}
-
-/** Rows in order, each id once (a page read after a change can overlap). */
-function owedMerge(a: Commitment[], b: Commitment[]): Commitment[] {
-  const seen = new Set(a.map((c) => c.id));
-  return [...a, ...b.filter((c) => !seen.has(c.id) && seen.add(c.id))];
-}
-
-/** How many captures one page of Activity shows. `khipu activity` has no
- *  `--offset`, so "Show 40 more" re-asks for a longer window (`--limit`) and
- *  renders all of it: the list is newest-first, so a longer limit is always a
- *  superset of a shorter one. */
-const ACTIVITY_PAGE = 40;
-
-/** The kinds `khipu search --kind` accepts on the modes this screen offers.
- *  `media` is semantic-only and `node` is literal/hybrid-only, so neither is
- *  offered as a chip: a filter that silently fails on the selected mode is
- *  worse than no filter. */
-const SEARCH_KINDS = ["episode", "topic"] as const;
-
-/** Settings sub-navigation (overhaul phase 5, `mocks/main.settings.html`).
- *  Eleven sections, one per thing a person comes here to change. */
-type SettingsSection =
-  | "database"
-  | "capture"
-  | "routing"
-  | "owner"
-  | "work"
-  | "projects"
-  | "features"
-  | "index"
-  | "data"
-  | "another-mac"
-  | "components"
-  | "updates"
-  | "look"
-  | "advanced";
-
-const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
-  ["database", "Database"],
-  ["capture", "Capture & models"],
-  ["owner", "Owner actions"],
-  ["work", "Work"],
-  ["projects", "Projects"],
-  ["features", "Optional features"],
-  ["index", "Embeddings"],
-  ["data", "Data & backups"],
-  ["another-mac", "Another Mac"],
-  ["components", "Components"],
-  ["updates", "Updates"],
-  ["look", "Look"],
-  ["advanced", "Advanced"],
-] as const;
-
-/** The capture cadence, read-only: `khipu config` does not expose it, so
- *  these mirror `session_capture.MIN_TURNS` / `MIN_MINUTES` — the engine's
- *  own defaults, overridable only by the environment. Shown as text, never as
- *  an input that would not be saved anywhere. */
-const CAPTURE_MIN_TURNS = 5;
-const CAPTURE_MIN_MINUTES = 20;
-
-/** `commitments.kind` values, in the mocks' words. Anything the engine adds
- *  later falls through to its own raw kind rather than being hidden. */
-const OWED_KIND_LABEL: Record<string, string> = {
-  followup: "Follow-up",
-  blocker: "Blocker",
-  question: "Question",
-  promise: "Promise",
-  decision: "Decision",
-};
-
-/** The project a capture belongs to, from the episode's own `scope`. A scope is
- *  either a repo path on disk or free text the session named for itself; only
- *  the path form is a project, so free text carries no tag rather than a
- *  sentence squeezed into a pill. Never invented. */
-function projectFromScope(scope: string | undefined | null): string | null {
-  if (!scope || !scope.trim()) return null;
-  const s = scope.trim();
-  if (!s.startsWith("/")) return null;
-  const parts = s.split("/").filter(Boolean);
-  const codeAt = parts.lastIndexOf("Code");
-  if (codeAt >= 0 && parts[codeAt + 1]) return parts[codeAt + 1];
-  return parts[parts.length - 1] ?? null;
-}
-
-/** `session_id` is `harness:uuid`, so the harness is the half before the
- *  colon — the same split `khipu search --harness` does server-side. */
-function harnessFromSession(sessionId: string | null | undefined): string | null {
-  if (!sessionId) return null;
-  const at = sessionId.indexOf(":");
-  return at > 0 ? sessionId.slice(0, at) : null;
-}
-
-/** One full episode row from `khipu activity --show ID`. Everything here is a
- *  column the CLI actually returns; nothing is derived on the way in. */
-type EpisodeDetail = {
-  id: number;
-  ts?: string | null;
-  ingested_at?: string | null;
-  session_id?: string | null;
-  scope?: string | null;
-  summary?: string | null;
-  topics?: unknown;
-  people?: unknown;
-  decisions?: unknown;
-  preferences?: unknown;
-  edges?: unknown;
-  raw?: unknown;
-};
-
-/** jsonb array columns carry whatever the capture wrote. Only the entries that
- *  are already text become bullets — an object is never stringified into one. */
-function asStrings(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  const out: string[] = [];
-  for (const item of value) {
-    if (typeof item === "string" && item.trim()) out.push(item.trim());
-    else if (typeof item === "number") out.push(String(item));
-  }
-  return out;
-}
-
-/** `raw.open_loops` — what THIS capture opened, in the capture's own words.
- *  Entries are strings or `{text, kind, due_after, owner}` objects
- *  (khipu.commitments._normalize_open_loop). */
-function openLoopTexts(raw: unknown): string[] {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
-  const loops = (raw as { open_loops?: unknown }).open_loops;
-  if (!Array.isArray(loops)) return [];
-  const out: string[] = [];
-  for (const item of loops) {
-    if (typeof item === "string" && item.trim()) out.push(item.trim());
-    else if (item && typeof item === "object") {
-      const text = (item as { text?: unknown }).text;
-      if (typeof text === "string" && text.trim()) out.push(text.trim());
-    }
-  }
-  return out;
-}
-
-function parseTs(iso: string | null | undefined): Date | null {
-  if (!iso) return null;
-  const d = new Date(String(iso).replace(" ", "T"));
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
-/** Day heading for the Activity list: Today / Yesterday / "Sep 2". */
-function dayLabel(iso: string | null | undefined): string {
-  const d = parseTs(iso);
-  if (!d) return "Undated";
-  const today = new Date();
-  const yesterday = new Date(today);
-  yesterday.setDate(today.getDate() - 1);
-  if (d.toDateString() === today.toDateString()) return "Today";
-  if (d.toDateString() === yesterday.toDateString()) return "Yesterday";
-  return d.toLocaleDateString([], { month: "short", day: "numeric" });
-}
-
-function timeLabel(iso: string | null | undefined): string {
-  const d = parseTs(iso);
-  return d ? fmtClock(d) : "";
-}
-
-function shortDateLabel(iso: string | null | undefined): string {
-  const d = parseTs(iso);
-  return d ? d.toLocaleDateString([], { month: "short", day: "numeric" }) : "—";
-}
-
-function isToday(iso: string | null | undefined): boolean {
-  const d = parseTs(iso);
-  return d != null && d.toDateString() === new Date().toDateString();
-}
-
-/** Graph node ids are `prefix:rest`. The prefix IS the kind — it is minted by
- *  the graph builder, not guessed here — so a neighbour renders as a kind Tag
- *  plus the rest of its own id. */
-const NODE_PREFIX_LABEL: Record<string, string> = {
-  topic: "Topic",
-  path: "Path",
-  episode: "Episode",
-  concept: "Concept",
-  symbol: "Symbol",
-  file: "File",
-  note: "Note",
-};
-
-function nodeKindLabel(id: string): string {
-  const at = id.indexOf(":");
-  if (at <= 0) return "Node";
-  const prefix = id.slice(0, at);
-  return NODE_PREFIX_LABEL[prefix] ?? prefix;
-}
-
-function nodeTitle(id: string): string {
-  const at = id.indexOf(":");
-  return at > 0 ? id.slice(at + 1) : id;
-}
-
-/** Neighbourhood rows out of one `khipu graph` payload. Shared by the Graph
- *  sub-view and the Recall detail pane's "Connected" list so the two can never
- *  read the same payload differently. */
-function graphNeighborsFrom(parsed: unknown): {
-  rootId: string | null;
-  neighbors: GraphNeighbor[];
-} {
-  if (parsed && typeof parsed === "object") {
-    const obj = parsed as {
-      id?: unknown;
-      edges?: unknown;
-      walk?: unknown;
-      graph_table?: unknown;
-    };
-    const rootId = typeof obj.id === "string" ? obj.id : null;
-
-    if (Array.isArray(obj.walk) && obj.walk.length > 0) {
-      const neighbors: GraphNeighbor[] = [];
-      for (const row of obj.walk as GraphWalkRow[]) {
-        if (typeof row.node_id !== "string" || !row.node_id) continue;
-        neighbors.push({
-          id: row.node_id,
-          via: typeof row.via === "string" ? row.via : undefined,
-          type: typeof row.type === "string" ? row.type : undefined,
-          hops: typeof row.hops === "number" ? row.hops : undefined,
-          mode: "walk",
-        });
-      }
-      return { rootId, neighbors };
-    }
-
-    const edges = Array.isArray(obj.edges) ? (obj.edges as GraphEdge[]) : [];
-    const edgeRows =
-      edges.length > 0
-        ? edges
-        : Array.isArray(obj.graph_table)
-          ? (obj.graph_table as GraphEdge[])
-          : [];
-    return {
-      rootId,
-      neighbors: edgeRows.map((e) => ({
-        id: e.dst === rootId ? (e.src ?? "") : (e.dst ?? e.src ?? ""),
-        src: e.src,
-        dst: e.dst,
-        type: e.type,
-        mode: "edge" as const,
-      })),
-    };
-  }
-  return { rootId: null, neighbors: [] };
-}
 
 // Any user-typed value reaches argparse as its own argv element, so a value
 // beginning with "-" would be read as a FLAG rather than as the value. Callers
@@ -856,100 +171,12 @@ async function runKhipu(args: string[]): Promise<string> {
   return invoke<string>("run_khipu", { args });
 }
 
-type JobEntry = {
-  plist_label?: string;
-  log_path?: string;
-  last_run_iso?: string | null;
-  last_run_mtime?: number | null;
-  plist_loaded?: boolean;
-  plist_current?: boolean | null;
-  next_schedule?: string;
-  last_exit?: number | null;
-};
-
-type DoctorJobs = {
-  nightly?: JobEntry;
-  monthly?: JobEntry;
-};
-
-const NOT_CONFIGURED_LABEL: Record<string, string> = {
-  memory_root: "File ↔ PG drift (legacy wiki)",
-  // A step nightly_step_health() has never recorded yet (fresh install, or
-  // a Mac that just updated) — skipped, not red; see healthRows.tsx LABELS.
-  notes_reconcile: "Notes watcher installed",
-  embed_provider: "Embedding provider reachable",
-};
-
-/** Milliseconds, as a person reads them: sub-second in ms, above that in
- *  seconds to one decimal. */
-function formatMs(ms: number | null | undefined): string {
-  if (ms == null || !Number.isFinite(ms)) return "—";
-  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
-}
-
-async function spawnKhipu(subcommand: string): Promise<{
-  ok?: boolean;
-  pid?: number;
-  log_path?: string;
-  engine_log_path?: string;
-  subcommand?: string;
-}> {
-  return invoke("spawn_khipu", { subcommand });
-}
-
-function prettyJson(raw: string): string {
-  try {
-    return JSON.stringify(JSON.parse(raw), null, 2);
-  } catch {
-    return raw;
-  }
-}
-
 function parseJson(raw: string): unknown {
   try {
     return JSON.parse(raw);
   } catch {
     return null;
   }
-}
-
-function presenceLabel(
-  presence: SecretsPresence | null,
-  key: keyof SecretsPresence,
-): string {
-  if (presence == null) return "—";
-  const value = presence[key];
-  if (typeof value !== "boolean") return "—";
-  return value ? "yes" : "no";
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-/** Newest-first goes by the `mtime` `khipu paths` reports (epoch ms); an older
- *  CLI without it falls back to the date written into the file name
- *  (2026-09-28, 20260928), and undated files follow in listed order. */
-function fileStamp(f: { path: string; mtime?: number | string }): number {
-  if (f.mtime != null) {
-    const t = typeof f.mtime === "number" ? f.mtime : Date.parse(f.mtime);
-    if (!Number.isNaN(t)) return t;
-  }
-  const m = f.path.match(/(20\d{2})-?(\d{2})-?(\d{2})/);
-  return m ? Date.UTC(+m[1], +m[2] - 1, +m[3]) : 0;
-}
-
-const DATA_FILES_SHOWN = 10;
-
-function formatTs(raw: string): string {
-  const d = new Date(raw);
-  if (Number.isNaN(d.getTime())) return raw;
-  const time = fmtClock(d);
-  const sameDay = d.toDateString() === new Date().toDateString();
-  if (sameDay) return time;
-  return `${d.toLocaleDateString([], { month: "short", day: "numeric" })} ${time}`;
 }
 
 function BrandMark({ size = 26 }: { size?: number }) {
@@ -967,53 +194,10 @@ function BrandMark({ size = 26 }: { size?: number }) {
   );
 }
 
-function Spinner() {
-  return <Loader2 size={14} className="spin" aria-hidden />;
-}
-
-/** First load in flight: not the empty state, which would claim the answer. */
-function ReadingLine({ what }: { what: string }) {
-  return (
-    <EmptyState
-      icon={<Loader2 size={22} className="spin" aria-hidden />}
-      title={`Reading ${what}…`}
-    />
-  );
-}
-
-/** A first load that failed and left nothing to show. */
-function ReadFailed({ what, onRetry }: { what: string; onRetry: () => void }) {
-  return (
-    <Callout
-      tone="err"
-      stripe
-      title={`Couldn't read ${what}`}
-      action={
-        <button type="button" onClick={onRetry}>
-          <RefreshCw size={14} strokeWidth={1.75} aria-hidden /> Retry
-        </button>
-      }
-    >
-      The CLI didn't answer, so there is nothing to show yet. Check that Python
-      3.11 and the Khipu folder are set under Settings → Advanced.
-    </Callout>
-  );
-}
-
 /** A Python traceback in a toast is its last non-empty line (the exception);
  *  the full text stays in the toast's title. */
 function toastLine(text: string): string {
   return toastWords(text);
-}
-
-type Tone = "ok" | "warn" | "err" | "neutral";
-
-function opsStatusTone(status: string | undefined): Tone {
-  if (status === "ok") return "ok";
-  if (status === "fail" || status === "error" || status === "failed") {
-    return "err";
-  }
-  return "warn";
 }
 
 function PanelHeader({
@@ -1042,194 +226,10 @@ function PanelHeader({
   );
 }
 
-/** The JSON body itself. Kept as its own piece so Home can put two of them
- *  inside one disclosure without nesting two more. */
-function RawBlock({ text, empty }: { text: string; empty?: string }) {
-  const body = text && text !== "\u2026" ? text : empty || "No data yet.";
-  return <pre className="code tall">{body}</pre>;
-}
-
-/** Raw JSON, behind a collapsed "Advanced" disclosure. It used to sit expanded
- *  on every primary screen — a debug affordance as permanent furniture
- *  (audit 2026-09-04). */
-function RawJson({
-  text,
-  empty,
-  openKey = 0,
-  label = "Advanced",
-}: {
-  text: string;
-  empty?: string;
-  openKey?: number;
-  label?: string;
-}) {
-  return (
-    <Disclosure label={label} openKey={openKey}>
-      <RawBlock text={text} empty={empty} />
-    </Disclosure>
-  );
-}
-
-type OwedRowAction = "select" | "unselect" | "settle" | "closedone" | "activity" | "reopen" | "done" | "snooze";
-
-/** One Owed row. Memoised: a list of thousands re-renders only the rows
- *  whose item, tick or busy state changed. `onAct` is stable. */
-const OwedRow = memo(function OwedRow({
-  c,
-  selectable,
-  checked,
-  busy,
-  onAct,
-}: {
-  c: Commitment;
-  selectable: boolean;
-  checked: boolean;
-  busy: boolean;
-  onAct: (action: OwedRowAction, c: Commitment) => void;
-}) {
-  // "Seen again" is evidence a later session re-stated the item; it is
-  // shown only when it actually happened (seen_count > 1), and a
-  // pre-migration hub answers 1 for every row.
-  const seen = (c.seen_count ?? 1) > 1 ? owedAgo(c, "last_seen") : null;
-  return (
-    <ListRow className="owed-row" dataId={c.id}>
-      {selectable ? (
-        <span className="w24">
-          <input
-            type="checkbox"
-            aria-label={`Select: ${c.text ?? `#${c.id}`}`}
-            checked={checked}
-            onChange={(e) => onAct(e.target.checked ? "select" : "unselect", c)}
-          />
-        </span>
-      ) : null}
-      <span className="w88">
-        <Tag kind tone={c.kind === "blocker" ? "warn" : "neutral"}>
-          {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
-        </Tag>
-      </span>
-      <span className="grow owed-main">
-        <span className="owed-text" title={c.text}>
-          {c.owner === "agent" && c.owner_label ? (
-            <>
-              <Tag title="Who this is for">{c.owner_label}</Tag>{" "}
-            </>
-          ) : null}
-          {c.text}
-        </span>
-        {c.status === "closed" && c.close_reason ? (
-          <span className="meta owed-reason">Closed: {owedReasonWords(c.close_reason)}</span>
-        ) : null}
-        {c.status !== "closed" && c.looks_settled ? (
-          <span className="inline owed-settled">
-            <span className="meta">{c.looks_settled}</span>
-            <button
-              type="button"
-              className="sm link"
-              disabled={busy}
-              onClick={() => onAct("settle", c)}
-            >
-              Close as settled
-            </button>
-          </span>
-        ) : null}
-        {c.status !== "closed" && c.looks_done ? (
-          <span className="inline owed-settled">
-            <span className="meta">
-              Looks done{c.looks_done.reason ? `: ${owedReasonWords(c.looks_done.reason)}` : ""}
-            </span>
-            <button
-              type="button"
-              className="sm link"
-              disabled={busy}
-              onClick={() => onAct("closedone", c)}
-            >
-              Close
-            </button>
-          </span>
-        ) : null}
-        {seen ? (
-          <span
-            className="meta owed-seen"
-            title={`Restated by ${c.seen_count} captures`}
-          >
-            seen {seen}
-          </span>
-        ) : null}
-      </span>
-      <WaitingToSync pending={c.pending_sync} />
-      <span className="w128">
-        {c.project ? (
-          <Tag
-            title={
-              c.project.includes(":")
-                ? `${harnessLabel(c.project.split(":")[0] ?? "")} session · ${c.project}`
-                : c.project
-            }
-          >
-            {shortProject(c.project)}
-          </Tag>
-        ) : (
-          <span className="meta">—</span>
-        )}
-      </span>
-      <span className="meta w52">{shortDateLabel(c.opened_at)}</span>
-      <span className="meta w44">{shortDateLabel(c.due_after)}</span>
-      <span className="w50">
-        {c.opened_episode != null ? (
-          <button
-            type="button"
-            className="link sm mono"
-            title="Open the capture that opened this"
-            onClick={() => onAct("activity", c)}
-          >
-            #{c.opened_episode}
-          </button>
-        ) : (
-          <span className="meta mono">—</span>
-        )}
-      </span>
-      <span className="w132 acts-cell">
-        {c.status === "closed" ? (
-          <button
-            type="button"
-            className="sm"
-            disabled={busy}
-            onClick={() => onAct("reopen", c)}
-          >
-            Reopen
-          </button>
-        ) : (
-          <>
-            <button
-              type="button"
-              className="sm"
-              disabled={busy}
-              onClick={() => onAct("done", c)}
-            >
-              Done
-            </button>
-            <button
-              type="button"
-              className="sm"
-              disabled={busy}
-              onClick={() => onAct("snooze", c)}
-            >
-              Snooze
-            </button>
-          </>
-        )}
-      </span>
-    </ListRow>
-  );
-});
-
 export default function App() {
   const [tab, setTab] = useState<Tab>("home");
-  // Today is the new place on tab "home"; the old Home sits under Older screens.
-  const [showOldHome, setShowOldHome] = useState(false);
   const [paneRetryKeys, setPaneRetryKeys] = useState<Record<Tab, number>>({
-    "first-run": 0, home: 0, activity: 0, memory: 0, recall: 0, revisions: 0, work: 0, harnesses: 0, routing: 0, "routing-old": 0, settings: 0, guides: 0,
+    "first-run": 0, home: 0, memory: 0, routing: 0, settings: 0, guides: 0,
   });
   // Every screen shares one scroll container (`.main-content`), so a screen
   // would open scrolled to wherever the last one was left. A layout effect runs
@@ -1240,156 +240,32 @@ export default function App() {
   // Configuration presence lets setup proceed; it does not prove the database answers.
   const [dsnOk, setDsnOk] = useState<boolean | null>(null);
   // Needs you (slice A3): one read for Today's cards and the sidebar count.
-  const needs = useNeedsYou(dsnOk === true && tab !== "first-run", tab === "home" && !showOldHome);
+  const needs = useNeedsYou(dsnOk === true && tab !== "first-run", tab === "home");
   const [dbReachable, setDbReachable] = useState<boolean | null>(null);
   const [loading, setLoading] = useState<Partial<Record<CacheTab, boolean>>>(
     {},
   );
   const [error, setError] = useState<string | null>(null);
-  // First-load outcome per source ("status", "activity", "owed:open", ...). A
-  // source stays "ok" once it has answered, so a later failed refresh keeps
-  // the last-good rows; only a source that never answered shows as failed.
-  const [loadState, setLoadState] = useState<Record<string, "ok" | "failed">>(
-    {},
-  );
-  const markLoaded = useCallback((key: string, ok: boolean) => {
-    const next = ok ? "ok" : "failed";
-    setLoadState((prev) =>
-      prev[key] === "ok" || prev[key] === next ? prev : { ...prev, [key]: next },
-    );
-  }, []);
   const fetchedAt = useRef<Partial<Record<CacheTab, number>>>({});
   // Doctor reads can overlap (a forced read after an install while a TTL read
   // is still running); only the newest request may write its answer.
   const doctorSeq = useRef(0);
-  const rightNowSeq = useRef(0);
   const dsnSeq = useRef(0);
-  const activitySeq = useRef(0);
-  const activityDetailSeq = useRef(0);
-  const searchSeq = useRef(0);
-  const graphSeq = useRef(0);
-  const recallDetailSeq = useRef(0);
-  const revisionsSeq = useRef(0);
-  const revisionsCache = useRef<Record<string, {
-    at: number;
-    text: string;
-    conflicts: ConflictSummary | null;
-    recent: RecentRevision[];
-  }>>({});
   const feedbackButtonRef = useRef<HTMLButtonElement>(null);
 
-  const [statusText, setStatusText] = useState("…");
-  const [counts, setCounts] = useState<Counts | null>(null);
-  // Split so Status sample-0 cannot clobber Revisions-derived drift UI.
-  const [statusConflicts, setStatusConflicts] =
-    useState<ConflictSummary | null>(null);
-  const [revisionsConflicts, setRevisionsConflicts] =
-    useState<ConflictSummary | null>(null);
-  const [recentCaptures, setRecentCaptures] = useState<
-    Array<{ id: number; summary?: string; ts?: string; scope?: string }>
-  >([]);
-  const [doctorText, setDoctorText] = useState("…");
   // The same report as `doctorText`, parsed — `HealthReportRows` iterates its
   // `*_ok` fields directly rather than re-parsing the pretty-printed string.
   const [doctorParsed, setDoctorParsed] = useState<Record<
     string,
     unknown
   > | null>(null);
-  const [doctorOk, setDoctorOk] = useState<boolean | null>(null);
-  const [doctorReadError, setDoctorReadError] = useState<string | null>(null);
-  const [doctorLastOkAt, setDoctorLastOkAt] = useState<number | null>(null);
-  // Plain-language failures derived from the doctor report: title, the cause
-  // in a sentence, and at most one fix action. Home's attention callouts and
-  // the health report's red rows (`healthRows.tsx`) both read this so the
-  // wording never drifts between the two (2026-08-17 / 2026-09-05).
-  const [attention, setAttention] = useState<Attention[]>([]);
-  const [doctorCheckCount, setDoctorCheckCount] = useState(0);
   // Home's four tiles read these straight off the doctor payload; nothing here
   // is derived from a field the report does not carry.
   const [liveness, setLiveness] = useState<LivenessPayload | null>(null);
   const [t3Health, setT3Health] = useState<T3Health | null>(null);
-  // D3: Home's "Right now" card — its own fetch (`liveness_now`, fixed
-  // argv `khipu sessions liveness`) rather than reusing `liveness` above,
-  // so a Capture now click can refresh just this card without waiting on
-  // the full doctor pass (DB round trips, backup checks, etc.).
-  const [rightNow, setRightNow] = useState<LivenessPayload | null>(null);
-  const [rightNowReadError, setRightNowReadError] = useState<string | null>(null);
-  const [captureNowBusy, setCaptureNowBusy] = useState(false);
-  const [captureNowMsg, setCaptureNowMsg] = useState<string | null>(null);
   // The last recorded end-to-end recall probe. Harnesses reads it for its
   // "Verified …" line; nothing about that line is app-local state.
   const [recallProbe, setRecallProbe] = useState<RecallProbeStatus | null>(null);
-  const [embedCoverage, setEmbedCoverage] = useState<(
-    Record<string, unknown> & {
-      missing?: number;
-      stale?: number;
-      pct?: number;
-      active_profile?: unknown;
-    }
-  ) | null>(null);
-  // `coverage()` reports the active index profile alongside the per-kind
-  // rows; Settings names it rather than saying "the index" and leaving the
-  // person to guess which one.
-  const [embedActiveProfile, setEmbedActiveProfile] = useState<string | null>(null);
-  const [backupHealth, setBackupHealth] = useState<{
-    ok?: boolean;
-    freshest_backup_age_seconds?: number;
-  } | null>(null);
-  const [snapshotHealth, setSnapshotHealth] = useState<{
-    ok?: boolean;
-    age_seconds?: number;
-    /** This Mac's offline copy is behind or just replaced (the doctor's `prompt_recall_snapshot.fresh`). */
-    notTrusted?: boolean;
-  } | null>(null);
-  const [probeBusy, setProbeBusy] = useState(false);
-  const [doctorJobs, setDoctorJobs] = useState<DoctorJobs | null>(null);
-  // Checks the CLI never ran on this machine (`not_configured`). Kept
-  // separate from doctorIssues so a skip never gets folded into either
-  // "all green" or the red issue list.
-  const [doctorNotConfigured, setDoctorNotConfigured] = useState<string[]>(
-    [],
-  );
-  const [doctorSkipReasons, setDoctorSkipReasons] = useState<
-    Record<string, string | undefined>
-  >({});
-  const [jobSpawnMsg, setJobSpawnMsg] = useState<string | null>(null);
-  const [revisionsText, setRevisionsText] = useState("…");
-  const [activityText, setActivityText] = useState("…");
-  const [activityList, setActivityList] = useState<
-    Array<{
-      id: number;
-      summary?: string;
-      ts?: string;
-      ingested_at?: string;
-      session_id?: string;
-      scope?: string;
-      mirror_age_seconds?: number;
-    }>
-  >([]);
-  const [activityCount, setActivityCount] = useState<number | null>(null);
-  // Held in a ref, not state, so Home's own `loadActivity(false)` can never
-  // shrink a list the Activity screen has already paged out.
-  const activityLimitRef = useRef(ACTIVITY_PAGE);
-  const [activityLimit, setActivityLimit] = useState(ACTIVITY_PAGE);
-  const [activityFilter, setActivityFilter] = useState("");
-  const [activityProject, setActivityProject] = useState<string | null>(null);
-  const [activityHarness, setActivityHarness] = useState<string | null>(null);
-  const [activitySince, setActivitySince] = useState<"today" | "7d" | null>(null);
-  const [activitySelected, setActivitySelected] = useState<number | null>(null);
-  const [activityDetail, setActivityDetail] = useState<EpisodeDetail | null>(
-    null,
-  );
-  const [activityDetailLoading, setActivityDetailLoading] = useState(false);
-  const [editOpen, setEditOpen] = useState(false);
-  const [editTarget, setEditTarget] = useState<number | null>(null);
-  const [editText, setEditText] = useState("");
-  const [editSaving, setEditSaving] = useState(false);
-  // One confirm for both screens' Forget button, through the shared Dialog.
-  const [forgetTarget, setForgetTarget] = useState<number | null>(null);
-  const [forgetError, setForgetError] = useState<string | null>(null);
-  const [opsEvents, setOpsEvents] = useState<
-    Array<{ kind?: string; status?: string; created_at?: string }>
-  >([]);
   const [secretsPresence, setSecretsPresence] = useState<SecretsPresence | null>(
     null,
   );
@@ -1400,132 +276,6 @@ export default function App() {
   const [modelsMsg, setModelsMsg] = useState<string | null>(null);
   const [modelsSaving, setModelsSaving] = useState(false);
   const modelCheck = useModelVerify();
-  const [revSlug, setRevSlug] = useState("");
-  const [revRecent, setRevRecent] = useState<RecentRevision[]>([]);
-  const [revShowId, setRevShowId] = useState("");
-  const [query, setQuery] = useState("");
-  const recallSearchInput = useRef<HTMLInputElement | null>(null);
-  const [searchText, setSearchText] = useState("");
-  // A failed search used to clear searchText, which the render reads as
-  // "never searched" — the failure vanished with the toast and the panel
-  // looked like an empty first run. Kept separate so it renders its own
-  // inline, retryable state instead (audit 2026-08-31).
-  const [searchErr, setSearchErr] = useState<string | null>(null);
-  // The CLI's search default is `--mode hybrid` (cosine + token overlap +
-  // literal, fused by RRF). The pane offered a "Semantic" checkbox that sent
-  // the DEPRECATED `--semantic` alias when on and, when off, silently fell
-  // back to literal-only — so neither position of the switch could reach the
-  // mode the CLI itself considers best, and the empty state told people
-  // literal keyword matching was the default (audit 2026-08-17, 2026-09-04).
-  // Three named modes, hybrid first, mapped 1:1 onto `--mode`.
-  const [searchMode, setSearchMode] = useState<SearchMode>("hybrid");
-  const [searchProject, setSearchProject] = useState("");
-  const [searchSince, setSearchSince] = useState("");
-  const [searchKind, setSearchKind] = useState("");
-  const [searchHarness, setSearchHarness] = useState("");
-  const [searchVia, setSearchVia] = useState("");
-  // The mock's chips row: a chip is the applied filter, "+ Filter" reveals the
-  // inputs that set them.
-  const [searchFiltersOpen, setSearchFiltersOpen] = useState(false);
-  // The app's own round-trip time. Not a CLI field — it is measured here and
-  // labelled as what it is.
-  const [searchElapsedMs, setSearchElapsedMs] = useState<number | null>(null);
-  const [recallSelected, setRecallSelected] = useState<string | null>(null);
-  const [recallDetail, setRecallDetail] = useState<EpisodeDetail | null>(null);
-  const [recallDetailLoading, setRecallDetailLoading] = useState(false);
-  const [recallNeighbors, setRecallNeighbors] = useState<GraphNeighbor[]>([]);
-  const [copiedId, setCopiedId] = useState<string | null>(null);
-  // Separate from the shared `actionBusy`: the results area needs to know
-  // that THIS search is in flight so it can show a loading state instead of
-  // leaving the "type a query" empty state on screen (audit 2026-09-04).
-  const [searchBusy, setSearchBusy] = useState(false);
-  const [graphBusy, setGraphBusy] = useState(false);
-  // Recall holds Search and the graph walk; the walk is a sub-view of a result,
-  // not a peer destination (audit IA).
-  const [recallView, setRecallView] = useState<"search" | "graph">("search");
-  // One cached array per status. Home's preview, the rail badge and the Owed
-  // screen's own table all read this, so a write that moves a row between two
-  // statuses cannot leave one of them stale (phase 4: the segmented control
-  // shows all three counts at once, so all three are fetched).
-  const [owedPages, setOwedPages] = useState<Partial<Record<OwedListKey, OwedPage>>>({});
-  const owedPagesRef = useRef(owedPages);
-  owedPagesRef.current = owedPages;
-  const owedByStatus = useMemo(() => {
-    const out: Partial<Record<OwedStatus, Commitment[]>> = {};
-    if (owedPages["open:user"]) {
-      out.open = OWED_OPEN_KEYS.reduce<Commitment[]>((acc, k) => owedMerge(acc, owedPages[k]?.rows ?? []), []);
-    }
-    if (owedPages.closed) out.closed = owedPages.closed.rows;
-    if (owedPages.stale) out.stale = owedPages.stale.rows;
-    return out;
-  }, [owedPages]);
-  const [owedMoreBusy, setOwedMoreBusy] = useState<OwedListKey | null>(null);
-  // Many at once (slice 5): the ids ticked in the open list, the dialog for
-  // Close… or Move to….
-  const [owedSelected, setOwedSelected] = useState<ReadonlySet<number>>(new Set());
-  const [owedChangeMode, setOwedChangeMode] = useState<"close" | "move" | null>(null);
-  const [owedStatus, setOwedStatus] = useState<OwedStatus>("open");
-  const [owedProject, setOwedProject] = useState<string | null>(null);
-  const [owedKind, setOwedKind] = useState<string | null>(null);
-  // Reads in flight per status. The three statuses load concurrently, so one
-  // finishing must not end another's loading state.
-  const [owedInFlight, setOwedInFlight] = useState<Record<OwedStatus, number>>({
-    open: 0,
-    closed: 0,
-    stale: 0,
-  });
-  const owedLoading = owedInFlight.open + owedInFlight.closed + owedInFlight.stale > 0;
-  // Latest request per status: an older reply never overwrites a newer one.
-  const owedSeq = useRef<Record<OwedStatus, number>>({ open: 0, closed: 0, stale: 0 });
-  const [owedBusyId, setOwedBusyId] = useState<number | null>(null);
-  // The hub is away: per status, the banner to show above the list.
-  const [owedOffline, setOwedOffline] = useState<Partial<Record<OwedStatus, OwedOffline | null>>>({});
-  const [owedSaved, setOwedSaved] = useState(false);
-  const [snoozeTarget, setSnoozeTarget] = useState<Commitment | null>(null);
-  // Bumped by an attention item with no fix action, and by "Details": opens
-  // Home's one disclosure instead of dead-ending.
-  const [homeAdvancedKey, setHomeAdvancedKey] = useState(0);
-  // The health rows a tile or callout was opened for: opens the disclosure,
-  // scrolls to the first row it names and marks them for a few seconds.
-  const [healthFocus, setHealthFocus] = useState<{ keys: readonly string[]; n: number } | null>(null);
-  const openHealth = useCallback((keys: readonly string[]) => {
-    setHomeAdvancedKey((k) => k + 1);
-    setHealthFocus((f) => ({ keys, n: (f?.n ?? 0) + 1 }));
-  }, []);
-  useEffect(() => {
-    if (!healthFocus) return;
-    let marked: Element[] = [];
-    const frame = requestAnimationFrame(() =>
-      requestAnimationFrame(() => {
-        marked = markHealthRows(document, healthFocus.keys);
-        marked[0]?.scrollIntoView?.({ behavior: "smooth", block: "center" });
-      }),
-    );
-    const done = window.setTimeout(() => marked.forEach((el) => el.classList.remove("health-hl")), 4000);
-    return () => {
-      cancelAnimationFrame(frame);
-      window.clearTimeout(done);
-      marked.forEach((el) => el.classList.remove("health-hl"));
-    };
-  }, [healthFocus]);
-  const [owedFetchedAt, setOwedFetchedAt] = useState<Partial<Record<OwedStatus, number>>>({});
-  const [nodeId, setNodeId] = useState("");
-  const [hops, setHops] = useState(1);
-  const [graphText, setGraphText] = useState("");
-  const [actionBusy, setActionBusy] = useState(false);
-  const [activityRawKey, setActivityRawKey] = useState(0);
-  const [revisionsRawKey, setRevisionsRawKey] = useState(0);
-
-  // Declared here, not next to the render, because the rail-badge effect below
-  // reads owedOpenCount in its dependency list.
-  const owedOpenRows = owedByStatus.open ?? [];
-  // The rail badge and Home's preview count "Needs you" ONLY — the global
-  // open total is ~330 rows of the agent's own plan steps, which is exactly
-  // the number that got the screen ignored (phase 4 addendum).
-  const needsYouRows = owedOpenRows.filter((c) => owedGroupOf(c) === "needs-you");
-  const owedOpenCount = owedByStatus.open ? needsYouRows.length : null;
-  const owedRows = owedByStatus[owedStatus] ?? [];
-
   const markLoading = (key: CacheTab, on: boolean) => {
     setLoading((prev) => ({ ...prev, [key]: on }));
   };
@@ -1572,48 +322,6 @@ export default function App() {
   useEffect(() => {
     if (!welcomeCompleted()) setTab("first-run");
   }, []);
-  const loadStatus = useCallback(async (force = false) => {
-    if (!needsFetch("status", force)) return;
-    markLoading("status", true);
-    setError(null);
-    try {
-      // Default --sample 0: PG stats only (no NAS file-hash walk).
-      const raw = await runKhipu(["status"]);
-      const parsed = parseJson(raw) as {
-        counts?: Counts;
-        conflicts?: ConflictSummary;
-        recent_captures?: Array<{
-          id: number;
-          summary?: string;
-          ts?: string;
-          scope?: string;
-        }>;
-      } | null;
-      if (
-        parsed === null ||
-        typeof parsed !== "object" ||
-        Array.isArray(parsed)
-      ) {
-        // Keep last-good KPIs; do not stamp fetchedAt so retry is not TTL-blocked.
-        setError("Unexpected response from hub");
-        markLoaded("status", false);
-        return;
-      }
-      setStatusText(prettyJson(raw));
-      setCounts(parsed.counts ?? null);
-      setStatusConflicts(parsed.conflicts ?? null);
-      setRecentCaptures(parsed.recent_captures ?? []);
-      fetchedAt.current.status = Date.now();
-      markLoaded("status", true);
-    } catch (e) {
-      // Preserve last-good KPIs/lists; toast only.
-      setError(String(e));
-      markLoaded("status", false);
-    } finally {
-      markLoading("status", false);
-    }
-  }, []);
-
   const loadSecretsPresence = useCallback(async () => {
     try {
       const raw = await invoke<string>("secrets_presence");
@@ -1631,15 +339,7 @@ export default function App() {
     }
   }, []);
 
-  /** A key was saved: re-read what is stored and the health report. */
-  const onKeySaved = useCallback(async () => {
-    fetchedAt.current.activity = undefined;
-    await loadSecretsPresence();
-    await loadStatus(true);
-  }, [loadSecretsPresence, loadStatus]);
 
-  /** Resolves to the error it put in the toast, or null, so a caller that
-   *  posts its own toast afterwards can keep the doctor failure visible. */
   const loadDoctor = useCallback(async (force = false): Promise<string | null> => {
     if (!needsFetch("doctor", force)) return null;
     const seq = ++doctorSeq.current;
@@ -1648,1041 +348,61 @@ export default function App() {
     try {
       const raw = await runKhipu(["doctor"]);
       if (seq !== doctorSeq.current) return null;
-      const parsed = parseJson(raw) as { ok?: boolean } | null;
-      if (
-        parsed === null ||
-        typeof parsed !== "object" ||
-        Array.isArray(parsed)
-      ) {
-        // Keep last-good doctorOk; do not stamp fetchedAt so retry is not TTL-blocked.
-        setError("Unexpected response from hub");
-        setDoctorReadError("Unexpected response from hub");
-        return "Unexpected response from hub";
+      const parsed = parseJson(raw) as Record<string, unknown> | null;
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        setError("Khipu's health check gave an unreadable answer.");
+        return "Khipu's health check gave an unreadable answer.";
       }
-      setDoctorText(prettyJson(raw));
-      setDoctorParsed(parsed as Record<string, unknown>);
-      setDoctorOk(typeof parsed.ok === "boolean" ? parsed.ok : null);
-      setDoctorReadError(null);
-      setDoctorLastOkAt(Date.now());
-      const { items } = buildAttention(parsed as Record<string, unknown>);
-      const doctorT3 = (parsed as { t3?: T3Health }).t3 ?? null;
-      const t3Warnings = doctorT3?.warnings ?? [];
-      if (t3Warnings.length > 0) {
-        const reason = t3WarningReason(doctorT3);
-        const sentences = t3Warnings.map((w) => w.trim().replace(/[.\s]+$/, ""));
-        items.push({
-          key: "t3",
-          tone: "warn",
-          title:
-            reason === "lookup" ? "T3 Code is not linking threads"
-              : reason === "hooks" ? "Some T3 providers have no Khipu hooks"
-              : reason === "partial" ? "Some T3 providers are missing a Khipu feature"
-              : reason === "unlinked" ? "Recent T3 work is not linked to a thread"
-              : "T3 Code needs a look",
-          cause:
-            sentences.join(". ") +
-            (reason === "hooks" || reason === "partial"
-              ? ". Captures still land and remain searchable."
-              : ". Captures still land and remain searchable; thread filtering is unavailable until this is resolved."),
-          fix: { label: "Open Harnesses", kind: "open-harnesses" },
-        });
-      }
-      const lv = (parsed as { capture_liveness?: LivenessPayload })
-        .capture_liveness;
-      setLiveness(lv ?? null);
-      setT3Health(doctorT3);
-      setRecallProbe(
-        (parsed as { recall_probe?: RecallProbeStatus }).recall_probe ?? null,
-      );
-      const cov = (parsed as {
-        embed_coverage?: Record<string, unknown> & {
-          missing?: number;
-          stale?: number;
-          pct?: number;
-          active_profile?: unknown;
-          budget?: unknown;
-          query_cache?: unknown;
-        };
-      }).embed_coverage;
-      setEmbedCoverage(cov ?? null);
-      setEmbedActiveProfile(
-        typeof cov?.active_profile === "string" ? cov.active_profile : null,
-      );
-      setBackupHealth(
-        (parsed as { backup?: { ok?: boolean; freshest_backup_age_seconds?: number } }).backup ?? null,
-      );
-      {
-        const hub = (parsed as { hub_snapshot?: { ok?: boolean; age_seconds?: number } }).hub_snapshot;
-        setSnapshotHealth(hub ? { ...hub, notTrusted: snapshotNotTrusted(parsed) } : null);
-      }
-      setDoctorJobs((parsed as { jobs?: DoctorJobs }).jobs ?? null);
-      const notConfiguredRaw = (parsed as { not_configured?: unknown })
-        .not_configured;
-      setDoctorNotConfigured(
-        Array.isArray(notConfiguredRaw)
-          ? notConfiguredRaw.filter((x): x is string => typeof x === "string")
-          : [],
-      );
-      const nightlyStepsForSkip = (
-        parsed as {
-          nightly_steps?: Record<string, { skipped?: boolean; reason?: string }>;
-        }
-      ).nightly_steps;
-      const nightlyStepSkipReasons: Record<string, string | undefined> = {};
-      for (const [key, step] of Object.entries(nightlyStepsForSkip ?? {})) {
-        if (step?.skipped) {
-          nightlyStepSkipReasons[key.replace(/_ok$/, "")] = step.reason;
-        }
-      }
-      setDoctorSkipReasons({
-        memory_root: (parsed as { drift?: { skipped?: string } }).drift
-          ?.skipped,
-        ...nightlyStepSkipReasons,
-      });
-      setAttention(items);
-      // The number of boolean `*_ok` verdicts in this report — what "all
-      // checks passed" is actually a claim about.
-      setDoctorCheckCount(
-        Object.entries(parsed as Record<string, unknown>).filter(
-          ([k, v]) => k.endsWith("_ok") && typeof v === "boolean",
-        ).length,
-      );
+      setDoctorParsed(parsed);
+      setLiveness((parsed as { capture_liveness?: LivenessPayload }).capture_liveness ?? null);
+      setT3Health((parsed as { t3?: T3Health }).t3 ?? null);
+      setRecallProbe((parsed as { recall_probe?: RecallProbeStatus }).recall_probe ?? null);
       fetchedAt.current.doctor = Date.now();
       return null;
     } catch (e) {
-      // Preserve last-good doctorOk/text; toast only.
       if (seq !== doctorSeq.current) return null;
       setError(String(e));
-      setDoctorReadError(String(e));
       return String(e);
     } finally {
       if (seq === doctorSeq.current) markLoading("doctor", false);
     }
   }, []);
+  /** A key was saved: re-read what is stored and the health report. */
+  const onKeySaved = useCallback(async () => {
+    await loadSecretsPresence();
+    await loadDoctor(true);
+  }, [loadSecretsPresence, loadDoctor]);
 
-  /** D3: Home's "Right now" card — `liveness_now` (fixed argv `khipu
-   *  sessions liveness`), the same session_capture.liveness_all() call
-   *  doctor makes, fetched on its own so a Capture now click can refresh
-   *  just this card without paying for the full doctor pass. */
-  const loadRightNow = useCallback(async (force = false) => {
-    if (!needsFetch("rightNow", force)) return;
-    const seq = ++rightNowSeq.current;
-    markLoading("rightNow", true);
+  /** Memory › Project work lists: a finished line closes the owed item it
+   *  carries (`khipu owed --close=ID`, as before). */
+  const owedWrite = useCallback(async (id: number, args: string[]) => {
     try {
-      const raw = await invoke<string>("liveness_now");
-      const parsed = parseJson(raw) as LivenessPayload | null;
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !parsed.harnesses || typeof parsed.harnesses !== "object" || Array.isArray(parsed.harnesses)) {
-        if (seq !== rightNowSeq.current) return;
-        setRightNowReadError("Unexpected response from hub");
-        return;
-      }
-      if (seq !== rightNowSeq.current) return;
-      setRightNow(parsed);
-      setRightNowReadError(null);
-      fetchedAt.current.rightNow = Date.now();
-    } catch (e) {
-      if (seq !== rightNowSeq.current) return;
-      setError(String(e));
-      setRightNowReadError(String(e));
-    } finally {
-      if (seq === rightNowSeq.current) markLoading("rightNow", false);
-    }
-  }, []);
-
-  /** "Capture now" — `khipu capture now`, no arguments: flags the most
-   *  recently active local session (K1) for capture at its next Stop /
-   *  PreCompact / SessionEnd instead of waiting on the fixed cadence. */
-  const runCaptureNow = useCallback(async () => {
-    setCaptureNowBusy(true);
-    setCaptureNowMsg(null);
-    try {
-      const raw = await invoke<string>("khipu_capture_now");
-      const parsed = parseJson(raw) as { queued?: boolean; error?: string } | null;
-      setCaptureNowMsg(
-        parsed?.queued
-          ? "Queued; lands at the end of the current turn."
-          : (parsed?.error ?? "Nothing to capture — no active session found."),
-      );
-    } catch (e) {
-      setCaptureNowMsg(String(e));
-    } finally {
-      setCaptureNowBusy(false);
-      await loadRightNow(true);
-    }
-  }, [loadRightNow]);
-
-  /** `khipu doctor --probe` — the only doctor invocation that WRITES: it runs
-   * a fresh capture-then-search round trip and records the result, which
-   * plain `doctor` only reads. Without a button here the recall_probe check
-   * could only go stale and stay red (audit 2026-09-04). */
-  const runRecallProbe = useCallback(async () => {
-    setProbeBusy(true);
-    setError(null);
-    try {
-      await runKhipu(["doctor", "--probe"]);
-    } catch (e) {
-      // A probe that exits non-zero is a FAILED probe, not a broken button —
-      // the reload below shows the recorded verdict either way.
-      setError(String(e));
-    } finally {
-      setProbeBusy(false);
-      await loadDoctor(true);
-    }
-  }, [loadDoctor]);
-
-  /** `khipu migrate` through the same fixed-argv command Welcome's
-   *  Database step uses: applies the updates doctor named as pending. */
-  const applyMigrations = useCallback(async () => {
-    setProbeBusy(true);
-    setError(null);
-    try {
-      requireMigrationSuccess(await invoke<string>("khipu_migrate", { dryRun: false }));
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setProbeBusy(false);
-      await loadDoctor(true);
-    }
-  }, [loadDoctor]);
-
-  /** `khipu snapshot refresh` through its fixed-argv command: rebuilds this
-   *  Mac's offline copy, the fix doctor names for prompt-time recall. */
-  const refreshSnapshot = useCallback(async () => {
-    setProbeBusy(true);
-    setError(null);
-    try {
-      requireCliSuccess(await invoke<string>("khipu_snapshot_refresh"));
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setProbeBusy(false);
-      await loadDoctor(true);
-    }
-  }, [loadDoctor]);
-
-  /** `khipu owed` — the commitments a session left behind, cached per status
-   *  so the rail badge, Home's preview and this screen's table are one fetch
-   *  rather than three racing over one array. The open list is read once per
-   *  owner, so the owner's own items are never behind thousands of a job's. */
-  const fetchOwedPage = useCallback(async (key: OwedListKey, cursor: string | null) => {
-    const [status, owner] = key.split(":") as [OwedStatus, string | undefined];
-    const raw = await runKhipu([
-      "owed",
-      "--envelope",
-      `--status=${status}`,
-      `--owner=${owner ?? "all"}`,
-      `--limit=${OWED_PAGE}`,
-      ...(cursor ? [`--cursor=${cursor}`] : []),
-    ]);
-    const parsed = parseJson(raw);
-    const answer = parseOwedAnswer(parsed);
-    const readAt = Date.now();
-    let rows = answer ? (answer.rows as Commitment[]).map((c) => ({ ...c, read_at_ms: readAt })) : [];
-    // A bare list (an older answer) is every owner's: keep this list's own.
-    if (owner) rows = rows.filter((c) => owedOwnerOf(c) === owner);
-    const o = (parsed ?? {}) as { total?: unknown; next_cursor?: unknown };
-    return {
-      answer,
-      rows,
-      total: typeof o.total === "number" ? o.total : null,
-      next: typeof o.next_cursor === "string" && o.next_cursor ? o.next_cursor : null,
-    };
-  }, []);
-
-  const loadOwed = useCallback(
-    async (status: OwedStatus, force = false) => {
-      const at = owedFetchedAt[status];
-      if (!force && at != null && Date.now() - at < CACHE_TTL_MS) return;
-      const seq = ++owedSeq.current[status];
-      const latest = () => owedSeq.current[status] === seq;
-      setOwedInFlight((prev) => ({ ...prev, [status]: prev[status] + 1 }));
-      try {
-        let stale: OwedOffline | null = null;
-        const lists = await Promise.all(
-          owedListKeys(status).map(async (key): Promise<[OwedListKey, OwedPage]> => {
-            const had = owedPagesRef.current[key];
-            // A list read further than its first page is re-read only on a
-            // write or Refresh, so the timer never folds it back to one page.
-            if (!force && had && had.pages > 1) return [key, had];
-            const first = await fetchOwedPage(key, null);
-            if (first.answer?.stale) stale = { kind: "stale", refreshedAt: first.answer.refreshedAt };
-            let page: OwedPage = { rows: first.rows, total: first.total, next: first.next, pages: 1 };
-            while (page.pages < (had?.pages ?? 1) && page.next) {
-              const more = await fetchOwedPage(key, page.next);
-              page = { ...page, rows: owedMerge(page.rows, more.rows), next: more.next, pages: page.pages + 1 };
-            }
-            return [key, page];
-          }),
-        );
-        if (!latest()) return;
-        setOwedOffline((prev) => ({ ...prev, [status]: stale }));
-        setOwedPages((prev) => ({ ...prev, ...Object.fromEntries(lists) }));
-        setOwedFetchedAt((prev) => ({ ...prev, [status]: Date.now() }));
-        markLoaded(`owed:${status}`, true);
-      } catch (e) {
-        if (!latest()) return;
-        if (isHubUnreachable(String(e))) {
-          // The hub is away: a banner, not a toast. The next refresh tries again.
-          setOwedOffline((prev) => ({ ...prev, [status]: { kind: "unreachable" } }));
-        } else {
-          setError(String(e));
-        }
-        markLoaded(`owed:${status}`, false);
-      } finally {
-        setOwedInFlight((prev) => ({ ...prev, [status]: Math.max(0, prev[status] - 1) }));
-      }
-    },
-    [owedFetchedAt, markLoaded, fetchOwedPage],
-  );
-
-  // Owed writes can change Work's waiting model even while the Work tab is
-  // closed, so initialise its reader before the write callback closes over it.
-  const work = useWork(tab === "work", dsnOk === true);
-
-  /** Show more: the next page of one list, by the cursor the last returned. */
-  const loadOwedMore = useCallback(
-    async (key: OwedListKey) => {
-      const had = owedPagesRef.current[key];
-      if (!had?.next) return;
-      setOwedMoreBusy(key);
-      try {
-        const more = await fetchOwedPage(key, had.next);
-        setOwedPages((prev) => {
-          const cur = prev[key];
-          if (!cur || cur.next !== had.next) return prev;
-          return {
-            ...prev,
-            [key]: { rows: owedMerge(cur.rows, more.rows), total: more.total ?? cur.total, next: more.next, pages: cur.pages + 1 },
-          };
-        });
-      } catch (e) {
-        setError(String(e));
-      } finally {
-        setOwedMoreBusy(null);
-      }
-    },
-    [fetchOwedPage],
-  );
-
-  /** Done / Reopen / Snooze. Every write refetches all three statuses, because
-   *  each one can move a row between them — a stale count on the segmented
-   *  control is the same lie as a stale row in the table. */
-  const owedWrite = useCallback(
-    async (id: number, args: string[]) => {
-      setOwedBusyId(id);
-      setOwedSaved(false);
-      setError(null);
-      try {
-        const raw = await runKhipu(["owed", ...args]);
-        const parsed = parseJson(raw) as
-          | { ok?: boolean; error?: string; waiting_to_sync?: boolean }
-          | null;
-        if (parsed && parsed.waiting_to_sync === true) {
-          // Queued on this Mac, not an error: it replays when the hub is back.
-          setOwedSaved(true);
-        } else if (parsed && parsed.ok === false) {
-          setError(parsed.error ?? `Commitment #${id} was not updated.`);
-        }
-      } catch (e) {
-        setError(String(e));
-      } finally {
-        setOwedBusyId(null);
-        await Promise.all([
-          loadOwed("open", true),
-          loadOwed("closed", true),
-          loadOwed("stale", true),
-          work.load(true),
-        ]);
-      }
-    },
-    [loadOwed, work.load],
-  );
-
-  /** Home's one fix action for a harness that stopped recording: the same
-   *  install the Harnesses screen runs, then a fresh health read. */
-  const reinstallHook = useCallback(
-    async (harness: string) => {
-      setActionBusy(true);
-      setError(null);
-      let message: string | null = null;
-      try {
-        const run = await runInstall(runKhipu, harness);
-        if (run.failed) message = `install failed: ${run.failed}`;
-        else if (run.verifyFailed) message = `Installed; verify failed: ${run.verifyFailed}`;
-      } catch (e) {
-        message = String(e);
-      } finally {
-        // The doctor read clears the toast, so the message goes up after it.
-        const doctorError = await loadDoctor(true);
-        if (message && doctorError) message = `${message} The health check then failed: ${doctorError}`;
-        if (message) setError(message);
-        setActionBusy(false);
-      }
-    },
-    [loadDoctor],
-  );
-
-  const loadActivity = useCallback(async (force = false, limit?: number) => {
-    if (limit != null) activityLimitRef.current = limit;
-    const requestedLimit = activityLimitRef.current;
-    if (!needsFetch("activity", force)) return;
-    const seq = ++activitySeq.current;
-    const latest = () => activitySeq.current === seq;
-    markLoading("activity", true);
-    setError(null);
-    try {
-      const raw = await runKhipu([
-        "activity",
-        `--limit=${requestedLimit}`,
-      ]);
-      const parsed = parseJson(raw) as {
-        episode_count?: number;
-        recent?: Array<{
-          id: number;
-          summary?: string;
-          ts?: string;
-          ingested_at?: string;
-          session_id?: string;
-          scope?: string;
-          mirror_age_seconds?: number;
-        }>;
-        ops_events?: Array<{
-          kind?: string;
-          status?: string;
-          created_at?: string;
-        }>;
-        secrets?: unknown;
-      } | null;
-      if (!latest()) return;
-      if (
-        parsed === null ||
-        typeof parsed !== "object" ||
-        Array.isArray(parsed)
-      ) {
-        // Keep last-good lists/KPIs; do not stamp fetchedAt so retry is not TTL-blocked.
-        setError("Unexpected response from hub");
-        markLoaded("activity", false);
-        return;
-      }
-      setActivityText(prettyJson(raw));
-      setActivityList(parsed.recent ?? []);
-      setActivityCount(
-        typeof parsed.episode_count === "number" ? parsed.episode_count : null,
-      );
-      setOpsEvents(parsed.ops_events ?? []);
-      if (isSecretsPresence(parsed.secrets)) {
-        setSecretsPresence(pickSecretsPresence(parsed.secrets));
-        setSecretsPresenceMsg(null);
-      } else {
-        setSecretsPresence(null);
-        setSecretsPresenceMsg("Secrets presence unknown.");
-      }
-      fetchedAt.current.activity = Date.now();
-      markLoaded("activity", true);
-    } catch (e) {
-      // Preserve last-good activity lists/KPIs; toast only.
-      if (!latest()) return;
-      setError(String(e));
-      markLoaded("activity", false);
-    } finally {
-      if (latest()) markLoading("activity", false);
-    }
-  }, []);
-
-  const loadRevisions = useCallback(
-    async (force = false) => {
-      const slug = revSlug.trim();
-      const cached = revisionsCache.current[slug];
-      if (!force && cached && Date.now() - cached.at <= CACHE_TTL_MS) {
-        ++revisionsSeq.current;
-        setRevisionsText(cached.text);
-        setRevisionsConflicts(cached.conflicts);
-        setRevRecent(cached.recent);
-        markLoading("revisions", false);
-        return;
-      }
-      const seq = ++revisionsSeq.current;
-      markLoading("revisions", true);
-      setError(null);
-      try {
-        // No --sample: the pane compares every topic. Passing 40 here checked
-        // the alphabetically-first 40 of 622 and then rendered "Drift & LWW"
-        // green for the whole corpus (audit 2026-08-17). The full pass costs
-        // 1.3 s on this machine, which is the right trade for a pane that only
-        // runs when someone opens it.
-        const args = ["revisions", "--limit", "40"];
-        if (slug) {
-          args.push("--slug", slug);
-        }
-        const raw = await runKhipu(args);
-        const parsed = parseJson(raw) as
-          | { conflicts?: ConflictSummary; recent?: RecentRevision[] }
-          | null;
-        if (
-          parsed === null ||
-          typeof parsed !== "object" ||
-          Array.isArray(parsed)
-        ) {
-          // Keep last-good conflicts; do not stamp fetchedAt so retry is not TTL-blocked.
-          if (seq !== revisionsSeq.current) return;
-          setError("Unexpected response from hub");
-          return;
-        }
-        if (seq !== revisionsSeq.current) return;
-        const text = prettyJson(raw);
-        const conflicts = parsed.conflicts ?? null;
-        // The slug filter narrows `recent`, and nothing rendered `recent` — so
-        // typing a slug and pressing List changed only data the pane never
-        // showed, and the control looked broken (audit 2026-08-17).
-        const recent = ((parsed as { recent?: RecentRevision[] }).recent ?? []).slice(0, 40);
-        revisionsCache.current[slug] = { at: Date.now(), text, conflicts, recent };
-        setRevisionsText(text);
-        setRevisionsConflicts(conflicts);
-        setRevRecent(recent);
-      } catch (e) {
-        // Preserve last-good revisions conflicts/text; toast only.
-        if (seq !== revisionsSeq.current) return;
-        setError(String(e));
-      } finally {
-        if (seq === revisionsSeq.current) markLoading("revisions", false);
-      }
-    },
-    [revSlug],
-  );
-
-  /** One full episode row, for both detail panes. `activity --show` is the
-   *  only CLI read that returns decisions / open loops / where. */
-  const loadEpisodeDetail = useCallback(
-    async (id: number): Promise<EpisodeDetail | null> => {
-      const raw = await runKhipu(["activity", `--show=${id}`]);
-      const parsed = parseJson(raw);
-      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        ? (parsed as EpisodeDetail)
-        : null;
-    },
-    [],
-  );
-
-  const selectEpisode = useCallback(
-    async (id: number) => {
-      const seq = ++activityDetailSeq.current;
-      setActivitySelected(id);
-      setActivityDetail(null);
-      setActivityDetailLoading(true);
-      setError(null);
-      try {
-        const detail = await loadEpisodeDetail(id);
-        if (seq !== activityDetailSeq.current) return;
-        setActivityDetail(detail);
-        setActivityText(prettyJson(JSON.stringify(detail ?? {}, null, 2)));
-      } catch (e) {
-        if (seq !== activityDetailSeq.current) return;
-        setError(String(e));
-      } finally {
-        if (seq === activityDetailSeq.current) setActivityDetailLoading(false);
-      }
-    },
-    [loadEpisodeDetail],
-  );
-
-  /** `khipu episode edit ID --summary TEXT` — correcting a summary a model got
-   *  wrong. The CLI re-embeds it in the same transaction; when it could not
-   *  (no key, no profile) it says so, and so do we, rather than implying the
-   *  correction is searchable when it is not. */
-  const saveSummary = useCallback(async () => {
-    const id = editTarget;
-    const text = editText.trim();
-    if (id == null || !text) return;
-    const selectedAtSave = activitySelected;
-    const detailSeqAtSave = activityDetailSeq.current;
-    setEditSaving(true);
-    setError(null);
-    try {
-      const raw = await runKhipu([
-        "episode",
-        "edit",
-        String(id),
-        `--summary=${text}`,
-      ]);
-      const parsed = parseJson(raw) as
-        | { ok?: boolean; reembedded?: boolean; error?: string }
-        | null;
-      if (parsed && parsed.ok === false) {
-        setError(parsed.error ?? `Episode #${id} was not updated.`);
-        return;
-      }
-      setEditOpen(false);
-      setEditTarget(null);
-      if (
-        selectedAtSave === id &&
-        detailSeqAtSave === activityDetailSeq.current
-      ) {
-        const detail = await loadEpisodeDetail(id);
-        if (detailSeqAtSave === activityDetailSeq.current) {
-          setActivityDetail(detail);
-        }
-      }
-      await loadActivity(true);
-      if (parsed && parsed.reembedded === false) {
-        setError(
-          "Summary saved. Search by meaning picks it up at the next nightly.",
-        );
-      }
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setEditSaving(false);
-    }
-  }, [activitySelected, editTarget, editText, loadEpisodeDetail, loadActivity]);
-
-  /** `khipu episode forget ID` — soft-deletes the episode and drops its
-   * vectors. The only destructive write either pane makes, so it goes behind
-   * the shared confirm Dialog (audit 2026-09-04). */
-  const confirmForget = useCallback(async () => {
-    const id = forgetTarget;
-    if (id == null) return;
-    setActionBusy(true);
-    setError(null);
-    setForgetError(null);
-    try {
-      const raw = await runKhipu(["episode", "forget", String(id)]);
-      const parsed = parseJson(raw) as {
-        ok?: unknown;
-        soft_deleted?: unknown;
-        partial?: unknown;
-        error?: unknown;
-        snapshot?: { ok?: unknown; error?: unknown; reason?: unknown } | null;
-        legacy_file?: { ok?: unknown; error?: unknown; reason?: unknown } | null;
-      } | null;
-      setActivityText(prettyJson(raw));
-      setActivityRawKey((k) => k + 1);
-      if (!parsed || parsed.soft_deleted !== true) {
-        setForgetError(
-          typeof parsed?.error === "string"
-            ? parsed.error
-            : `Could not verify that episode #${id} was removed.`,
-        );
-        return;
-      }
-      let localCopyFailure: string | null = null;
-      const remainingStores = Array.isArray(parsed.partial)
-        ? parsed.partial.filter((store): store is string => typeof store === "string")
-        : [];
-      if (!parsed.snapshot || parsed.snapshot.ok !== true) {
-        localCopyFailure =
-          typeof parsed.snapshot?.error === "string"
-            ? parsed.snapshot.error
-            : typeof parsed.snapshot?.reason === "string"
-              ? parsed.snapshot.reason
-              : "missing success verdict";
-      } else if (
-        parsed.legacy_file?.ok === false ||
-        (typeof parsed.legacy_file?.reason === "string" &&
-          parsed.legacy_file.reason.startsWith("unreadable:"))
-      ) {
-        localCopyFailure =
-          typeof parsed.legacy_file.error === "string"
-            ? parsed.legacy_file.error
-            : typeof parsed.legacy_file.reason === "string"
-              ? parsed.legacy_file.reason
-              : "missing success verdict";
-      }
-      if (remainingStores.length > 0) {
-        localCopyFailure = `remaining stores: ${remainingStores.join(", ")}`;
-      }
-      setForgetTarget(null);
-      ++activitySeq.current;
-      ++activityDetailSeq.current;
-      ++searchSeq.current;
-      ++recallDetailSeq.current;
-      setActivityDetailLoading(false);
-      setSearchBusy(false);
-      setRecallDetailLoading(false);
-      setActivityList((rows) => rows.filter((row) => row.id !== id));
-      setSearchText((previous) => {
-        const cached = parseJson(previous);
-        const keep = (row: unknown) =>
-          !row || typeof row !== "object" || (row as SearchResult).kind !== "episode" || String((row as SearchResult).id) !== String(id);
-        if (Array.isArray(cached)) return prettyJson(JSON.stringify(cached.filter(keep)));
-        if (cached && typeof cached === "object" && Array.isArray((cached as { results?: unknown }).results)) {
-          return prettyJson(JSON.stringify({
-            ...(cached as Record<string, unknown>),
-            results: ((cached as { results: unknown[] }).results).filter(keep),
-          }));
-        }
-        return previous;
-      });
-      if (activitySelected === id) {
-        setActivitySelected(null);
-        setActivityDetail(null);
-      }
-      if (recallDetail?.id === id || recallSelected === `episode:${id}`) {
-        setRecallSelected(null);
-        setRecallDetail(null);
-        setRecallNeighbors([]);
-      }
-      await loadActivity(true);
-      if (localCopyFailure) {
-        setError(
-          `Episode #${id} was removed from database; local copy could not be removed: ${localCopyFailure}`,
-        );
-      }
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setActionBusy(false);
-    }
-  }, [forgetTarget, activitySelected, recallDetail, recallSelected, loadActivity]);
-
-  const showRevision = useCallback(async (explicitId?: string) => {
-    const id = Number(explicitId ?? revShowId);
-    if (!Number.isFinite(id) || id <= 0) {
-      setError("Enter a valid id");
-      return;
-    }
-    setActionBusy(true);
-    setError(null);
-    try {
-      const raw = await runKhipu(["revisions", "--show", String(id)]);
-      setRevisionsText(prettyJson(raw));
-      setRevisionsRawKey((k) => k + 1);
-      setRevShowId(String(id));
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setActionBusy(false);
-    }
-  }, [revShowId]);
-
-  /** `override` is how Activity's "Open in Recall" searches for an episode id
-   *  without waiting a render for the query and mode it just set. */
-  const doSearch = useCallback(
-    async (override?: {
-      query?: string; mode?: SearchMode; via?: string; project?: string; since?: string; kind?: string; harness?: string;
-    }) => {
-      const q = (override?.query ?? query).trim();
-      const mode = override?.mode ?? searchMode;
-      const via = (override?.via ?? searchVia).trim();
-      const project = (override?.project ?? searchProject).trim();
-      const since = (override?.since ?? searchSince).trim();
-      const kind = override?.kind ?? searchKind;
-      const harness = (override?.harness ?? searchHarness).trim();
-      const seq = ++searchSeq.current;
-      const latest = () => searchSeq.current === seq;
-      if (!q && !via) {
-        setSearchBusy(false);
-        return;
-      }
-      if (!q) {
-        setSearchBusy(false);
-        setSearchText("");
-        setSearchErr(null);
-        setRecallSelected(null);
-        setRecallDetail(null);
-        setRecallNeighbors([]);
-        return;
-      }
-      setSearchBusy(true);
-      setError(null);
-      setSearchErr(null);
-      setRecallSelected(null);
-      setRecallDetail(null);
-      setRecallNeighbors([]);
-      const startedAt = Date.now();
-      try {
-        // Always `--mode`, never the deprecated `--semantic` alias. Filters are
-        // only passed when non-empty (an empty `--project=` matches nothing)
-        // and always as one `--name=value` token, so a value beginning with a
-        // dash cannot be read as a flag.
-        const args = ["search", "--mode", mode, "--limit", "20"];
-        if (project) args.push(`--project=${project}`);
-        if (since) args.push(`--since=${since}`);
-        if (kind) args.push(`--kind=${kind}`);
-        if (harness) args.push(`--harness=${harness}`);
-        if (via) args.push(`--via=${via}`);
-        args.push("--", q);
-        const raw = await runKhipu(args);
-        if (!latest()) return;
-        const parsed = parseJson(raw) as { ok?: unknown; error?: unknown; results?: unknown } | null;
-        if (
-          !parsed ||
-          typeof parsed !== "object" ||
-          Array.isArray(parsed) ||
-          parsed.ok === false ||
-          !Array.isArray(parsed.results)
-        ) {
-          throw new Error(
-            typeof parsed?.error === "string" ? parsed.error : "Invalid search response.",
-          );
-        }
-        setSearchText(prettyJson(raw));
-        setSearchElapsedMs(Date.now() - startedAt);
-      } catch (e) {
-        // Keep the query and any prior results — only the new attempt failed —
-        // and surface it inline (below) so it survives the toast timing out.
-        if (!latest()) return;
-        setError(String(e));
-        setSearchErr(String(e));
-      } finally {
-        if (latest()) setSearchBusy(false);
-      }
-    },
-    [query, searchMode, searchProject, searchSince, searchKind, searchHarness, searchVia],
-  );
-
-  /** `explicitId` is how a Recall result opens its own neighbourhood — the
-   *  graph view used to be reachable only by pasting an id you had to already
-   *  know (audit 2026-09-04). */
-  const doGraph = useCallback(async (explicitId?: string) => {
-    const target = (explicitId ?? nodeId).trim();
-    if (!target) return;
-    const seq = ++graphSeq.current;
-    const latest = () => graphSeq.current === seq;
-    setGraphBusy(true);
-    setError(null);
-    try {
-      const raw = await runKhipu([
-        "graph",
-        "--hops",
-        String(clampHops(hops)),
-        "--limit",
-        "40",
-        "--",
-        target,
-      ]);
-      if (!latest()) return;
-      setGraphText(prettyJson(raw));
-    } catch (e) {
-      if (!latest()) return;
-      setError(String(e));
-      setGraphText("");
-    } finally {
-      if (latest()) setGraphBusy(false);
-    }
-  }, [nodeId, hops]);
-
-  /** Fill the detail pane for one hit: the full episode row when it is an
-   *  episode, and its one-hop neighbourhood either way. A topic or node has no
-   *  CLI read beyond what the search payload already carried, so its pane
-   *  shows that and its neighbours — nothing invented to fill the space. */
-  const selectRecallResult = useCallback(
-    async (r: SearchResult) => {
-      const id = String(r.id ?? r.label ?? "");
-      if (!id) return;
-      const seq = ++recallDetailSeq.current;
-      const latest = () => recallDetailSeq.current === seq;
-      setRecallSelected(`${r.kind ?? "item"}:${id}`);
-      setRecallDetail(null);
-      setRecallNeighbors([]);
-      setRecallDetailLoading(true);
-      try {
-        if (r.kind === "episode") {
-          const detail = await loadEpisodeDetail(Number(id));
-          if (!latest()) return;
-          setRecallDetail(detail);
-        }
-        const raw = await runKhipu([
-          "graph",
-          "--hops",
-          "1",
-          "--limit",
-          "20",
-          "--",
-          id,
-        ]);
-        if (!latest()) return;
-        setRecallNeighbors(graphNeighborsFrom(parseJson(raw)).neighbors);
-      } catch (e) {
-        if (!latest()) return;
-        setError(String(e));
-      } finally {
-        if (latest()) setRecallDetailLoading(false);
-      }
-    },
-    [loadEpisodeDetail],
-  );
-
-  const copyId = useCallback(async (value: string) => {
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopiedId(value);
-      window.setTimeout(
-        () => setCopiedId((c) => (c === value ? null : c)),
-        1500,
-      );
+      const parsed = parseJson(await runKhipu(["owed", ...args])) as { ok?: boolean; error?: string } | null;
+      if (parsed && parsed.ok === false) setError(parsed.error ?? `Item #${id} was not updated.`);
     } catch (e) {
       setError(String(e));
     }
   }, []);
 
-  /** Activity → Recall: read this exact episode directly. */
-  const openInRecall = useCallback(
-    async (id: number) => {
-      setTab("recall");
-      setRecallView("search");
-      setSearchMode("hybrid");
-      setQuery("");
-      setSearchProject("");
-      setSearchSince("");
-      setSearchKind("");
-      setSearchHarness("");
-      setSearchVia("");
-      setSearchText("");
-      setSearchErr(null);
-      setSearchElapsedMs(null);
-      ++searchSeq.current;
-      setSearchBusy(false);
-      const seq = ++recallDetailSeq.current;
-      setRecallSelected(`episode:${id}`);
-      setRecallDetail(null);
-      setRecallNeighbors([]);
-      setRecallDetailLoading(true);
-      try {
-        const detail = await loadEpisodeDetail(id);
-        if (recallDetailSeq.current !== seq) return;
-        setRecallDetail(detail);
-      } catch (e) {
-        if (recallDetailSeq.current !== seq) return;
-        setError(String(e));
-      } finally {
-        if (recallDetailSeq.current === seq) setRecallDetailLoading(false);
-      }
-    },
-    [loadEpisodeDetail],
-  );
+  /** The apps page's "search what T3 saved" opens Memory. */
+  const openT3Captures = useCallback(() => setTab("memory"), []);
 
-  /** T3's card opens Recall with provenance, never a text guess based on the
-   * provider name.  An existing query is retained; otherwise the user gets a
-   * focused field with the `via:t3` chip already applied. */
-  const openT3Captures = useCallback(() => {
-    const existingQuery = query.trim();
-    setTab("recall");
-    setRecallView("search");
-    setSearchVia("t3");
-    setSearchFiltersOpen(true);
-    setSearchProject("");
-    setSearchSince("");
-    setSearchKind("");
-    setSearchHarness("");
-    setSearchText("");
-    setSearchErr(null);
-    if (existingQuery) {
-      void doSearch({ query: existingQuery, via: "t3", project: "", since: "", kind: "", harness: "" });
-    } else {
-      window.setTimeout(() => recallSearchInput.current?.focus(), 0);
-    }
-  }, [doSearch, query]);
-
-  /** Owed → Activity: the capture that opened the commitment. */
-  const openInActivity = useCallback(
-    (id: number) => {
-      setTab("activity");
-      void selectEpisode(id);
-    },
-    [selectEpisode],
-  );
-
+  // The apps page and the guides read capture liveness, T3 and the stored
+  // recall probe out of the health report.
   useEffect(() => {
     if (!dsnOk) return;
-    // Fire-and-forget: never block tab paint on CLI. Home is the merged
-    // Status + Doctor screen, so it pulls all three read paths.
-    if (tab === "home") {
-      void loadStatus(false);
-      void loadDoctor(false);
-      void loadActivity(false);
-      void loadRightNow(false);
-    }
-    // Harnesses reads capture liveness and the stored recall probe out of the
-    // health report, so it needs the same read Home does.
-    if (tab === "harnesses") void loadDoctor(false);
-    if (tab === "revisions") void loadRevisions(false);
-    if (tab === "activity") void loadActivity(false);
-    if (tab === "work") {
-      // All three, because the segmented control shows all three counts.
-      void loadOwed(owedStatus, false);
-      void loadOwed("open", false);
-      void loadOwed("closed", false);
-      void loadOwed("stale", false);
-    }
-  }, [
-    tab,
-    dsnOk,
-    owedStatus,
-    loadStatus,
-    loadDoctor,
-    loadRevisions,
-    loadActivity,
-    loadOwed,
-    loadRightNow,
-  ]);
+    if (tab === "settings" || tab === "guides") void loadDoctor(false);
+  }, [tab, dsnOk, loadDoctor]);
 
-  // The rail's Owed badge is a count of open commitments, so it has to be
-  // known before anyone opens Owed.
-  useEffect(() => {
-    if (!dsnOk || owedOpenCount != null) return;
-    void loadOwed("open", false);
-  }, [dsnOk, owedOpenCount, loadOwed]);
-
-  // Other conversations can change these items. Re-read every minute while
-  // Owed is open and whenever the window regains focus; refresh the badge
-  // on the same cadence from any tab.
-  useEffect(() => {
-    if (!dsnOk) return;
-    const refresh = () => {
-      if (tab === "work") {
-        void loadOwed(owedStatus, false);
-        void loadOwed("open", false);
-        void loadOwed("closed", false);
-        void loadOwed("stale", false);
-      } else {
-        void loadOwed("open", false);
-      }
-    };
-    const every = window.setInterval(refresh, 60_000);
-    const onFocus = () => refresh();
-    window.addEventListener("focus", onFocus);
-    return () => {
-      window.clearInterval(every);
-      window.removeEventListener("focus", onFocus);
-    };
-  }, [dsnOk, tab, owedStatus, loadOwed]);
-
-  /** The window's places and the old screens still reachable. Ids are Tab
-   *  ids: Today shows the old Home, Accounts the old routing screen and
-   *  Settings the old Settings, until each is replaced. Memory is new (slice
-   *  A7); the old Recall is under Older screens.
-   *  Revisions is a drill-in from Home; it is listed under Older screens so
-   *  nothing is unreachable. Welcome is a first-run flow. */
   const PLACE_TITLES: Partial<Record<Tab, string>> = {
-    home: "Today", routing: "Accounts", memory: "Memory", settings: "Settings",
-    "routing-old": "Accounts and routing", recall: "Recall", work: "Work", activity: "Activity", harnesses: "Harnesses", guides: "Guides", revisions: "Conflicting edits",
+    home: "Today", routing: "Accounts", memory: "Memory", settings: "Settings", guides: "Guides",
   };
 
-  const [dataDir, setDataDir] = useState("");
-  const [dataFiles, setDataFiles] = useState<
-    Array<{ path: string; bytes: number; mtime?: number | string }>
-  >([]);
-  const [dataFilesAll, setDataFilesAll] = useState(false);
-  const [backupOut, setBackupOut] = useState("~/Downloads");
-  const [importSource, setImportSource] = useState("");
-  const [pathsMsg, setPathsMsg] = useState<string | null>(null);
-  const [graphSources, setGraphSources] = useState<
-    Array<{
-      id: string;
-      kind: string;
-      enabled?: boolean;
-      root?: string;
-    }>
-  >([]);
-  const [graphSourcesMsg, setGraphSourcesMsg] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string>("…");
   const [noticeDialog, setNoticeDialog] = useState<LaunchPlan["dialog"]>(null);
   const [noticeCard, setNoticeCard] = useState<CardState | null>(null);
   const [feedbackOpen, setFeedbackOpen] = useState(false);
-  const [storageReportOpen, setStorageReportOpen] = useState(false);
   const [feedbackSending, setFeedbackSending] = useState(false);
-  const [updateMsg, setUpdateMsg] = useState<string | null>(null);
-  const [updateBusy, setUpdateBusy] = useState(false);
   const [setupJoinPassphrase, setSetupJoinPassphrase] = useState("");
   const [setupJoinAllowUnencrypted, setSetupJoinAllowUnencrypted] = useState(false);
   const [setupJoinMsg, setSetupJoinMsg] = useState<string | null>(null);
@@ -2694,23 +414,27 @@ export default function App() {
     expires_at?: number;
     ipv4?: string;
   } | null>(null);
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>("database");
   // The new Settings (13 rows) is the Settings place; the old one stays under
   // Older screens until a later slice deletes it.
-  const [oldSettings, setOldSettings] = useState(false);
-  const openOldSettings = (section?: SettingsSection) => {
-    if (section) setSettingsSection(section);
-    setOldSettings(true);
+  // Settings opens on one row when a notice, a guide or a link asks for it.
+  const [settingsRow, setSettingsRow] = useState<{ id: string; n: number } | null>(null);
+  const openSettingsRow = useCallback((id: string) => {
+    setSettingsRow((r) => ({ id, n: (r?.n ?? 0) + 1 }));
     setTab("settings");
-  };
-  // Routing delivery is part of doctor, not `khipu route --json`; read the
-  // existing cached report whenever this Settings group becomes active.
-  useEffect(() => {
-    if (dsnOk && tab === "routing-old") void loadDoctor(false);
-  }, [dsnOk, tab, loadDoctor]);
-  // Read once at start, so the count beside Projects shows before it is opened.
-  const projects = useCliState<ProjectsList>("khipu_projects_list", true);
-  const projectsWaiting = askedCount(projects.data);
+  }, []);
+  /** Where each section of the older Settings (and its routing screen) now
+   *  lives, for the notices and guide steps that still name an old section. */
+  const openOldSection = useCallback((section: string) => {
+    if (section === "routing") { setAcctView("room"); setTab("routing"); return; }
+    if (section === "projects") { setTab("memory"); return; }
+    const row: Record<string, string> = {
+      database: "where", capture: "summaries", index: "meaning", features: "meaning", data: "backups",
+      "another-mac": "macs", components: "where", updates: "updates", look: "look", advanced: "agent",
+      owner: "apps", work: "macs",
+    };
+    openSettingsRow(row[section] ?? "macs");
+  }, [openSettingsRow]);
+
   // Plan usage (docs/plans/2026-10-14-plan-usage.md, phase 2). Doctor carries
   // only the cached figures; the app reads `khipu usage --json` itself (it can
   // probe on demand) and adds one attention item when any window still in
@@ -2720,95 +444,30 @@ export default function App() {
   // while it shows and at its earliest reset, so it never outlives a reset
   // or freezes its countdown while Home stays open.
   const plans = usePlanUsage(
-    tab === "home"
-      ? "home"
-      : tab === "work"
-        ? "work"
-        : tab === "guides"
-          ? "guides"
-          : tab === "routing" || tab === "routing-old"
-          ? "settings"
-          : null,
+    tab === "guides" ? "guides" : tab === "routing" ? "settings" : null,
   );
-  const planItems = usePlanAttention(plans.data);
   // Guides: the guide on screen (Grok Bot also takes the step to open at), and
   // the live evidence the page, the rail badge and Home's hint all read. It
   // re-reads when the user comes to one of the screens that shows it.
   const [guideOpen, setGuideOpen] = useState<{ id: GuideId; step?: number } | null>(null);
-  const guideSignals = useGuideSignals(tab === "home" || tab === "guides" || tab === "harnesses" ? tab : "other");
+  const guideSignals = useGuideSignals(tab === "guides" ? "guides" : "other");
   const openGuide = (id: GuideId, step?: number) => {
     setGuideOpen({ id, step });
     setTab("guides");
   };
   const openGuideTarget = (t: GuideTarget) => {
     if (t.kind === "guide") openGuide(t.id);
-    else if (t.kind === "harnesses") setTab("harnesses");
-    else {
-      if (t.section === "routing") setTab("routing-old");
-      else {
-        setSettingsSection(t.section as SettingsSection);
-        openOldSettings();
-      }
-    }
+    else if (t.kind === "harnesses") openSettingsRow("apps");
+    else openOldSection(t.section);
   };
   // Routing truth phase 4: the routing record (`khipu route --json`), read on
   // Home and every minute while Home stays open. Its attention items warn and
   // block nothing (the record is guidance, not a gate).
   // Accounts and routing is its own rail destination; Work shows the accounts too.
-  const routing = useRouting(tab === "home" || tab === "work" || tab === "routing");
+  const routing = useRouting(tab === "home" || tab === "routing");
   // Accounts view: Room right now or Running now (Order and rules is still its older screen).
   const [acctView, setAcctView] = useState<"room" | "running" | "rules">("room");
   const runningNow = useRunning(tab === "routing");
-  // Work (docs/plans/2026-10-15-work-view.md, phase 4): the live view, read
-  // every few seconds while Work is open and once a minute for the rail
-  // badge otherwise. The Owed tab folded into Work as its own section
-  // (Decision 14); `owedFocusKey` opens Work there.
-  /** Close… or Move to… on the ticked items, or Close on one that looks
-   *  settled: one call with every id (`khipu_owed_change`), then every list
-   *  and Work read again. Resolves to null, or the words to show. */
-  const owedChangeMany = useCallback(
-    async (action: "close" | "reassign", ids: number[], reason: string, to: OwedOwner | null, label: string | null) => {
-      setOwedSaved(false);
-      const workLoad = work.load;
-      const res = await owedChange(action, ids, reason, to, label);
-      if (res.queued) setOwedSaved(true);
-      if (res.error === null) setOwedSelected(new Set());
-      await Promise.all([loadOwed("open", true), loadOwed("closed", true), loadOwed("stale", true), workLoad(true)]);
-      return res.error;
-    },
-    [loadOwed, work.load],
-  );
-
-  // "Close all that look done" is one bulk change; its button waits for it.
-  const [owedClosingDone, setOwedClosingDone] = useState(false);
-  const closeAllLookingDone = useCallback(
-    async (ids: number[]) => {
-      setOwedClosingDone(true);
-      try {
-        await owedChangeMany("close", ids, LOOKED_DONE_REASON, null, null);
-      } finally {
-        setOwedClosingDone(false);
-      }
-    },
-    [owedChangeMany],
-  );
-
-  const [owedFocusKey, setOwedFocusKey] = useState(0);
-  const openOwedInWork = useCallback(() => {
-    setTab("work");
-    setOwedFocusKey((k) => k + 1);
-  }, []);
-  // Plans shows a pause only from a record read without error, never a guess.
-  const routingForPlans = routing.error ? null : routing.data;
-  // Phase 9: "Read no accounts" (Plans says so) and Plans' Add an account…,
-  // which opens the dialog Home's account cards hold.
-  const [noneTracked, setNoneTracked] = useState(false);
-  const [addAccountSignal, setAddAccountSignal] = useState(0);
-  const promotionItems = useMemo(() => promotionAttention(doctorParsed), [doctorParsed]);
-  const homeAttention = useMemo(
-    () => [...attention, ...planItems, ...promotionItems],
-    [attention, planItems, promotionItems],
-  );
   // "Connect to a server you run or another Mac…" reopens the first-run flow
   // at the Database step rather than restarting it — `welcomeInitialStepKey`
   // is bumped on every click so a second visit still jumps even when
@@ -2818,15 +477,9 @@ export default function App() {
   const needsRoutingSetup = routingNeedsSetup(routing.data);
   const openNoticeTarget = useCallback((target: NoticeTarget) => {
     if (target.kind === "home") setTab("home");
-    else if (target.kind === "harnesses") setTab("harnesses");
-    else if (target.kind === "settings") {
-      if (target.section === "routing") setTab("routing-old");
-      else {
-        setSettingsSection(target.section);
-        openOldSettings();
-      }
-      if (target.group) revealSettingsGroup(target.group);
-    } else {
+    else if (target.kind === "harnesses") openSettingsRow("apps");
+    else if (target.kind === "settings") openOldSection(target.section);
+    else {
       setWelcomeInitialStep(target.step);
       setWelcomeInitialStepKey((k) => k + 1);
       setTab("first-run");
@@ -2837,15 +490,6 @@ export default function App() {
     setWelcomeInitialStepKey((k) => k + 1);
     setTab("first-run");
   }, []);
-  const openAccountsStepInFirstRun = useCallback(() => {
-    setWelcomeInitialStep("accounts");
-    setWelcomeInitialStepKey((k) => k + 1);
-    setTab("first-run");
-  }, []);
-  // `db status`'s `host_kind` — "this-mac" / "local-docker" mean the stored
-  // connection cannot be reached from another Mac (docs/plans/2026-09-05-
-  // setup-that-cannot-strand-you.md, "Second Mac"): gates the Another Mac
-  // join-kit buttons and is read before the Move dialog's target step too.
   const [dbHostKind, setDbHostKind] = useState<string | null>(null);
   const loadDbHostKind = useCallback(async () => {
     try {
@@ -2858,10 +502,9 @@ export default function App() {
     }
   }, []);
   useEffect(() => {
-    if (tab === "settings" && (settingsSection === "database" || settingsSection === "another-mac")) {
-      void loadDbHostKind();
-    }
-  }, [tab, settingsSection, loadDbHostKind]);
+    // Your Macs (another Mac) and the move dialog's target step read it.
+    if (tab === "settings") void loadDbHostKind();
+  }, [tab, loadDbHostKind]);
 
   // Settings › Database › "Move this memory to another database…" —
   // docs/plans/2026-09-05-setup-that-cannot-strand-you.md, "Move the
@@ -2969,50 +612,6 @@ export default function App() {
   const moveConnectSummary = (moveResult?.connect as { stages?: { id?: string; detail?: string }[] } | undefined)
     ?.stages?.find((s) => s.id === "summary")?.detail;
   const moveRemaining = Array.isArray(moveResult?.remaining) ? (moveResult?.remaining as string[]) : [];
-  // "Index now" and "Restore" both do something a person cannot undo with the
-  // same button, so each goes through a confirm Dialog.
-  const [importConfirm, setImportConfirm] = useState(false);
-  const [hubSnapBusy, setHubSnapBusy] = useState(false);
-  const [hubSnapshotHealth, setHubSnapshotHealth] = useState<{
-    refreshed_at?: string;
-    caught_up_at?: string | null;
-    size_bytes?: number;
-    bytes?: number;
-    ok?: boolean;
-  } | null>(null);
-
-  const loadPaths = useCallback(async () => {
-    try {
-      const raw = await runKhipu(["paths"]);
-      const parsed = parseJson(raw) as {
-        data_dir?: string;
-        files?: Array<{ path: string; bytes: number; mtime?: number | string }>;
-      } | null;
-      setDataDir(parsed?.data_dir ?? "");
-      setDataFiles(parsed?.files ?? []);
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
-
-  const loadGraphSources = useCallback(async () => {
-    try {
-      const raw = await runKhipu(["sources", "list"]);
-      const parsed = parseJson(raw) as {
-        sources?: Array<{
-          id: string;
-          kind: string;
-          enabled?: boolean;
-          root?: string;
-        }>;
-      } | null;
-      setGraphSources(parsed?.sources ?? []);
-      setGraphSourcesMsg(null);
-    } catch (e) {
-      setGraphSourcesMsg(String(e));
-    }
-  }, []);
-
   const loadModels = useCallback(async () => {
     try {
       const raw = await runKhipu(["models"]);
@@ -3103,62 +702,17 @@ export default function App() {
     }
   }, [models, loadModels, loadDoctor]);
 
-  const toggleGraphSource = useCallback(
-    async (id: string, enabled: boolean) => {
-      setGraphSourcesMsg(null);
-      try {
-        const raw = await runKhipu([
-          "sources",
-          enabled ? "enable" : "disable",
-          id,
-        ]);
-        const parsed = parseJson(raw) as { ok?: boolean; error?: string } | null;
-        if (!parsed?.ok) {
-          setGraphSourcesMsg(parsed?.error ?? "sources command failed");
-          return;
-        }
-        await loadGraphSources();
-      } catch (e) {
-        setGraphSourcesMsg(String(e));
-      }
-    },
-    [loadGraphSources],
-  );
-
   useEffect(() => {
     // First-run needs this too: it tells the user which file to create, and
     // the data folder is relocatable from Settings. Loading it only for
     // Settings meant the onboarding screen named ~/.config/khipu no matter
     // where the DSN was actually supposed to go. `khipu paths` needs no DSN,
     // so it works on exactly the screen that exists because there isn't one.
-    let alive = true;
-    if (tab === "settings" || tab === "first-run") {
-      void loadPaths();
-      void loadGraphSources();
-    }
     if (tab === "settings") {
       void loadModels();
       void loadSecretsPresence();
-      void (async () => {
-        setHubSnapBusy(true);
-        try {
-          const raw = await runKhipu(["status"]);
-          if (!alive) return;
-          const parsed = parseJson(raw) as { hub_snapshot?: typeof hubSnapshotHealth } | null;
-          setHubSnapshotHealth(parsed?.hub_snapshot ?? null);
-        } catch {
-          if (!alive) return;
-          setHubSnapshotHealth(null);
-        } finally {
-          if (alive) setHubSnapBusy(false);
-        }
-      })();
     }
-    return () => {
-      alive = false;
-      setHubSnapBusy(false);
-    };
-  }, [tab, loadPaths, loadGraphSources, loadModels, loadSecretsPresence, runKhipu]);
+  }, [tab, loadModels, loadSecretsPresence]);
 
   useEffect(() => {
     void getVersion()
@@ -3172,65 +726,6 @@ export default function App() {
       })
       .catch(() => setAppVersion("unknown"));
   }, []);
-
-  const checkForUpdates = useCallback(async () => {
-    setUpdateBusy(true);
-    setUpdateMsg(null);
-    let stage: "check" | "download" = "check";
-    try {
-      const update = await check();
-      if (!update) {
-        setUpdateMsg(`Up to date (v${appVersion}).`);
-        return;
-      }
-      setUpdateMsg(`Downloading v${update.version}…`);
-      stage = "download";
-      await update.downloadAndInstall();
-      setUpdateMsg("Update installed — relaunching…");
-      await relaunch();
-    } catch (e) {
-      // The updater plugin rejects with plain strings as often as Errors;
-      // show the text either way, and say which step failed, so a failing
-      // Mac can be diagnosed from the message alone.
-      const text = e instanceof Error ? e.message : String(e ?? "unknown error");
-      setUpdateMsg(
-        stage === "download"
-          ? `Update download or install failed: ${text}`
-          : `Update check failed: ${text}`,
-      );
-    } finally {
-      setUpdateBusy(false);
-    }
-  }, [appVersion]);
-
-  const applyDataDir = useCallback(async () => {
-    if (!dataDir.trim()) return;
-    setActionBusy(true);
-    setPathsMsg(null);
-    try {
-      const raw = await runKhipu(["paths", `--set=${dataDir.trim()}`]);
-      setPathsMsg(prettyJson(raw));
-      await loadPaths();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setActionBusy(false);
-    }
-  }, [dataDir, loadPaths]);
-
-  const doBackupLocal = useCallback(async () => {
-    if (!backupOut.trim()) return;
-    setActionBusy(true);
-    setPathsMsg(null);
-    try {
-      const raw = await runKhipu(["backup-local", `--out=${backupOut.trim()}`]);
-      setPathsMsg(prettyJson(raw));
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setActionBusy(false);
-    }
-  }, [backupOut]);
 
   // A database only this Mac can reach cannot be joined; otherwise a kit is
   // made only with a passphrase or the owner's explicit unencrypted opt-out.
@@ -3311,139 +806,13 @@ export default function App() {
     }
   }, [setupJoinPassphrase, setupJoinAllowUnencrypted]);
 
-  const runScheduledJob = useCallback(async (subcommand: string) => {
-    setJobSpawnMsg(null);
-    setActionBusy(true);
-    try {
-      const out = await spawnKhipu(subcommand);
-      setJobSpawnMsg(
-        out.ok
-          ? `Started ${subcommand} (pid ${out.pid ?? "?"}). Engine log: ${out.engine_log_path ?? "—"}${out.log_path ? ` (wrapper: ${out.log_path})` : ""}`
-          : `Could not start ${subcommand}`,
-      );
-      void loadDoctor(true);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setActionBusy(false);
-    }
-  }, [loadDoctor]);
-
-  const doImportLocal = useCallback(async () => {
-    if (!importSource.trim()) return;
-    setActionBusy(true);
-    setPathsMsg(null);
-    try {
-      const raw = await runKhipu(["import-local", `--source=${importSource.trim()}`, "--replace"]);
-      setPathsMsg(prettyJson(raw));
-      await loadPaths();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setActionBusy(false);
-    }
-  }, [importSource, loadPaths]);
-
-  /** What Advanced shows as "raw configuration": only values this app already
-   *  holds, never a fresh read that could disagree with the screen above it. */
-  const settingsRawText = useMemo(
-    () =>
-      JSON.stringify(
-        {
-          app_version: appVersion,
-          data_dir: dataDir,
-          data_files: dataFiles,
-          models,
-          secrets_present: secretsPresence,
-          search_index_profile: embedActiveProfile,
-          capture_cadence: {
-            turns: CAPTURE_MIN_TURNS,
-            minutes: CAPTURE_MIN_MINUTES,
-          },
-        },
-        null,
-        2,
-      ),
-    [appVersion, dataDir, dataFiles, models, secretsPresence, embedActiveProfile],
-  );
-
-  const searchResults = useMemo<SearchResult[]>(() => {
-    const parsed = parseJson(searchText);
-    if (Array.isArray(parsed)) return parsed as SearchResult[];
-    if (parsed && typeof parsed === "object") {
-      const results = (parsed as { results?: unknown }).results;
-      if (Array.isArray(results)) return results as SearchResult[];
-    }
-    return [];
-  }, [searchText]);
-
-  /** The engine's own per-leg timing, when the payload carries it. The chips
-   *  row still shows the app's round trip; this says which leg spent it. */
-  const searchTiming = useMemo<SearchTiming | null>(() => {
-    const parsed = parseJson(searchText);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    const t = (parsed as { timing?: unknown }).timing;
-    if (!t || typeof t !== "object" || Array.isArray(t)) return null;
-    return t as SearchTiming;
-  }, [searchText]);
-  const searchDegraded = useMemo<string | null>(() => {
-    const parsed = parseJson(searchText);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    const d = (parsed as { degraded?: unknown }).degraded;
-    return typeof d === "string" && d ? d : null;
-  }, [searchText]);
-  const searchFallback = useMemo(() => {
-    const parsed = parseJson(searchText);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    const data = parsed as {
-      stale?: unknown;
-      snapshot_refreshed_at?: unknown;
-      mode?: unknown;
-      filters_dropped?: unknown;
-    };
-    if (data.stale !== true) return null;
-    return {
-      refreshedAt: typeof data.snapshot_refreshed_at === "string" ? data.snapshot_refreshed_at : null,
-      mode: typeof data.mode === "string" ? data.mode : null,
-      filtersDropped: Array.isArray(data.filters_dropped)
-        ? data.filters_dropped.filter((item): item is string => typeof item === "string")
-        : [],
-    };
-  }, [searchText]);
-
-  const graphData = useMemo(
-    () => graphNeighborsFrom(parseJson(graphText)),
-    [graphText],
-  );
-
-  const openDrift = revisionsConflicts?.open_file_vs_pg ?? 0;
-  const unreadableTopics = revisionsConflicts?.topic_files_unreadable ?? [];
-  const multiCount =
-    revisionsConflicts?.topics_with_multiple_revisions?.length ?? 0;
-  const anyLoading = Object.values(loading).some(Boolean) || actionBusy;
   const workingLabel = (() => {
     if (feedbackSending) return "Sending feedback…";
     if (advertiseBusy) return "Advertising a join PIN…";
-    if (updateBusy) return "Checking for updates…";
-    if (actionBusy) return "Working…";
-    const bits: string[] = [];
-    if (loading.status) bits.push("counts");
-    if (loading.doctor) bits.push("health");
-    if (loading.activity) bits.push("recent sessions");
-    if (loading.revisions) bits.push("conflicting edits");
-    if (hubSnapBusy && !loading.status && tab === "settings") bits.push("counts");
-    if (bits.length) return `Reading the memory server — ${bits.join(" · ")}`;
+    if (loading.doctor) return "Reading the health check…";
     return null;
   })();
-  const tabBusy = (id: Tab): boolean => {
-    if (id === "home") {
-      return Boolean(loading.status) || Boolean(loading.doctor);
-    }
-    if (id === "activity") return Boolean(loading.activity);
-    if (id === "revisions") return Boolean(loading.revisions);
-    if (id === "settings") return hubSnapBusy;
-    return false;
-  };
+  const tabBusy = (id: Tab): boolean => id === "settings" && Boolean(loading.doctor);
 
   const panelClass = (id: Tab) =>
     tab === id ? "panel" : "panel is-hidden";
@@ -3451,58 +820,29 @@ export default function App() {
   const retryActivePane = async (): Promise<void> => {
     const activeTab = tab;
     switch (activeTab) {
-      case "home":
-        await Promise.all([loadStatus(true), loadDoctor(true), loadActivity(true), loadRightNow(true), refreshDsn(true), plans.load(), routing.load()]);
-        break;
-      case "activity": await loadActivity(true); break;
-      case "revisions": await loadRevisions(true); break;
-      case "work": await Promise.all([work.load(true), loadOwed("open", true)]); break;
-      case "harnesses": await loadDoctor(true); break;
+      case "home": await Promise.all([refreshDsn(true), routing.load()]); break;
       case "routing": await Promise.all([routing.load(true), plans.load()]); break;
-      case "routing-old": await Promise.all([loadDoctor(true), plans.load()]); break;
-      case "settings": await Promise.all([refreshDsn(true), loadPaths(), loadGraphSources(), loadModels(), loadSecretsPresence()]); break;
+      case "settings": await Promise.all([refreshDsn(true), loadDoctor(true), loadModels(), loadSecretsPresence()]); break;
       case "first-run": await refreshDsn(true); break;
       case "guides": await guideSignals.reload(); break;
       case "memory": break;
-      case "recall": break;
     }
     setPaneRetryKeys((keys) => ({ ...keys, [activeTab]: keys[activeTab] + 1 }));
   };
 
-  // Total checks that never ran on this machine — not_configured entries.
-  // A skip must never read as a clean pass (audit 2026-08-31).
-  const doctorSkipCount = doctorNotConfigured.length;
-
-  /* ---- Home tiles. Every value below comes from a field `khipu status` or
-     `khipu doctor` actually returns; where one is absent the element is
-     dropped rather than filled with a placeholder. -------------------------- */
-
-  const harnessIds = liveness?.harnesses ? Object.keys(liveness.harnesses) : [];
-  const harnessRed = liveness?.red ?? [];
-  const provenHarnesses = Object.values(liveness?.harnesses ?? {}).filter(
-    (h) => h.seen === true && h.ok === true,
-  ).length;
-  const livenessCollectionOk =
-    liveness?.ok === true &&
-    typeof (liveness as { error?: unknown } | null)?.error !== "string";
-  const allHarnessesProven =
-    livenessCollectionOk &&
-    harnessIds.length > 0 &&
-    provenHarnesses === harnessIds.length;
-  const recordingValue = harnessIds.length
-    ? `${provenHarnesses} of ${harnessIds.length}`
-    : "—";
-  const recordingSub = harnessIds.length
-    ? `${harnessIds.map(harnessLabel).join(" · ")}${provenHarnesses < harnessIds.length ? " · some not checked" : ""}`
-    : undefined;
-
-  // The rail's health line, and the plain-language replacement for "DSN ok".
-  const claudeHomes = claudeHomesGap(
-    (doctorParsed as { claude_homes?: ClaudeHomesReport } | null)?.claude_homes,
-  );
+  const [counts, setCounts] = useState<Counts | null>(null);
+  useEffect(() => {
+    if (!dsnOk || tab !== "guides") return;
+    let alive = true;
+    void runKhipu(["status"])
+      .then((raw) => {
+        const parsed = parseJson(raw) as { counts?: Counts } | null;
+        if (alive) setCounts(parsed?.counts ?? null);
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [tab, dsnOk]);
   const t3Gap = t3HealthGap(t3Health);
-  const railHealth = railHealthLine(dbReachable, liveness, claudeHomes, t3Gap);
-
   // Guides: four "Start here" items ticked from live state, each guide row's
   // state, and the rail badge (setups started and not finished, plus problems).
   const accountsRead = (plans.data?.accounts ?? []).filter((a) => liveWords(a).live).length;
@@ -3517,8 +857,11 @@ export default function App() {
   const guideProblems = liveness ? (liveness.red ?? []).length : null;
   // "When something turns red" follows doctor itself, not only capture
   // liveness: it must not say "No problems" while doctor is red.
-  const doctorProblems =
-    doctorOk == null ? null : attention.length > 0 ? attention.length : doctorOk ? 0 : 1;
+  const doctorProblems = (() => {
+    if (!doctorParsed) return null;
+    const n = buildAttention(doctorParsed).items.length + ((t3Health?.warnings ?? []).length > 0 ? 1 : 0);
+    return n > 0 ? n : doctorParsed.ok === false ? 1 : 0;
+  })();
   const guideRowStates = guideStates({
     ...guideStartSignals,
     grok: guideSignals.grok,
@@ -3526,376 +869,15 @@ export default function App() {
     doctorProblems,
     t3: t3Gap,
   });
-  const guidesBadge = railBadge(guideSignals.grok, guideProblems);
   // Every setup item reads live state that arrives after first paint. Until
   // each source has answered (or failed, or the database is unreachable) the
   // hint says it is checking, instead of "2 of 4 done" from empty defaults.
   const setupSignalsKnown =
     guideSignals.logSettled &&
-    (liveness != null || doctorReadError != null || dbReachable === false) &&
+    (liveness != null || error != null || dbReachable === false) &&
     (counts != null || error != null || dbReachable === false) &&
     (plans.data != null || plans.error != null || dbReachable === false);
-  const homeHint = hintState(guideStartItems, guideSignals.prefs, {
-    prefs: guideSignals.prefsLoaded,
-    signals: setupSignalsKnown,
-  });
-
-  const coverage = (() => {
-    if (!embedCoverage) return null;
-    if (typeof embedCoverage.pct === "number") {
-      return {
-        pct: embedCoverage.pct,
-        missing: typeof embedCoverage.missing === "number" ? embedCoverage.missing : 0,
-        stale: typeof embedCoverage.stale === "number" ? embedCoverage.stale : 0,
-        unit: "chunks" as const,
-      };
-    }
-    let total = 0;
-    let embedded = 0;
-    let missing = 0;
-    for (const v of Object.values(embedCoverage)) {
-      if (!v || typeof v !== "object") continue;
-      const row = v as { total?: unknown; embedded?: unknown; missing?: unknown };
-      if (typeof row.total !== "number") continue;
-      total += row.total;
-      embedded += typeof row.embedded === "number" ? row.embedded : 0;
-      missing += typeof row.missing === "number" ? row.missing : 0;
-    }
-    if (total === 0) return null;
-    return { pct: (embedded / total) * 100, missing, stale: 0, unit: "rows" as const };
-  })();
-
-  const backupAge = backupHealth?.freshest_backup_age_seconds;
-  const backupSub = [
-    backupAge != null ? `Database ${fmtAgo(backupAge)}` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
-
-  const jobEntries: Array<[string, JobEntry | undefined]> = [
-    ["Nightly consolidate", doctorJobs?.nightly],
-    ["Monthly consolidate", doctorJobs?.monthly],
-  ];
-  const jobsOk = jobEntries.filter(
-    ([, e]) => e && e.plist_loaded !== false && (e.last_exit ?? 0) === 0,
-  ).length;
-  const nextJob = doctorJobs?.nightly?.next_schedule;
-  const jobsSummary = doctorJobs
-    ? `Scheduled jobs (${jobsOk} ok${nextJob ? `, next ${nextJob}` : ""}) · Full health report`
-    : "Full health report";
-
-  // Owed: the project and kind filters offer only values the loaded rows
-  // actually carry, so a chip can never select an empty list.
-  const owedProjects = Array.from(
-    new Set(owedRows.map((c) => c.project).filter((p): p is string => Boolean(p))),
-  ).sort();
-  const owedKinds = Array.from(
-    new Set(owedRows.map((c) => c.kind).filter((k): k is string => Boolean(k))),
-  ).sort();
-  const visibleOwed = owedRows.filter(
-    (c) =>
-      (!owedProject || c.project === owedProject) &&
-      (!owedKind || c.kind === owedKind),
-  );
-  /** Every item in a list, as the CLI counted it (a bare-list answer: the
-   *  rows read, marked "+" while more pages remain). */
-  const owedListTotal = (key: OwedListKey): number | null => {
-    const page = owedPages[key];
-    return page ? (page.total ?? page.rows.length) : null;
-  };
-  const owedCount = (status: OwedStatus): string => {
-    const keys = owedListKeys(status);
-    if (!keys.every((k) => owedPages[k])) return "";
-    const total = keys.reduce((sum, k) => sum + (owedListTotal(k) ?? 0), 0);
-    const more = keys.some((k) => owedPages[k]?.total == null && owedPages[k]?.next);
-    return ` · ${total.toLocaleString()}${more ? "+" : ""}`;
-  };
-  const owedChipFilter = Boolean(owedProject || owedKind);
-  /** "Showing 200 of 2,800" and Show more, under one list. */
-  const renderOwedMore = (key: OwedListKey, shown: number) => {
-    const page = owedPages[key];
-    if (!page) return null;
-    const total = page.total ?? page.rows.length;
-    if (!page.next && (owedChipFilter || shown >= total)) return null;
-    const next = Math.min(OWED_PAGE, Math.max(0, total - page.rows.length)) || OWED_PAGE;
-    return (
-      <div className="inline owed-more">
-        {/* A chip narrows what is read so far; Show more still reads on. */}
-        <span className="meta">
-          {owedChipFilter
-            ? `${page.rows.length.toLocaleString()} of ${total.toLocaleString()} read`
-            : `Showing ${page.rows.length.toLocaleString()} of ${total.toLocaleString()}`}
-        </span>
-        {page.next ? (
-          <button
-            type="button"
-            className="sm"
-            disabled={owedMoreBusy != null}
-            onClick={() => void loadOwedMore(key)}
-          >
-            {owedMoreBusy === key ? <Spinner /> : null}
-            Show {next.toLocaleString()} more
-          </button>
-        ) : null}
-      </div>
-    );
-  };
-  const toggleOwed = (ids: number[], on: boolean) =>
-    setOwedSelected((prev) => {
-      const next = new Set(prev);
-      for (const id of ids) {
-        if (on) next.add(id);
-        else next.delete(id);
-      }
-      return next;
-    });
-  // The mock's ok callout: commitments a later capture closed today. Built
-  // only from `closed_at`, which `commitments.list_owed` returns.
-  const closedToday = (owedByStatus.closed ?? []).filter((c) =>
-    isToday(c.closed_at),
-  );
-
-  // Activity: the filter row narrows the fetched page in the browser; the
-  // fetch itself is `--limit` only (the CLI has no --offset and no text
-  // filter), which is why "Show 40 more" re-asks for a longer window.
-  const activityProjects = Array.from(
-    new Set(
-      activityList
-        .map((ep) => projectFromScope(ep.scope))
-        .filter((p): p is string => Boolean(p)),
-    ),
-  ).sort();
-  const activityHarnesses = Array.from(
-    new Set(
-      activityList
-        .map((ep) => harnessFromSession(ep.session_id))
-        .filter((h): h is string => Boolean(h)),
-    ),
-  ).sort();
-  const activityFilterText = activityFilter.trim().toLowerCase();
-  const visibleActivity = activityList.filter((ep) => {
-    if (activityProject && projectFromScope(ep.scope) !== activityProject) {
-      return false;
-    }
-    if (activityHarness && harnessFromSession(ep.session_id) !== activityHarness) {
-      return false;
-    }
-    if (activitySince) {
-      const when = parseTs(ep.ts ?? ep.ingested_at);
-      if (!when) return false;
-      if (activitySince === "today") {
-        if (when.toDateString() !== new Date().toDateString()) return false;
-      } else if (Date.now() - when.getTime() > 7 * 24 * 3600 * 1000) {
-        return false;
-      }
-    }
-    if (
-      activityFilterText &&
-      !(ep.summary ?? "").toLowerCase().includes(activityFilterText) &&
-      !String(ep.id).includes(activityFilterText)
-    ) {
-      return false;
-    }
-    return true;
-  });
-  const sortedActivity = [...visibleActivity].sort((a, b) => {
-    const at = parseTs(a.ts ?? a.ingested_at)?.getTime() ?? 0;
-    const bt = parseTs(b.ts ?? b.ingested_at)?.getTime() ?? 0;
-    return bt - at;
-  });
-  const activityDays: Array<{ label: string; rows: typeof activityList }> = [];
-  for (const ep of sortedActivity) {
-    const label = dayLabel(ep.ts ?? ep.ingested_at);
-    const last = activityDays[activityDays.length - 1];
-    if (last && last.label === label) last.rows.push(ep);
-    else activityDays.push({ label, rows: [ep] });
-  }
-  /** ok / warn from the harness liveness the doctor payload already carries;
-   *  a harness it says nothing about gets the neutral dot, never a green one. */
-  const harnessDotClass = (sessionId: string | undefined): string => {
-    const h = harnessFromSession(sessionId);
-    const known = h ? liveness?.harnesses?.[h] : undefined;
-    if (!known || known.ok == null) return "hdot";
-    return known.ok ? "hdot ok" : "hdot warn";
-  };
-
-  // Recall: the relevance bar is relative to the top hit in THIS response —
-  // the CLI's fused score has no absolute scale.
-  const topScore = searchResults[0]?.score ?? null;
-  const selectedResult =
-    searchResults.find((r) => `${r.kind ?? "item"}:${r.id}` === recallSelected) ??
-    (recallDetail && recallSelected === `episode:${recallDetail.id}`
-      ? {
-          kind: "episode",
-          id: recallDetail.id,
-          label: `Episode ${recallDetail.id}`,
-          snippet: recallDetail.summary,
-        }
-      : null) ??
-    null;
-  const openLoopsFor = (episodeId: number | null | undefined) =>
-    episodeId == null
-      ? []
-      : owedOpenRows.filter((c) => c.opened_episode === episodeId);
-
-  // The rows' one action callback, stable across renders so a memoised row
-  // re-renders only when its own props change; it calls the latest handlers.
-  const owedActRef = useRef<(action: OwedRowAction, c: Commitment) => void>(() => {});
-  owedActRef.current = (action, c) => {
-    if (action === "select" || action === "unselect") toggleOwed([c.id], action === "select");
-    else if (action === "settle") void owedChangeMany("close", [c.id], c.looks_settled ?? "", null, null);
-    else if (action === "closedone") void owedChangeMany("close", [c.id], c.looks_done?.reason ? `Looked done: ${owedReasonWords(c.looks_done.reason)}` : LOOKED_DONE_REASON, null, null);
-    else if (action === "activity") openInActivity(c.opened_episode ?? 0);
-    else if (action === "reopen") void owedWrite(c.id, [`--reopen=${c.id}`]);
-    else if (action === "done") void owedWrite(c.id, [`--close=${c.id}`]);
-    else setSnoozeTarget(c);
-  };
-  const owedAct = useCallback((action: OwedRowAction, c: Commitment) => owedActRef.current(action, c), []);
-
-  /** One Owed table. Same columns for every group and every status; only the
-   *  actions differ (a closed row reopens, an open one closes or snoozes). */
-  // The owner's items never go stale: the quiet ones show after the active
-  // ones, one group per "Quiet for N weeks", instead of disappearing.
-  const renderNeedsYou = (allRows: Commitment[], title: string) => {
-    // Rows that look done list first, in their own group, and nowhere else.
-    const done = allRows.filter((c) => c.looks_done);
-    const rows = allRows.filter((c) => !c.looks_done);
-    const active = rows.filter((c) => !c.quiet_weeks);
-    const weeks = [...new Set(rows.map((c) => c.quiet_weeks ?? 0).filter((n) => n > 0))].sort((a, b) => a - b);
-    return (
-      <>
-        {done.length > 0 ? (
-          <Disclosure
-            key="looks-done"
-            className="group"
-            defaultOpen
-            label={
-              <>
-                <strong>Looks done</strong>
-                <span className="nav-count quiet">{done.length.toLocaleString()}</span>
-              </>
-            }
-          >
-            <div className="inline">
-              <button
-                type="button"
-                className="sm"
-                disabled={owedBusyId != null || owedClosingDone}
-                onClick={() => void closeAllLookingDone(done.map((c) => c.id))}
-              >
-                Close all that look done
-              </button>
-            </div>
-            {renderOwedTable(done, "Looks done")}
-          </Disclosure>
-        ) : null}
-        {active.length > 0 ? renderOwedTable(active, title) : null}
-        {weeks.map((n) => {
-          const quiet = rows.filter((c) => c.quiet_weeks === n);
-          const label = `Quiet for ${n} weeks`;
-          return (
-            <Disclosure
-              key={`quiet-${n}`}
-              className="group"
-              defaultOpen
-              label={
-                <>
-                  <strong>{label}</strong>
-                  <span className="nav-count quiet">{quiet.length.toLocaleString()}</span>
-                </>
-              }
-            >
-              {renderOwedTable(quiet, label)}
-            </Disclosure>
-          );
-        })}
-      </>
-    );
-  };
-
-  const renderOwedTable = (rows: Commitment[], groupTitle?: string) => {
-    const selectable = owedStatus === "open";
-    const allOn = rows.length > 0 && rows.every((c) => owedSelected.has(c.id));
-    return (
-    <div className="card">
-      {selectable ? (
-        <ListRow className="owed-selall">
-          <label className="inline">
-            <input
-              type="checkbox"
-              aria-label={groupTitle ? `Select every item shown in ${groupTitle}` : "Select every item shown"}
-              checked={allOn}
-              onChange={(e) => toggleOwed(rows.map((c) => c.id), e.target.checked)}
-            />
-            <span className="meta">Select all {rows.length.toLocaleString()} shown</span>
-          </label>
-        </ListRow>
-      ) : null}
-      <div className="card-head owed-head">
-        {selectable ? <span className="w24" /> : null}
-        <span className="w88">Kind</span>
-        <span className="grow">What you owe</span>
-        <span className="w128">Project</span>
-        <span className="w52">Opened</span>
-        <span className="w44">Due</span>
-        <span className="w50">From</span>
-        <span className="w132" />
-      </div>
-      {rows.map((c) => (
-        <OwedRow
-          key={c.id}
-          c={c}
-          selectable={selectable}
-          checked={owedSelected.has(c.id)}
-          busy={owedBusyId === c.id}
-          onAct={owedAct}
-        />
-      ))}
-    </div>
-    );
-  };
-
-  const renderJobRow = (
-    label: string,
-    entry: JobEntry | undefined,
-    spawnName: string,
-  ) => (
-    <div key={label} className="row-item">
-      <span className="row-main">{label}</span>
-      <span className="row-meta">
-        {entry?.last_run_iso
-          ? `last ${formatTs(entry.last_run_iso)}`
-          : entry?.last_run_mtime
-            ? "ran (mtime only)"
-            : "never"}
-        {entry?.next_schedule ? ` · next ${entry.next_schedule}` : ""}
-        {entry?.plist_loaded === false ? " · agent not loaded" : ""}
-        {entry?.plist_current === false ? " · needs re-render, relaunch Khipu" : ""}
-        {entry?.last_exit != null && entry.last_exit !== 0
-          ? ` · exit ${entry.last_exit}`
-          : ""}
-      </span>
-      <button type="button" onClick={() => void runScheduledJob(spawnName)}>
-        Run now
-      </button>
-    </div>
-  );
-
-  const goTab = (id: string) => {
-    if (id === "oldhome") {
-      setShowOldHome(true);
-      setTab("home");
-      return;
-    }
-    setShowOldHome(false);
-    if (id === "settings-old") {
-      setOldSettings(true);
-      setTab("settings");
-      return;
-    }
-    if (id === "settings") setOldSettings(false);
-    setTab(id as Tab);
-  };
+  const goTab = (id: string) => setTab(id as Tab);
   // The name the owner gave this Mac comes with the routing record (`this_mac`);
   // until it has been read the sidebar says "On this Mac".
   const thisMac: string | null = routing.data?.this_mac ?? null;
@@ -3912,2339 +894,12 @@ export default function App() {
     placeItem("routing", <Gauge size={18} aria-hidden />, "Which AI has room, and who gets what work"),
     placeItem("memory", <Search size={18} aria-hidden />, "Find what you said"),
   ];
-  const settingsItem = placeItem("settings", <SlidersHorizontal size={18} aria-hidden />, "Capture, models, data and this Mac");
-  const workWaiting = work.data?.counts.waiting ?? 0;
-  const workBlocking = work.data?.counts.blocking ?? 0;
-  const workQuiet = work.data?.counts.quiet ?? 0;
-  const harnessBadge = harnessesBadge(liveness, claudeHomes, t3Gap);
-  // Each old screen once, one name each, in the order of the places that replace them.
-  const olderItems: NavItem[] = [
-    placeItem("home", <CircleCheck size={18} aria-hidden />, "The home screen from before Today", { id: "oldhome", label: "Home" }),
-    placeItem("routing-old", NAV_ICONS.routing, "Accounts, routing rules, and what needs your attention", {}),
-    placeItem("recall", <Search size={18} aria-hidden />, "The old search and graph screen"),
-    placeItem("work", NAV_ICONS.work, WORK_LEDE, {
-      badge: workWaiting + workQuiet > 0 ? (
-        <span className={workWaiting ? "nav-badge" : "nav-badge quiet"}
-          aria-label={badgeLabel(workWaiting, workBlocking, workQuiet)} title={badgeLabel(workWaiting, workBlocking, workQuiet)}>
-          {workBlocking > 0 ? <span className="bdot" aria-hidden /> : null}
-          {(workWaiting + workQuiet).toLocaleString()}
-        </span>
-      ) : undefined,
-    }),
-    placeItem("activity", NAV_ICONS.activity, "Every session Khipu recorded"),
-    placeItem("harnesses", NAV_ICONS.harnesses, "Claude Code · Cursor · Aegis · Codex", {
-      badge: harnessBadge ? <span className={harnessBadge.quiet ? "nav-count quiet" : "nav-count"}>{harnessBadge.n}</span> : undefined,
-    }),
-    placeItem("guides", NAV_ICONS.guides, "Step-by-step help for setting up Khipu and each tool it works with", {
-      badge: guidesBadge > 0 ? (
-        <span className="nav-count" aria-label={guidesBadge === 1 ? "1 setup left" : `${guidesBadge} setups left`}>{guidesBadge}</span>
-      ) : undefined,
-    }),
-    placeItem("revisions", <RailIcon d={<path d="M4 3v10M12 3v10M4 8h8" />} />, "Edits to the same memory made in two places"),
-    { id: "settings-old", label: "Settings (older)", icon: <SlidersHorizontal size={18} aria-hidden />, hint: "The earlier Settings screen" },
-  ];
-  // What the old rail's foot carried; each moves out as its new home lands.
-  const olderExtra = (
-    <>
-      <div className="rail-health">
-        <span className={`hdot ${railHealth.tone}`} aria-hidden />
-        <span>{railHealth.text}</span>
-        {anyLoading ? <Loader2 size={12} className="spin rail-spin" aria-hidden /> : null}
-      </div>
-      <div className="rail-meta">
-        <button ref={feedbackButtonRef} type="button" className="rail-feedback" onClick={() => setFeedbackOpen(true)}>
-          <MessageSquare size={14} aria-hidden />
-          Feedback
-        </button>
-        <span className="version-chip">v{appVersion}</span>
-      </div>
-    </>
-  );
-  const toolbarTitle = tab === "home" && showOldHome ? "Home" : PLACE_TITLES[tab];
-  const settingsCtx: SettingsCtx = {
-    appVersion,
-    thisMac,
-    runKhipu,
-    onToast: (m) => setError(m),
-    liveness,
-    recallProbe,
-    t3: t3Health,
-    refreshHealth: () => loadDoctor(true),
-    onSearchT3Captures: openT3Captures,
-    onOpenGuide: (id) => openGuide(id, id === "grok_bot" ? guideSignals.grok.current : undefined),
-    synth: models.synth,
-    modelsError: models.models_error,
-    modelsSaving,
-    modelsMsg,
-    onSynthChange: (patch) => updateModelRole("synth", patch),
-    onSaveModels: saveModels,
-    secretsPresence,
-    secretsPresenceMsg,
-    modelCheck,
-    onKeySaved,
-    doctorSynth: (doctorParsed?.synth_provider as DoctorSynthProvider | undefined) ?? null,
-    dsnOk,
-    dbReachable,
-    onMoveMemory: () => setMoveOpen(true),
-    onOpenGuides: () => setTab("guides"),
-    onFeedback: () => setFeedbackOpen(true),
-    onOpenOldSettings: (section) => openOldSettings(section as SettingsSection | undefined),
-  };
-
-  return (
-    <div className="shell sh-window">
-      <Sidebar
-        brand={<BrandMark />}
-        items={places}
-        current={tab === "home" && showOldHome ? "oldhome" : tab}
-        onGo={goTab}
-        settings={settingsItem}
-        macName={thisMac}
-        older={{ items: olderItems, extra: olderExtra }}
-      />
-
-      <main className="main" aria-busy={workingLabel != null}>
-        {tab === "routing" ? (
-          <Toolbar title="Accounts">
-            <ViewSwitch
-              label="Accounts view"
-              options={[
-                { id: "room", label: "Room right now" },
-                { id: "running", label: "Running now" },
-                { id: "rules", label: "Order and rules" },
-              ]}
-              value={acctView}
-              onChange={setAcctView}
-            />
-          </Toolbar>
-        ) : toolbarTitle && tab !== "memory" ? <Toolbar title={toolbarTitle} heading={false} /> : null}
-        <WorkingBanner label={workingLabel} />
-        <div className="main-content">
-        <section className={panelClass("first-run")}>
-          <PaneBoundary key={paneRetryKeys["first-run"]} title={PANE_TITLES["first-run"]} onRetry={retryActivePane}>
-          <div className="panel-body onboard-wrap" data-tauri-drag-region>
-            <Welcome
-              dsnOk={dsnOk}
-              refreshDsn={() => refreshDsn(true)}
-              runKhipu={runKhipu}
-              onFinish={() => {
-                // Finishing setup covers what's new, so record the version.
-                recordVersionOnSetupFinish(appVersion);
-                setTab("home");
-              }}
-              openIntegrations={() => setTab("harnesses")}
-              initialStep={welcomeInitialStep}
-              initialStepKey={welcomeInitialStepKey}
-            />
-          </div>
-          </PaneBoundary>
-        </section>
-
-        <section className={tab === "home" && !showOldHome ? "panel fill today-panel" : "panel is-hidden"}>
-          <PaneBoundary key={paneRetryKeys["home"]} title="Today" onRetry={retryActivePane}>
-            <Today
-              active={tab === "home" && !showOldHome}
-              needs={needs}
-              onOpen={(link) => {
-                if (link === "running-now") { setAcctView("running"); setTab("routing"); }
-                else if (link === "accounts") setTab("routing");
-                else if (link === "search") setTab("memory");
-                else setTab("settings");
-              }}
-            />
-          </PaneBoundary>
-        </section>
-
-        <section className={tab === "home" && showOldHome ? "panel" : "panel is-hidden"}>
-          <PaneBoundary key={paneRetryKeys["home"]} title={PANE_TITLES["home"]} onRetry={retryActivePane}>
-          <PanelHeader title="Home" lede="Is memory working right now?">
-            {loading.status || loading.doctor ? <Spinner /> : null}
-            <button
-              type="button"
-              onClick={() => {
-                void loadStatus(true);
-                void loadDoctor(true);
-                void loadActivity(true);
-                void refreshDsn(true);
-                void loadRightNow(true);
-                void plans.load();
-                void routing.load();
-              }}
-            >
-              <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
-              Refresh
-            </button>
-          </PanelHeader>
-          <div className="panel-body wide">
-            <SetupHint
-              state={homeHint}
-              onAct={(id) => {
-                if (id === "connect") openGuide("grok_bot", guideSignals.grok.current);
-                else if (id === "accounts") setAddAccountSignal((n) => n + 1);
-                else openGuide("saving");
-              }}
-              onSeeAll={() => {
-                setGuideOpen(null);
-                setTab("guides");
-              }}
-              onHide={() => guideSignals.updatePrefs({ hintHidden: true })}
-              onDismissAllSet={() => guideSignals.updatePrefs({ setUpSeen: true })}
-            />
-            {noticeCard ? (
-              <WhatsNewCard
-                card={noticeCard}
-                appVersion={appVersion}
-                needsRoutingSetup={needsRoutingSetup}
-                onShow={openNoticeTarget}
-                onClose={() => {
-                  writeCardState(null);
-                  setNoticeCard(null);
-                }}
-                onSeeAll={() => {
-                  setSettingsSection("updates");
-                  openOldSettings();
-                }}
-              />
-            ) : null}
-            {/* Phase 9: the Found card or the automatic-tracking card, after
-             *  What's new and before the attention callouts. */}
-            <HomeAccountCards
-              active
-              addSignal={addAccountSignal}
-              onNone={setNoneTracked}
-              onChanged={() => {
-                void plans.reread();
-                void routing.load();
-              }}
-              onOpenAccounts={() => {
-                setTab("routing-old");
-                revealSettingsGroup("accounts");
-              }}
-            />
-            {homeAttention.map((a) => (
-              <Callout
-                key={a.key}
-                tone={a.tone}
-                stripe
-                title={a.title}
-                action={
+  const settingsItem = placeItem("settings", <SlidersHorizontal size={18} aria-hidden />, "Your Macs, sign-ins, updates and help");
+  const toolbarTitle = PLACE_TITLES[tab];
+  // Settings › Your Macs › Add another Mac: the older Settings' Another Mac section, unchanged.
+  const anotherMacSection = (
                   <>
-                    {a.fix ? (
-                      <button
-                        type="button"
-                        className="primary sm"
-                        disabled={actionBusy || probeBusy}
-                        onClick={() => {
-                          if (a.fix?.kind === "reinstall-hook" && a.harness) {
-                            void reinstallHook(a.harness);
-                          } else if (a.fix?.kind === "recall-probe") {
-                            void runRecallProbe();
-                          } else if (a.fix?.kind === "revisions") {
-                            setTab("revisions");
-                          } else if (a.fix?.kind === "open-harnesses") {
-                            setTab("harnesses");
-                          } else if (a.fix?.kind === "apply-migrations") {
-                            void applyMigrations();
-                          } else if (a.fix?.kind === "refresh-snapshot") {
-                            void refreshSnapshot();
-                          } else if (a.fix?.kind === "storage-report") {
-                            setStorageReportOpen(true);
-                          } else if (a.fix?.kind === "work-settings") {
-                            setSettingsSection("work");
-                            openOldSettings();
-                          }
-                        }}
-                      >
-                        {a.fix.label}
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        className="sm"
-                        onClick={() => openHealth(healthKeysForAttention(a.key))}
-                      >
-                        Details
-                      </button>
-                    )}
-                  </>
-                }
-              >
-                {a.cause}
-              </Callout>
-            ))}
-            {doctorReadError ? (
-              <Callout tone="warn" title="Health check failed">
-                {doctorReadError}. {doctorLastOkAt
-                  ? `Showing the last report from ${new Date(doctorLastOkAt).toLocaleTimeString()} until the next check succeeds.`
-                  : "The latest check failed; refresh to try again."}
-              </Callout>
-            ) : null}
-            {attention.length === 0 && doctorOk && !doctorReadError && allHarnessesProven ? (
-              <Callout
-                tone="ok"
-                title="Everything is recording and in sync"
-                action={
-                  <button
-                    type="button"
-                    className="sm"
-                    onClick={() => setHomeAdvancedKey((k) => k + 1)}
-                  >
-                    Details
-                  </button>
-                }
-              >
-                {doctorCheckCount} checks passed
-                {doctorSkipCount > 0
-                  ? `, ${doctorSkipCount} not configured on this Mac`
-                  : ""}
-                .
-              </Callout>
-            ) : null}
-
-            {/* D3: pending turns per live harness, queue depth and
-             *  captured-today, none of which reached Home before this
-             *  (session_capture.liveness_all() already tracked them). */}
-            <RightNowCard
-              liveness={rightNow}
-              busy={captureNowBusy}
-              loading={Boolean(loading.rightNow)}
-              error={rightNowReadError}
-              message={captureNowMsg}
-              onCaptureNow={() => void runCaptureNow()}
-            />
-
-            <PlansCard
-              state={plans}
-              routing={routingForPlans}
-              onRoutingChanged={() => routing.load(true)}
-              noneTracked={noneTracked}
-              onAddAccount={() => setAddAccountSignal((n) => n + 1)}
-              onOpenAccounts={() => {
-                setTab("routing-old");
-                revealSettingsGroup("accounts");
-              }}
-            />
-
-            <RoutingCard
-              state={routing}
-              plans={plans.data}
-              onOpenAccounts={() => {
-                setTab("routing-old");
-                revealSettingsGroup("accounts");
-              }}
-            />
-
-            <div className="tiles">
-              <Tile
-                label="Database"
-                value={
-                  dbReachable == null
-                    ? "…"
-                    : dbReachable
-                      ? "Connected"
-                      : "Not reachable"
-                }
-                sub={
-                  snapshotHealth?.age_seconds != null
-                    ? `Offline copy ${fmtAgo(snapshotHealth.age_seconds)}${snapshotHealth.notTrusted ? " · not trusted yet" : ""}`
-                    : undefined
-                }
-                tone={dbReachable === false ? "err" : snapshotHealth?.notTrusted ? "warn" : "neutral"}
-                onOpen={() => openHealth(TILE_HEALTH_KEYS.database)}
-                openLabel="Database: show its health checks"
-              />
-              <Tile
-                label="Recording"
-                value={recordingValue}
-                sub={recordingSub}
-                tone={harnessRed.length > 0 ? "err" : "neutral"}
-                onOpen={() => openHealth(TILE_HEALTH_KEYS.recording)}
-                openLabel="Recording: show its health checks"
-              />
-              <Tile
-                label="Search index"
-                value={coverage ? `${coverage.pct.toFixed(1)}%` : "—"}
-                sub={
-                  coverage
-                    ? coverage.missing > 0 || coverage.stale > 0
-                      ? [
-                          coverage.missing > 0
-                            ? `${coverage.missing} ${coverage.unit === "chunks" ? "chunks missing" : "rows not indexed yet"}`
-                            : null,
-                          coverage.stale > 0 ? `${coverage.stale} stale` : null,
-                          "catching up",
-                        ].filter(Boolean).join(" · ")
-                      : "Everything indexed"
-                    : undefined
-                }
-                tone={coverage && (coverage.missing > 0 || coverage.stale > 0) ? "warn" : "neutral"}
-                onOpen={() => openHealth(TILE_HEALTH_KEYS.search)}
-                openLabel="Search index: show its health checks"
-              />
-              <Tile
-                label="Backups"
-                value={
-                  backupHealth?.ok == null
-                    ? "—"
-                    : backupHealth.ok
-                      ? "Fresh"
-                      : "Stale"
-                }
-                sub={backupSub || undefined}
-                tone={backupHealth?.ok === false ? "err" : "neutral"}
-                onOpen={() => openHealth(TILE_HEALTH_KEYS.backups)}
-                openLabel="Backups: show its health checks"
-              />
-            </div>
-
-            <div className="cols">
-              <div className="card col">
-                <div className="card-head">
-                  Recent captures
-                  <span className="spacer" />
-                  <button
-                    type="button"
-                    className="link sm"
-                    onClick={() => setTab("activity")}
-                  >
-                    Open Activity
-                  </button>
-                </div>
-                {loadState.status !== "ok" ? (
-                  loadState.status === "failed" && !loading.status ? (
-                    <ReadFailed
-                      what="recent captures"
-                      onRetry={() => void loadStatus(true)}
-                    />
-                  ) : (
-                    <ReadingLine what="captures" />
-                  )
-                ) : recentCaptures.length === 0 ? (
-                  <EmptyState
-                    title="No captures yet"
-                    hint="Sessions your harnesses record show up here within a minute."
-                  />
-                ) : (
-                  recentCaptures.slice(0, 5).map((ep) => {
-                    const project = projectFromScope(ep.scope);
-                    return (
-                      <ListRow key={ep.id}>
-                        <span className="hdot ok" aria-hidden />
-                        {ep.ts ? (
-                          <span className="meta">{formatTs(ep.ts)}</span>
-                        ) : null}
-                        {project ? <Tag>{project}</Tag> : null}
-                        <span className="grow ellip t2">
-                          {ep.summary || `Episode ${ep.id}`}
-                        </span>
-                      </ListRow>
-                    );
-                  })
-                )}
-              </div>
-
-              <div className="card col">
-                <div className="card-head">
-                  Needs you
-                  <span className="spacer" />
-                  <button
-                    type="button"
-                    className="link sm"
-                    onClick={openOwedInWork}
-                  >
-                    Open Owed
-                  </button>
-                </div>
-                {loadState["owed:open"] !== "ok" ? (
-                  loadState["owed:open"] === "failed" && owedInFlight.open === 0 ? (
-                    <ReadFailed
-                      what="what you owe"
-                      onRetry={() => void loadOwed("open", true)}
-                    />
-                  ) : (
-                    <ReadingLine what="commitments" />
-                  )
-                ) : needsYouRows.length === 0 ? (
-                  <EmptyState
-                    title="Nothing needs you"
-                    hint="Questions, blockers and the follow-ups you own appear here."
-                  />
-                ) : (
-                  <>
-                    {needsYouRows.slice(0, 4).map((c) => {
-                      const age = owedAgo(c, "opened");
-                      return (
-                        <ListRow key={c.id}>
-                          <Tag kind tone={c.kind === "blocker" ? "warn" : "neutral"}>
-                            {OWED_KIND_LABEL[c.kind ?? ""] ?? c.kind ?? "Owed"}
-                          </Tag>
-                          <span className="grow ellip t2">{c.text}</span>
-                          {age ? <span className="meta">{age}</span> : null}
-                        </ListRow>
-                      );
-                    })}
-                  </>
-                )}
-              </div>
-            </div>
-
-            <Disclosure label={jobsSummary} openKey={homeAdvancedKey}>
-              {doctorJobs ? (
-                <div className="rows">
-                  <div className="rows-head">Scheduled jobs</div>
-                  {renderJobRow("Nightly consolidate", doctorJobs.nightly, "nightly")}
-                  {renderJobRow("Monthly consolidate", doctorJobs.monthly, "monthly")}
-                </div>
-              ) : null}
-              {jobSpawnMsg ? <pre className="code">{jobSpawnMsg}</pre> : null}
-
-              {doctorNotConfigured.length ? (
-                <div className="rows">
-                  <div className="rows-head">Not checked on this Mac</div>
-                  {doctorNotConfigured.map((name) => (
-                    <div key={name} className="row-item">
-                      <CircleMinus
-                        size={16}
-                        strokeWidth={1.75}
-                        aria-hidden
-                        className="muted"
-                      />
-                      <span className="row-main">
-                        {NOT_CONFIGURED_LABEL[name] ?? name}
-                      </span>
-                      <span className="row-meta">
-                        {doctorSkipReasons[name] ?? `${name} not configured`}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-
-              <div className="chips">
-                <Tag>episodes {counts?.episodes ?? "—"}</Tag>
-                <Tag>topics {counts?.topics ?? "—"}</Tag>
-                <Tag>connections {counts?.edges ?? "—"}</Tag>
-                <Tag>indexed rows {counts?.embeddings ?? "—"}</Tag>
-                <button
-                  type="button"
-                  className="link sm"
-                  onClick={() => setTab("revisions")}
-                  title="Topics edited in two places, and the older versions kept"
-                >
-                  Conflicting edits
-                  {statusConflicts
-                    ? ` (${statusConflicts.open_file_vs_pg ?? 0})`
-                    : ""}
-                </button>
-              </div>
-
-              <div className="inline">
-                <button
-                  type="button"
-                  disabled={probeBusy}
-                  title="Record a throwaway session, search for it, then forget it — proves recall works end to end."
-                  onClick={() => void runRecallProbe()}
-                >
-                  {probeBusy ? (
-                    <Loader2 size={14} className="spin" aria-hidden />
-                  ) : (
-                    <Stethoscope size={14} strokeWidth={1.75} aria-hidden />
-                  )}
-                  Run recall probe
-                </button>
-              </div>
-
-              <div className="rows-head">Full health report</div>
-              <HealthReportRows
-                parsed={doctorParsed ?? {}}
-                attention={homeAttention}
-                plans={plans.data}
-                routing={routing.data}
-                busy={actionBusy || probeBusy}
-                onFixAction={(fix, harness) => {
-                  if (fix.kind === "reinstall-hook" && harness) {
-                    void reinstallHook(harness);
-                  } else if (fix.kind === "recall-probe") {
-                    void runRecallProbe();
-                  } else if (fix.kind === "revisions") {
-                    setTab("revisions");
-                  } else if (fix.kind === "apply-migrations") {
-                    void applyMigrations();
-                  } else if (fix.kind === "refresh-snapshot") {
-                    void refreshSnapshot();
-                  } else if (fix.kind === "storage-report") {
-                    setStorageReportOpen(true);
-                  } else if (fix.kind === "work-settings") {
-                    setSettingsSection("work");
-                    openOldSettings();
-                  }
-                }}
-              />
-              {(doctorParsed?.storage as { line?: string } | undefined)?.line ? (
-                <p className="muted">{(doctorParsed?.storage as { line: string }).line}</p>
-              ) : null}
-              <Disclosure label="Raw report">
-                <div className="rows-head">Doctor report</div>
-                <RawBlock text={doctorText} />
-                <div className="rows-head">Database report</div>
-                <RawBlock text={statusText} />
-              </Disclosure>
-            </Disclosure>
-          </div>
-          </PaneBoundary>
-        </section>
-
-        <section className={`${panelClass("activity")} fill`}>
-          <PaneBoundary key={paneRetryKeys["activity"]} title={PANE_TITLES["activity"]} onRetry={retryActivePane}>
-          <PanelHeader
-            title="Activity"
-            lede="Every capture, newest first. Open one to read, correct, or forget it."
-          >
-            {loading.activity ? <Spinner /> : null}
-            <button type="button" onClick={() => void loadActivity(true)}>
-              <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
-              Refresh
-            </button>
-          </PanelHeader>
-          <div className="panel-body wide">
-            {tab === "activity" ? <PendingForgets run={runKhipu} refreshKey={activityRawKey} /> : null}
-            <div className="inline">
-              <input
-                className="activity-filter"
-                value={activityFilter}
-                onChange={(e) => setActivityFilter(e.target.value)}
-                placeholder="Filter captures"
-                aria-label="Filter captures"
-              />
-              <div className="chips">
-                {activityProjects.map((proj) => (
-                  <Chip
-                    key={`ap-${proj}`}
-                    on={activityProject === proj}
-                    onClick={() =>
-                      setActivityProject(activityProject === proj ? null : proj)
-                    }
-                    onRemove={
-                      activityProject === proj
-                        ? () => setActivityProject(null)
-                        : undefined
-                    }
-                  >
-                    Project · {proj}
-                  </Chip>
-                ))}
-                {activityHarnesses.map((h) => (
-                  <Chip
-                    key={`ah-${h}`}
-                    on={activityHarness === h}
-                    onClick={() =>
-                      setActivityHarness(activityHarness === h ? null : h)
-                    }
-                    onRemove={
-                      activityHarness === h
-                        ? () => setActivityHarness(null)
-                        : undefined
-                    }
-                  >
-                    Harness · {harnessLabel(h)}
-                  </Chip>
-                ))}
-                {(["today", "7d"] as const).map((w) => (
-                  <Chip
-                    key={`as-${w}`}
-                    on={activitySince === w}
-                    onClick={() =>
-                      setActivitySince(activitySince === w ? null : w)
-                    }
-                    onRemove={
-                      activitySince === w
-                        ? () => setActivitySince(null)
-                        : undefined
-                    }
-                  >
-                    Since · {w === "today" ? "Today" : "7 days"}
-                  </Chip>
-                ))}
-              </div>
-              <span className="meta push">
-                {visibleActivity.length === activityList.length
-                  ? `${activityList.length} loaded`
-                  : `${visibleActivity.length} of ${activityList.length} loaded`}
-                {activityCount != null
-                  ? ` · ${activityCount.toLocaleString()} captures in all`
-                  : ""}
-              </span>
-            </div>
-
-            <div className="split">
-              <div className="card col">
-                <div className="card-scroll">
-                  {loadState.activity !== "ok" ? (
-                    loadState.activity === "failed" && !loading.activity ? (
-                      <ReadFailed
-                        what="captures"
-                        onRetry={() => void loadActivity(true)}
-                      />
-                    ) : (
-                      <ReadingLine what="captures" />
-                    )
-                  ) : visibleActivity.length === 0 ? (
-                    <EmptyState
-                      title={
-                        activityList.length === 0
-                          ? "No captures yet"
-                          : "Nothing matches those filters"
-                      }
-                      hint={
-                        activityList.length === 0
-                          ? "Sessions appear here as each harness's capture hook records them."
-                          : "Clear a chip or the text filter to see the rest of this page."
-                      }
-                    />
-                  ) : (
-                    activityDays.map((day) => (
-                      <div key={day.label}>
-                        <div className="day">{day.label}</div>
-                        {day.rows.map((ep) => {
-                          const harness = harnessFromSession(ep.session_id);
-                          const project = projectFromScope(ep.scope);
-                          return (
-                            <button
-                              key={ep.id}
-                              type="button"
-                              className={
-                                activitySelected === ep.id
-                                  ? "row on act-row"
-                                  : "row act-row"
-                              }
-                              onClick={() => void selectEpisode(ep.id)}
-                            >
-                              <span className="meta w60">
-                                {timeLabel(ep.ts ?? ep.ingested_at)}
-                              </span>
-                              <span
-                                className={harnessDotClass(ep.session_id)}
-                                aria-hidden
-                              />
-                              <span className="meta w78">
-                                {harness ? harnessLabel(harness) : "—"}
-                              </span>
-                              {project ? (
-                                <Tag title={ep.scope}>{project}</Tag>
-                              ) : null}
-                              <span className="grow ellip t2 act-sum">
-                                {ep.summary || "(no summary)"}
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    ))
-                  )}
-                  {activityList.length >= activityLimit &&
-                  (activityCount == null ||
-                    activityList.length < activityCount) ? (
-                    <div className="row" style={{ justifyContent: "center" }}>
-                      <button
-                        type="button"
-                        className="link sm"
-                        disabled={Boolean(loading.activity)}
-                        onClick={() => {
-                          const next = activityLimit + ACTIVITY_PAGE;
-                          setActivityLimit(next);
-                          void loadActivity(true, next);
-                        }}
-                      >
-                        Show {ACTIVITY_PAGE} more
-                      </button>
-                    </div>
-                  ) : null}
-                </div>
-              </div>
-
-              <div className="card col">
-                {activityDetailLoading ? (
-                  <EmptyState
-                    icon={<Loader2 size={22} className="spin" aria-hidden />}
-                    title="Opening…"
-                  />
-                ) : activityDetail ? (
-                  <>
-                    <div className="card-head">
-                      <span className="head-title">
-                        Episode {activityDetail.id}
-                      </span>
-                      <span className="spacer" />
-                      <span className="meta">
-                        {timeLabel(activityDetail.ts)}
-                        {harnessFromSession(activityDetail.session_id)
-                          ? ` · ${harnessLabel(
-                              harnessFromSession(activityDetail.session_id) ??
-                                "",
-                            )}`
-                          : ""}
-                      </span>
-                    </div>
-                    <div className="detail">
-                      <div className="section">
-                        <h3>Summary</h3>
-                        <p>
-                          {activityDetail.summary || "No summary was recorded."}
-                        </p>
-                      </div>
-                      {asStrings(activityDetail.decisions).length > 0 ? (
-                        <div className="section">
-                          <h3>Decisions</h3>
-                          <ul>
-                            {asStrings(activityDetail.decisions).map((d) => (
-                              <li key={d}>{d}</li>
-                            ))}
-                          </ul>
-                        </div>
-                      ) : null}
-                      {openLoopTexts(activityDetail.raw).length > 0 ? (
-                        <div className="section">
-                          <h3>Opened</h3>
-                          <ul>
-                            {openLoopTexts(activityDetail.raw).map((t) => (
-                              <li key={t}>
-                                {t} <Tag kind>Owed</Tag>
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      ) : null}
-                      <div className="section">
-                        <h3>Where</h3>
-                        <p className="t2">
-                          {[
-                            projectFromScope(activityDetail.scope),
-                            activityDetail.scope,
-                            activityDetail.session_id
-                              ? `session ${activityDetail.session_id}`
-                              : null,
-                          ]
-                            .filter(Boolean)
-                            .join(" · ") || "Not recorded"}
-                        </p>
-                      </div>
-                    </div>
-                    <div className="acts">
-                        <button
-                          type="button"
-                          className="sm"
-                          onClick={() => openInRecall(activityDetail.id)}
-                        >
-                          <Search size={14} strokeWidth={1.75} aria-hidden />
-                          Open in Recall
-                        </button>
-                        <button
-                          type="button"
-                          className="sm"
-                          onClick={() => {
-                            setEditText(activityDetail.summary ?? "");
-                            setEditTarget(activityDetail.id);
-                            setEditOpen(true);
-                          }}
-                        >
-                          Edit summary
-                        </button>
-                        <button
-                          type="button"
-                          className="sm danger push"
-                          onClick={() => {
-                            setForgetError(null);
-                            setForgetTarget(activityDetail.id);
-                          }}
-                        >
-                          <Trash2 size={14} strokeWidth={1.75} aria-hidden />
-                          Forget
-                        </button>
-                    </div>
-                  </>
-                ) : (
-                  <EmptyState
-                    title="Pick a capture"
-                    hint="Its summary, decisions, what it left open and where it ran appear here."
-                  />
-                )}
-              </div>
-            </div>
-
-            <Disclosure label="Advanced" openKey={activityRawKey}>
-              {opsEvents.length > 0 ? (
-                <div className="rows">
-                  <div className="rows-head">System check-ins</div>
-                  {opsEvents.slice(0, 8).map((ev, i) => (
-                    <div
-                      key={`${ev.kind}-${ev.created_at}-${i}`}
-                      className="row-item"
-                    >
-                      <span className="row-main mono">{ev.kind}</span>
-                      <Tag dot tone={opsStatusTone(ev.status)}>
-                        {ev.status ?? "?"}
-                      </Tag>
-                      {ev.created_at ? (
-                        <span className="row-meta">
-                          {formatTs(ev.created_at)}
-                        </span>
-                      ) : null}
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-              <RawBlock text={activityText} />
-            </Disclosure>
-          </div>
-          </PaneBoundary>
-        </section>
-
-        <section className={`${panelClass("memory")} fill`}>
-          <PaneBoundary key={paneRetryKeys["memory"]} title={PANE_TITLES["memory"]} onRetry={retryActivePane}>
-            {tab === "memory" ? (
-              <Memory
-                run={runKhipu}
-                onForgotten={(id) => setActivityList((rows) => rows.filter((row) => row.id !== id))}
-                onOwedClose={(id) => owedWrite(id, [`--close=${id}`])}
-              />
-            ) : null}
-          </PaneBoundary>
-        </section>
-
-        <section className={`${panelClass("recall")} fill`}>
-          <PaneBoundary key={paneRetryKeys["recall"]} title={PANE_TITLES["recall"]} onRetry={retryActivePane}>
-          <PanelHeader
-            title="Recall"
-            lede="What does the agent remember about this?"
-          >
-            <Segmented
-              ariaLabel="Recall view"
-              value={recallView}
-              onChange={setRecallView}
-              options={[
-                { value: "search", label: "Search", hint: "Find episodes, topics and nodes." },
-                {
-                  value: "graph",
-                  label: "Graph",
-                  hint: "Walk what a topic or node is connected to.",
-                },
-              ]}
-            />
-          </PanelHeader>
-          <div className="panel-body wide">
-            {recallView === "search" ? (
-              <>
-            <div className="inline">
-              <input
-                className="grow"
-                ref={recallSearchInput}
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder={
-                  SEARCH_MODES.find((m) => m.mode === searchMode)?.placeholder ??
-                  "ask in your own words"
-                }
-                aria-label="Search"
-                autoCapitalize="off"
-                autoCorrect="off"
-                spellCheck={false}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") void doSearch();
-                }}
-              />
-              <Segmented
-                ariaLabel="Search mode"
-                value={searchMode}
-                onChange={setSearchMode}
-                options={SEARCH_MODES.map((m) => ({
-                  value: m.mode,
-                  label: m.label,
-                  hint: m.hint,
-                }))}
-              />
-              <button
-                type="button"
-                className="primary"
-                onClick={() => void doSearch()}
-              >
-                {searchBusy ? (
-                  <Loader2 size={14} className="spin" aria-hidden />
-                ) : (
-                  <Search size={14} strokeWidth={1.75} aria-hidden />
-                )}
-                Search
-              </button>
-            </div>
-
-            <div className="chips">
-              <Chip
-                on={Boolean(searchProject.trim())}
-                title="Match the episode's project or repo path"
-                onClick={() => setSearchFiltersOpen(true)}
-                onRemove={
-                  searchProject.trim()
-                    ? () => {
-                        setSearchProject("");
-                        void doSearch({ project: "" });
-                      }
-                    : undefined
-                }
-              >
-                Project · {searchProject.trim() || "Any"}
-              </Chip>
-              <Chip
-                on={Boolean(searchSince.trim())}
-                title="ISO date (2026-08-01) or a relative window: 7d, 24h, 30m"
-                onClick={() => setSearchFiltersOpen(true)}
-                onRemove={
-                  searchSince.trim()
-                    ? () => {
-                        setSearchSince("");
-                        void doSearch({ since: "" });
-                      }
-                    : undefined
-                }
-              >
-                Since · {searchSince.trim() || "Any"}
-              </Chip>
-              <Chip
-                on={Boolean(searchKind)}
-                onClick={() => setSearchFiltersOpen(true)}
-                onRemove={
-                  searchKind
-                    ? () => {
-                        setSearchKind("");
-                        void doSearch({ kind: "" });
-                      }
-                    : undefined
-                }
-              >
-                Kind · {searchKind ? `${searchKind[0].toUpperCase()}${searchKind.slice(1)}` : "Any"}
-              </Chip>
-              <Chip
-                on={Boolean(searchHarness.trim())}
-                title="The half of a session id before the colon"
-                onClick={() => setSearchFiltersOpen(true)}
-                onRemove={
-                  searchHarness.trim()
-                    ? () => {
-                        setSearchHarness("");
-                        void doSearch({ harness: "" });
-                      }
-                    : undefined
-                }
-              >
-                Harness ·{" "}
-                {searchHarness.trim()
-                  ? harnessLabel(searchHarness.trim())
-                  : "Any"}
-              </Chip>
-              <Chip
-                on={Boolean(searchVia.trim())}
-                title="Exact capture origin, such as T3 Code"
-                onClick={() => setSearchFiltersOpen(true)}
-                onRemove={
-                  searchVia.trim()
-                    ? () => {
-                        setSearchVia("");
-                        if (query.trim()) void doSearch({ via: "" });
-                        else {
-                          setSearchText("");
-                          setSearchErr(null);
-                        }
-                      }
-                    : undefined
-                }
-              >
-                Source · {searchVia.trim() === "t3" ? "T3 Code" : searchVia.trim() || "Any"}
-              </Chip>
-              <Chip onClick={() => setSearchFiltersOpen((o) => !o)}>
-                {searchFiltersOpen ? "Hide filters" : "+ Filter"}
-              </Chip>
-              {searchText ? (
-                <span className="meta push">
-                  {searchResults.length} result
-                  {searchResults.length === 1 ? "" : "s"}
-                  {searchElapsedMs != null
-                    ? ` · ${(searchElapsedMs / 1000).toFixed(1)} s`
-                    : ""}
-                </span>
-              ) : null}
-            </div>
-
-            {searchFiltersOpen ? (
-              <div className="filter-row">
-                <label className="filter-label">
-                  Project
-                  <input
-                    className="filter-input"
-                    value={searchProject}
-                    onChange={(e) => setSearchProject(e.target.value)}
-                    placeholder="any"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void doSearch();
-                    }}
-                  />
-                </label>
-                <label
-                  className="filter-label"
-                  title="ISO date (2026-08-01) or a relative window: 7d, 24h, 30m."
-                >
-                  Since
-                  <input
-                    className="filter-input"
-                    value={searchSince}
-                    onChange={(e) => setSearchSince(e.target.value)}
-                    placeholder="any · e.g. 7d"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void doSearch();
-                    }}
-                  />
-                </label>
-                <label className="filter-label">
-                  Harness
-                  <input
-                    className="filter-input"
-                    value={searchHarness}
-                    onChange={(e) => setSearchHarness(e.target.value)}
-                    placeholder="any · e.g. claude_code"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void doSearch();
-                    }}
-                  />
-                </label>
-                <label className="filter-label">
-                  Source
-                  <input
-                    className="filter-input"
-                    value={searchVia}
-                    onChange={(e) => setSearchVia(e.target.value)}
-                    placeholder="any · e.g. t3"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void doSearch();
-                    }}
-                  />
-                </label>
-                <div className="chips">
-                  <Chip
-                    tiny
-                    on={!searchKind}
-                    onClick={() => setSearchKind("")}
-                  >
-                    Any kind
-                  </Chip>
-                  {SEARCH_KINDS.map((k) => (
-                    <Chip
-                      key={k}
-                      tiny
-                      on={searchKind === k}
-                      onClick={() => setSearchKind(searchKind === k ? "" : k)}
-                    >
-                      {k[0].toUpperCase()}
-                      {k.slice(1)}
-                    </Chip>
-                  ))}
-                </div>
-                <button type="button" onClick={() => void doSearch()}>
-                  Apply
-                </button>
-              </div>
-            ) : null}
-
-            {searchDegraded && !searchErr ? (
-              <Callout
-                tone="warn"
-                title={
-                  (DEGRADED_COPY[searchDegraded] ?? DEGRADED_COPY["embed-unavailable"]).title
-                }
-              >
-                {(DEGRADED_COPY[searchDegraded] ?? DEGRADED_COPY["embed-unavailable"]).hint}
-              </Callout>
-            ) : null}
-
-            {searchFallback && !searchErr ? (
-              <Callout tone="warn" title="Offline copy">
-                {[
-                  searchFallback.refreshedAt ? `Updated ${searchFallback.refreshedAt}` : null,
-                  searchFallback.mode ? `Search: ${searchFallback.mode}` : null,
-                  searchFallback.filtersDropped.length
-                    ? `Filters not used: ${searchFallback.filtersDropped.join(", ")}`
-                    : null,
-                ].filter(Boolean).join(" · ")}
-              </Callout>
-            ) : null}
-
-            {searchErr ? (
-              <Callout
-                tone="warn"
-                title="Search failed"
-                action={
-                  <button type="button" onClick={() => void doSearch()}>
-                    Retry
-                  </button>
-                }
-              >
-                {searchErr}
-              </Callout>
-            ) : null}
-
-            <div className="split">
-              <div className="card col">
-                <div className="card-scroll">
-                  {searchBusy ? (
-                    <EmptyState
-                      icon={<Loader2 size={22} className="spin" aria-hidden />}
-                      title="Searching…"
-                      hint={`Searching for “${query.trim()}”.`}
-                    />
-                  ) : searchResults.length > 0 ? (
-                    searchResults.map((r, i) => {
-                      const key = `${r.kind ?? "item"}:${r.id}`;
-                      const why = whyText(r);
-                      const width =
-                        r.score != null &&
-                        Number.isFinite(r.score) &&
-                        topScore
-                          ? Math.max(
-                              6,
-                              Math.min(100, (r.score / topScore) * 100),
-                            )
-                          : null;
-                      return (
-                        <button
-                          key={`${key}-${i}`}
-                          type="button"
-                          className={
-                            recallSelected === key ? "result on" : "result"
-                          }
-                          onClick={() => void selectRecallResult(r)}
-                        >
-                          <span className="tl">
-                            <Tag
-                              kind
-                              tone={r.kind === "episode" ? "accent" : "neutral"}
-                            >
-                              {r.kind ?? "item"}
-                            </Tag>
-                            <span className="title ellip grow">
-                              {r.label ?? String(r.id ?? "")}
-                            </span>
-                          </span>
-                          {r.snippet ? (
-                            <span className="snip">{r.snippet}</span>
-                          ) : null}
-                          <span className="foot">
-                            {/* date · project · harness — the mock's footer,
-                                every part straight off the row and simply
-                                absent when the payload has no value for it. */}
-                            {r.ts ? <span>{shortDateLabel(r.ts)}</span> : null}
-                            {r.ts && r.project ? <span>·</span> : null}
-                            {r.project ? (
-                              <span title={r.project}>{shortProject(r.project)}</span>
-                            ) : null}
-                            {(r.ts || r.project) && r.harness ? (
-                              <span>·</span>
-                            ) : null}
-                            {r.harness ? (
-                              <span>{harnessLabel(r.harness)}</span>
-                            ) : null}
-                            {!r.ts && !r.project && !r.harness && r.id != null ? (
-                              <span className="mono">
-                                {r.kind === "episode"
-                                  ? `#${r.id}`
-                                  : String(r.id)}
-                              </span>
-                            ) : null}
-                            {width != null ? (
-                              <span
-                                className="score"
-                                title={`Relevance ${r.score?.toFixed(4)}, relative to the top hit in this response.`}
-                              >
-                                {why ? <span>{why}</span> : null}
-                                <span className="bar" aria-hidden>
-                                  <i style={{ width: `${width}%` }} />
-                                </span>
-                              </span>
-                            ) : null}
-                          </span>
-                        </button>
-                      );
-                    })
-                  ) : !searchText ? (
-                    <EmptyState
-                      icon={<Search size={22} strokeWidth={1.75} aria-hidden />}
-                      title="Search topics, episodes, and nodes"
-                      hint="Type a question in your own words and press Enter. Best match weighs meaning, word overlap and exact text together."
-                    />
-                  ) : (
-                    <EmptyState
-                      icon={<Search size={22} strokeWidth={1.75} aria-hidden />}
-                      title={searchFallback ? "No matches in offline copy" : "No results"}
-                      hint={
-                        searchFallback
-                          ? "This offline copy has no match. Reconnect to search the current shared memory."
-                          : (searchMode === "literal"
-                              ? "Nothing contains those exact words. Try Best match, which also scores meaning and word overlap."
-                              : searchMode === "semantic"
-                                ? "Nothing in the vector index was close enough. Try Best match, which also matches the words themselves."
-                                : "Nothing recorded matched that query by meaning, word overlap or exact text.") +
-                            (searchProject.trim() || searchSince.trim() || searchKind || searchHarness.trim() || searchVia.trim()
-                              ? " The filter chips are still applied."
-                              : "")
-                      }
-                    />
-                  )}
-                </div>
-              </div>
-
-              <div className="card col">
-                {recallDetailLoading ? (
-                  <EmptyState
-                    icon={<Loader2 size={22} className="spin" aria-hidden />}
-                    title="Opening…"
-                  />
-                ) : selectedResult ? (
-                  <>
-                    <div className="card-head">
-                      {recallDetail
-                        ? `Episode ${recallDetail.id}`
-                        : (selectedResult.kind ?? "item")}
-                      <span className="spacer" />
-                      {recallDetail?.ts ? (
-                        <span className="meta">
-                          {shortDateLabel(recallDetail.ts)} ·{" "}
-                          {timeLabel(recallDetail.ts)}
-                        </span>
-                      ) : null}
-                    </div>
-                    <div className="detail">
-                      <div className="section">
-                        <h3>Summary</h3>
-                        <p>
-                          {recallDetail?.summary ||
-                            selectedResult.snippet ||
-                            "Nothing more than the title is recorded here."}
-                        </p>
-                      </div>
-                      {asStrings(recallDetail?.decisions).length > 0 ? (
-                        <div className="section">
-                          <h3>Decisions</h3>
-                          <ul>
-                            {asStrings(recallDetail?.decisions).map((d) => (
-                              <li key={d}>{d}</li>
-                            ))}
-                          </ul>
-                        </div>
-                      ) : null}
-                      {openLoopsFor(recallDetail?.id).length > 0 ? (
-                        <div className="section">
-                          <h3>Still open</h3>
-                          <ul>
-                            {openLoopsFor(recallDetail?.id).map((c) => (
-                              <li key={c.id}>
-                                {c.text} <Tag kind>Owed</Tag>
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      ) : null}
-                      {recallNeighbors.length > 0 ? (
-                        <div className="section">
-                          <h3>Connected</h3>
-                          {recallNeighbors.slice(0, 8).map((n, i) => (
-                            <div
-                              key={`${n.id}-${i}`}
-                              className="row plain"
-                            >
-                              <Tag kind>{nodeKindLabel(n.id)}</Tag>
-                              <span className="grow ellip t2" title={n.id}>
-                                {nodeTitle(n.id)}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      ) : null}
-                    </div>
-                    <div className="acts">
-                        <button
-                          type="button"
-                          className="sm"
-                          onClick={() => {
-                            const id = String(
-                              selectedResult.id ?? selectedResult.label ?? "",
-                            );
-                            setNodeId(id);
-                            setRecallView("graph");
-                            void doGraph(id);
-                          }}
-                        >
-                          <Waypoints size={14} strokeWidth={1.75} aria-hidden />
-                          Walk the graph
-                        </button>
-                        <button
-                          type="button"
-                          className="sm"
-                          onClick={() =>
-                            void copyId(String(selectedResult.id ?? ""))
-                          }
-                        >
-                          {copiedId === String(selectedResult.id ?? "")
-                            ? "Copied"
-                            : "Copy id"}
-                        </button>
-                        {recallDetail ? (
-                          <button
-                            type="button"
-                            className="sm danger push"
-                            onClick={() => setForgetTarget(recallDetail.id)}
-                          >
-                            <Trash2 size={14} strokeWidth={1.75} aria-hidden />
-                            Forget
-                          </button>
-                        ) : null}
-                    </div>
-                  </>
-                ) : (
-                  <EmptyState
-                    title="Pick a result"
-                    hint="What it says, what it decided, what it left open and what it connects to appear here."
-                  />
-                )}
-              </div>
-            </div>
-
-            <Disclosure label="Advanced">
-              {searchTiming ? (
-                <div className="rows">
-                  <div className="rows-head">Where the time went</div>
-                  {Object.entries(TIMING_LABEL)
-                    .filter(([key]) => typeof searchTiming[key as keyof SearchTiming] === "number")
-                    .map(([key, label]) => (
-                      <div key={key} className="row-item">
-                        <span className="row-main">{label}</span>
-                        <span className="row-meta">
-                          {formatMs(searchTiming[key as keyof SearchTiming] as number)}
-                        </span>
-                      </div>
-                    ))}
-                  {searchTiming.embed_cache ? (
-                    <div className="row-item">
-                      <span className="row-main">Query embedding</span>
-                      <span className="row-meta">
-                        {searchTiming.embed_cache === "hit"
-                          ? "reused from cache · no API call"
-                          : searchTiming.embed_cache === "miss"
-                            ? "computed and cached for next time"
-                            : "not cached (hub not migrated)"}
-                      </span>
-                    </div>
-                  ) : null}
-                  {searchElapsedMs != null ? (
-                    <div className="row-item">
-                      <span className="row-main">App round trip</span>
-                      <span className="row-meta">{formatMs(searchElapsedMs)}</span>
-                    </div>
-                  ) : null}
-                </div>
-              ) : null}
-              <RawBlock text={searchText} empty="Results appear here." />
-            </Disclosure>
-          </>
-            ) : (
-              <>
-            <div className="toolbar">
-              <input
-                className="mono"
-                value={nodeId}
-                onChange={(e) => setNodeId(e.target.value)}
-                placeholder="node id — e.g. topic:khipu"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") void doGraph();
-                }}
-              />
-              <label className="hops-label">
-                hops
-                <input
-                  type="number"
-                  className="hops-input"
-                  min={1}
-                  max={4}
-                  value={hops}
-                  onChange={(e) =>
-                    setHops(clampHops(Number(e.target.value)))
-                  }
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void doGraph();
-                  }}
-                />
-              </label>
-              <button
-                type="button"
-                className="primary"
-                onClick={() => void doGraph()}
-              >
-                {graphBusy ? (
-                  <Loader2 size={14} className="spin" aria-hidden />
-                ) : (
-                  <Waypoints size={14} strokeWidth={1.75} aria-hidden />
-                )}
-                Walk
-              </button>
-            </div>
-
-            {!graphText ? (
-              <EmptyState
-                icon={<Waypoints size={22} strokeWidth={1.75} aria-hidden />}
-                title="Explore the graph"
-                hint="Enter a node id and walk its neighbours up to 4 hops out."
-              />
-            ) : null}
-
-            {graphData.neighbors.length > 0 ? (
-              <div className="rows">
-                <div className="rows-head">
-                  Neighbors ({graphData.neighbors.length})
-                </div>
-                {graphData.neighbors.slice(0, 40).map((n, i) => {
-                  switch (n.mode) {
-                    case "walk":
-                      return (
-                        <div
-                          key={`${n.id}-${n.via}-${n.hops}-${i}`}
-                          className="row-item"
-                        >
-                          <Tag kind>{n.type ?? "walk"}</Tag>
-                          <span className="row-main mono">{n.id}</span>
-                          <span className="row-meta">
-                            {n.hops != null
-                              ? `${n.hops} hop${n.hops === 1 ? "" : "s"}`
-                              : ""}
-                            {n.via
-                              ? `${n.hops != null ? " · " : ""}via ${n.via}`
-                              : ""}
-                          </span>
-                        </div>
-                      );
-                    case "edge": {
-                      const outbound = n.src === graphData.rootId;
-                      const inbound = n.dst === graphData.rootId;
-                      const other = outbound
-                        ? n.dst
-                        : inbound
-                          ? n.src
-                          : n.id || null;
-                      return (
-                        <div
-                          key={`${n.src}-${n.dst}-${i}`}
-                          className="row-item"
-                        >
-                          <Tag kind>{n.type ?? "edge"}</Tag>
-                          <span className="edge-arrow" aria-hidden>
-                            {outbound ? "→" : inbound ? "←" : "↔"}
-                          </span>
-                          <span className="row-main mono">
-                            {other ?? `${n.src} → ${n.dst}`}
-                          </span>
-                        </div>
-                      );
-                    }
-                    default: {
-                      const _exhaustive: never = n;
-                      void _exhaustive;
-                      return null;
-                    }
-                  }
-                })}
-              </div>
-            ) : graphText ? (
-              // "No edges" is an absence, not a pass — the ok/success callout
-              // read as "the walk found something good" (audit 2026-09-04).
-              <Callout tone="neutral" title="No edges">
-                This node has no neighbors at the requested hop count. Check the
-                id, or try more hops.
-              </Callout>
-            ) : null}
-
-            <RawJson text={graphText} empty="Neighborhood JSON." />
-          </>
-            )}
-          </div>
-          </PaneBoundary>
-        </section>
-
-        <section className={panelClass("revisions")}>
-          <PaneBoundary key={paneRetryKeys["revisions"]} title={PANE_TITLES["revisions"]} onRetry={retryActivePane}>
-          <PanelHeader
-            title="Conflicting edits"
-            lede="When the same topic is edited in two places, the newest wins and the older version is kept. Every note file is compared against the database."
-          >
-            {loading.revisions ? <Spinner /> : null}
-            <button type="button" onClick={() => void loadRevisions(true)}>
-              <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
-              Refresh
-            </button>
-          </PanelHeader>
-          <div className="panel-body">
-            {revisionsConflicts ? (
-              <Callout
-                tone={openDrift > 0 || unreadableTopics.length > 0 ? "warn" : "ok"}
-                title="Out-of-sync files"
-              >
-                Out of sync: <strong>{openDrift}</strong> · Topics compared:{" "}
-                <strong>{revisionsConflicts.topics_checked ?? 0}</strong> ·
-                Topics with more than one version: <strong>{multiCount}</strong>
-                {unreadableTopics.length > 0 ? (
-                  <>
-                    {" "}
-                    · Unreadable:{" "}
-                    <strong>{unreadableTopics.join(", ")}</strong>
-                  </>
-                ) : null}
-              </Callout>
-            ) : null}
-
-            <div className="toolbar">
-              <input
-                className="mono"
-                value={revSlug}
-                onChange={(e) => setRevSlug(e.target.value)}
-                placeholder="filter slug (optional)"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") void loadRevisions(true);
-                }}
-              />
-              <button type="button" onClick={() => void loadRevisions(true)}>
-                List
-              </button>
-            </div>
-            <div className="toolbar">
-              <input
-                className="mono"
-                value={revShowId}
-                onChange={(e) => setRevShowId(e.target.value)}
-                placeholder="revision id"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") void showRevision();
-                }}
-              />
-              <button type="button" onClick={() => void showRevision()}>
-                Show body
-              </button>
-            </div>
-
-            {revRecent.length > 0 ? (
-              <div className="rows">
-                <div className="rows-head">
-                  {revSlug.trim()
-                    ? `Revisions of ${revSlug.trim()} (${revRecent.length})`
-                    : `Recent revisions (${revRecent.length})`}
-                </div>
-                {revRecent.map((r) => (
-                  <div className="row-item" key={r.id}>
-                    <button
-                      type="button"
-                      className="id-chip"
-                      onClick={() => void showRevision(String(r.id))}
-                    >
-                      #{r.id}
-                    </button>
-                    <Tag className="mono">{r.slug}</Tag>
-                    <span className="row-main">
-                      {r.note || r.source || "revision"}
-                    </span>
-                    {r.revised_at ? (
-                      <span className="row-meta">{formatTs(r.revised_at)}</span>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
-            ) : revSlug.trim() ? (
-              <Callout tone="neutral" title="No older versions for that topic">
-                Nothing in the edit history matches “{revSlug.trim()}”.
-              </Callout>
-            ) : null}
-
-            {multiCount > 0 ? (
-              <div className="rows">
-                <div className="rows-head">Topics with multiple revisions</div>
-                {(revisionsConflicts?.topics_with_multiple_revisions ?? [])
-                  .slice(0, 12)
-                  .map((t) => (
-                    <div key={t.slug} className="row-item">
-                      <button
-                        type="button"
-                        className="id-chip"
-                        onClick={() => {
-                          setRevSlug(t.slug);
-                          setTab("revisions");
-                          void (async () => {
-                            setActionBusy(true);
-                            setError(null);
-                            try {
-                              // No --sample, for the same reason loadRevisions
-                              // dropped it: sampling 40 of 622 topics renders
-                              // the conflicts summary green for the whole
-                              // corpus off a partial pass (audit 2026-08-17).
-                              const raw = await runKhipu([
-                                "revisions",
-                                "--slug",
-                                t.slug,
-                                "--limit",
-                                "20",
-                              ]);
-                              const parsed = parseJson(raw) as {
-                                conflicts?: ConflictSummary;
-                              } | null;
-                              if (
-                                parsed === null ||
-                                typeof parsed !== "object" ||
-                                Array.isArray(parsed)
-                              ) {
-                                setError("Unexpected response from hub");
-                                return;
-                              }
-                              setRevisionsText(prettyJson(raw));
-                              setRevisionsConflicts(parsed.conflicts ?? null);
-                              setRevisionsRawKey((k) => k + 1);
-                            } catch (e) {
-                              setError(String(e));
-                            } finally {
-                              setActionBusy(false);
-                            }
-                          })();
-                        }}
-                      >
-                        {t.slug}
-                      </button>
-                      <span className="row-main">
-                        {t.revision_count} revs
-                      </span>
-                      {t.last_revised_at ? (
-                        <span className="row-meta">
-                          last {formatTs(t.last_revised_at)}
-                        </span>
-                      ) : null}
-                    </div>
-                  ))}
-              </div>
-            ) : null}
-
-            <RawJson text={revisionsText} openKey={revisionsRawKey} />
-          </div>
-          </PaneBoundary>
-        </section>
-
-        <section className={panelClass("work")}>
-          <PaneBoundary key={paneRetryKeys["work"]} title={PANE_TITLES["work"]} onRetry={retryActivePane}>
-          <WorkView
-            work={work}
-            routing={routing}
-            plans={plans.data}
-            projects={projects.data}
-            owedFocusKey={owedFocusKey}
-            onOwedClose={(id) => owedWrite(id, [`--close=${id}`])}
-            onSnooze={(id, title) =>
-              setSnoozeTarget(owedOpenRows.find((c) => String(c.id) === id) ?? { id: Number(id), text: title })
-            }
-            onOpenRouting={() => {
-              setTab("routing-old");
-            }}
-            onOpenWorkSettings={() => {
-              setSettingsSection("work");
-              openOldSettings();
-            }}
-            owedSection={
-              <>
-                <div className="inline wk-owed-lede">
-                  <span className="meta">What you still owe on each project, kept from your own sessions.</span>
-                  {owedLoading ? <Spinner /> : null}
-                  <button type="button" className="sm" onClick={() => void loadOwed(owedStatus, true)}>
-                    <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
-                    Refresh
-                  </button>
-                </div>
-                <div className="inline">
-                  <Segmented
-                    ariaLabel="Commitment status"
-                    value={owedStatus}
-                    onChange={(next) => {
-                      setOwedStatus(next);
-                      setOwedSelected(new Set());
-                      void loadOwed(next, false);
-                    }}
-                    options={[
-                      { value: "open", label: `Open${owedCount("open")}` },
-                      { value: "closed", label: `Closed${owedCount("closed")}` },
-                      { value: "stale", label: `Stale${owedCount("stale")}` },
-                    ]}
-                  />
-                  <div className="chips">
-                    {owedProjects.map((proj) => (
-                      <Chip
-                        key={proj}
-                        title={proj}
-                        on={owedProject === proj}
-                        onClick={() =>
-                          setOwedProject(owedProject === proj ? null : proj)
-                        }
-                        onRemove={
-                          owedProject === proj ? () => setOwedProject(null) : undefined
-                        }
-                      >
-                        Project · {shortProject(proj)}
-                      </Chip>
-                    ))}
-                    {owedKinds.map((k) => (
-                      <Chip
-                        key={`ok-${k}`}
-                        on={owedKind === k}
-                        onClick={() => setOwedKind(owedKind === k ? null : k)}
-                        onRemove={owedKind === k ? () => setOwedKind(null) : undefined}
-                      >
-                        Kind · {OWED_KIND_LABEL[k] ?? k}
-                      </Chip>
-                    ))}
-                  </div>
-                  <span className="meta push">
-                    Closed automatically when a later capture says it was done
-                  </span>
-                </div>
-
-                <OfflineBanner state={owedOffline[owedStatus] ?? null} />
-                <SavedOnThisMac show={owedSaved} />
-                {owedStatus === "open" && owedSelected.size > 0 ? (
-                  <OwedSelectionBar
-                    count={owedSelected.size}
-                    onClose={() => setOwedChangeMode("close")}
-                    onMove={() => setOwedChangeMode("move")}
-                    onClear={() => setOwedSelected(new Set())}
-                  />
-                ) : null}
-
-                {loadState[`owed:${owedStatus}`] !== "ok" ? (
-                  loadState[`owed:${owedStatus}`] === "failed" && owedInFlight[owedStatus] === 0 ? (
-                    owedOffline[owedStatus]?.kind === "unreachable" ? null : (
-                      <ReadFailed
-                        what="commitments"
-                        onRetry={() => void loadOwed(owedStatus, true)}
-                      />
-                    )
-                  ) : (
-                    <div className="card">
-                      <ReadingLine what="commitments" />
-                    </div>
-                  )
-                ) : visibleOwed.length === 0 ? (
-                  <div className="card">
-                    <EmptyState
-                      title={
-                        owedProject
-                          ? `Nothing owed on ${shortProject(owedProject)}`
-                          : owedStatus === "open"
-                            ? "Nothing owed yet"
-                            : `Nothing ${owedStatus} here`
-                      }
-                      hint="Questions, blockers, follow-ups and promises your sessions leave open appear here."
-                    />
-                  </div>
-                ) : owedStatus === "open" ? (
-                  // Open items are grouped by who owes them: "Needs you" first and
-                  // never buried under the agent's own plan steps, which is what
-                  // made a 300-row list unusable (phase 4 addendum).
-                  OWED_GROUPS.map(([id, title, hint, owner]) => {
-                    const key = `open:${owner}` as OwedListKey;
-                    const rows = visibleOwed.filter((c) => owedGroupOf(c) === id);
-                    // The heading counts every item the owner has, read or
-                    // not yet read; a chip filter counts what it shows.
-                    const count = owedChipFilter ? rows.length : (owedListTotal(key) ?? rows.length);
-                    if (rows.length === 0 && count === 0) return null;
-                    return (
-                      <Disclosure
-                        key={id}
-                        className="group"
-                        defaultOpen={id === "needs-you"}
-                        label={
-                          <>
-                            <strong>{title}</strong>
-                            <span className="nav-count quiet">{count.toLocaleString()}</span>
-                            <span className="meta wrap">{hint}</span>
-                          </>
-                        }
-                      >
-                        {id === "needs-you" ? renderNeedsYou(rows, title) : rows.length > 0 ? renderOwedTable(rows, title) : null}
-                        {renderOwedMore(key, rows.length)}
-                      </Disclosure>
-                    );
-                  })
-                ) : (
-                  <>
-                    {renderOwedTable(visibleOwed)}
-                    {renderOwedMore(owedStatus, visibleOwed.length)}
-                  </>
-                )}
-
-                {closedToday.length > 0 ? (
-                  <Callout
-                    tone="ok"
-                    title={`Closed today · ${closedToday.length}`}
-                    action={
-                      owedStatus === "closed" ? undefined : (
-                        <button
-                          type="button"
-                          className="sm"
-                          onClick={() => {
-                            setOwedStatus("closed");
-                            void loadOwed("closed", false);
-                          }}
-                        >
-                          Show them
-                        </button>
-                      )
-                    }
-                  >
-                    A later capture said these were done, so they were closed.
-                    Reopen one if that was wrong.
-                  </Callout>
-                ) : null}
-                {owedStatus === "closed" && closedToday.length > 0 ? (
-                  <div className="card">
-                    <div className="card-head">Closed today</div>
-                    {closedToday.map((c) => (
-                      <ListRow key={`ct-${c.id}`}>
-                        <span className="grow ellip" title={c.text}>
-                          {c.text}
-                        </span>
-                        <span className="meta">{timeLabel(c.closed_at)}</span>
-                        <button
-                          type="button"
-                          className="sm"
-                          disabled={owedBusyId === c.id}
-                          onClick={() => void owedWrite(c.id, [`--reopen=${c.id}`])}
-                        >
-                          Reopen
-                        </button>
-                      </ListRow>
-                    ))}
-                  </div>
-                ) : null}
-              </>
-            }
-          />
-          </PaneBoundary>
-        </section>
-
-        <section className={panelClass("guides")}>
-          <PaneBoundary key={paneRetryKeys["guides"]} title={PANE_TITLES["guides"]} onRetry={retryActivePane}>
-          <PanelHeader
-            title="Guides"
-            lede="Step-by-step help for setting up Khipu and each tool it works with."
-          />
-          <div className="panel-body wide">
-            <GuidesPage
-              runKhipu={runKhipu}
-              signals={guideSignals}
-              startItems={guideStartItems}
-              setupKnown={{ prefs: guideSignals.prefsLoaded, signals: setupSignalsKnown }}
-              states={guideRowStates}
-              hasT3={t3Health != null}
-              open={guideOpen}
-              onOpen={(id) => openGuide(id)}
-              onBack={() => setGuideOpen(null)}
-              onTarget={openGuideTarget}
-            />
-          </div>
-          </PaneBoundary>
-        </section>
-
-        <section className={panelClass("harnesses")}>
-          <PaneBoundary key={paneRetryKeys["harnesses"]} title={PANE_TITLES["harnesses"]} onRetry={retryActivePane}>
-          <PanelHeader
-            title="Harnesses"
-            lede="Which agents are wired in, and whether each one is actually recording."
-          />
-          <IntegrationsPanel
-            runKhipu={runKhipu}
-            onToast={(m) => setError(m)}
-            active={tab === "harnesses"}
-            liveness={liveness}
-            recallProbe={recallProbe}
-            t3={t3Health}
-            refreshHealth={() => loadDoctor(true)}
-            onSearchT3Captures={openT3Captures}
-            onOpenGuide={(id) => openGuide(id, id === "grok_bot" ? guideSignals.grok.current : undefined)}
-            onAnotherMac={() => {
-              setSettingsSection("another-mac");
-              openOldSettings();
-            }}
-          />
-          </PaneBoundary>
-        </section>
-
-        <section className={`${panelClass("routing")} ac-panel`}>
-          <PaneBoundary key={paneRetryKeys.routing} title={PANE_TITLES.routing} onRetry={retryActivePane}>
-            {tab === "routing" && acctView === "running" ? <RunningNow hook={runningNow} /> : null}
-            {tab === "routing" && acctView === "rules" ? <OrderAndRules active /> : null}
-            {tab === "routing" && acctView === "room" ? (
-              <Accounts
-                routing={routing}
-                plans={plans.data}
-                thisMac={thisMac}
-                onReloadPlans={() => plans.load()}
-                onOpenOlder={() => setTab("routing-old")}
-                running={runningNow}
-              />
-            ) : null}
-          </PaneBoundary>
-        </section>
-
-        <section className={panelClass("routing-old")}>
-          <PaneBoundary key={paneRetryKeys["routing-old"]} title={PANE_TITLES["routing-old"]} onRetry={retryActivePane}>
-          <PanelHeader title="Accounts and routing" lede="Accounts, routing rules, and what needs your attention." />
-          <div className="panel-body wide">
-            {tab === "routing-old" ? <RoutingSettings
-              active
-              plansState={plans}
-              onSetUpAccounts={openAccountsStepInFirstRun}
-              deliveryHealth={(doctorParsed as { routing_delivery?: RouteDeliveryHealth } | null)?.routing_delivery ?? null}
-              deliveryHealthError={doctorReadError}
-              deliveryHealthReadAt={doctorLastOkAt}
-              onRetryDelivery={() => loadDoctor(true)}
-            /> : null}
-          </div>
-          </PaneBoundary>
-        </section>
-
-        <section className={panelClass("settings")}>
-          <PaneBoundary key={paneRetryKeys["settings"]} title={PANE_TITLES["settings"]} onRetry={retryActivePane}>
-          {!oldSettings ? <Settings ctx={settingsCtx} active={tab === "settings"} /> : <>
-          <PanelHeader
-            title="Settings"
-            lede="Capture, models, data and this Mac."
-          />
-          <div className="panel-body wide settings-body">
-            <div className="settings-split">
-              <div className="subnav" role="tablist" aria-label="Settings sections">
-                {SETTINGS_SECTIONS.map(([id, label]) => (
-                  <button
-                    key={id}
-                    type="button"
-                    role="tab"
-                    aria-selected={settingsSection === id}
-                    className={settingsSection === id ? "on" : undefined}
-                    onClick={() => setSettingsSection(id)}
-                  >
-                    {label}
-                    {id === "projects" && projectsWaiting > 0 ? (
-                      <span className="nav-count" aria-label={`${projectsWaiting} waiting for your answer`}>
-                        {projectsWaiting}
-                      </span>
-                    ) : null}
-                  </button>
-                ))}
-              </div>
-
-              <div className="settings-pane">
-                {settingsSection === "look" ? <LookPage /> : null}
-                {settingsSection === "database" ? (
-                  <>
-                    <div className="section-card">
-                      <div className="section-head">Connection</div>
-                      <div className="section-body">
-                        <div className="inline">
-                          <Tag tone={dbReachable === false ? "err" : dbReachable ? "ok" : "neutral"} dot>
-                            {dsnOk === false
-                              ? "Not configured"
-                              : dbReachable === false
-                                ? "Not reachable"
-                                : dbReachable
-                                  ? "Connected"
-                                  : "Not checked"}
-                          </Tag>
-                          <span className="meta">
-                            Stored in the login Keychain (service{" "}
-                            <code>Khipu</code>), never in a file in the repo.
-                          </span>
-                        </div>
-                        <p className="muted">
-                          Khipu's memory lives in one Postgres database. It can be on
-                          this Mac, on another Mac you already set up, or on a server
-                          you run — a cloud VM, a home box, any Postgres with pgvector.
-                          Every Mac that stores the same connection reads and writes
-                          the same memory, so the server is the single source of truth.
-                        </p>
-                        <p className="muted">
-                          Currently stored: database connection{" "}
-                          <strong>
-                            {presenceLabel(secretsPresence, "dsn_in_keychain")}
-                          </strong>
-                          . Harnesses that cannot reach the Keychain read the copy
-                          in the data folder instead.
-                        </p>
-                        <p className="muted">
-                          <strong>Encryption:</strong> prefer{" "}
-                          <code>sslmode=verify-full</code> with{" "}
-                          <code>root.crt</code> in the data folder.
-                        </p>
-                        {secretsPresenceMsg ? (
-                          <p className="muted">{secretsPresenceMsg}</p>
-                        ) : null}
-                        <div className="toolbar">
-                          <button type="button" onClick={() => void refreshDsn(true)}>
-                            <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
-                            Recheck connection
-                          </button>
-                          <button type="button" onClick={openDatabaseStepInFirstRun}>
-                            Connect to a server you run or another Mac…
-                          </button>
-                          <button type="button" onClick={() => setMoveOpen(true)}>
-                            Move this memory to another database…
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                    <Callout title="Changing this is a setup step">
-                      The connection is set during setup, so it is checked and
-                      migrated in one pass rather than saved half-applied.
-                    </Callout>
-                  </>
-                ) : null}
-
-                {settingsSection === "capture" ? (
-                  <>
-                    <p className="set-intro cm-intro">
-                      Khipu saves a short summary of each conversation (a capture) and keeps a list of what
-                      conversations say is still owed (commitments). Here you choose when it saves, which model
-                      writes the summaries, and manages explicitly filed asks.
-                    </p>
-
-                    <CaptureTuningCard
-                      active={tab === "settings" && settingsSection === "capture"}
-                      turns={CAPTURE_MIN_TURNS}
-                      minutes={CAPTURE_MIN_MINUTES}
-                    />
-
-                    <div className="section-card" id="summaries">
-                      <div className="section-head">Session summaries</div>
-                      <div className="section-body">
-                        <p className="set-help" id="synth-help">
-                          Which model writes the summary of each conversation. Search by meaning uses its own model,
-                          set in Embeddings.
-                        </p>
-                        {models.models_error ? (
-                          <Callout tone="err" title="The stored models setting could not be read">
-                            {models.models_error}. Showing defaults; saving is
-                            blocked until it is fixed or cleared.
-                          </Callout>
-                        ) : null}
-
-                        <SynthProviderChoices
-                          row={models.synth}
-                          onChange={(patch) => updateModelRole("synth", patch)}
-                          presence={secretsPresence}
-                          verifyResult={modelCheck.result}
-                          runError={modelCheck.runError}
-                          doctorSynth={
-                            (doctorParsed?.synth_provider as DoctorSynthProvider | undefined) ?? null
-                          }
-                        />
-                        <p className="measured">Measured on 15 real conversations, Oct 13.</p>
-
-                        <div className="toolbar">
-                          <button
-                            type="button"
-                            className="primary"
-                            disabled={modelsSaving || models.models_error != null}
-                            onClick={() => void saveModels()}
-                          >
-                            {modelsSaving ? "Saving…" : "Save models"}
-                          </button>
-                        </div>
-                        {modelsMsg ? <pre className="code">{modelsMsg}</pre> : null}
-
-                        <SynthFallbackField
-                          provider={models.synth.provider}
-                          doctorSynth={
-                            (doctorParsed?.synth_provider as DoctorSynthProvider | undefined) ?? null
-                          }
-                          presence={secretsPresence}
-                          verifyResult={modelCheck.result}
-                          onSaved={onKeySaved}
-                        />
-
-                        <SummariserCalls active={tab === "settings" && settingsSection === "capture"} />
-                      </div>
-                    </div>
-
-                    <KeysCard
-                      active={tab === "settings" && settingsSection === "capture"}
-                      presence={secretsPresence}
-                      presenceError={secretsPresenceMsg}
-                      verify={modelCheck}
-                      onKeySaved={onKeySaved}
-                    />
-
-                    <p className="cm-pointer">
-                      The model for search by meaning has its own section,{" "}
-                      <button type="button" className="link sm" onClick={() => setSettingsSection("index")}>
-                        Embeddings
-                      </button>
-                      .
-                    </p>
-                  </>
-                ) : null}
-
-                {settingsSection === "owner" ? (
-                  <OwnerActions active={tab === "settings" && settingsSection === "owner"} />
-                ) : null}
-
-                {settingsSection === "work" ? (
-                  <WorkSettings
-                    active={tab === "settings" && settingsSection === "work"}
-                    work={work}
-                    projectNames={projects.data}
-                  />
-                ) : null}
-
-                {settingsSection === "projects" ? (
-                  <ProjectsSettings active={tab === "settings" && settingsSection === "projects"} state={projects} />
-                ) : null}
-
-                {settingsSection === "features" ? (
-                  <OptionalFeatures active={tab === "settings" && settingsSection === "features"} />
-                ) : null}
-
-                {settingsSection === "index" ? (
-                  <EmbeddingsPanel active={tab === "settings" && settingsSection === "index"} />
-                ) : null}
-
-                {settingsSection === "data" ? (
-                  <>
-                    <div className="section-card">
-                      <div className="section-head">Data folder</div>
-                      <div className="section-body">
-                        <div className="toolbar">
-                          <input
-                            className="mono"
-                            value={dataDir}
-                            onChange={(e) => setDataDir(e.target.value)}
-                            placeholder="~/.config/khipu"
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") void applyDataDir();
-                            }}
-                          />
-                          <button
-                            type="button"
-                            className="primary"
-                            onClick={() => void applyDataDir()}
-                          >
-                            Set folder
-                          </button>
-                          <button type="button" onClick={() => void loadPaths()}>
-                            <RefreshCw size={14} strokeWidth={1.75} aria-hidden />
-                            Refresh
-                          </button>
-                        </div>
-                        {dataFiles.length > 0 ? (
-                          <>
-                            <div className="rows">
-                              {[...dataFiles]
-                                .sort((a, b) => fileStamp(b) - fileStamp(a))
-                                .slice(
-                                  0,
-                                  dataFilesAll ? undefined : DATA_FILES_SHOWN,
-                                )
-                                .map((f) => (
-                                  <div key={f.path} className="row-item">
-                                    <span className="row-main mono">{f.path}</span>
-                                    <span className="row-meta">{formatBytes(f.bytes)}</span>
-                                  </div>
-                                ))}
-                            </div>
-                            {dataFiles.length > DATA_FILES_SHOWN ? (
-                              <button
-                                type="button"
-                                className="sm link"
-                                onClick={() => setDataFilesAll((v) => !v)}
-                              >
-                                {dataFilesAll
-                                  ? "Show fewer"
-                                  : `Show all (${dataFiles.length})`}
-                              </button>
-                            ) : null}
-                          </>
-                        ) : (
-                          <p className="muted">No local files in the data folder yet.</p>
-                        )}
-                      </div>
-                    </div>
-
-                    <PathOverridesCard active={tab === "settings" && settingsSection === "data"} />
-
-                    <HubAwayCard active={tab === "settings" && settingsSection === "data"} />
-
-                    <div className="section-card">
-                      <div className="section-head">Backup</div>
-                      <div className="section-body">
-                        <p className="muted">
-                          Writes a zip of this Mac's data folder (connection file,
-                          certificates, local state). Paste a destination folder.
-                        </p>
-                        <div className="toolbar">
-                          <input
-                            className="mono"
-                            value={backupOut}
-                            onChange={(e) => setBackupOut(e.target.value)}
-                            placeholder="~/Downloads"
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") void doBackupLocal();
-                            }}
-                          />
-                          <button
-                            type="button"
-                            className="primary"
-                            onClick={() => void doBackupLocal()}
-                          >
-                            Backup
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="section-card">
-                      <div className="section-head">Restore</div>
-                      <div className="section-body">
-                        <p className="muted">
-                          Restores a previous zip or folder into the current data
-                          folder, merging with what is there.
-                        </p>
-                        <div className="toolbar">
-                          <input
-                            className="mono"
-                            value={importSource}
-                            onChange={(e) => setImportSource(e.target.value)}
-                            placeholder="~/Downloads/khipu-local-….zip"
-                            // Deliberately no Enter-to-submit, unlike every other
-                            // input here: this one writes over the current data
-                            // folder, and a stray Return while typing a path
-                            // should not start a restore.
-                          />
-                          <button
-                            type="button"
-                            disabled={!importSource.trim()}
-                            onClick={() => setImportConfirm(true)}
-                          >
-                            Restore…
-                          </button>
-                        </div>
-                        {pathsMsg ? <pre className="code">{pathsMsg}</pre> : null}
-                      </div>
-                    </div>
-                  </>
-                ) : null}
-
-                {settingsSection === "another-mac" ? (
-                  <>
-                  <GatewayUrlCard active={tab === "settings" && settingsSection === "another-mac"} />
+                  <GatewayUrlCard active={tab === "settings"} />
                   <div className="section-card">
                     <div className="section-head">Set up another Mac</div>
                     <div className="section-body">
@@ -6360,156 +1015,178 @@ export default function App() {
                           {advertiseInfo.ipv4 ? ` · LAN ${advertiseInfo.ipv4}` : null}
                         </p>
                       ) : null}
-                      {hubSnapshotHealth?.caught_up_at || hubSnapshotHealth?.refreshed_at ? (
-                        <p className="muted">
-                          Offline copy up to date as of{" "}
-                          <code>{hubSnapshotHealth.caught_up_at || hubSnapshotHealth.refreshed_at}</code>
-                          {typeof (hubSnapshotHealth.size_bytes ?? hubSnapshotHealth.bytes) === "number"
-                            ? ` (${formatBytes(hubSnapshotHealth.size_bytes ?? hubSnapshotHealth.bytes ?? 0)})`
-                            : null}
-                        </p>
-                      ) : null}
                       {setupJoinMsg ? <pre className="code">{setupJoinMsg}</pre> : null}
                     </div>
                   </div>
                   </>
-                ) : null}
+  );
+  const settingsCtx: SettingsCtx = {
+    appVersion,
+    thisMac,
+    runKhipu,
+    onToast: (m) => setError(m),
+    liveness,
+    recallProbe,
+    t3: t3Health,
+    refreshHealth: () => loadDoctor(true),
+    onSearchT3Captures: openT3Captures,
+    onOpenGuide: (id) => openGuide(id, id === "grok_bot" ? guideSignals.grok.current : undefined),
+    synth: models.synth,
+    modelsError: models.models_error,
+    modelsSaving,
+    modelsMsg,
+    onSynthChange: (patch) => updateModelRole("synth", patch),
+    onSaveModels: saveModels,
+    secretsPresence,
+    secretsPresenceMsg,
+    modelCheck,
+    onKeySaved,
+    doctorSynth: (doctorParsed?.synth_provider as DoctorSynthProvider | undefined) ?? null,
+    dsnOk,
+    dbReachable,
+    onMoveMemory: () => setMoveOpen(true),
+    onOpenGuides: () => setTab("guides"),
+    onFeedback: () => setFeedbackOpen(true),
+    onDatabaseStep: openDatabaseStepInFirstRun,
+    onRunSetup: () => setTab("first-run"),
+    anotherMac: anotherMacSection,
+    whatsNew: (
+      <>
+        {noticeCard ? (
+          <WhatsNewCard
+            card={noticeCard}
+            appVersion={appVersion}
+            needsRoutingSetup={needsRoutingSetup}
+            onShow={openNoticeTarget}
+            onClose={() => {
+              writeCardState(null);
+              setNoticeCard(null);
+            }}
+            onSeeAll={() => openSettingsRow("updates")}
+          />
+        ) : null}
+        <WhatsNewHistory appVersion={appVersion} needsRoutingSetup={needsRoutingSetup} onShow={openNoticeTarget} />
+      </>
+    ),
+    openRow: settingsRow,
+  };
 
-                {settingsSection === "components" ? (
-                  <>
-                    <div className="section-card">
-                      <div className="section-head">Components</div>
-                      <div className="section-body">
-                        <p className="muted">
-                          The database upgrades independently of the app.
-                          Versions come from Application Support and the
-                          compatibility matrix.
-                        </p>
-                        <ComponentsPanel active={tab === "settings"} />
-                      </div>
-                    </div>
+  return (
+    <div className="shell sh-window">
+      <Sidebar
+        brand={<BrandMark />}
+        items={places}
+        current={tab}
+        onGo={goTab}
+        settings={settingsItem}
+        macName={thisMac}
+      />
 
-                    <div className="section-card">
-                      <div className="section-head">Memory sources</div>
-                      <div className="section-body">
-                        <p className="muted">
-                          Turning a source off skips it next time; nothing already
-                          in the database is deleted.
-                        </p>
-                        <div className="rows">
-                          {graphSources.map((row) => {
-                            const status = row.enabled ? "On" : "Turned off";
-                            return (
-                              <div key={row.id} className="row-item">
-                                <label className="row-main">
-                                  <input
-                                    type="checkbox"
-                                    checked={Boolean(row.enabled)}
-                                    onChange={(e) =>
-                                      void toggleGraphSource(row.id, e.target.checked)
-                                    }
-                                  />
-                                  <span className="mono">{row.id}</span>
-                                  {row.root ? (
-                                    <span className="muted mono"> {row.root}</span>
-                                  ) : null}
-                                </label>
-                                <span className="row-meta">{status}</span>
-                              </div>
-                            );
-                          })}
-                        </div>
-                        {graphSourcesMsg ? (
-                          <pre className="code">{graphSourcesMsg}</pre>
-                        ) : null}
-                      </div>
-                    </div>
-                  </>
-                ) : null}
-
-                {settingsSection === "updates" ? (
-                  <div className="section-card">
-                    <div className="section-head">Updates</div>
-                    <div className="section-body">
-                      <p className="muted">
-                        Installed version <code>v{appVersion}</code>. Launch checks
-                        for a new release (fail-soft, nothing installs itself); use
-                        this button to download and install. Each build is signed,
-                        and the signature is checked before anything is replaced.
-                      </p>
-                      <div className="toolbar">
-                        <button
-                          type="button"
-                          className="primary"
-                          disabled={updateBusy}
-                          onClick={() => void checkForUpdates()}
-                        >
-                          {updateBusy ? (
-                            <Loader2 size={14} className="spin" aria-hidden />
-                          ) : null}
-                          {updateBusy ? "Checking…" : "Check for updates"}
-                        </button>
-                      </div>
-                      {updateMsg ? <pre className="code">{updateMsg}</pre> : null}
-                    </div>
-                  </div>
-                ) : null}
-                {settingsSection === "updates" ? (
-                  <WhatsNewHistory
-                    appVersion={appVersion}
-                    needsRoutingSetup={needsRoutingSetup}
-                    onShow={openNoticeTarget}
-                  />
-                ) : null}
-
-                {settingsSection === "advanced" ? (
-                  <>
-                    <div className="section-card">
-                      <div className="section-head">This Mac</div>
-                      <div className="section-body">
-                        <div className="toolbar">
-                          <button type="button" onClick={() => setTab("first-run")}>
-                            Run setup again
-                          </button>
-                          <button type="button" onClick={openAccountsStepInFirstRun}>
-                            Set up accounts again
-                          </button>
-                          <button type="button" onClick={() => setTab("revisions")}>
-                            Conflicting edits
-                          </button>
-                          <button type="button" onClick={() => setFeedbackOpen(true)}>
-                            <MessageSquare size={14} aria-hidden />
-                            Send feedback
-                          </button>
-                        </div>
-                        <p className="muted">
-                          Stuck? Open the health report on <strong>Home</strong>, or
-                          email <a href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</a>.
-                          If the health report is red, include it. Khipu leaves keys
-                          and passwords out of it, but read it before you send it.
-                        </p>
-                      </div>
-                    </div>
-
-                    <JobsCard active={tab === "settings" && settingsSection === "advanced"} />
-
-                    <HealthChecksCard
-                      active={tab === "settings" && settingsSection === "advanced"}
-                      diskSpace={doctorParsed?.disk_space as DiskSpace}
-                      onOpenStorageReport={() => setStorageReportOpen(true)}
-                    />
-
-                    <RawJson
-                      text={settingsRawText}
-                      label="Raw configuration"
-                      empty="Nothing read yet."
-                    />
-                  </>
-                ) : null}
-              </div>
-            </div>
+      <main className="main" aria-busy={workingLabel != null}>
+        {tab === "routing" ? (
+          <Toolbar title="Accounts">
+            <ViewSwitch
+              label="Accounts view"
+              options={[
+                { id: "room", label: "Room right now" },
+                { id: "running", label: "Running now" },
+                { id: "rules", label: "Order and rules" },
+              ]}
+              value={acctView}
+              onChange={setAcctView}
+            />
+          </Toolbar>
+        ) : toolbarTitle && tab !== "memory" && tab !== "guides" ? <Toolbar title={toolbarTitle} heading={false} /> : null}
+        <WorkingBanner label={workingLabel} />
+        <div className="main-content">
+        <section className={panelClass("first-run")}>
+          <PaneBoundary key={paneRetryKeys["first-run"]} title={PANE_TITLES["first-run"]} onRetry={retryActivePane}>
+          <div className="panel-body onboard-wrap" data-tauri-drag-region>
+            <Welcome
+              dsnOk={dsnOk}
+              refreshDsn={() => refreshDsn(true)}
+              runKhipu={runKhipu}
+              onFinish={() => {
+                // Finishing setup covers what's new, so record the version.
+                recordVersionOnSetupFinish(appVersion);
+                setTab("home");
+              }}
+              openIntegrations={() => openSettingsRow("apps")}
+              initialStep={welcomeInitialStep}
+              initialStepKey={welcomeInitialStepKey}
+            />
           </div>
-          </>}
+          </PaneBoundary>
+        </section>
+
+        <section className={tab === "home" ? "panel fill today-panel" : "panel is-hidden"}>
+          <PaneBoundary key={paneRetryKeys["home"]} title="Today" onRetry={retryActivePane}>
+            <Today
+              active={tab === "home"}
+              needs={needs}
+              onOpen={(link) => {
+                if (link === "running-now") { setAcctView("running"); setTab("routing"); }
+                else if (link === "accounts") setTab("routing");
+                else if (link === "search") setTab("memory");
+                else setTab("settings");
+              }}
+            />
+          </PaneBoundary>
+        </section>
+
+        <section className={`${panelClass("memory")} fill`}>
+          <PaneBoundary key={paneRetryKeys["memory"]} title={PANE_TITLES["memory"]} onRetry={retryActivePane}>
+            {tab === "memory" ? (
+              <Memory
+                run={runKhipu}
+                onOwedClose={(id) => owedWrite(id, [`--close=${id}`])}
+              />
+            ) : null}
+          </PaneBoundary>
+        </section>
+
+        <section className={panelClass("guides")}>
+          <PaneBoundary key={paneRetryKeys["guides"]} title={PANE_TITLES["guides"]} onRetry={retryActivePane}>
+          <PanelHeader
+            title="Guides"
+            lede="Step-by-step help for setting up Khipu and each tool it works with."
+          />
+          <div className="panel-body wide">
+            <GuidesPage
+              runKhipu={runKhipu}
+              signals={guideSignals}
+              startItems={guideStartItems}
+              setupKnown={{ prefs: guideSignals.prefsLoaded, signals: setupSignalsKnown }}
+              states={guideRowStates}
+              hasT3={t3Health != null}
+              open={guideOpen}
+              onOpen={(id) => openGuide(id)}
+              onBack={() => setGuideOpen(null)}
+              onTarget={openGuideTarget}
+            />
+          </div>
+          </PaneBoundary>
+        </section>
+
+        <section className={`${panelClass("routing")} ac-panel`}>
+          <PaneBoundary key={paneRetryKeys.routing} title={PANE_TITLES.routing} onRetry={retryActivePane}>
+            {tab === "routing" && acctView === "running" ? <RunningNow hook={runningNow} /> : null}
+            {tab === "routing" && acctView === "rules" ? <OrderAndRules active /> : null}
+            {tab === "routing" && acctView === "room" ? (
+              <Accounts
+                routing={routing}
+                plans={plans.data}
+                thisMac={thisMac}
+                onReloadPlans={() => plans.load()}
+                running={runningNow}
+              />
+            ) : null}
+          </PaneBoundary>
+        </section>
+
+        <section className={panelClass("settings")}>
+          <PaneBoundary key={paneRetryKeys["settings"]} title={PANE_TITLES["settings"]} onRetry={retryActivePane}>
+          <Settings ctx={settingsCtx} active={tab === "settings"} />
           </PaneBoundary>
         </section>
         </div>
@@ -6524,201 +1201,12 @@ export default function App() {
         returnFocusRef={feedbackButtonRef}
       />
 
-      <StorageReportDialog
-        open={storageReportOpen}
-        run={runKhipu}
-        onClose={() => setStorageReportOpen(false)}
-      />
-
       <PostUpdateNoticeDialog
         plan={noticeDialog}
         needsRoutingSetup={needsRoutingSetup}
         onShow={openNoticeTarget}
         onDismiss={() => setNoticeDialog(null)}
       />
-
-      {/* Forget — the one destructive write either list makes. */}
-      <Dialog
-        open={forgetTarget != null}
-        className="kit-dialog"
-        ariaLabelledBy="forget-title"
-        onCancel={() => {
-          setForgetError(null);
-          setForgetTarget(null);
-        }}
-      >
-        <div className="kit-dialog-body">
-          <h2 id="forget-title">Forget episode #{forgetTarget}?</h2>
-          <p>
-            It stops appearing in search and recall, and its vectors are
-            deleted. The row itself is kept, so this is not a shred.
-          </p>
-          {forgetError ? <p role="alert">{forgetError}</p> : null}
-          <div className="kit-dialog-actions">
-            <button
-              type="button"
-              onClick={() => {
-                setForgetError(null);
-                setForgetTarget(null);
-              }}
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              className="danger"
-              disabled={actionBusy}
-              onClick={() => void confirmForget()}
-            >
-              <Trash2 size={14} strokeWidth={1.75} aria-hidden />
-              Forget
-            </button>
-          </div>
-        </div>
-      </Dialog>
-
-      {/* Edit summary — `khipu episode edit`, which re-embeds in the same
-          transaction so the correction is findable, not just visible. */}
-      <Dialog
-        open={editOpen}
-        className="kit-dialog"
-        ariaLabelledBy="edit-title"
-        onCancel={() => {
-          setEditOpen(false);
-          setEditTarget(null);
-        }}
-      >
-        <div className="kit-dialog-body">
-          <h2 id="edit-title">Edit summary</h2>
-          <p>
-            This is what search reads. Saving re-indexes the capture straight
-            away.
-          </p>
-          <textarea
-            className="edit-summary"
-            value={editText}
-            onChange={(e) => setEditText(e.target.value)}
-            aria-label="Episode summary"
-          />
-          <div className="kit-dialog-actions">
-            <button
-              type="button"
-              onClick={() => {
-                setEditOpen(false);
-                setEditTarget(null);
-              }}
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              className="primary"
-              disabled={editSaving || !editText.trim()}
-              onClick={() => void saveSummary()}
-            >
-              {editSaving ? (
-                <Loader2 size={14} className="spin" aria-hidden />
-              ) : null}
-              Save
-            </button>
-          </div>
-        </div>
-      </Dialog>
-
-      {/* Manual bulk changes use their fixed-argv command. */}
-      <OwedChangeDialog
-        mode={owedChangeMode}
-        count={owedSelected.size}
-        onCancel={() => setOwedChangeMode(null)}
-        onConfirm={async (reason, to, label) => {
-          const why = await owedChangeMany(
-            owedChangeMode === "move" ? "reassign" : "close",
-            Array.from(owedSelected),
-            reason,
-            to,
-            label,
-          );
-          if (why === null) setOwedChangeMode(null);
-          return why;
-        }}
-      />
-
-      {/* Snooze — `khipu owed --snooze ID --until`. Presets only: the CLI
-          refuses free text rather than silently clearing a due date. */}
-      <Dialog
-        open={snoozeTarget != null}
-        className="kit-dialog"
-        ariaLabelledBy="snooze-title"
-        onCancel={() => setSnoozeTarget(null)}
-      >
-        <div className="kit-dialog-body">
-          <h2 id="snooze-title">Snooze until</h2>
-          <p>{snoozeTarget?.text}</p>
-          <div className="kit-dialog-actions">
-            <button type="button" onClick={() => setSnoozeTarget(null)}>
-              Cancel
-            </button>
-            {(
-              [
-                ["1d", "A day"],
-                ["7d", "A week"],
-                ["2w", "Two weeks"],
-                ["1m", "A month"],
-              ] as const
-            ).map(([value, label]) => (
-              <button
-                key={value}
-                type="button"
-                disabled={owedBusyId != null}
-                onClick={() => {
-                  const target = snoozeTarget;
-                  setSnoozeTarget(null);
-                  if (target) {
-                    void owedWrite(target.id, [
-                      `--snooze=${target.id}`,
-                      `--until=${value}`,
-                    ]).then(() => work.load(true));
-                  }
-                }}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-        </div>
-      </Dialog>
-
-      {/* Restore — writes over the current data folder. */}
-      <Dialog
-        open={importConfirm}
-        className="kit-dialog"
-        ariaLabelledBy="import-title"
-        onCancel={() => setImportConfirm(false)}
-      >
-        <div className="kit-dialog-body">
-          <h2 id="import-title">Restore into the data folder?</h2>
-          <p>
-            Files from <code>{importSource.trim()}</code> are merged into{" "}
-            <code>{dataDir || "the data folder"}</code>. A file with the same
-            name is overwritten, and nothing here undoes that.
-          </p>
-          <div className="kit-dialog-actions">
-            <button type="button" onClick={() => setImportConfirm(false)}>
-              Cancel
-            </button>
-            <button
-              type="button"
-              className="danger"
-              onClick={() => {
-                setImportConfirm(false);
-                void doImportLocal();
-              }}
-            >
-              Restore
-            </button>
-          </div>
-        </div>
-      </Dialog>
 
       {/* Settings › Database › "Move this memory to another database…" —
           docs/plans/2026-09-05-setup-that-cannot-strand-you.md, "Move the
@@ -6870,7 +1358,7 @@ export default function App() {
                       type="button"
                       onClick={() => {
                         resetMoveDialog();
-                        setSettingsSection("another-mac");
+                        openSettingsRow("macs");
                       }}
                     >
                       Open Another Mac…

@@ -42,9 +42,6 @@
   .gd-btn.primary:hover { background: var(--accent-hover); }
 }
 
-/* Rail: Guides sits below Settings, set apart by a divider. */
-.nav-divider { height: 1px; background: var(--border); margin: 0 var(--s2) var(--s2); }
-
 /* Start here */
 .gd-card {
   background: var(--surface);
@@ -169,22 +166,6 @@
 .gd-pop dt { font-weight: 600; }
 .gd-pop dd { margin: 0; color: var(--text-2); }
 .gd-pop-acts { display: flex; gap: var(--s2); margin-top: var(--s3); }
-
-/* First-run hint on Home. */
-.gd-hint {
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  gap: var(--s3);
-  align-items: start;
-  background: var(--accent-soft);
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
-  border-radius: var(--r-md);
-  padding: var(--s3) var(--s4);
-}
-.gd-hint-lead { color: var(--accent-text); margin-top: 2px; }
-.gd-hint b { display: block; }
-.gd-hint p { margin: 2px 0 var(--s2); color: var(--text-2); }
-.gd-hint-row { display: flex; gap: var(--s2); flex-wrap: wrap; align-items: center; }
 
 @media (max-width: 900px) {
   .gd-guide, .gd-list, .gd-checklist, .gd-can { grid-template-columns: minmax(0, 1fr); }

@@ -76,6 +76,12 @@ export const memoryFakes: FakeHandler = (cmd, args, flags) => {
     });
     return { ok: true, results: rows };
   }
+  if (a[0] === "episode" && a[1] === "forget-pending") {
+    // flags.memPending: two forgets made on this Mac that have not reached the shared memory (A11).
+    if (!flags.memPending) return { ok: true, strings: [], ids: [], count: 0 };
+    if (a.includes("--send")) { flags.memPending = false; return { ok: true, pending: 0 }; }
+    return { ok: true, strings: ["k:aa", "h:bb"], ids: [], count: 2 };
+  }
   if (a[0] === "episode" && a[1] === "forget") {
     gone.add(Number(a[2]));
     return { ok: true, soft_deleted: true, partial: [], snapshot: { ok: true }, legacy_file: { ok: true } };

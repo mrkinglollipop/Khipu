@@ -223,3 +223,21 @@
   .ac-doit { align-items: stretch; }
   .ac-ahead-row { flex-direction: column; align-items: flex-start; }
 }
+
+/* A11: what moved here from the older Accounts screen. */
+.ac-more { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+.ac-more h3 { margin: 0; font-size: 15px; }
+.ac-more-item { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.ac-more-item p, .ac-more-item ul { margin: 0; }
+.ac-more-item ul { padding-left: 18px; }
+.ac-more-confirm { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); }
+.ac-note { color: var(--muted); font-size: var(--t-md); }
+.ac-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.ac-btn.danger { color: var(--err); border-color: var(--err); }
+.ac-finder { display: flex; flex-direction: column; gap: 10px; margin: 24px 12px 12px; padding-top: 16px; border-top: 1px solid var(--border); }
+.ac-finder h2 { margin: 0; font-size: 15px; }
+.ac-finder-more summary { cursor: pointer; color: var(--accent-text); }
+.ac-finder-more[open] summary { margin-bottom: 8px; }
+/* The finder's found rows were drawn for a wide page; in the list pane they stack. */
+.ac-finder .aa-found { grid-template-columns: minmax(0, 1fr); row-gap: 8px; align-items: start; }
+.ac-finder .aa-found .aa-btns { justify-content: flex-start; }
