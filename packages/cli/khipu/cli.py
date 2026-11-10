@@ -4372,6 +4372,14 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
             out["job_state"] = {"ok": True}
         except Exception as exc:  # noqa: BLE001 — no timer stage starves the next
             out["job_state"] = timer_error(exc)
+        # This Mac's own status row for "Your Macs". A hub that is down or an older hub without the table is a
+        # note in the receipt, never a failure of the timer.
+        try:
+            from khipu import macs
+
+            out["mac_status"] = macs.publish()
+        except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
+            out["mac_status"] = timer_error(exc)
         # The routing copy between Macs must not depend on a prompt helper
         # being alive. Last, so a slow hub cannot delay the stages above.
         try:
@@ -5142,6 +5150,14 @@ def build_parser() -> argparse.ArgumentParser:
     hf = sub.add_parser("health", help="The five checks the app shows, as plain rows (a view over doctor)")
     hf.add_argument("--json", action="store_true", help="Print JSON (the only form)")
     hf.set_defaults(func=lambda args: __import__("khipu.health_five", fromlist=["cmd_health"]).cmd_health(args))
+
+    mc = sub.add_parser("macs", help="One status row per Mac, shared through the hub (this Mac live, the others as last reported)")
+    mc.add_argument("--json", action="store_true", help="Print JSON (the only form)")
+    mc.set_defaults(func=lambda args: __import__("khipu.macs", fromlist=["cmd_macs"]).cmd_macs(args))
+
+    rn = sub.add_parser("running", help="Which jobs are running, on which Mac, and which have gone quiet (this Mac live, the other as last reported)")
+    rn.add_argument("--json", action="store_true", help="Print JSON (the only form)")
+    rn.set_defaults(func=lambda args: __import__("khipu.running_now", fromlist=["cmd_running"]).cmd_running(args))
 
     ny = sub.add_parser("needs-you", help="Everything waiting on the owner, in the app and MCP's own words")
     ny.add_argument("--json", action="store_true", help="Print the complete structured answer")

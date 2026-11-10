@@ -33,7 +33,7 @@ def doc(**over) -> dict:
 def test_shape_and_healthy_example():
     d = doc()
     assert list(d) == ["checked_at", "mac", "headline", "areas", "jobs_running", "silent_runners", "free_gb",
-                       "last_backup_at", "agent_note"]
+                       "last_backup_at", "macs", "agent_note"]
     assert d["headline"] == "Everything is working."
     assert [a["name"] for a in d["areas"]] == list(doctor_summary.AREAS)
     assert all(set(a) == {"key", "name", "state", "line", "khipu_doing", "you_do", "link"} for a in d["areas"])

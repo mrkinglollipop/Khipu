@@ -10,7 +10,6 @@ them): it reads whether this Mac's routing record exists and was folded recently
 """
 from __future__ import annotations
 
-import socket
 from datetime import datetime, timedelta, timezone
 
 from khipu.doctor_summary import AREAS, OTHER, WORDS, failing_keyed
@@ -79,17 +78,10 @@ def _iso(moment: datetime) -> str:
 
 
 def mac_label() -> str:
-    """The name the owner gave this Mac, else its host name."""
-    try:
-        from khipu import routing
+    """The name the owner gave this Mac, else its host name (one helper, in ``macs``)."""
+    from khipu import macs
 
-        names = routing.settings().get("routing_mac_names") or {}
-        given = names.get(routing._local_mac())
-        if isinstance(given, str) and given.strip():
-            return given.strip()
-    except Exception:  # noqa: BLE001 - a label is never worth failing the report
-        pass
-    return socket.gethostname().split(".")[0] or "This Mac"
+    return macs.mac_label()
 
 
 def _routing_problem(report: dict, now: datetime) -> tuple[str, str, str] | None:
@@ -140,8 +132,31 @@ def _last_backup_at(report: dict, now: datetime) -> str | None:
     return _iso(now - timedelta(seconds=age)) if isinstance(age, (int, float)) else None
 
 
-def build(report: dict, *, now: datetime | None = None, mac: str | None = None, why: str = "") -> dict:
-    """The health document for one doctor report (an empty report means the checks could not run)."""
+def _with_other_macs(rows: list[dict], notes: list[str], peers: dict | None, mac: str) -> list[dict]:
+    """Say, on the Routing row, whether each other Mac that reported in the last 15 minutes holds the same routing
+    version as this one. A Mac with no row, an old row or a row from an older build adds nothing (this Mac only).
+    Returns the short ``macs`` list: this Mac, then the others, each with when it last reported."""
+    if not peers:
+        return []
+    mine = peers.get("routing_version")
+    shown = [{"name": mac, "this_mac": True, "seen_at": peers.get("checked_at"), "stale": False}]
+    for other in peers.get("others") or []:
+        name = other.get("name") or "Your other Mac"
+        shown.append({"name": name, "this_mac": False, "seen_at": other.get("seen_at"), "stale": bool(other.get("stale"))})
+        theirs = (other.get("health") or {}).get("routing_version")
+        if other.get("stale") or not mine or not theirs:
+            continue
+        same = theirs == mine
+        rows[2]["line"] = f"{rows[2]['line']} {name} holds " + ("the same routing version." if same else "a different routing version right now.")
+        if not same:
+            notes.append(f"[{AREAS[2]}] routing version {mine} here, {theirs} on {name}")
+    return shown
+
+
+def build(report: dict, *, now: datetime | None = None, mac: str | None = None, why: str = "",
+          peers: dict | None = None) -> dict:
+    """The health document for one doctor report (an empty report means the checks could not run).
+    ``peers`` is ``{"routing_version", "others": [macs.others() entries]}``; without it the document is this Mac's alone."""
     now = now or datetime.now(timezone.utc)
     mac = mac or mac_label()
     ran = bool(report)
@@ -178,10 +193,13 @@ def build(report: dict, *, now: datetime | None = None, mac: str | None = None, 
             rows[i]["you_do"] = " ".join(dict.fromkeys(y for _s, _l, _d, y in items if y != NOTHING)) or NOTHING
     else:
         notes.append("doctor produced no report, so no check ran" + (f": {why}" if why else ""))
+    if peers and ran:
+        peers = dict(peers, checked_at=_iso(now))
     running = _jobs_running(report) if ran else None
     if ran and not problems[4]:
         rows[4]["line"] = ("No job is running." if not running else
                            f"{running} job{'s are' if running != 1 else ' is'} running.")
+    others = _with_other_macs(rows, notes, peers if ran else None, mac)
     lead = next((r for s in ("err", "warn", "unknown") for r in rows if r["state"] == s), None)
     headline = ("Everything is working." if lead is None
                 else f"{lead['name']}: {lead['line']} {lead['khipu_doing']}".strip())
@@ -193,7 +211,7 @@ def build(report: dict, *, now: datetime | None = None, mac: str | None = None, 
     return {"checked_at": _iso(now), "mac": mac, "headline": headline, "areas": rows,
             "jobs_running": running, "silent_runners": silent,
             "free_gb": _free_gb(report) if ran else None,
-            "last_backup_at": _last_backup_at(report, now) if ran else None, "agent_note": note}
+            "last_backup_at": _last_backup_at(report, now) if ran else None, "macs": others, "agent_note": note}
 
 
 def run_doctor() -> tuple[dict, str]:
@@ -218,6 +236,18 @@ def run_doctor() -> tuple[dict, str]:
 def cmd_health(args) -> int:
     import json
 
+    from khipu import macs
+
     report, why = run_doctor()
-    print(json.dumps(build(report, why=why), indent=2, ensure_ascii=False))
+    try:
+        rest, _how = macs.others()
+        peers = {"routing_version": macs.routing_version(), "others": rest}
+    except Exception:  # noqa: BLE001 - the other Mac's row is never worth failing the report
+        peers = None
+    doc = build(report, why=why, peers=peers)
+    print(json.dumps(doc, indent=2, ensure_ascii=False))
+    if report:
+        # Tell the hub how this Mac is, after the report is out; a write that fails changes nothing above.
+        macs.publish(macs.local_row(doc, share=True))
+        macs.remember_health(doc)
     return 0
