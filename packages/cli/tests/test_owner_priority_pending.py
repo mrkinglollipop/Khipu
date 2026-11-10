@@ -255,7 +255,7 @@ def test_a_priority_write_answers_with_a_short_receipt(world):
     _owner_priority()
     routing.amend_priority("Claude", role="x " * 900, via="app", expect=routing.priority_version())
     _be(world, OTHER)
-    shown = mcp_server._tool_route({})
+    shown = mcp_server._tool_route({"full": True})
     out = mcp_server._tool_route_priority({"account": "Codex", "exception": "release work", "until": FAR,
                                            "owner_request": "release work for Codex",
                                            "base": shown["priority_owner_revision"],
@@ -274,7 +274,7 @@ def test_a_priority_write_answers_with_a_short_receipt(world):
 def test_a_since_read_showing_the_priority_counts_as_shown(world):
     _owner_priority()
     _be(world, OTHER)
-    start = mcp_server._tool_route({})["version"]
+    start = mcp_server._tool_route({"full": True})["version"]
     routing.amend_priority("Claude", append="and docs", via="app", expect=routing.priority_version())
     # Not shown yet: a request on the new revision is refused.
     revision = routing.read_view()["priority_owner_revision"]
@@ -293,7 +293,7 @@ def test_a_since_read_showing_the_priority_counts_as_shown(world):
 def test_a_since_read_without_the_priority_records_nothing(world):
     _owner_priority()
     _be(world, OTHER)
-    mcp_server._tool_route({})
+    mcp_server._tool_route({"full": True})
     routing.amend_priority("Claude", append="and docs", via="app", expect=routing.priority_version())
     after = routing.read_view()["version"]
     revision = routing.read_view()["priority_owner_revision"]

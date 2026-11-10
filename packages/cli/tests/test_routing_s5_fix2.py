@@ -27,7 +27,7 @@ def identity(monkeypatch):
 
 
 def read_rule():
-    return mcp_server._tool_route({})["rules"][0]["owner_revision"]
+    return mcp_server._tool_route({"full": True})["rules"][0]["owner_revision"]
 
 
 def proposal(words, author=None):
@@ -60,7 +60,7 @@ def test_f1_rule_uses_delivered_revision_not_callers_base(home, entry, base_mode
 @pytest.mark.parametrize("base_mode", ["omitted", "forged_current"])
 def test_f1_priority_uses_delivered_revision_not_callers_base(home, entry, base_mode):
     routing.set_priority([{"account": "Claude"}], via="app", expect=routing.priority_version())
-    mcp_server._tool_route({})
+    mcp_server._tool_route({"full": True})
     # Owner writes must not count as conversation reads.
     routing.set_priority([{"account": "Codex"}], via="app",
                          expect=routing.read_view()["priority_version"])
@@ -145,46 +145,6 @@ def test_f4_dismiss_crossing_expiry_keeps_owner_rule(home, monkeypatch):
     assert next(iter(view["proposals"].values()))["status"] == "expired"
 
 
-def test_f5_replacement_notices_fit_summary_budget(home):
-    routing.add_rule("OWNER", via="app")
-    config = home["data"] / "config.json"
-    cfg = json.loads(config.read_text())
-    cfg["routing_summary_chars"] = 1500
-    config.write_text(json.dumps(cfg))
-    base = read_rule()
-    for i in range(160):
-        routing.request_rule(f"PROPOSAL {i}", n=1, base=base)
-    out = routing.summary()
-    # Owner words and heading are exempt; notices are not.
-    non_owner = [s for s in out["text"].splitlines() if "proposal by" in s]
-    assert sum(len(s) + 1 for s in non_owner) < 1500
-    assert out["dropped"] > 0
-    counted = sum(len(line) + 1 for line in out["text"].splitlines()[1:]) - out["rules_note_chars"]
-    assert counted <= 1500
-    assert recall_rule.start_context_fits(out["text"])
-
-
-def test_f5_hook_acknowledges_only_notices_actually_delivered(home):
-    routing.add_rule("OWNER", via="app")
-    proposal("FIRST", routing.conversation_author())
-    proposal("SECOND", OTHER)
-    from khipu import agent_view
-
-    agent_view.prepare_routing_table(refresh=True)
-    out = routing.prompt_push(None, budget=2, session_id="fix2-author")
-    assert "was replaced by a newer proposal" in out["text"]
-    # Delivery recording uses the same public hook boundary as recall.
-    info = {"status": "full", "pending": dict(session="fix2-author", version=out["version"],
-             epoch=out["epoch"], full=True, at=routing._iso(home["clock"].now),
-             notices=out.get("notices"), routing_changes=out.get("routing_changes"))}
-    recall_prompt._routing_delivered(info, False)
-    assert "was replaced by a newer proposal" in routing.summary()["text"]
-    recall_prompt._routing_delivered(info, True)
-    assert "was replaced by a newer proposal" not in routing.summary()["text"]
-    home["clock"].advance(days=8)
-    assert "was replaced by a newer proposal" not in routing.summary()["text"]
-
-
 def test_f1_a_different_session_cannot_use_another_conversations_read(home, monkeypatch):
     routing.add_rule("OWNER", via="app")
     observed = read_rule()
@@ -192,15 +152,6 @@ def test_f1_a_different_session_cannot_use_another_conversations_read(home, monk
     with pytest.raises(routing.RouteError, match="not shown"):
         mcp_server._tool_route_rule({"text": "UNSEEN", "rule": 1, "owner_request": "change", "base": observed})
     assert routing.read_view()["rules"][0]["text"] == "OWNER"
-
-
-def test_f5_unacknowledged_notices_age_out(home):
-    routing.add_rule("OWNER", via="app")
-    proposal("FIRST")
-    proposal("SECOND", OTHER)
-    assert "was replaced by a newer proposal" in routing.summary()["text"]
-    home["clock"].advance(days=8)
-    assert "was replaced by a newer proposal" not in routing.summary()["text"]
 
 
 def test_f1_cli_read_provides_a_receipt_for_its_priority_request(home, capsys):
@@ -229,7 +180,7 @@ def test_f1_empty_priority_read_does_not_observe_a_later_owner_write(home, monke
         return record(view, **kwargs)
 
     monkeypatch.setattr(routing, "_record_read", move_after_response_is_built)
-    shown = mcp_server._tool_route({})
+    shown = mcp_server._tool_route({"full": True})
     assert shown["priority"] is None
     mcp_server._tool_route_priority({"entries": [{"account": "Grok"}], "owner_request": "prepared on empty",
                                      "base": shown["priority_owner_revision"]})

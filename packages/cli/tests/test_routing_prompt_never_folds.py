@@ -160,8 +160,8 @@ def test_an_old_view_with_an_owner_change_behind_it_says_routing_is_updating(hom
     home[0] = T0 + timedelta(seconds=600)
     _owner_note(home[0])
     out = _push(kick=lambda why: None)
-    assert "Routing is updating" in (out.get("text") or "")
-    assert "arrives with the next prompt" in out["text"]
+    # The page the prompt has is older than the owner's change: it says so.
+    assert "the record may have moved since" in (out.get("text") or "")
 
 
 def test_an_old_view_with_no_owner_change_behind_it_says_nothing(home):
@@ -190,6 +190,9 @@ def test_no_usable_view_folds_inline(home, folds, damage):
         path.unlink()
     else:
         path.write_text(path.read_text().replace('"version"', '"versio_"', 1))
+    from khipu import routing_page_file
+
+    routing_page_file.path().unlink()  # and no page yet: the prompt has nothing else to read
     before = len(folds)
     kicks: list[str] = []
     out = _push(kick=kicks.append)
@@ -201,19 +204,23 @@ def test_no_usable_view_folds_inline(home, folds, damage):
 
 
 def test_an_owner_change_written_mid_prompt_is_delivered_on_the_next_prompt(home):
+    from khipu import routing_delivery, routing_page_file
+
     seen = _record()
-    marker = _marker(seen, home)
-    saved = routing.view_file().read_bytes()
-    routing.set_note("Codex first for builds today", via="app")  # the owner writes while the prompt is reading
+    delivered = _push(session_id="s-mid")
+    assert routing_delivery.acknowledge("s-mid", delivered["routing_changes"], take=True)
+    saved, page = routing.view_file().read_bytes(), routing_page_file.path().read_bytes()
+    routing.add_rule("Codex first for builds today.", via="app")  # the owner writes while the prompt is reading
     routing.view_file().write_bytes(saved)  # ... and its refold has not landed yet
+    routing_page_file.path().write_bytes(page)
     kicks: list[str] = []
-    first = _push(dict(marker), kick=kicks.append)
+    first = _push(session_id="s-mid", kick=kicks.append)
     assert kicks == ["inputs"]
-    assert first["kind"] == "none" and first["version"] == seen["version"]  # the saved view, nothing newer yet
+    assert first["kind"] == "none" and first["version"] == seen["version"]  # the saved page, nothing newer yet
     routing.refold_in_background()  # the child's refold, after its answer
-    second = _push(dict(marker), kick=kicks.append)
-    assert kicks == ["inputs"]  # the view is current now
-    assert second["kind"] == "changes" and "Codex first for builds today" in second["text"]
+    second = _push(session_id="s-mid", kick=kicks.append)
+    assert kicks == ["inputs"]  # the page is current now
+    assert second.get("routing_changes") and "Codex first for builds today." in second["text"]
 
 
 # ---- 5. only one refold at a time --------------------------------------------------------

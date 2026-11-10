@@ -256,7 +256,7 @@ def test_stop_with_the_defaults_leaves_no_row(mac, capsys):
     view = routing.read_view()
     assert _entry(view, client) is None
     assert [e["label"] for e in view["priority"]["entries"]] == ["Codex"]
-    assert "Claude client" not in routing.light_status(start=True)["text"]
+    assert "Claude client" not in routing.light_status()["text"]
     doctor = routing.doctor_block()
     assert "Claude client" not in json.dumps(doctor["accounts"]) + json.dumps(doctor["warnings"])
     assert "Claude client: no longer tracked" in _latest_lines(view)

@@ -168,9 +168,8 @@ def test_partial_report_never_reaches_any_non_owner_surface(replay, monkeypatch)
             break
         pages.append(page)
         assert routing_delivery.acknowledge("synthetic-child", page["routing_changes"], now=replay.now)
-    assert pages
     outputs["child"] = [start, pages, routing_delivery.snapshot("synthetic-child", "agent:synthetic")]
-    error, outputs["mcp"] = replay.call(session_id="synthetic-mcp")
+    error, outputs["mcp"] = replay.call(session_id="synthetic-mcp", full=True)
     assert not error and outputs["mcp"]["accounts"]
     outputs["replication"] = routing.replication_payload(
         [dict(e, reported=planted) for e in routing._read_all_events()[0]], bindings={})

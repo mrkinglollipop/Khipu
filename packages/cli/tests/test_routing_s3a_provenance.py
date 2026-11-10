@@ -152,7 +152,6 @@ def test_track_records_provenance_and_pins_id(mac, via, label, source):
         assert accounts.status()["accounts"][0]["naming_hint"] == routing.account_identity.NAME_ACCOUNT
         assert routing.conversation_view()["accounts"][0]["naming_hint"] == routing.account_identity.NAME_ACCOUNT
         assert usage.public_row({"harness": "claude", "home": "~/.claude-work"})["naming_hint"] == routing.account_identity.NAME_ACCOUNT
-        assert routing.account_identity.NAME_ACCOUNT in routing.summary()["text"]
     else:
         assert ident == "claude:work"
     before = routing.events_file().read_bytes(), (mac.data / "config.json").read_bytes()

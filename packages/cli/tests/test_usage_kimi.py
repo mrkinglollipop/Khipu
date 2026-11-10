@@ -294,7 +294,7 @@ def test_a_passed_reset_is_checked_by_khipu_not_called_untracked(replay, kimi, m
     replay.advance(2 * 3600)
     entry = next(e for e in replay.view()["accounts"] if e["key"] == "kimi:main")
     assert entry["configured"] is True
-    assert routing._NOT_CONFIGURED not in routing.summary(now=replay.now)["text"]
+    assert routing._NOT_CONFIGURED not in routing.light_status(now=replay.now)["text"]
     reply["usages"]["limit_5h"] = {"used_ratio": 0.05, "reset_time": routing._iso(T0 + timedelta(hours=6))}
     _reply(kimi, reply)
     out = routing.check_account("kimi:main", now=replay.now, in_child=True, load=lambda: 0.0)

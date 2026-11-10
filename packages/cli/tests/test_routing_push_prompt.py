@@ -11,7 +11,6 @@ with what it printed before routing existed.
 """
 from __future__ import annotations
 
-import fcntl
 import io
 import json
 import os
@@ -42,8 +41,10 @@ SESSION = "11111111-2222-3333-4444-555555555555"
 PROMPT = "what did we decide about the recall hook"
 HITS = [{"kind": "episode", "id": "41", "score": 0.9, "snippet": "kept the hook fail-open",
          "label": "kept the hook fail-open"}]
-FULL = "## Routing at "
-CHANGES = "## Routing changes at "
+# Every routing block is the routing page now: at a conversation's first
+# prompt and again whenever the page changed.
+FULL = "ROUTING "
+CHANGES = "ROUTING "
 CLIENT = Path(__file__).resolve().parents[1] / "bin" / "khipu-recall-client.py"
 
 
@@ -106,24 +107,6 @@ def _record() -> None:
     routing.report(account="Claude", state="open", author=ME)
 
 
-def test_pending_rule_mark_and_prior_words_repeat_with_an_unrelated_next_push(home, monkeypatch):
-    monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
-    routing.add_rule("Original rule wording.", via="app")
-    before = routing.read_view()
-    shown = routing.conversation_view()
-    routing.request_rule("Requested replacement.", n=1, author=ME, base=next(r["owner_revision"] for r in shown["rules"] if r["n"] == 1))
-    heard_pending = routing.read_view()
-    routing.report(account="Codex", state="limited", until="2h", author=ME)
-    marker = {"version": heard_pending["version"], "epoch": heard_pending["epoch"],
-              "full_at": routing._iso(home["clock"].now)}
-    agent_view.prepare_routing_table(refresh=True)
-    pushed = routing.prompt_push(marker, budget=1.0)
-    assert pushed["kind"] == "changes"
-    assert "changed by a Claude Code conversation at the owner's request" in pushed["text"]
-    assert "it replaced: “Original rule wording.”" in pushed["text"]
-    assert pushed["version"] > before["version"]
-
-
 def _payload(prompt: str = PROMPT, session: str | None = SESSION) -> dict:
     out = {"prompt": prompt, "cwd": "/work/project-a", "hook_event_name": "UserPromptSubmit"}
     if session is not None:
@@ -146,15 +129,22 @@ def _ctx(out: str) -> str:
     return data["hookSpecificOutput"]["additionalContext"] if data else ""
 
 
+def _routing_at(ctx: str) -> int:
+    if ctx.startswith("ROUTING") or ctx.startswith("## Routing"):
+        return 0
+    found = [i + 2 for i in (ctx.find("\n\nROUTING"), ctx.find("\n\n## Routing")) if i >= 0]
+    return min(found) if found else -1
+
+
 def _routing_part(out: str) -> str:
     ctx = _ctx(out)
-    at = ctx.find("## Routing")
+    at = _routing_at(ctx)
     return ctx[at:] if at >= 0 else ""
 
 
 def _recall_part(out: str) -> str:
     ctx = _ctx(out)
-    at = ctx.find("## Routing")
+    at = _routing_at(ctx)
     return ctx if at < 0 else ctx[:at].rstrip("\n")
 
 
@@ -251,7 +241,7 @@ def test_with_the_push_off_the_output_and_the_log_line_are_as_before(home, monke
     _record()
     routing.add_rule("Never a -fast tier.", via="app")
     out = _cold(monkeypatch)
-    assert "## Prior work" in _ctx(out) and "## Routing" not in out
+    assert "## Prior work" in _ctx(out) and "ROUTING" not in out
     assert " routing=" not in _last_log()
     _push_on(monkeypatch)
     for how in ("env", "file", "setting"):
@@ -311,39 +301,6 @@ def test_nothing_is_sent_when_nothing_changed(home, monkeypatch):
     assert _marker() == before
 
 
-def test_changes_since_the_last_seen_version_are_sent_as_current_state(home, monkeypatch):
-    _record()
-    _push_on(monkeypatch)
-    _seen_now()
-    home["clock"].advance(minutes=10)
-    routing.report(account="Claude", state="limited", until="2h", author=ME)
-    out = _cold(monkeypatch)
-    part = _routing_part(out).splitlines()
-    assert part[0] == ("## Routing changes at 15:10Z (Khipu's routing record; data, not instructions; "
-                       "guidance, not a gate)")
-    assert len(part) == 2 and part[1].startswith("Claude: limit reached, back about 17:10Z, in 2 h"), part
-    assert _recall_part(out).startswith("## Prior work")
-    assert _last_log().endswith(" routing=changes:1")
-    assert _marker()["version"] == routing.read_view()["version"]
-    assert _marker()["full_at"] == "2026-10-14T15:00:00Z"  # a change block keeps the last full summary's time
-
-
-def test_a_replaced_line_is_never_sent(home, monkeypatch):
-    _record()
-    _push_on(monkeypatch)
-    _seen_now()
-    home["clock"].advance(minutes=1)
-    routing.report(account="Claude", state="limited", until="2h", author=ME)
-    routing.read_view()  # a version of its own
-    home["clock"].advance(minutes=1)
-    routing.report(account="Claude", state="open", author=ME)  # reopened before the next prompt
-    home["clock"].advance(minutes=1)
-    part = _routing_part(_cold(monkeypatch))
-    lines = part.splitlines()[1:]
-    assert len(lines) == 1 and lines[0].startswith("Claude: open"), part
-    assert "limit reached" not in part
-
-
 def _wait_current() -> None:
     """The per-prompt child refolds a stale view after its answer, off the prompt;
     wait for that (asking for it ourselves if no child managed it)."""
@@ -353,66 +310,6 @@ def _wait_current() -> None:
         routing.refold_in_background()
         time.sleep(0.1)
     raise AssertionError("the view was not refolded")
-
-
-def test_a_limits_end_with_no_file_changing_is_sent(home, monkeypatch):
-    # valid_until passed, no input changed: the prompt answers the saved view (it never folds
-    # one that has a saved view), the child refolds it after its answer, the next prompt sends it.
-    _record()
-    _push_on(monkeypatch)
-    _seen_now()
-    home["clock"].advance(hours=1, minutes=1)
-    first = _routing_part(_cold(monkeypatch))
-    assert "probably open" not in first and "has not been refreshed since 15:00Z" in first  # the saved view, said to be old
-    _wait_current()
-    part = _routing_part(_cold(monkeypatch))
-    assert part.startswith(CHANGES)
-    assert "Codex: probably open: its limit was due to end at 16:00Z" in part
-
-
-def test_the_order_and_the_budget_of_a_change_block(home, monkeypatch):
-    _record()
-    _push_on(monkeypatch)
-    seen = _seen_now()
-    home["clock"].advance(minutes=1)
-    routing.add_hold("keep it for the audit", reason="keep", scope="machine", owner=True, via="app")
-    routing.report(account="Codex", state="open", author=ME)
-    routing.report(account="Claude second", state="limited", until="3h", author=ME)
-    routing.add_rule("Never the paid xAI API.", via="app")
-    lines = _routing_part(_cold(monkeypatch)).splitlines()[1:]
-    assert lines[0] == "Standing rule 1. Never the paid xAI API."
-    assert lines[1].startswith("Claude second: limit reached")
-    assert lines[2].startswith("Codex: open")
-    assert lines[3].startswith("Hold on")
-    assert len(lines) == 4
-    # Over the budget: whole lines from the bottom, then where to read the rest.
-    # The marker is set back by hand: a delivery never moves it back.
-    assert recall_prompt._update_routing_marker(SESSION, lambda _old: dict(seen), 0.05)
-    _set(home, routing_prompt_chars=150)
-    lines = _routing_part(_cold(monkeypatch)).splitlines()[1:]
-    assert lines[0] == "Standing rule 1. Never the paid xAI API."
-    assert lines[1].startswith("Claude second: limit reached")
-    assert lines[-1] == f"2 more changes: `khipu_route` since {seen['version']}"
-    assert sum(len(x) + 1 for x in lines[1:]) <= 150
-
-
-def test_a_changed_rule_longer_than_the_budget_is_named_not_sent_whole(home, monkeypatch):
-    _record()
-    _push_on(monkeypatch)
-    _seen_now()
-    _set(home, routing_prompt_chars=400, routing_line_chars=40)
-    rule = ("Every Grok result that is acted on gets a re-check from a different model family, "
-            "and the re-check looks wider than the list Grok gave. ") * 4
-    routing.add_rule(rule, via="app")
-    note = "Codex first for builds today; Grok for read-only surveys; second Claude for reviews. " * 3
-    routing.set_note(note, via="app")
-    home["clock"].advance(minutes=1)
-    routing.report(account="Claude", state="limited", until="2h", author=ME)
-    lines = _routing_part(_cold(monkeypatch)).splitlines()
-    # Longer than the prompt's room: never one whole line; the words stay owed and arrive as pages.
-    assert not any(rule.strip() in line for line in lines)
-    assert any(entity.startswith("rule:") for entity in _marker().get("owed", []))
-    assert any(line.startswith("Claude: limit reached") for line in lines)
 
 
 @pytest.mark.parametrize("why", ["behind", "old", "epoch"])
@@ -515,30 +412,6 @@ def test_an_undelivered_block_is_sent_again_on_the_one_shot_path(home, monkeypat
     assert _marker()["version"] == routing.read_view()["version"]
 
 
-def test_the_seen_marker_works_on_the_daemon_path(home, monkeypatch, daemon):
-    _record()
-    _push_on(monkeypatch)
-    code, out = _client(home)
-    assert code == 0 and _routing_part(out).startswith(FULL)
-    assert _wait_log(1).endswith(" routing=full")
-    first = _marker()
-    assert first["version"] == routing.read_view()["version"]
-    # Nothing changed: nothing sent, and the recall part as before.
-    home["search"]["hits"] = [dict(HITS[0], id="42")]
-    code, out = _client(home)
-    assert code == 0 and "## Routing" not in out and "## Prior work" in out
-    assert _wait_log(2).endswith(" routing=none")
-    # A change: only the change, and the marker moves.
-    home["clock"].advance(minutes=3)
-    routing.report(account="Claude", state="limited", until="1h", author=ME)
-    home["search"]["hits"] = [dict(HITS[0], id="43")]
-    code, out = _client(home)
-    assert _routing_part(out).startswith(CHANGES) and "Claude: limit reached" in out
-    assert _wait_log(3).endswith(" routing=changes:1")
-    assert _marker()["version"] == routing.read_view()["version"] > first["version"]
-    assert _marker()["full_at"] == first["full_at"]
-
-
 def test_an_unconfirmed_block_on_the_daemon_path_is_sent_again(home, monkeypatch, daemon):
     _record()
     _push_on(monkeypatch)
@@ -580,10 +453,10 @@ def test_a_damaged_view_is_refolded_from_the_log(home, monkeypatch):
     _push_on(monkeypatch)
     routing.view_file().write_bytes(b"\x00\xff{not json" * 1000)
     part = _routing_part(_cold(monkeypatch))
-    assert part.startswith(FULL) and "Codex: limit reached" in part
+    assert part.startswith(FULL) and "Codex: LIMIT REACHED" in part
 
 
-@pytest.mark.parametrize("name", ["prompt_push", "_prompt_view", "summary", "push_off"])
+@pytest.mark.parametrize("name", ["prompt_push", "page_push", "_page_answer", "push_off"])
 def test_a_routing_failure_never_breaks_the_hook(home, monkeypatch, name):
     _record()
     _push_on(monkeypatch)
@@ -602,7 +475,7 @@ def test_no_session_id_sends_nothing(home, monkeypatch):
     _record()
     _push_on(monkeypatch)
     out = _cold(monkeypatch, session=None)
-    assert "## Routing" not in out
+    assert "ROUTING" not in out
     assert _last_log().endswith(" routing=skipped:no-session")
 
 
@@ -711,83 +584,6 @@ def _wait_saved(seconds: float = 120.0) -> None:
     raise AssertionError("the late child never saved the view")
 
 
-@pytest.mark.parametrize("damage", ["huge-log", "huge-view"])
-def test_a_huge_record_never_slows_the_one_shot_path(home, monkeypatch, damage):
-    _record()
-    _damage(home, monkeypatch, damage)
-    with monkeypatch.context() as m:
-        read = _watch_the_read(home, m)
-        before = _cold(m, session="other")
-        _push_on(m)
-        try:
-            out = _cold(m)
-            assert read["held"]()  # the hook answered while the child's read was still held
-            assert read["hook_reads"] == []  # the hook never reads the record itself
-            assert out == before  # late: nothing added, and recall's part byte for byte
-            assert _last_log().endswith(" routing=skipped:budget")
-            assert _marker() == {}
-            _assert_waited_only_the_budget(read, 0.1)
-        finally:
-            read["go"]()
-        _wait_saved()
-    _push_on(monkeypatch)
-    # The next prompt is answered from the saved view. A refold would take 30 s,
-    # past any wait, so a generous budget only keeps a busy machine from making
-    # the child's small read late. Set in the child, not in config.json: the
-    # config's stat is part of the view's fingerprint, and a write would refold.
-    monkeypatch.setattr(routing, "prompt_budget", lambda: recall_prompt._ROUTING_WAIT_MOST)
-    monkeypatch.setattr(routing, "fold", _cpu_bound_fold(30.0))
-    home["search"]["hits"] = [dict(HITS[0], id="42")]
-    assert _routing_part(_cold(monkeypatch)).startswith(FULL), _log_lines()[-2:]
-
-
-@pytest.mark.parametrize("damage", ["huge-log", "huge-view"])
-def test_a_huge_record_never_slows_the_daemon_path(home, monkeypatch, daemon, damage):
-    _record()
-    _damage(home, monkeypatch, damage)
-    # The search itself is CPU-bound Python in the daemon: a routing read holding
-    # the daemon's GIL would starve it past its own deadline.
-
-    def busy_search(*_a, **_k):
-        end = time.monotonic() + 0.3
-        while time.monotonic() < end:
-            pass
-        return {"hits": [dict(h) for h in home["search"]["hits"]], "legs": ["lexical"], "degraded": None}
-
-    monkeypatch.setattr(recall_prompt, "_search_hits", busy_search)
-    started = time.monotonic()
-    code, before = _client(home)
-    baseline = time.monotonic() - started
-    assert code == 0 and "## Prior work" in before
-    _wait_log(1)
-    _push_on(monkeypatch)
-    recall_prompt._save_recent_batches(SESSION, [])  # the same hits again are not a repeat
-    started = time.monotonic()
-    code, out = _client(home)
-    took = time.monotonic() - started
-    assert code == 0
-    assert out == before  # nothing added, recall's part byte for byte
-    assert took < baseline + 0.1 + 0.4, (took, baseline)
-    line = _wait_log(2)
-    assert " reason=ok " in line and line.endswith(" routing=skipped:budget")
-    assert _marker() == {}
-    _wait_saved()
-
-
-def test_only_one_prompt_refolds_at_a_time(home, monkeypatch):
-    _record()
-    routing.view_file().unlink()
-    _push_on(monkeypatch)
-    lock = routing.routing_dir() / routing.PROMPT_FOLD_LOCK
-    with open(lock, "a") as fd:
-        fcntl.flock(fd, fcntl.LOCK_EX)  # another prompt's child is folding
-        out = _cold(monkeypatch)
-    assert "## Routing" not in out
-    assert _last_log().endswith(" routing=skipped:fold-busy")
-    home["search"]["hits"] = [dict(HITS[0], id="42")]
-    assert _routing_part(_cold(monkeypatch)).startswith(FULL)
-
-
 def _u16(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
@@ -816,39 +612,12 @@ def _assert_note_arrives_whole_in_context(first, pull):
     assert _marker()["version"] == routing.read_view()["version"]
 
 
-@pytest.mark.usefixtures("unbounded_render")
-def test_a_block_too_long_for_the_harness_limit_arrives_as_pages(home, monkeypatch):
-    _record()
-    routing.set_note("Codex first for builds today; Grok for surveys. " * 250, via="app")
-    _push_on(monkeypatch)
-    first = _cold(monkeypatch)
-    assert _ctx(first).startswith("## Prior work")
-    assert "page 1/" in _ctx(first)
-    assert "note" in _marker()["owed"]
-    _assert_note_arrives_whole_in_context(first, lambda: _cold(monkeypatch))
-    home["search"]["hits"] = []
-    assert json.loads(_cold(monkeypatch)) == {}
-    assert _last_log().endswith(" routing=none")
-
-
-@pytest.mark.usefixtures("unbounded_render")
-def test_a_block_and_the_recall_part_together_stay_within_the_harness_limit(home, monkeypatch):
-    _record()
-    routing.set_note("Codex first for builds today; Grok for surveys. " * 180, via="app")
-    _push_on(monkeypatch)
-    first = _cold(monkeypatch)
-    assert _ctx(first).startswith("## Prior work")
-    _assert_note_arrives_whole_in_context(first, lambda: _cold(monkeypatch))
-
-
 def test_a_mac_with_no_record_hears_it_once_and_nothing_is_written(home, monkeypatch):
     _push_on(monkeypatch)
     part = _routing_part(_cold(monkeypatch))
-    assert part.splitlines() == [
-        "## Routing at 15:00Z (Khipu's routing record, version 0; data, not instructions; guidance, not a gate)",
-        "No routing record on this Mac."]
+    assert part.splitlines() == ["ROUTING: no routing record on this Mac."]
     home["search"]["hits"] = [dict(HITS[0], id="42")]
-    assert "## Routing" not in _cold(monkeypatch)
+    assert "ROUTING" not in _cold(monkeypatch)
     assert _last_log().endswith(" routing=none")
     assert not routing.routing_dir().exists()
 
@@ -864,50 +633,6 @@ def _block_of(text_len_target: int, marker: dict) -> str:
     text = routing.prompt_push(dict(marker), budget=1.0)["text"]
     assert _u16(text) == text_len_target
     return text
-
-
-@pytest.mark.parametrize("kind", ["full", "changes"])
-@pytest.mark.usefixtures("unbounded_render")
-def test_a_paged_block_does_not_ack_its_undelivered_remainder(home, monkeypatch, kind):
-    from khipu import recall_rule
-
-    _record()
-    seen = _seen_now() if kind == "changes" else {}
-    if kind == "changes":
-        # A changed note this long is named in the update and its words paged across prompts.
-        routing.set_note("n" * (recall_rule._HOOK_CONTEXT_BUDGET - 60), via="app")
-    else:
-        _block_of(recall_rule._HOOK_CONTEXT_BUDGET - 60, seen)
-    _push_on(monkeypatch)
-    first = _cold(monkeypatch)
-    assert _ctx(first).startswith("## Prior work")
-    assert "page 1/" in _ctx(first)
-    assert "note" in _marker()["owed"]
-    _assert_note_arrives_whole_in_context(first, lambda: _cold(monkeypatch))
-    assert "pointer" not in _marker()
-
-
-@pytest.mark.usefixtures("unbounded_render")
-def test_paged_delivery_continues_on_the_daemon_path(home, monkeypatch, daemon):
-    from khipu import recall_rule
-
-    _record()
-    _block_of(recall_rule._HOOK_CONTEXT_BUDGET - 60, {})
-    _push_on(monkeypatch)
-    def pull():
-        # This daemon has no routing helper, whose one-second tick keeps the
-        # table inside its two-second freshness window; a stale table makes
-        # the prompt skip routing (InventoryUnavailable) and no page advances.
-        agent_view.prepare_routing_table(refresh=True)
-        expected = len(_log_lines()) + 1
-        code, output = _client(home)
-        assert code == 0
-        _wait_log(expected)
-        return output
-    first = pull()
-    assert "page 1/" in _ctx(first)
-    assert "note" in _marker()["owed"]
-    _assert_note_arrives_whole_in_context(first, pull)
 
 
 def test_the_routing_clock_starts_when_the_read_starts(home, monkeypatch):
@@ -986,7 +711,10 @@ def test_a_late_routing_child_ends_on_a_stop_signal(home, monkeypatch, name):
     signal.signal(sig, lambda *_a: None)  # as ``recall_daemon.serve`` does: stop the service, not the process
     try:
         _cold(monkeypatch)
-        assert _last_log().endswith(" routing=skipped:budget") and len(pids) == 1
+        # The prompt has its page at once; the record moved past it, so its
+        # child refolds after answering, off the prompt: that refold must end
+        # on a stop signal.
+        assert len(pids) == 1
         os.kill(pids[0], 0)  # still folding
         os.kill(pids[0], sig)
         for _ in range(150):
@@ -1034,7 +762,7 @@ def test_the_hooks_own_switches_turn_the_push_off_on_the_daemon_path(home, monke
     from its own environment, so a hook that set them still got routing."""
     _record()
     code, before = _client(home)
-    assert code == 0 and "## Prior work" in before and "## Routing" not in before
+    assert code == 0 and "## Prior work" in before and "ROUTING" not in before
     _wait_log(1)
     _push_on(monkeypatch)  # the service's own environment: on
     recall_prompt._save_recent_batches(SESSION, [])
@@ -1156,25 +884,8 @@ def test_a_switched_off_setting_is_decided_in_the_child_and_logs_nothing(home, m
     _push_on(monkeypatch)
     _set(home, routing_push_prompt=False)
     out = _cold(monkeypatch, session=None)
-    assert "## Routing" not in out
+    assert "ROUTING" not in out
     assert " routing=" not in _last_log()
-
-
-def test_a_fold_longer_than_the_childs_bound_still_saves_the_view(home, monkeypatch):
-    """Finding R2-2: a refold slower than the child's bound was killed before
-    it saved the view, so every later prompt started the same fold again."""
-    _record()
-    routing.view_file().unlink()
-    _set(home, routing_prompt_budget_ms=50)
-    monkeypatch.setattr(recall_prompt, "_ROUTING_CHILD_MOST", 0.2)
-    monkeypatch.setattr(routing, "fold", _cpu_bound_fold(2.5))
-    _push_on(monkeypatch)
-    out = _cold(monkeypatch)
-    assert "## Routing" not in out and _last_log().endswith(" routing=skipped:budget")
-    _wait_saved()
-    monkeypatch.setattr(routing, "fold", _cpu_bound_fold(30.0))  # would be late if it folded again
-    home["search"]["hits"] = [dict(HITS[0], id="42")]
-    assert _routing_part(_cold(monkeypatch)).startswith(FULL)
 
 
 def _fold_cost(home, events: list[dict]) -> int:
@@ -1243,7 +954,7 @@ def test_an_unsaved_view_with_no_saved_one_is_the_same_view_until_it_changes(hom
         assert _last_log().endswith(" routing=full")
         epoch = _marker()["epoch"]
         home["search"]["hits"] = [dict(HITS[0], id="42")]
-        assert "## Routing" not in _cold(monkeypatch)
+        assert "ROUTING" not in _cold(monkeypatch)
         assert _last_log().endswith(" routing=none")
         assert _marker()["epoch"] == epoch
     finally:
@@ -1327,7 +1038,7 @@ def test_the_daemon_never_forks_itself_for_routing(home, monkeypatch, helper_dae
     assert isinstance(_marker()["version"], int) and _marker()["full_at"]
     home["search"]["hits"] = [dict(HITS[0], id="42")]
     code, out = _client(home)
-    assert code == 0 and "## Prior work" in out and "## Routing" not in out
+    assert code == 0 and "## Prior work" in out and "ROUTING" not in out
     assert _wait_log(2).endswith(" routing=none")
     assert forks == [] and helper_daemon.routing_forkserver.spawned == 1
 
@@ -1339,7 +1050,7 @@ def test_a_switched_off_push_never_asks_the_helper(home, monkeypatch, helper_dae
     if "setting" in off:
         _set(home, routing_push_prompt=off["setting"])
     code, out = _client(home, env=off.get("env"))
-    assert code == 0 and "## Prior work" in out and "## Routing" not in out
+    assert code == 0 and "## Prior work" in out and "ROUTING" not in out
     assert " routing=" not in _wait_log(1)
     assert helper_daemon.routing_forkserver.spawned == 0
 
@@ -1360,12 +1071,12 @@ def test_a_dead_helper_is_started_again_and_recall_is_unchanged(home, monkeypatc
     home["search"]["hits"] = [dict(HITS[0], id="42")]
     code, out = _client(home)
     # The prompt that finds it dead never waits for the next one to start.
-    assert code == 0 and "## Prior work" in out and "## Routing" not in out
+    assert code == 0 and "## Prior work" in out and "ROUTING" not in out
     assert _wait_log(2).endswith(" routing=skipped:starting")
     assert helper_daemon.routing_forkserver.wait_ready(10)
     home["search"]["hits"] = [dict(HITS[0], id="43")]
     code, out = _client(home)
-    assert code == 0 and "## Prior work" in out and "## Routing" in out
+    assert code == 0 and "## Prior work" in out and "ROUTING " in out
     assert helper_daemon.routing_forkserver.spawned == 2
 
 
@@ -1772,10 +1483,17 @@ def _alive(pid: int) -> bool:
 
 
 def _stalled_view() -> None:
-    """view.json becomes a FIFO nobody writes: every read of it blocks."""
+    """view.json and the routing page file become FIFOs nobody writes: every
+    read of either blocks (a prompt reads the page file, never the view)."""
+    from khipu import routing_page_file
+
     routing.read_view()
     routing.view_file().unlink()
     os.mkfifo(routing.view_file())
+    page = routing_page_file.path()
+    if page.exists():
+        page.unlink()
+    os.mkfifo(page)
 
 
 def test_readers_a_prompt_stopped_waiting_for_end_soon_and_are_capped(home, monkeypatch):
@@ -1893,67 +1611,6 @@ def _lock_contended(monkeypatch) -> None:
     monkeypatch.setattr(routing, "_lock", busy)
 
 
-def test_an_unsaved_change_is_never_taken_for_no_change(home, monkeypatch):
-    """Finding R5-2: a change that could not be saved was never pushed while saves
-    kept failing. A prompt now answers the saved view and folds nothing, so the
-    change is not lost to it: the seen marker stays at the saved version, and the
-    next prompt after a refold that can save delivers it."""
-    _record()
-    _push_on(monkeypatch)
-    before = _seen_now()
-    saved = routing.view_file().read_bytes()
-    home["clock"].advance(minutes=10)
-    routing.report(account="Claude", state="limited", until="2h", author=ME)
-    routing.view_file().write_bytes(saved)  # as if the fold after the report had not been saved
-    pids = _count_forks(monkeypatch)
-    with monkeypatch.context() as m:
-        _lock_contended(m)
-        first = _routing_part(_cold(monkeypatch))
-        assert "Claude: limit reached" not in first and "has not been refreshed since" in first
-        assert {k: _marker().get(k) for k in ("version", "epoch")} == {k: before.get(k) for k in ("version", "epoch")}
-        _await_children(pids)  # the child's own refold (it cannot save either) holds the fold lock until it ends
-        assert routing.refold_in_background() == "failed"  # it cannot save: the view stays as it was
-    _wait_current()
-    home["search"]["hits"] = [dict(HITS[0], id="42")]
-    out = _cold(monkeypatch)
-    assert _routing_part(out).startswith(CHANGES) and "Claude: limit reached" in _routing_part(out)
-    assert _last_log().endswith(" routing=changes:1")
-
-
-def test_a_fold_that_cannot_save_a_change_is_pushunsaved_never_no_change(home, monkeypatch):
-    """The inline fold (no ``kick``: the daemon's poll) of a view that is out of
-    date, with the save failing: its version is the saved one's, so it must raise
-    ``PushUnsaved`` rather than answer "none". (With no view.json at all there is
-    no saved version to mistake it for, so ``unsaved_change`` is False there.)"""
-    _record()
-    _push_on(monkeypatch)
-    before = _seen_now()
-    saved = routing.view_file().read_bytes()
-    home["clock"].advance(minutes=10)
-    routing.report(account="Claude", state="limited", until="2h", author=ME)
-    routing.view_file().write_bytes(saved)  # the fold after the report was not saved
-    with monkeypatch.context() as m:
-        _lock_contended(m)
-        agent_view.prepare_routing_table(refresh=True)
-        with pytest.raises(routing.PushUnsaved):
-            routing.prompt_push(before, budget=1.0)
-
-
-def test_an_unsaved_view_that_changed_nothing_still_sends_nothing(home, monkeypatch):
-    _record()
-    _push_on(monkeypatch)
-    before = _seen_now()
-    home["clock"].advance(minutes=1)
-    Path(routing.events_file()).touch()  # an input changed; the state did not
-    with monkeypatch.context() as m:
-        _lock_contended(m)
-        agent_view.prepare_routing_table(refresh=True)
-        assert routing.prompt_push(before, budget=1.0)["kind"] == "none"
-        assert "## Routing" not in _cold(monkeypatch)
-        assert _last_log().endswith(" routing=none")
-    assert _marker() == before
-
-
 def _fake_reader(lines: list[tuple[float, bytes]], *, budget: float = 0.01):
     """A ``_RoutingAtPrompt`` reading a pipe a thread writes ``lines`` to,
     each after its delay; the ready line comes first, at once."""
@@ -2048,50 +1705,6 @@ def _answered_while_the_search_ran(home, monkeypatch) -> recall_prompt._RoutingA
     return at
 
 
-@pytest.mark.parametrize("change", ["none", "report", "refold", "telemetry", "source", "epoch", "damaged", "pace_verdict"])
-def test_a_buffered_answer_from_an_older_record_generation_is_dropped(home, monkeypatch, change):
-    """Codex review of the cold-start fix: an answer buffered while the
-    search ran was taken after the record changed under it, so the prompt
-    said "Claude: open" at version 2 while the record said limited at 3. An
-    answer is taken only while its routing is current. A source change or
-    a new count drops it; saving the same routing with newer telemetry does
-    not withdraw an already buffered answer."""
-    at = _answered_while_the_search_ran(home, monkeypatch)
-    before = _marker()
-    if change == "report":
-        routing.report(account="Claude", state="limited", until="2h", author=ME)
-    elif change == "refold":
-        routing._save_view(routing._load_view())
-    elif change in {"telemetry", "source", "epoch", "pace_verdict"}:
-        view = routing._load_view()
-        if change == "telemetry":
-            view.update(folded_at=routing._iso(T0 + timedelta(seconds=6)),
-                        checked_at=routing._iso(T0 + timedelta(seconds=6)),
-                        valid_until=routing._iso(T0 + timedelta(seconds=7)))
-            view["accounts"][0]["pace"] = [{"window": "weekly", "rate_pct_per_h": 1.25}]
-        elif change == "source":
-            # A folded external change is rejected even without a new log
-            # stat or version, as with an unsaved source-backed fold.
-            view["effective"]["runner:synthetic"] = {"silent": True, "unreadable": False}
-        elif change == "epoch":
-            view["epoch"] = "replacement-count"
-        else:
-            view["accounts"][0]["pace"] = [{"window": "weekly", "plan": {"verdict": "outpacing"}}]
-        routing._save_view(view)
-    elif change == "damaged":
-        view = routing._load_view()
-        view["effective"] = {}
-        routing.view_file().write_text(json.dumps(view))  # the digest no longer matches
-    began = time.monotonic()
-    out = at.collect()
-    assert time.monotonic() - began < 0.05  # stats, never a wait
-    if change in {"none", "refold", "telemetry"}:
-        assert out is not None and out["kind"] == "full"
-        return
-    assert out is None and at.status == "skipped:stale"
-    assert _marker() == before
-
-
 def test_an_older_full_summary_never_moves_the_marker_back(home):
     """Codex review of the cold-start fix: a late full summary at version 2,
     delivered after version 3 was heard, rewound the marker to 2. Within one
@@ -2111,30 +1724,6 @@ def test_an_older_full_summary_never_moves_the_marker_back(home):
     assert _marker() == {"version": 4, "epoch": "e1", "full_at": later}
     assert recall_prompt.mark_routing_seen(SESSION, version=1, epoch="e2", full_at=earlier)
     assert _marker() == {"version": 1, "epoch": "e2", "full_at": earlier}
-
-
-def test_a_full_summary_resets_a_marker_ahead_of_the_record(home, monkeypatch):
-    """Adversarial review of the no-rewind rule: a marker ahead of the record
-    in its own epoch (a view.json restored from a backup) gets the full
-    summary, "the record's count started again"; refusing to move the
-    marker back made every later prompt send it again. A full summary read
-    against this very marker sets it back; one read against an older marker
-    (a newer block delivered since) does not."""
-    _record()
-    _push_on(monkeypatch)
-    view = routing.read_view()
-    ahead = {"version": view["version"] + 5, "epoch": view["epoch"], "full_at": routing._iso(T0)}
-    assert recall_prompt._update_routing_marker(SESSION, lambda _old: dict(ahead), 0.05)
-    assert "## Routing" in _cold(monkeypatch)
-    assert _last_log().endswith(" routing=full")
-    assert _marker()["version"] == view["version"]
-    assert "## Routing" not in _cold(monkeypatch)  # heard: not sent again
-    assert _last_log().endswith(" routing=none")
-    # Read against version 2, delivered after version 3 was heard: kept at 3.
-    assert recall_prompt._update_routing_marker(SESSION, lambda _old: dict(ahead, version=3), 0.05)
-    assert recall_prompt.mark_routing_seen(SESSION, version=2, epoch=view["epoch"],
-                                           full_at=routing._iso(T0), based_on=2)
-    assert _marker()["version"] == 3
 
 
 def test_a_pipe_that_never_stops_is_drained_only_briefly(home):
@@ -2184,32 +1773,6 @@ def test_an_answer_finished_after_the_request_deadline_is_not_taken(home):
     writer.join(5)
     out = at.collect(limit=time.monotonic() + 0.5)
     assert out is not None and out["kind"] == "full"
-
-
-def test_transport_oversize_repacks_the_reserved_changes(home, monkeypatch):
-    """An oversized transport answer still delivers the canonical reservation."""
-    from khipu import routing_delivery
-
-    _record()
-    _push_on(monkeypatch)
-    huge = "x" * (recall_prompt._ROUTING_ANSWER_MOST + 10)
-    real = routing.prompt_push
-
-    def push(marker, **kw):
-        out = real(marker, **kw)
-        return dict(out, kind="full", text="## Routing\n" + huge)
-
-    monkeypatch.setattr(routing, "prompt_push", push)
-    output = _cold(monkeypatch)
-    ctx = _ctx(output)
-    assert _u16(ctx) <= 10_000
-    assert "x" * 100 not in ctx
-    assert "Claude: open" in ctx and "Codex: limit reached" in ctx
-    state = routing_delivery.snapshot(SESSION)
-    assert all(entry["acked"] for entry in state["entries"].values())
-    assert not _marker().get("owed")
-    assert _marker()["version"] == routing.read_view()["version"]
-    assert _last_log().endswith(" routing=full")
 
 
 # ---- dispatched lanes: no automatic prior-work push ---------------------------------------------

@@ -171,7 +171,7 @@ def test_a_page_file_khipu_did_not_write_is_not_read(home):
 def test_a_prompt_reads_the_page_file_and_never_folds_or_reads_the_view(home, monkeypatch):
     _record()
     page = routing_page_file.read()
-    for name in ("fold", "_load_view", "read_view", "_prompt_view", "_inputs", "_light_inputs", "summary"):
+    for name in ("fold", "_load_view", "read_view", "_prompt_view", "_inputs", "_light_inputs"):
         monkeypatch.setattr(routing, name, _boom)
     kicks: list[str] = []
     out = _push(kick=kicks.append)

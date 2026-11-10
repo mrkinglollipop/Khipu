@@ -140,8 +140,8 @@ def test_adapter_metadata_never_reaches_agents(owner, monkeypatch):
     assert payload["warnings"] and _leaks(payload, owner) == []
     err, routed = call("khipu_route")
     assert not err and _leaks(routed, owner) == []
-    assert _leaks(routing.summary(), owner) == []
-    assert _leaks(routing.light_status(start=True), owner) == []
+    assert _leaks(_start_page(), owner) == []
+    assert _leaks(routing.light_status(), owner) == []
     assert _leaks(routing.prompt_push(None, budget=5), owner) == []
 
 
@@ -312,7 +312,7 @@ def test_a_cached_note_naming_the_user_is_not_passed_on(owner):
 def test_routing_report_evidence_names_the_account_by_its_id(owner):
     routing.conversation_write({"state": "limited", "account": "Work", "until": "1h",
                                 "evidence": f"Login failed at {owner['login']}"}, author={"harness": "claude-code"})
-    err, out = call("khipu_route")
+    err, out = call("khipu_route", full=True)
     assert not err and _leaks(out, owner) == []
     ident = routing.account_id(usage._key(owner["account"]))
     assert f"Login failed at {ident}" in json.dumps(out)
@@ -326,21 +326,26 @@ def test_the_owners_note_reaches_agents_as_written(owner, capsys):
     routing.conversation_write({"state": "limited", "account": "Work", "until": "1h",
                                 "evidence": f"Login failed at {owner['login']} for /{USER}"},
                                author={"harness": "claude-code"})
-    err, out = call("khipu_route")
+    # The note is in the full record, whole; the routing page every reader
+    # is handed carries the owner's rules, not his note, and leaks nothing.
+    err, out = call("khipu_route", full=True)
     assert not err and text in json.dumps(out)
     assert _leaks(out, owner, allow=text) == []
-    assert cli.main(["route", "--summary"]) == 0
+    assert cli.main(["route", "--summary"]) == 0  # the page, as every reader gets it
     stdout = capsys.readouterr().out
-    assert text in stdout and _leaks(stdout, owner, allow=text) == []
-    start = routing.light_status(start=True)
+    assert stdout.startswith("ROUTING ") and _leaks(stdout, owner) == []
+    start = _start_page()
     prompt = routing.prompt_push(None, budget=5)
-    assert text in start["text"] and text in prompt["text"]
-    assert _leaks(start, owner, allow=text) == [] and _leaks(prompt, owner, allow=text) == []
+    def body(page):  # the page below its first line, which carries the time it was rendered
+        return page.split("\n", 1)[1]
+
+    assert start["text"].startswith("ROUTING ") and body(prompt["text"]) == body(start["text"])
+    assert _leaks(start, owner) == [] and _leaks(prompt, owner) == []
     light = ms._tool_status_light({"prompt": "review local routing"})
-    assert text in light["routing"]["text"]
+    assert body(light["routing"]["text"]) == body(start["text"])
     err, status = call("khipu_status", prompt="review local routing")
-    assert not err and text in status["routing"]["text"]
-    assert _leaks(status, owner, allow=text) == []
+    assert not err and body(status["routing"]["text"]) == body(start["text"])
+    assert _leaks(status, owner) == []
 
 
 def test_a_filesystem_error_in_a_tool_is_said_in_fixed_words(owner, monkeypatch):
@@ -460,8 +465,9 @@ def test_every_agent_surface_is_clean(owner, monkeypatch, tmp_path, capsys):
                                          evidence=f"Login failed at {owner['login']} (~/.{NAME}) for /{USER}")
     outputs["khipu_route"] = call("khipu_route")
     outputs["khipu_route since"] = call("khipu_route", since="0")
-    outputs["summary"] = routing.summary()
-    outputs["start push"] = routing.light_status(start=True)
+    outputs["khipu_route full"] = call("khipu_route", full=True)
+    outputs["start push"] = _start_page()
+    outputs["khipu_status routing"] = routing.light_status()
     outputs["prompt push"] = routing.prompt_push(None, budget=5)
     assert cli.main(["route", "--summary"]) == 0
     outputs["route --summary"] = capsys.readouterr().out
@@ -706,10 +712,15 @@ def _seed(home, accounts, user: str):
     usage._save_cache(rows)
 
 
+def _start_page() -> dict:
+    """What a conversation or a subagent is handed at its start, whatever the push switches say."""
+    return routing._start_page(routing.read_view(), routing._now())
+
+
 def _agent_surfaces(capsys) -> dict:
     out = {"khipu_usage": call("khipu_usage")[1], "khipu_route": call("khipu_route")[1],
-           "summary": routing.summary(), "start push": routing.light_status(start=True),
-           "prompt push": routing.prompt_push(None, budget=5)}
+           "khipu_route full": call("khipu_route", full=True)[1], "start push": _start_page(),
+           "khipu_status routing": routing.light_status(), "prompt push": routing.prompt_push(None, budget=5)}
     payload: dict = {}
     ms._attach_plan_warnings(payload)
     out["khipu_status warnings"] = payload
@@ -746,9 +757,9 @@ def test_an_invalid_entry_never_shows_any_part_of_its_path(tmp_path, monkeypatch
 
 def test_an_ended_note_is_no_longer_kept(owner, monkeypatch):
     routing.set_note(owner["login"], via="app")
-    assert owner["login"] in json.dumps(call("khipu_route")[1])
+    assert owner["login"] in json.dumps(call("khipu_route", full=True)[1])
     routing.end_note(via="app")
-    call("khipu_route")
+    call("khipu_route", full=True)
 
     def fail(**_kw):
         raise ValueError(f"Provider failed at {owner['login']}")

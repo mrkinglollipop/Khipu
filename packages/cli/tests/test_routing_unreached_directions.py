@@ -97,10 +97,12 @@ def test_owner_local_directions_never_reach_other_surfaces(directions, monkeypat
                 break
             pages.append(page)
             assert routing_delivery.acknowledge("synthetic-recipient", page["routing_changes"], now=directions.now)
-        assert start and start["text"] and pages
+        # The page went whole at the start; a tool result gets it again only
+        # when it changes, so ``pages`` may well be empty.
+        assert start and start["text"]
         output = [start, pages, routing_delivery.snapshot("synthetic-recipient", "agent:synthetic")]
     elif surface == "mcp":
-        error, output = directions.call(session_id="synthetic-recipient")
+        error, output = directions.call(session_id="synthetic-recipient", full=True)
         assert not error and output["accounts"]
     elif surface == "replication":
         events = routing._read_all_events()[0]

@@ -158,7 +158,9 @@ def _deliver(session: str, out: dict) -> None:
     assert recall_prompt._routing_delivered(info, True)
 
 
-def test_every_conversation_gets_the_receipt_first_and_whole_until_delivered(plain):
+def test_every_conversation_gets_the_applied_change_once_until_delivered(plain):
+    # The page carries the change itself (Codex PAUSED); the receipt with its
+    # undo is in the full record and Settings, not on the page.
     others = ["s-other-a", "s-other-b"]
     view = routing.read_view()
     for s in [OWNER, *others]:
@@ -167,14 +169,13 @@ def test_every_conversation_gets_the_receipt_first_and_whole_until_delivered(pla
     _say(plain)
     ok, out = owner_act.act("route.pause", {"account": "Codex", "until": "6h"})
     assert ok, out
-    (receipt,) = routing.recent_receipts(routing.read_view(), routing._now())
+    assert routing.recent_receipts(routing.read_view(), routing._now())
     for session in [OWNER, *others]:
         pushed = _push(session)
-        lines = pushed["text"].split("\n")
-        assert lines[1] == receipt["text"], (session, pushed["text"])
+        assert "Codex: PAUSED until" in pushed["text"], (session, pushed["text"])
         _deliver(session, pushed)
         again = _push(session)
-        assert receipt["text"] not in (again.get("text") or ""), (session, again)
+        assert not again.get("text"), (session, again)
 
 
 def test_the_receipt_comes_from_the_folded_view_not_the_owner_actions_log(plain, monkeypatch):
@@ -234,7 +235,7 @@ def test_a_handoff_or_job_marker_keeps_the_request_pending(plain, monkeypatch):
 
 def test_a_crossed_request_is_never_applied(plain):
     routing.add_rule("OWNER words", via="app")
-    base = mcp_server._tool_route({})["rules"][0]["owner_revision"]
+    base = mcp_server._tool_route({"full": True})["rules"][0]["owner_revision"]
     routing.edit_rule(1, "OWNER moved on", via="app")
     _say(plain)
     out = mcp_server._tool_route_rule({"text": "stale edit", "rule": 1, "owner_request": "y", "base": base})
@@ -334,7 +335,7 @@ def test_undo_reverts_exactly_one_change_and_is_receipted(plain):
 def test_undo_of_an_instant_rule_request_takes_the_rule_back(plain):
     routing.add_rule("Original rule", via="app")
     _say(plain)
-    base = mcp_server._tool_route({})["rules"][0]["owner_revision"]
+    base = mcp_server._tool_route({"full": True})["rules"][0]["owner_revision"]
     out = mcp_server._tool_route_rule({"text": "Directed edit", "rule": 1, "owner_request": "Matt said so", "base": base})
     assert out["applied"] is True and routing.read_view()["rules"][0]["text"] == "Directed edit"
     ok, undone = owner_act.act("direction.undo", {"id": out["instant"]["owner_action"]})

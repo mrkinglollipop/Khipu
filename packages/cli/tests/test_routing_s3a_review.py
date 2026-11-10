@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import pytest
 from khipu import routing, accounts, config, usage, mcp_server
+from tests.routing_page_text import page_text
 
 T0 = datetime(2026, 10, 20, 14, tzinfo=timezone.utc)
 AUTHOR = {"kind": "conversation", "harness": "codex", "project": "synthetic", "session": "s1"}
@@ -257,23 +258,26 @@ def test_owner_move_preserves_id_alias_and_pause(mac):
     assert next(a for a in routing.read_view(now=mac.clock["now"])["accounts"] if a["key"] == new_key)["state"] == "paused"
 
 
-@pytest.mark.parametrize("first_reader", ["account_id", "summary"])
+@pytest.mark.parametrize("first_reader", ["account_id", "page"])
 @pytest.mark.parametrize("issued_alias", [False, True])
 def test_historical_identity_is_independent_of_reader_order(mac, first_reader, issued_alias):
     _setup(mac, [{"label": "Grok", "harness": "grok"}])
     key = "codex|/synthetic/old-login"
+    # An old build issued the alias before this one ever ran. The pause's
+    # fold writes the routing page, which reads account ids, so the alias
+    # must already exist for the migration to carry it.
+    alias = routing._legacy_account_id(key) if issued_alias else None
     routing.pause(key, via="app")
     path = routing.events_file()
     original = path.read_bytes()
-    alias = routing._legacy_account_id(key) if issued_alias else None
     if first_reader == "account_id":
         ident = routing.account_id(key)
-        text = routing.summary()["text"]
+        text = page_text()
     else:
-        text = routing.summary()["text"]
+        text = page_text()
         ident = routing.account_id(key)
     assert re.fullmatch(r"codex:a-[a-z2-7]{8}", ident)
-    assert f"Codex ({ident}): paused by you until you lift it" in text
+    assert f"Codex ({ident}): PAUSED" in text
     assert routing._resolve_account_key(ident) == key
     if alias:
         assert routing.resolve_account(alias) == ident
@@ -284,7 +288,7 @@ def test_historical_identity_is_independent_of_reader_order(mac, first_reader, i
     before_config = (mac.data / "config.json").read_bytes()
     for _ in range(3):
         assert routing.account_id(key) == ident
-        assert f"Codex ({ident}): paused by you until you lift it" in routing.summary()["text"]
+        assert f"Codex ({ident}): PAUSED" in page_text()
         routing.migrate_accounts()
     assert path.read_bytes() == after
     assert (mac.data / "config.json").read_bytes() == before_config

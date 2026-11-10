@@ -49,14 +49,14 @@ def test_untracked_change_is_acknowledged_once(replay):
     replay.advance(1)
     replay.view()
     removed, context, info = replay.offer()
-    assert "no longer tracked" in context
+    # The page changed (Codex left it): it goes once, without Codex.
+    assert context.startswith("ROUTING ") and "Codex:" not in context
     replay.ack(info)
     for _ in range(3):
         replay.advance(1)
         again, context, info = replay.offer()
-        assert "no longer tracked" not in context
-        assert not any(i["entity"] == "account:codex|"
-                       for i in (again.get("routing_changes") or {}).get("items", []))
+        assert not context
+        assert not (again.get("routing_changes") or {}).get("items")
 
 
 def test_replayed_removal_offer_does_not_reprint_acknowledged_change(replay):
@@ -99,7 +99,7 @@ def test_deepseek_names_missing_usage_setup_with_its_local_key_paths(replay):
     entry = next(a for a in replay.view()["accounts"] if a["harness"] == "deepseek")
     assert entry["usage_setup"] == "store its API key with `khipu secrets --set deepseek_api_key` or the `deepseek_key_file` setting"
     assert entry["usage_setup"] in routing.account_line(entry, replay.now)
-    assert "no report yet" not in routing.summary()["text"].split("DeepSeek:", 1)[1].split("\n", 1)[0]
+    assert "no report yet" not in routing.light_status()["text"].split("DeepSeek:", 1)[1].split("\n", 1)[0]
     assert usage.http_quota_accounts() == []
     assert "host" not in replay.view()["definitions"]["providers"]["deepseek"]
 

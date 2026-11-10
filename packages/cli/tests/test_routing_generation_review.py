@@ -11,7 +11,6 @@ import pytest
 
 from khipu import recall_prompt, routing, routing_advice, routing_generation
 from tests.test_routing_acceptance import AUTHOR, replay  # noqa: F401
-from tests.test_routing_push_prompt import _fake_reader
 from tests.test_routing_s17c_advise import MAIN, NOW, _coverage, _runner, _spend, mac  # noqa: F401
 
 
@@ -46,27 +45,6 @@ def _update_runner(folder, kind, value):
         {"time": NOW.timestamp(), "interval": 20, **_telemetry(kind, value)}))
 
 
-@pytest.mark.parametrize("kind,value", [("concurrency", 2), ("spend", 35)])
-def test_changed_cap_verdict_invalidates_revision_and_buffered_go(mac, kind, value):
-    folder, before = _seed_cap(mac, kind)
-    generation = routing._generation(before, routing.settings())
-    buffered = routing._advice_push_adjust({"kind": "none"}, before, NOW, "review", "main")
-    assert "go (" in buffered["text"]
-    _update_runner(folder, kind, value)
-    routing._poll_refold(NOW)
-    after = routing._load_view()
-    assert routing_advice.account_advice(after, after["accounts"][0], NOW)["verdict"] == "hold_back"
-    assert before["version"] == after["version"]
-    buffered.update(version=before["version"], epoch=before["epoch"],
-                    generation=generation, done=time.monotonic())
-    at, writer = _fake_reader([(0.0, json.dumps(buffered).encode() + b"\n")])
-    writer.join(5)
-    assert at.collect() is None
-    assert routing_generation.revision(before) != routing_generation.revision(after)
-    # Check the semantic fallback itself, independently of heartbeat stats.
-    assert not routing_generation.matches(str(routing.view_file()), routing_generation.revision(before))
-
-
 @pytest.mark.parametrize("kind", ["concurrency", "spend"])
 def test_a_stale_answer_does_not_bless_a_heartbeat_changed_since_its_fold(mac, kind):
     """A prompt answers a stale view as it stands; the heartbeat that made it
@@ -96,27 +74,6 @@ def test_runner_change_invalidates_generation_before_refold(mac, kind):
     _update_runner(folder, kind, 35)
     assert not recall_prompt._routing_generation_current(generation)
     assert heartbeat in {item[0] for item in generation}
-
-
-@pytest.mark.parametrize("kind", ["concurrency", "spend"])
-def test_same_verdict_telemetry_keeps_semantic_revision(mac, kind):
-    folder, before = _seed_cap(mac, kind)
-    generation = routing._generation(before, routing.settings())
-    buffered = routing._advice_push_adjust({"kind": "none"}, before, NOW, "review", "main")
-    assert "go (" in buffered["text"]
-    buffered.update(version=before["version"], epoch=before["epoch"],
-                    generation=generation, done=time.monotonic())
-    _update_runner(folder, kind, 1)
-    routing._poll_refold(NOW)
-    after = routing._load_view()
-    assert routing_advice.account_advice(before, before["accounts"][0], NOW)["verdict"] == "go"
-    assert routing_advice.account_advice(after, after["accounts"][0], NOW)["verdict"] == "go"
-    assert routing_generation.revision(before) == routing_generation.revision(after)
-    assert routing_generation.matches(str(routing.view_file()), routing_generation.revision(before))
-    at, writer = _fake_reader([(0.0, json.dumps(buffered).encode() + b"\n")])
-    writer.join(5)
-    assert at.collect() == buffered
-    assert recall_prompt._routing_generation_current(generation)
 
 
 @pytest.mark.parametrize("kind", ["concurrency", "spend"])

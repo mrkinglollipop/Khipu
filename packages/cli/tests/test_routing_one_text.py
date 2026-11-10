@@ -230,3 +230,163 @@ def test_khipu_route_delivery_block_names_the_conversation_and_counts_its_subage
     assert delivery["subagents"]["count"] == 2 and delivery["subagents"]["handed_over"] == 2
     assert PARENT not in json.dumps(delivery) and "alpha" not in json.dumps(delivery)
     assert ms._route_page(routing, None)["delivery"] == "untracked: pass session_id"
+
+
+# ---- ported from the child-block tests (slice 8a): what still holds for the page -------------
+
+
+def test_a_child_start_without_an_agent_id_gets_the_page_and_reserves_nowhere(home, monkeypatch):  # noqa: F811
+    _record()
+    payload = _start()
+    del payload["agent_id"]
+    assert _ctx(_hook(payload, monkeypatch)) == routing_page_file.read()["text"]
+    assert routing_delivery.snapshot(routing_delivery.hook_session(PARENT), "main") == {}
+    assert routing_delivery.snapshot(routing_delivery.hook_session(PARENT), "agent:unknown") == {}
+
+
+def test_per_agent_ledgers_stay_bounded_finished_and_stale(home):  # noqa: F811
+    _record()
+    session = routing_delivery.hook_session(PARENT)
+
+    def start(name):
+        answer = routing._start_page(routing.read_view(), routing._now(), component=f"agent:{name}", session=session)
+        assert routing_delivery.acknowledge(session, answer["routing_changes"], take=True)
+
+    start("old")
+    home["clock"].advance(days=8)
+    start("fresh")
+    # A finished component older than the stale age is dropped outright.
+    assert routing_delivery.snapshot(session, "agent:old") == {}
+    for i in range(40):
+        start(f"a{i}")
+    path = routing_delivery._path(session)
+    assert path.stat().st_size < 1_048_576
+    agents = {name: state for name, state in json.loads(path.read_text()).items() if name.startswith("agent:")}
+    assert len(agents) <= routing_delivery._AGENT_MAX_COMPONENTS
+    # Finished agents keep only revision proof, never the delivered words.
+    assert "ACCOUNTS" not in json.dumps(agents)
+    assert all(not state.get("entries") for state in agents.values())
+
+
+def test_a_subagents_tool_call_read_has_the_parents_prompt_deadline(home, monkeypatch):  # noqa: F811
+    import time
+
+    from tests.test_routing_page_delivery import _set
+
+    _record()
+    _hook(_start(), monkeypatch)
+    home["clock"].advance(minutes=2)
+    routing.report(account="Codex", state="open", author=ME)
+    _set(home, routing_prompt_budget_ms=50)
+    real = routing_page_file.read
+
+    def slow():
+        time.sleep(2)
+        return real()
+
+    monkeypatch.setattr(routing_page_file, "read", slow)
+    began = time.monotonic()
+    assert _hook(_tool(), monkeypatch) == {}
+    assert time.monotonic() - began < 1.0
+
+
+def test_parallel_tool_calls_do_not_print_the_same_page_twice(home, monkeypatch):  # noqa: F811
+    _record()
+    _hook(_start(), monkeypatch)
+    home["clock"].advance(minutes=2)
+    routing.report(account="Codex", state="open", author=ME)
+    first = routing.child_page_push(PARENT, "a1")
+    assert first and first["text"]
+    # Leased before printing: a second call before its ack gets nothing.
+    assert routing.child_page_push(PARENT, "a1") is None
+    home["clock"].advance(minutes=5)  # that call never confirmed it: after the lease the page goes again
+    third = routing.child_page_push(PARENT, "a1")
+    assert third and third["routing_changes"]["batch"] != first["routing_changes"]["batch"]
+    assert routing_delivery.acknowledge(third["session"], third["routing_changes"], take=True)
+    assert routing.child_page_push(PARENT, "a1") is None
+
+
+def test_no_agent_identity_means_no_per_agent_pages(home, monkeypatch):  # noqa: F811
+    _record()
+    payload = _tool()
+    del payload["agent_id"]
+    out, _info, kind = routing_delegation.hook_main(json.dumps(payload))
+    # A parent's ordinary (non-delegation) Bash call still gets nothing.
+    assert out == {} and kind is None
+
+
+# ---- ported from the agent-ack tests: a subagent's page is judged like any other delivery ---
+
+
+def _agent_health(home, agent="a1"):  # noqa: F811
+    state = routing_delivery.snapshot(routing_delivery.hook_session(PARENT), f"agent:{agent}")
+    return routing_health.component_health(state, routing._now(), slack=2, child=True)
+
+
+def test_a_subagent_handed_each_new_page_never_reads_as_stalled(home, monkeypatch):  # noqa: F811
+    _record()
+    _hook(_start(), monkeypatch)
+    for i in range(6):
+        home["clock"].advance(minutes=2)
+        routing.report(account="Codex", state="open" if i % 2 == 0 else "limited", until=None if i % 2 == 0
+                       else "1h", author=ME)
+        assert _ctx(_hook(_tool(), monkeypatch)).startswith("ROUTING ")
+        assert _agent_health(home)["status"] == "green", _agent_health(home)
+        assert _hook(_tool(), monkeypatch) == {}
+
+
+def test_a_live_subagent_whose_reads_always_arrive_late_still_goes_red(home, monkeypatch):  # noqa: F811
+    _record()
+    _hook(_start(), monkeypatch)
+    home["clock"].advance(minutes=2)
+    routing.report(account="Codex", state="open", author=ME)
+    for _ in range(4):
+        home["clock"].advance(seconds=70)
+        # Read in the forked child, and its hook had stopped waiting: nothing is printed or confirmed.
+        assert routing._child_page_push_inline(PARENT, "a1")
+    health = _agent_health(home)
+    assert health["status"] == "red" and "lease-expired-twice" in health["reasons"]
+    receipt = routing_delivery.page_receipt(routing_delivery.snapshot(routing_delivery.hook_session(PARENT), "agent:a1"),
+                                            _revision(), routing._now())
+    assert receipt["page"] == "in_flight"
+    home["clock"].advance(seconds=70)
+    receipt = routing_delivery.page_receipt(routing_delivery.snapshot(routing_delivery.hook_session(PARENT), "agent:a1"),
+                                            _revision(), routing._now())
+    assert receipt["page"] == "owed" and "never confirmed" in receipt["why"]
+
+
+def test_cold_imports_are_paid_before_the_page_reads_budget(home, monkeypatch):  # noqa: F811
+    import time
+
+    from tests.test_routing_page_delivery import _set
+
+    _record()
+    _hook(_start(), monkeypatch)
+    home["clock"].advance(minutes=2)
+    routing.report(account="Codex", state="open", author=ME)
+    _set(home, routing_prompt_budget_ms=100)
+    warm = {"done": False}
+    read = routing._child_page_push_inline
+
+    def cold_read(*args, **kwargs):
+        if not warm["done"]:
+            time.sleep(0.4)  # a cold interpreter importing what the read needs
+        return read(*args, **kwargs)
+
+    monkeypatch.setattr(routing, "prompt_imports", lambda: warm.update(done=True))
+    monkeypatch.setattr(routing, "_child_page_push_inline", cold_read)
+    assert _ctx(_hook(_tool(), monkeypatch)).startswith("ROUTING ")
+
+
+def test_a_page_read_in_process_is_leased_and_carries_nothing_beyond_the_page(home, monkeypatch):  # noqa: F811
+    # The privacy tests read subagent pages in process and scan every string
+    # in them: nothing beyond what the subagent is shown, no flight or plan.
+    _record()
+    _hook(_start(), monkeypatch)
+    home["clock"].advance(minutes=2)
+    routing.report(account="Codex", state="open", author=ME)
+    page = routing._child_page_push_inline(PARENT, "a1")
+    assert page and page["text"] == routing_page_file.read()["text"]
+    assert not {"lease", "delivery_plan", "delivery_reservation", "page", "sig"} & set(page)
+    assert routing_delivery.snapshot(page["session"], "agent:a1").get("flight")
+    assert routing_delivery.acknowledge(page["session"], page["routing_changes"], take=True)
