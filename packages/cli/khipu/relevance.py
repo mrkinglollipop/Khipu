@@ -1,4 +1,4 @@
-"""The one absolute relevance gate, behind the ``relevance_floor`` switch.
+"""The one absolute relevance gate (always on).
 
 ``recall_prompt._apply_score_floor`` is relative to the top row, so a prompt
 about something memory has never seen still keeps its three nearest
