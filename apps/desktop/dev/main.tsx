@@ -30,6 +30,7 @@ import {
 } from "../src/FoundAccounts";
 import type { AccountRefs } from "../src/FoundAccounts";
 import App from "../src/App";
+import { ProjectLists } from "../src/memory/ProjectLists";
 import { RoutingSettings } from "../src/RoutingSettings";
 import { OfflineBanner, SavedOnThisMac, WaitingToSync } from "../src/OfflineBanner";
 import { OfflineWaitsCard } from "../src/SettingsControls";
@@ -452,6 +453,9 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   "app-needs-slow": { title: "Today: answers take four seconds", fake: { needsSlow: true }, render: () => <App /> },
   // Memory: open the window, then pick Memory in the sidebar. Answers from fakes/memory.ts.
   "app-memory-offline": { title: "The whole window, Only my words refused", fake: { memOffline: true }, render: () => <App /> },
+  // Memory › Project work lists on its own, and with no project holding a list.
+  "worklists": { title: "Project work lists", render: () => <ProjectLists /> },
+  "worklists-none": { title: "Project work lists, none yet", fake: { noProjects: true }, render: () => <ProjectLists /> },
   "app-welcome": { title: "The whole window, first run", fake: { welcome: true }, render: () => <App /> },
   // Accounts (slice A4): open the window, then press Accounts in the sidebar.
   "app-accounts": { title: "The whole window, Accounts", fake: { accounts: true }, render: () => <App /> },
@@ -496,7 +500,7 @@ function Page() {
       </main>
     );
   }
-  if (hash.startsWith("app") || hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst" || hash === "routing-settings-cde" || hash === "routing-settings-cde-worst" || hash.startsWith("routing-overrides")) {
+  if (hash.startsWith("app") || hash.startsWith("worklists") || hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst" || hash === "routing-settings-cde" || hash === "routing-settings-cde-worst" || hash.startsWith("routing-overrides")) {
     // The Settings pane at its app width, uncapped by the 960 state frame.
     return <div style={{ height: "100%" }} data-state={hash}>{st.render()}</div>;
   }

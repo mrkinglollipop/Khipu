@@ -13,6 +13,7 @@ import { accountsFakes } from "./accounts";
 import { todayFakes } from "./today";
 import { runningFakes } from "./running";
 import { needsFakes } from "./needs";
+import { projectsFakes } from "./projects";
 
 export type FakeSwitches = Record<string, unknown>;
 export type FakeHandler = (cmd: string, args: Record<string, unknown> | undefined, flags: FakeSwitches) => unknown | undefined;
@@ -20,7 +21,7 @@ export type FakeHandler = (cmd: string, args: Record<string, unknown> | undefine
 export { RAW, raw, isRaw } from "./raw";
 export type { Raw } from "./raw";
 
-export const FAKE_HANDLERS: FakeHandler[] = [shellFakes, accountsFakes, todayFakes, runningFakes, needsFakes, memoryFakes];
+export const FAKE_HANDLERS: FakeHandler[] = [shellFakes, accountsFakes, todayFakes, runningFakes, needsFakes, memoryFakes, projectsFakes];
 
 export function fakeAnswer(cmd: string, args: Record<string, unknown> | undefined, flags: FakeSwitches): unknown | undefined {
   for (const handler of FAKE_HANDLERS) {
