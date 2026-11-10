@@ -236,7 +236,10 @@ def activity_payload(*, limit: int = 40) -> dict:
             # unreadable list shows no episode.
             from khipu.tombstones import withhold
 
-            recent = withhold(_recent_rows(cur, limit), fail_closed=False, episode_key="id")
+            from khipu.memory_rows import annotate_activity_rows
+
+            recent = withhold(annotate_activity_rows(cur, _recent_rows(cur, limit)),
+                              fail_closed=False, episode_key="id")
     try:
         from khipu.keychain import secrets_status
 

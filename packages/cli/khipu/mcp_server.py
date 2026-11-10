@@ -315,6 +315,13 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Exact capture origin, e.g. 't3' (episodes only)",
                 },
+                "owner_words": {
+                    "type": "boolean",
+                    "description": (
+                        "Match only the owner's own lines (episodes only). Each row then "
+                        "carries quote, title, tool, mac and project."
+                    ),
+                },
                 "tz": {
                     "type": "string",
                     "description": (
@@ -1227,6 +1234,9 @@ def _tool_search(args: dict) -> dict:
     t3_thread = (args.get("t3_thread") or "").strip() or None
     via = (args.get("via") or "").strip() or None
     tz = args.get("tz") or None
+    # Only a caller that asks gets the extra keys; everyone else's rows are unchanged.
+    owner_words = args.get("owner_words") is True
+    extra = {"owner_words_only": True} if owner_words else {}
 
     offline = False
     try:
@@ -1235,7 +1245,7 @@ def _tool_search(args: dict) -> dict:
         payload = hybrid_search(
             query, limit=max(1, limit), mode=mode, kind=kind, project=project,
             since=since, until=until, session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
-            tz=tz, source=source,
+            tz=tz, source=source, **extra,
         )
     except Exception as exc:
         if not hub_connection_failed(exc):
@@ -1243,6 +1253,10 @@ def _tool_search(args: dict) -> dict:
         if source or kind == "library":
             raise ValueError(
                 "library search needs the hub; the offline snapshot holds no libraries"
+            ) from exc
+        if owner_words:
+            raise ValueError(
+                "owner_words search needs the hub; the offline snapshot cannot do it"
             ) from exc
         offline = True
         payload = search_stale_payload(
