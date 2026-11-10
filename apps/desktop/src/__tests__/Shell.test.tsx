@@ -15,14 +15,13 @@ const places: NavItem[] = [
   { id: "accounts", label: "Accounts" },
   { id: "memory", label: "Memory" },
 ];
-const older: NavItem[] = [{ id: "work", label: "Work" }, { id: "activity", label: "Activity" }];
 const settings: NavItem = { id: "settings", label: "Settings" };
 
 function Harness({ start = "today", mac }: { start?: string; mac?: string | null }) {
   const [current, setCurrent] = useState(start);
   return (
     <div>
-      <Sidebar brand={<i />} items={places} current={current} onGo={setCurrent} settings={settings} macName={mac} older={{ items: older, extra: <p>extras</p> }} />
+      <Sidebar brand={<i />} items={places} current={current} onGo={setCurrent} settings={settings} macName={mac} />
       <TabBar items={places} current={current} onGo={setCurrent} />
     </div>
   );
@@ -46,24 +45,9 @@ describe("Sidebar", () => {
     expect(screen.getByText("On M5")).toBeInTheDocument();
   });
 
-  it("keeps the older screens behind a toggle that opens and closes", () => {
+  it("has no Older screens entry", () => {
     render(<Harness />);
-    const toggle = screen.getByRole("button", { name: "Older screens" });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    fireEvent.click(screen.getByRole("button", { name: "Work" }));
-    expect(screen.getByRole("button", { name: "Work" })).toHaveAttribute("aria-current", "page");
-    expect(screen.getByText("extras")).toBeInTheDocument();
-  });
-
-  it("closes the older-screens popover on Escape", () => {
-    // jsdom has no matchMedia, so the sidebar counts as narrow only when told; Escape works either way.
-    render(<Harness start="today" />);
-    const toggle = screen.getByRole("button", { name: "Older screens" });
-    fireEvent.click(toggle);
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("button", { name: "Older screens" })).toBeNull();
   });
 
   it("has a tab bar with the same places", () => {

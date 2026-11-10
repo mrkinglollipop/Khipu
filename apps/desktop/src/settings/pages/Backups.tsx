@@ -1,12 +1,42 @@
+import { useState } from "react";
 import { Tag } from "../../ui";
 import type { HealthState, Loaded, MacsDoc } from "../data";
 import { CheckedLine } from "./CheckedLine";
 import { macName } from "../data";
 import { fmtAgoSince } from "../../time";
 
-/** Read-only: the newest successful backup and the free space, from the status
- *  commands. Nothing here says how often backups run; Khipu does not report it. */
-export function BackupsPage({ macs, health }: { macs: Loaded<MacsDoc>; health: HealthState }) {
+type BackupState =
+  | { kind: "idle" }
+  | { kind: "busy" }
+  | { kind: "done"; archive: string | null; files: number | null }
+  | { kind: "error"; message: string };
+
+/** The newest successful backup and the free space, from the status commands,
+ *  plus Back up now: the same `backup-local --out=~/Downloads` the older Data
+ *  screen ran. Nothing here says how often backups run; Khipu does not report it. */
+export function BackupsPage({ macs, health, run, onBackedUp }: {
+  macs: Loaded<MacsDoc>;
+  health: HealthState;
+  run: (args: string[]) => Promise<string>;
+  onBackedUp?: () => void;
+}) {
+  const [state, setState] = useState<BackupState>({ kind: "idle" });
+  const backUp = async () => {
+    setState({ kind: "busy" });
+    try {
+      const raw = await run(["backup-local", "--out=~/Downloads"]);
+      let doc: { ok?: boolean; error?: string; archive?: string; files?: number } | null = null;
+      try { doc = JSON.parse(raw); } catch { doc = null; }
+      if (!doc || typeof doc !== "object" || doc.ok !== true) {
+        setState({ kind: "error", message: (doc && doc.error) || "Khipu did not say the backup was written." });
+        return;
+      }
+      setState({ kind: "done", archive: doc.archive ?? null, files: typeof doc.files === "number" ? doc.files : null });
+      onBackedUp?.();
+    } catch (e) {
+      setState({ kind: "error", message: String(e) });
+    }
+  };
   const area = health.data?.areas.find((a) => a.key === "database") ?? null;
   const rows = macs.data?.macs ?? [];
   const mine = rows.find((m) => m.this_mac);
@@ -15,6 +45,20 @@ export function BackupsPage({ macs, health }: { macs: Loaded<MacsDoc>; health: H
   if (macs.loading && !macs.data && !health.data) return <p className="st-muted" role="status">Reading…</p>;
   return (
     <>
+      <div className="st-actions">
+        <button type="button" className="primary" disabled={state.kind === "busy"} onClick={() => void backUp()}>
+          {state.kind === "busy" ? "Backing up…" : "Back up now"}
+        </button>
+      </div>
+      <div>
+        {state.kind === "busy" ? <p className="st-muted" role="status">Writing a zip of this Mac's Khipu files to Downloads…</p> : null}
+        {state.kind === "done" ? (
+          <p role="status">
+            Backed up{state.files != null ? ` ${state.files} files` : ""}{state.archive ? ` to ${state.archive}` : ""}.
+          </p>
+        ) : null}
+        {state.kind === "error" ? <p role="alert">The backup did not finish: {state.message}</p> : null}
+      </div>
       <div className="st-kvs">
         <div className="st-kv"><div className="st-k">Last backup</div><div className="st-v">{when(lastBackup)}</div></div>
         {health.data?.free_gb != null ? (

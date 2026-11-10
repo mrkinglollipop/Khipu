@@ -414,8 +414,6 @@ export default function App() {
     expires_at?: number;
     ipv4?: string;
   } | null>(null);
-  // The new Settings (13 rows) is the Settings place; the old one stays under
-  // Older screens until a later slice deletes it.
   // Settings opens on one row when a notice, a guide or a link asks for it.
   const [settingsRow, setSettingsRow] = useState<{ id: string; n: number } | null>(null);
   const openSettingsRow = useCallback((id: string) => {

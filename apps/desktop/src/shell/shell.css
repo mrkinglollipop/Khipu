@@ -92,7 +92,6 @@
 }
 .sh-snav button:focus-visible,
 .sh-tabs button:focus-visible,
-.sh-older-btn:focus-visible,
 .sh-seg button:focus-visible,
 .sh-insp-close:focus-visible,
 .sh-row:focus-visible {
@@ -100,8 +99,7 @@
   outline-offset: -2px;
 }
 @media (hover: hover) and (pointer: fine) {
-  .sh-snav button:hover:not([aria-current]),
-  .sh-older-btn:hover {
+  .sh-snav button:hover:not([aria-current]) {
     background: var(--surface-2);
     color: var(--text);
   }
@@ -153,56 +151,6 @@
   white-space: nowrap;
 }
 
-/* Older screens: a quiet group that holds what the new places replace. */
-.sh-older {
-  position: relative;
-  margin: 0 10px 8px;
-}
-.sh-older-btn {
-  display: flex;
-  align-items: center;
-  justify-content: flex-start;
-  gap: 10px;
-  width: 100%;
-  height: 32px;
-  padding: 0 10px;
-  border: 0;
-  border-radius: 8px;
-  background: none;
-  color: var(--muted);
-  font: inherit;
-  font-size: 13.5px;
-  text-align: left;
-  cursor: pointer;
-}
-.sh-older-chev {
-  margin-left: auto;
-  transition: transform 140ms ease;
-}
-.sh-older[data-open="true"] .sh-older-chev {
-  transform: rotate(180deg);
-}
-.sh-older-list {
-  display: none;
-}
-.sh-older[data-open="true"] .sh-older-list {
-  display: block;
-}
-.sh-older-list .sh-snav {
-  padding: 4px 0 0;
-}
-.sh-older-list .sh-snav button {
-  height: 30px;
-  font-size: 13.5px;
-}
-.sh-older-extra {
-  margin-top: 8px;
-  padding: 10px 10px 2px;
-  border-top: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
 
 /* ---------- toolbar and body ---------- */
 .sh-toolbar {
@@ -424,39 +372,6 @@
   .sh-settings button[aria-current="page"]::before {
     display: none;
   }
-  .sh-older {
-    order: 3;
-    margin: 0;
-  }
-  .sh-older-btn {
-    width: 38px;
-    height: 38px;
-    padding: 0;
-    justify-content: center;
-  }
-  .sh-older-btn .sh-label,
-  .sh-older-chev {
-    display: none;
-  }
-  /* The list drops from the top bar as a popover. */
-  .sh-older-list {
-    position: absolute;
-    top: calc(100% + 8px);
-    right: 0;
-    width: 260px;
-    padding: 8px;
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    background: var(--surface);
-    box-shadow: var(--shadow-md);
-  }
-  .sh-older-list .sh-snav {
-    padding: 0;
-  }
-  .sh-older-list .sh-snav button {
-    width: 100%;
-    padding: 0 10px;
-  }
 
   .sh-toolbar {
     padding: 8px 16px;
@@ -543,13 +458,6 @@
   }
   .sh-onmac {
     height: 36px;
-  }
-  .sh-older-btn {
-    width: 44px;
-    height: 44px;
-  }
-  .sh-older-list .sh-snav button {
-    height: 44px;
   }
   .sh-insp-close {
     width: 44px;

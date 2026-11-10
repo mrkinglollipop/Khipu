@@ -3,8 +3,7 @@
    functions, so the page's tests can pin the words and the times. Every time
    is the viewer's own local time. */
 
-import { accountState, capitalise, whenLocal } from "./routing";
-import type { RouteAccount, RouteChange, RouteChangeItem, RouteView } from "./routing";
+import { capitalise } from "./routing";
 
 const MINUTE = 60;
 const HOUR = 60 * MINUTE;
@@ -41,8 +40,7 @@ export function endChoices(now: Date, firstHours: number): EndChoice[] {
   out.push({
     id: "soon",
     label: `In ${firstHours} hour${firstHours === 1 ? "" : "s"}, ${clock(soon)}`,
-    iso: isoLocal(soon),
-  });
+    iso: isoLocal(soon) });
   if (now.getHours() < 21) {
     const tonight = at(now, 0, 21);
     out.push({ id: "tonight", label: `Tonight, ${clock(tonight)}`, iso: isoLocal(tonight) });
@@ -151,8 +149,7 @@ const STATE_SAID: Record<string, string> = {
   down: "down",
   paused: "paused by you",
   probably_open: "probably open",
-  unknown: "unknown",
-};
+  unknown: "unknown" };
 
 export function stateSaid(state: unknown): string {
   return (typeof state === "string" && STATE_SAID[state]) || "unknown";
@@ -163,19 +160,10 @@ const HOLD_KIND: Record<string, string> = {
   disk_low: "Disk low",
   keep: "Keep for one purpose",
   outage: "Outage",
-  other: "Other",
-};
+  other: "Other" };
 
 export function holdKind(reason: string | null | undefined): string {
   return (reason && HOLD_KIND[reason]) || "Other";
-}
-
-function lowerFirst(text: string): string {
-  return text ? text.charAt(0).toLowerCase() + text.slice(1) : text;
-}
-
-function str(v: unknown): string | null {
-  return typeof v === "string" ? v : null;
 }
 
 export type ChangeRow = {
@@ -200,256 +188,5 @@ export type ChangeRow = {
 export type ChangeBy = "you" | "conversations" | "runners" | "khipu";
 export type ChangeAbout = "accounts" | "rules" | "holds" | "settings";
 
-function changeBy(item: RouteChangeItem): ChangeBy {
-  if (item.by === "you") return "you";
-  if (item.source === "probe" || item.source === "check" || item.source === "table") return "khipu";
-  if (item.source === "runner" || / lanes \(read by Khipu\)$/.test(item.by ?? "")) return "runners";
-  // Khipu's own seed, an unknown writer and a report with no author are Khipu's.
-  if (!item.by || item.by === "Khipu rules seed" || item.by === "an unknown writer") return "khipu";
-  return "conversations";
-}
-
-/** Your priority is your order of accounts; folders, lanes and the old
- *  table file are settings. */
-function changeAbout(entity: string): ChangeAbout {
-  const kind = entity.split(":")[0];
-  if (kind === "account" || kind === "priority") return "accounts";
-  if (kind === "rule" || kind === "note") return "rules";
-  if (kind === "hold") return "holds";
-  return "settings";
-}
-
-function whoWords(item: RouteChangeItem): string {
-  if (item.by === "you") {
-    // Khipu's owner check did not run for this line (khipu/routing.py `_mark_unchecked`).
-    if (item.via?.endsWith("-unchecked")) return "Marked as you, but not checked by Khipu";
-    return item.via === "app" ? "You, in Settings" : "You, outside the app";
-  }
-  if (item.source === "probe") return "The plan check";
-  if (item.source === "check") return "Khipu's check";
-  if (item.by) return capitalise(item.by.replace(/ lanes \(read by Khipu\)$/, " job runner"));
-  if (item.source === "runner") return "Your job runner";
-  if (item.source === "table") return "Your routing table";
-  return "Khipu";
-}
-
-type EffectiveModel = { model: string; until: string | null; basis: string | null; side: unknown };
-
-/** The models of an account's effective view, `[model, until, basis,
- *  [state, source] | null]` each (`routing._effective_account`). */
-function effectiveModels(raw: unknown): EffectiveModel[] {
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .filter((m): m is unknown[] => Array.isArray(m) && typeof m[0] === "string")
-    .map((m) => ({ model: m[0] as string, until: str(m[1]), basis: str(m[2]), side: m[3] ?? null }));
-}
-
-const SIDE_WHO: Record<string, string> = {
-  report: "a conversation",
-  runner: "a job runner",
-  probe: "the plan check",
-  check: "Khipu's check",
-  owner: "you",
-};
-
-/** The side that disagrees, `[state, source]`, in words. */
-function sideSaid(raw: unknown): { who: string; state: string } | null {
-  if (!Array.isArray(raw) || typeof raw[0] !== "string") return null;
-  return { who: SIDE_WHO[String(raw[1])] ?? "another report", state: stateSaid(raw[0]) };
-}
-
-function itemRow(change: RouteChange, item: RouteChangeItem, i: number, now: Date): ChangeRow {
-  const base = { key: `${change.version}-${i}`, at: change.at, who: whoWords(item), by: changeBy(item), about: changeAbout(item.entity), recipients: change.recipients ?? null };
-  const [kind, ...rest] = item.entity.split(":");
-  const ident = rest.join(":");
-  const cur = item.now ?? null;
-  const was = item.was ?? null;
-  if (kind === "account") {
-    const label = str(cur?.label) ?? str(was?.label) ?? "An account";
-    if (!cur) return { ...base, subject: label, text: "no longer tracked" };
-    // Worded as it stood when it changed, with each model's limit, and the
-    // disagreements and model limits that came or went beside the state
-    // (Codex review, finding 5).
-    const then = new Date(change.at);
-    const at = Number.isNaN(then.getTime()) ? now : then;
-    const nowModels = effectiveModels(cur.models);
-    const wasModels = effectiveModels(was?.models);
-    const lastSeen = str(cur.last_seen);
-    const entry = {
-      key: ident,
-      label,
-      harness: "",
-      ...cur,
-      models: nowModels,
-      disagreement: null,
-      last_seen: lastSeen ? { state: lastSeen } : null,
-    } as unknown as RouteAccount;
-    const said = accountState(entry, at).text.trim();
-    // A model's name keeps its capital ("Opus limit reached, ...").
-    const text = nowModels.some((m) => said.startsWith(m.model)) ? said : lowerFirst(said);
-    const parts: string[] = [];
-    if (was && was.state !== cur.state) parts.push(`was ${stateSaid(was.state)}`);
-    const dis = sideSaid(cur.disagreement);
-    if (dis && JSON.stringify(cur.disagreement) !== JSON.stringify(was?.disagreement)) parts.push(`${dis.who} said it is ${dis.state}`);
-    else if (!dis && sideSaid(was?.disagreement)) parts.push("the reports agree again");
-    for (const m of nowModels) {
-      const before = wasModels.find((x) => x.model === m.model);
-      const side = sideSaid(m.side);
-      if (side && JSON.stringify(m.side) !== JSON.stringify(before?.side)) parts.push(`${side.who} said ${m.model} is ${side.state}`);
-      else if (!side && sideSaid(before?.side)) parts.push(`the reports about ${m.model} agree again`);
-    }
-    for (const m of wasModels) {
-      if (!nowModels.some((x) => x.model === m.model)) parts.push(`${m.model} limit over`);
-    }
-    return { ...base, subject: label, text, aside: parts.length ? `(${parts.join("; ")})` : undefined };
-  }
-  if (kind === "hold") {
-    const scope = str(cur?.scope) ?? str(was?.scope) ?? "all work";
-    if (!cur) return { ...base, subject: "Hold", text: `on ${scope} ended` };
-    const until = str(cur.until);
-    const ends = until ? `ends ${whenLocal(until, now)}` : "until you clear it";
-    const words = str(cur.text);
-    return {
-      ...base,
-      subject: "Hold",
-      text: `on ${scope}: ${lowerFirst(holdKind(str(cur.reason)))}, ${ends}`,
-      aside: words ? `“${words}”` : undefined,
-    };
-  }
-  if (kind === "rule") {
-    const subject = `Standing rule ${ident}`;
-    if (!cur) {
-      return {
-        ...base,
-        subject,
-        text: was?.pending === true && was.pending_kind === "added" ? "dismissed" : "removed",
-        aside: was?.text ? `“${String(was.text)}”` : undefined,
-        restore: item.n ?? Number(ident),
-      };
-    }
-    if (cur.pending === true) {
-      const action = cur.pending_kind === "changed" ? "changed" : "added";
-      const by = str(cur.pending_by) ?? "a conversation";
-      const prior = str(cur.prior_text);
-      return {
-        ...base,
-        subject,
-        text: `${action} by ${by} at the owner's request; the owner has not confirmed it yet`,
-        aside: prior ? `“${String(cur.text)}”; it replaced “${prior}”` : `“${String(cur.text)}”`,
-      };
-    }
-    if (was?.pending === true && cur.pending !== true) {
-      if (was.text === cur.text) return { ...base, subject, text: "confirmed" };
-      if (cur.text === was.prior_text) return { ...base, subject, text: "undone", aside: `“${String(cur.text)}”` };
-      return { ...base, subject, text: "changed", aside: `“${String(cur.text)}”` };
-    }
-    if (!was) return { ...base, subject, text: "added", aside: `“${String(cur.text)}”` };
-    if (was.text !== cur.text) return { ...base, subject, text: "changed", aside: `“${String(cur.text)}”` };
-    if (was.seeded && !cur.seeded) return { ...base, subject, text: "confirmed" };
-    return { ...base, subject, text: "changed" };
-  }
-  if (item.entity === "note") {
-    if (!cur) return { ...base, subject: "Your note", text: "ended", aside: was?.text ? `“${String(was.text)}”` : undefined };
-    return { ...base, subject: "Your note", text: was ? "changed" : "written", aside: `“${String(cur.text)}”` };
-  }
-  if (kind === "runner") {
-    const subject = `${ident} job runner`;
-    if (!cur) return { ...base, subject, text: "folder no longer read" };
-    if (cur.unreadable) return { ...base, subject, text: "files can't be read" };
-    if (cur.silent) return { ...base, subject, text: "stopped reporting" };
-    return { ...base, subject, text: was ? "reporting again" : "folder added" };
-  }
-  if (kind === "lane") {
-    const [runner, lane] = ident.split("/");
-    const subject = `${runner}'s ${lane} job slot`;
-    if (!cur) return { ...base, subject, text: "its limit is over" };
-    const until = str(cur.until);
-    return {
-      ...base,
-      subject,
-      text: `reached a limit${until ? `, until ${whenLocal(until, now)}` : ""}`,
-      aside: "(not matched to an account)",
-    };
-  }
-  if (item.entity === "table") return { ...base, subject: "Routing table", text: "Current-state section changed" };
-  return { ...base, subject: capitalise(kind), text: "changed" };
-}
-
-/** A change recorded before Khipu kept each change's details. */
-function legacyRow(change: RouteChange, entity: string, i: number, view: RouteView): ChangeRow {
-  const [kind, ...rest] = entity.split(":");
-  const ident = rest.join(":");
-  const base = { key: `${change.version}-${i}`, at: change.at, who: "Khipu", by: "khipu" as const, about: changeAbout(entity), text: "changed", recipients: change.recipients ?? null };
-  if (kind === "account") {
-    const label = (view.accounts ?? []).find((a) => a.key === ident)?.label ?? "An account";
-    return { ...base, subject: label };
-  }
-  if (kind === "rule") return { ...base, subject: `Standing rule ${ident}` };
-  if (entity === "note") return { ...base, subject: "Your note" };
-  if (kind === "hold") return { ...base, subject: "A hold" };
-  if (kind === "runner") return { ...base, subject: `${ident} job runner` };
-  if (entity === "table") return { ...base, subject: "Routing table", text: "Current-state section changed" };
-  return { ...base, subject: capitalise(kind) };
-}
-
 export type ChangeDay = { key: string; label: string; rows: ChangeRow[] };
 
-function dayKey(d: Date): string {
-  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
-}
-
-/** Recent changes, newest first, one list per local day: "Today",
- *  "Yesterday", then "Mon, Oct 12". */
-export function changeDays(view: RouteView, now: Date): ChangeDay[] {
-  const rows: ChangeRow[] = [];
-  for (const change of view.changes ?? []) {
-    const items = change.items;
-    if (items && items.length) items.forEach((item, i) => rows.push(itemRow(change, item, i, now)));
-    else (change.entities ?? []).forEach((e, i) => rows.push(legacyRow(change, e, i, view)));
-  }
-  rows.reverse();
-  const today = dayKey(now);
-  const yesterday = dayKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1));
-  const days: ChangeDay[] = [];
-  for (const row of rows) {
-    const d = new Date(row.at);
-    if (Number.isNaN(d.getTime())) continue;
-    const key = dayKey(d);
-    let day = days.find((x) => x.key === key);
-    if (!day) {
-      const label =
-        key === today
-          ? "Today"
-          : key === yesterday
-            ? "Yesterday"
-            : d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
-      day = { key, label, rows: [] };
-      days.push(day);
-    }
-    day.rows.push(row);
-  }
-  return days;
-}
-
-/** The CLI names a setting by its key ("routing_table needs ..."); the page
- *  names it as the setting's own row does ("Routing table file needs ..."). */
-export function settingWords(msg: string, key: string, words: string): string {
-  return msg.replace(new RegExp(`\\b${key}\\b`, "g"), (_m: string, at: number) =>
-    at === 0 ? words : words.charAt(0).toLowerCase() + words.slice(1),
-  );
-}
-
-/** Why the routing table file can't be read, from the CLI's fixed phrase
- *  (`routing_sources._short_error`, or "no NOW block"), in plain words. */
-export function tableErrorWords(error: string): string {
-  const big = /^larger than (\d+) MB$/.exec(error);
-  if (big) return `it is larger than ${big[1]} MB`;
-  const words: Record<string, string> = {
-    missing: "no file at that path",
-    "a folder, not a file": "that is a folder, not a file",
-    "not a regular file": "that is not a plain file",
-    "no NOW block": "it has no current-state section",
-    "not allowed to read it": "Khipu isn't allowed to read it",
-  };
-  return words[error] ?? "it can't be read";
-}

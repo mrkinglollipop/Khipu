@@ -24,7 +24,6 @@ describe("App — Move", () => {
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "dsn_configured") return true;
       if (cmd === "khipu_db_status") return JSON.stringify({ ok: true, host_kind: "remote" });
-      if (cmd === "liveness_now") return JSON.stringify({ ok: true, harnesses: {} });
       if (cmd === "khipu_db_preflight") return JSON.stringify({ ok: true, stages: [] });
       if (cmd === "khipu_db_move" && args?.dryRun === true) {
         previews += 1;

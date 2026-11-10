@@ -25,7 +25,6 @@ describe("App — Join advertise", () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "dsn_configured") return true;
       if (cmd === "khipu_db_status") return JSON.stringify({ ok: true, host_kind: "remote" });
-      if (cmd === "liveness_now") return JSON.stringify({ ok: true, harnesses: {} });
       if (cmd === "join_advertise") return JSON.stringify({ ok: true, pin: "123456", timeout_sec: 600 });
       if (cmd === "run_khipu") return JSON.stringify({ ok: true, capture_liveness: { ok: true, harnesses: {} }, claude_homes: { homes: [] }, counts: {}, recent: [] });
       return JSON.stringify({ ok: true });
@@ -44,7 +43,6 @@ function mockRemoteHub() {
   invokeMock.mockImplementation(async (cmd: string) => {
     if (cmd === "dsn_configured") return true;
     if (cmd === "khipu_db_status") return JSON.stringify({ ok: true, host_kind: "remote" });
-    if (cmd === "liveness_now") return JSON.stringify({ ok: true, harnesses: {} });
     if (cmd === "join_advertise") return JSON.stringify({ ok: true, pin: "123456", timeout_sec: 600 });
     if (cmd === "join_export") return JSON.stringify({ ok: true, out: "/tmp/k.khipujoin", expected: {} });
     if (cmd === "run_khipu") return JSON.stringify({ ok: true, capture_liveness: { ok: true, harnesses: {} }, claude_homes: { homes: [] }, counts: {}, recent: [] });

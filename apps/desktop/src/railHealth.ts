@@ -71,10 +71,10 @@ export function railHealthLine(
   const red = liveness?.red ?? [];
   if (dsnOk === false) return { tone: "err", text: "Database not reachable" };
   if (red.length > 0) {
-    return { tone: "err", text: `${red.length} harness${red.length === 1 ? "" : "es"} not recording` };
+    return { tone: "err", text: `${red.length} app${red.length === 1 ? "" : "s"} not recording` };
   }
   if (liveness?.ok === false || typeof (liveness as { error?: unknown } | null)?.error === "string") return { tone: "err", text: "Couldn't check recording" };
-  if (liveness == null) return { tone: "warn", text: "Checking harnesses…" };
+  if (liveness == null) return { tone: "warn", text: "Checking apps…" };
   if (gap.checkFailed) return { tone: "warn", text: "Couldn't check Claude homes" };
   if (gap.missing > 0) return { tone: "warn", text: `${homesWord(gap.missing)} not installed` };
   if (gap.unreadable > 0) return { tone: "warn", text: `${homesWord(gap.unreadable)} can't be read` };
@@ -85,14 +85,14 @@ export function railHealthLine(
       text: t3.reason === "hooks" ? "T3 providers without hooks"
         : t3.reason === "partial" ? "T3 providers partly set up"
         : t3.reason === "other" ? "T3 needs a look"
-        : "T3 needs a linked capture",
+        : "T3 needs a linked save",
     };
   }
   const harnesses = Object.values(liveness.harnesses ?? {});
   if (harnesses.length === 0 || harnesses.some((h) => h.seen !== true || h.ok !== true)) {
     return { tone: "warn", text: "Recording not checked" };
   }
-  return { tone: "ok", text: "All harnesses recording" };
+  return { tone: "ok", text: "All apps recording" };
 }
 
 /** The count on the Harnesses nav item: red harnesses first, else the Claude

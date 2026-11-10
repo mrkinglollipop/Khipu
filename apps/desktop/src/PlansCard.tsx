@@ -269,14 +269,6 @@ export function unreadAccounts(report: UsageReport | null | undefined, now: Date
     .map((row) => `${row.account || row.harness || "Account"} (${usageErrorPhrase(row.error, row.harness)})`);
 }
 
-/** Accounts whose figures came from a fallback because the live read failed
- *  (Codex signed out, say): "Codex is showing its last turn (not signed in)". */
-export function liveReadFailures(report: UsageReport | null | undefined): string[] {
-  return (report?.accounts ?? [])
-    .filter((row) => row.ok !== false && row.live_error)
-    .map((row) => `${row.account || row.harness || "Account"} is showing its last turn (${usageErrorPhrase(row.live_error, row.harness)})`);
-}
-
 /** One attention item when any window still in force is at or above 90%. */
 export function planAttention(report: UsageReport | null | undefined, now: Date = new Date()): Attention[] {
   const hot: string[] = [];
@@ -711,21 +703,8 @@ function harnessName(h: string): string {
 }
 
 const LABEL_MAX = 64;
-const FOLDER_MAX = 1024;
 /** The most accounts read: `khipu config` and the app's own command refuse a longer list. */
 export const ACCOUNTS_MAX = 32;
-
-/** The name an account gets when the Name field is left empty: the CLI's
- *  name, with the login folder when there is one ("Codex (~/.codex-work)"),
- *  so a second login never takes the name of the default one. At most 64
- *  characters, as `khipu config` stores. */
-export function defaultAccountLabel(harness: string, home: string | null | undefined): string {
-  const name = harnessName(harness);
-  const folder = (home ?? "").trim();
-  if (!folder) return name;
-  const room = LABEL_MAX - name.length - 3;
-  return `${name} (${folder.length > room ? `…${folder.slice(folder.length - room + 1)}` : folder})`;
-}
 
 /** A login folder for comparing two entries, the way `khipu config` does:
  *  "~" expanded to the owner's folder when it is known, repeated slashes,
@@ -742,62 +721,6 @@ export function loginKey(home: string | null | undefined, userHome?: string | nu
 }
 
 export type FormProblem = { field: "name" | "home" | null; message: string };
-
-// eslint-disable-next-line no-control-regex
-const CONTROL = /[\u0000-\u001f\u007f]/;
-
-/** Why the Name or Login folder as typed cannot be saved, or null: the checks
- *  `khipu config` and the app's own command make, said in plain words before
- *  anything is sent. A folder starts with "~/" or "/": "~.codex-work" (the
- *  slash forgotten) names no folder this Mac has. */
-export function formProblem(entry: UsageAccountEntry): FormProblem | null {
-  const label = entry.label.trim();
-  if (CONTROL.test(label)) return { field: "name", message: "The Name must be one line of plain text." };
-  if (label.length > LABEL_MAX) {
-    return { field: "name", message: `That Name is too long: use ${LABEL_MAX} characters or fewer.` };
-  }
-  const folder = (entry.home ?? "").trim();
-  if (!folder) return null;
-  if (CONTROL.test(folder)) return { field: "home", message: "The Login folder must be one line of plain text." };
-  if (folder.length > FOLDER_MAX) return { field: "home", message: "That Login folder is too long." };
-  if (!(folder === "~" || folder.startsWith("~/") || folder.startsWith("/"))) {
-    return {
-      field: "home",
-      message: "Start the Login folder with ~/ (for example ~/.codex-work), or give the full path starting with /.",
-    };
-  }
-  return null;
-}
-
-/** Why `entry` cannot be added beside `entries`, in plain words, or null.
- *  The same two rules `khipu config` applies (each login once, each name
- *  once, a login compared after "~" is expanded), checked here so the owner
- *  is pointed at the field to change. */
-export function accountClash(
-  entries: UsageAccountEntry[],
-  entry: UsageAccountEntry,
-  userHome?: string | null,
-): FormProblem | null {
-  const valid = entries.filter((e) => !e.invalid);
-  const key = loginKey(entry.home, userHome);
-  const login = valid.find((e) => e.harness === entry.harness && loginKey(e.home, userHome) === key);
-  if (login && entry.harness === "muse") {
-    return { field: "name", message: `Muse is already listed as ${login.label}. Muse has one login, so it is read once.` };
-  }
-  if (login) {
-    const where = key ? `the login folder ${entry.home}` : "its default login";
-    return {
-      field: "home",
-      message: `${harnessName(entry.harness)} with ${where} is already listed as ${login.label}. Choose a different Login folder.`,
-    };
-  }
-  const name = entry.label.trim().toLowerCase();
-  const named = valid.find((e) => e.label.trim().toLowerCase() === name);
-  if (named) {
-    return { field: "name", message: `An account is already named ${named.label}. Type a different Name.` };
-  }
-  return null;
-}
 
 type StoredEntry = { label: string; harness: string; home?: string };
 

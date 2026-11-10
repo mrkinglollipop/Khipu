@@ -10,6 +10,7 @@ import { fmtAgoSince } from "../time";
 import { LookPage } from "./pages/Look";
 import { readLook } from "./lookModel";
 import { useSettingsData, thisMacRow } from "./data";
+import { refreshHealth } from "../shared/healthCache";
 import { macsSummary, signinsSummary } from "./words";
 import type { SettingsCtx } from "./context";
 import { YourMacsPage } from "./pages/YourMacs";
@@ -98,7 +99,7 @@ export function Settings({ ctx, active }: { ctx: SettingsCtx; active: boolean })
       case "summaries": return <SummariesPage ctx={ctx} active={pageActive} />;
       case "meaning": return <SearchByMeaningPage active={pageActive} />;
       case "books": return <BooksPage active={pageActive} />;
-      case "backups": return <BackupsPage macs={macs} health={health} />;
+      case "backups": return <BackupsPage macs={macs} health={health} run={ctx.runKhipu} onBackedUp={() => { void refreshHealth(); void reloadMacs(); }} />;
       case "where": return <WhereKeptPage ctx={ctx} health={health} />;
       case "look": return <LookPage macName={ctx.thisMac} part="look" />;
       case "login": return <LookPage macName={ctx.thisMac} part="opening" />;
