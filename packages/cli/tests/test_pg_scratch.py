@@ -644,20 +644,6 @@ class EmbedHybridSearchGraphCandidatesScratchTest(unittest.TestCase):
         self.assertNotIn("degraded_legs", payload)
         self.assertNotIn("time_interpretation", payload)
 
-    def test_switch_on_surfaces_the_wiki_linked_neighbor(self):
-        from khipu import embed
-
-        self._seed_linked_topics()
-        with mock.patch("khipu.features.enabled", side_effect=lambda name: name == "graph_candidates"):
-            payload = embed.hybrid_search("zzqwidgetalpha marker", mode="literal", kind="topic", limit=5)
-        ids = {r["id"] for r in payload["results"]}
-        self.assertIn(self._SEED_SLUG, ids)
-        self.assertIn(self._NEIGHBOR_SLUG, ids)
-        hit = next(r for r in payload["results"] if r["id"] == self._NEIGHBOR_SLUG)
-        self.assertEqual(
-            hit["via"], {"seed": f"topic:{self._SEED_SLUG}", "relation": "wiki_link"}
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

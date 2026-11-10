@@ -157,7 +157,7 @@ class ContractShapeTest(unittest.TestCase):
         self.assertEqual(c["capabilities"], sorted(c["capabilities"]))
         self.assertIn("search.hybrid", c["capabilities"])
         self.assertIn("launchers.read_only", c["capabilities"])
-        self.assertEqual(set(c["features"]), set(features.FEATURES))
+        self.assertEqual(set(c["features"]), set(features.FEATURES) | set(features._FIXED_CONTRACT_FEATURES))
         self.assertTrue(all(isinstance(v, bool) for v in c["features"].values()))
 
 
@@ -185,3 +185,16 @@ class VersionSyncTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContractFixedFeaturesTest(unittest.TestCase):
+    def test_contract_keeps_the_retired_switch_keys_with_their_fixed_values(self):
+        patch, _ = _isolated_data_dir()
+        with patch:
+            feats = features.contract()["features"]
+        self.assertIs(feats["validity_ranking"], True)
+        self.assertIs(feats["time_interpretation"], True)
+        self.assertIs(feats["relevance_floor"], True)
+        self.assertIs(feats["graph_candidates"], False)
+        self.assertIs(feats["rerank"], False)
+        self.assertIn("routing_push", feats)

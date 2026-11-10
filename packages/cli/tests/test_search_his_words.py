@@ -241,3 +241,13 @@ def test_is_automated_kinds():
                   'what does "This session is being continued" mean?', 'the Delegated task list looks off',
                   'run a check (scheduled for friday) please', 'use a < b'):
         assert not is_automated(typed), typed
+
+
+def test_title_uses_the_first_typed_line_when_there_is_no_summary():
+    from khipu import memory_rows as mr
+
+    auto = "Lane check (scheduled, not Matt): look at billing"
+    assert mr.title_of("", [auto, "what the owner typed"]) == "what the owner typed"
+    assert mr.title_of("anything", [auto, "what the owner typed"], verbatim_only=True) == "what the owner typed"
+    assert mr.title_of("", [auto]) == auto
+    assert mr.title_of("Work.", [auto, "what the owner typed"]) == "Work."

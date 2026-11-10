@@ -179,6 +179,19 @@ def capabilities() -> list[str]:
     return sorted(_CAPABILITIES)
 
 
+# Fixed values kept for readers of the contract. These switches were deleted
+# (validity ranking, time interpretation and the relevance floor are always on;
+# graph candidates and rerank are gone), but clients that read
+# ``contract.features`` may still look the keys up, so they stay published.
+_FIXED_CONTRACT_FEATURES = {
+    "graph_candidates": False,
+    "relevance_floor": True,
+    "rerank": False,
+    "time_interpretation": True,
+    "validity_ranking": True,
+}
+
+
 def contract() -> dict:
     """The capability signal carried on MCP ``initialize`` and in
     ``khipu_status`` (scope: "a real server version and a `capabilities`
@@ -186,5 +199,5 @@ def contract() -> dict:
     return {
         "version": __version__,
         "capabilities": capabilities(),
-        "features": {name: enabled(name) for name in sorted(FEATURES)},
+        "features": {**_FIXED_CONTRACT_FEATURES, **{name: enabled(name) for name in sorted(FEATURES)}},
     }

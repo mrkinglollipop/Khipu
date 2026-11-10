@@ -116,7 +116,8 @@ def title_of(summary: Any, quotes: list[str], verbatim_only: bool = False) -> st
 
     text = "" if verbatim_only or summary_text_is_empty(summary) else str(summary)
     if not text.strip() and quotes:
-        text = quotes[0]
+        # The first line the owner typed; the first stored quote only when none was typed.
+        text = (typed_quotes(quotes) or [quotes[0]])[0]
     for line in text.splitlines():
         line = line.strip().lstrip("#*- ").strip()
         if line:

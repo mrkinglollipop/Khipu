@@ -242,6 +242,17 @@ def health(now: datetime | None = None) -> dict:
                        if failed_here else ". Compaction has not run under this code yet." if not attempted_here else
                        f". Compaction last completed under this code." if result == "compacted" else
                        f". The last compaction attempt did not compact the record: {result}.") + waiting
+            why = out.get("overdue_why")
+            if why:
+                # Overdue: say why, and never claim nightly compaction where the reason says it cannot run here.
+                out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes), past {LINES_RED:,} lines "
+                                  f"or {BYTES_RED:,} bytes, and compaction is overdue: {why} "
+                                  + outcome.lstrip(". ").lstrip()
+                                  if level == "red" else
+                                  f"The routing record holds {lines:,} lines ({nbytes:,} bytes), past the "
+                                  f"{LINES_TRIGGER:,} lines or {BYTES_TRIGGER:,} bytes where it is compacted, and "
+                                  f"compaction is overdue: {why}")
+                return out
             out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes); it is compacted at "
                               f"{LINES_TRIGGER:,} lines or {BYTES_TRIGGER:,} bytes, nightly and after the plan figures "
                               f"refresh" + (f". It is past {LINES_RED:,} lines or {BYTES_RED:,} bytes and still has "
