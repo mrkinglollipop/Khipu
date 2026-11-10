@@ -950,3 +950,179 @@ def test_the_issuer_terminal_check_reads_the_kernel(home):
     finally:
         os.close(main)
         os.close(sub)
+
+
+# ---- the Claude desktop app (2026-11-10: every desktop turn was recorded a job's) --------------
+
+# What the desktop app sets for a conversation it shows (seen 2026-11-10): the
+# Agent SDK's child marker and the app's own handle as the host session id.
+DESKTOP_ENV = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "claude-desktop", "CLAUDE_CODE_CHILD_SESSION": "1",
+               "CLAUDE_CODE_HOST_SESSION_ID": "local_852a9695-8a4e-43bc-abbd-14284cf79d21",
+               "CLAUDE_CODE_SESSION_ATTENDED": "1", "CLAUDE_CODE_SESSION_ID": SESSION}
+DESKTOP_ISSUER = {"pid": 4242, "start": T0 - 5, "exe": "claude", "headless": False, "tty": False, "app": None}
+
+
+@pytest.fixture
+def launched(monkeypatch):
+    """The recorder's process tree reads as the desktop app's own agent."""
+    monkeypatch.setattr(owner_turns, "desktop_launched", lambda pid=None: True)
+
+
+def _desktop_record(prompt: str, env: dict | None = None, issuer: dict | None = None, session: str = SESSION):
+    return owner_turns.record(_payload(prompt, session), env={**DESKTOP_ENV, **(env or {})}, now=T0,
+                              issuer=DESKTOP_ISSUER if issuer is None else issuer)
+
+
+@pytest.mark.parametrize("entry", ["claude-desktop", "claude-desktop-3p"])
+def test_a_desktop_conversation_the_owner_types_in_counts(home, launched, entry):
+    _desktop_record("pause Codex until 5pm", env={"CLAUDE_CODE_ENTRYPOINT": entry})
+    turn = _last()
+    assert (turn["entrypoint"], turn["eligible"]) == (entry, True)
+    assert not turn.get("dispatched")
+
+
+def test_a_desktop_environment_the_app_did_not_start_stays_a_job(home, monkeypatch):
+    """The same environment from anything started under the conversation (an
+    Agent SDK script, a nested agent, its shell): the process tree does not
+    reach the app, so the SDK markers stay job evidence."""
+    monkeypatch.setattr(owner_turns, "desktop_launched", lambda pid=None: False)
+    _desktop_record("pause Codex until 5pm")
+    turn = _last()
+    assert turn["dispatched"] is True and turn["eligible"] is False
+    assert owner_turns.dispatched_job(DESKTOP_ENV, SESSION) == "a dispatched job's turn"
+
+
+def test_claude_p_from_a_desktop_shell_is_still_never_the_owner(home, launched):
+    _desktop_record("pause Codex until 5pm", env={"CLAUDE_CODE_SESSION_ID": "child-1"}, session="child-1",
+                    issuer={**DESKTOP_ISSUER, "print": True, "headless": True})
+    turn = _last("child-1")
+    assert (turn["entrypoint"], turn["eligible"]) == ("sdk-cli", False)
+
+
+@pytest.mark.parametrize("flags", [{"print": True, "headless": True}, {"headless": True}])
+def test_a_headless_desktop_child_is_a_machine_whatever_flag_spelling(home, launched, flags):
+    """``claude -pc`` carries -p inside a group of short flags: no ``print``
+    flag, but ``headless``. Its inherited desktop entrypoint no longer means
+    its SDK markers do, so the command line alone refuses it."""
+    _desktop_record("pause Codex until 5pm", issuer={**DESKTOP_ISSUER, **flags})
+    turn = _last()
+    assert (turn["entrypoint"], turn["eligible"]) == ("sdk-cli", False)
+
+
+@pytest.mark.parametrize("marker", [{"KHIPU_JOB": "1"}, {"KHIPU_PARENT_SESSION": "claude_code:p"},
+                                    {"CLAUDE_DISPATCHED_LANE": "claude"}])
+def test_a_job_marker_still_marks_a_desktop_job(home, launched, marker):
+    _desktop_record("pause Codex until 5pm", env=marker)
+    turn = _last()
+    assert turn["dispatched"] is True and turn["eligible"] is False
+
+
+@pytest.mark.parametrize("env", [
+    {"CLAUDE_CODE_HOST_SESSION_ID": "99999999-2222-3333-4444-555555555555"},  # not the app's handle form
+    {"CLAUDE_CODE_ENTRYPOINT": "cli"},                                        # not the desktop app
+    {"CLAUDE_CODE_ENTRYPOINT": "sdk-ts"},                                     # an Agent SDK script
+])
+def test_the_sdk_markers_stay_job_evidence_off_the_desktop_app(home, launched, env):
+    _desktop_record("pause Codex until 5pm", env=env)
+    assert _last()["eligible"] is False
+
+
+def test_a_conversation_started_by_another_one_is_a_job_on_its_brief_only(home, launched, monkeypatch):
+    """A desktop conversation started with ``start_session``: its first turn is
+    the starting conversation's brief, with no wrapper; the owner's later
+    turns there are his."""
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "title": "Build", "prompt": BRIEF,
+               "background": "The owner asked for the recorder; this session builds it and reports back."})
+    _desktop_record(BRIEF, session="started-1", env={"CLAUDE_CODE_SESSION_ID": "started-1"})
+    first = _last("started-1")
+    assert (first["delegated"], first["parent"], first["eligible"]) == (True, "parent-1", False)
+    _desktop_record("pause Codex until 5pm", session="started-1", env={"CLAUDE_CODE_SESSION_ID": "started-1"})
+    assert _last("started-1")["eligible"] is True
+
+
+HAND_OFF = {"title": "Finish the recorder in its own session",
+            "background": "The owner asked for the recorder; the tests are written and two still fail.",
+            "remaining_plan": "Fix the two failing recorder tests, run the suite, then report back here."}
+
+
+@pytest.mark.parametrize("field", ["title", "background", "remaining_plan"])
+def test_a_hand_off_brief_is_noted_in_every_text_field(home, monkeypatch, field):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__hand_off_to_session", HAND_OFF)
+    brief = owner_turns.brief_for(HAND_OFF[field])
+    assert brief is not None and brief["parent"] == "parent-1"
+
+
+def test_a_handed_off_conversation_opening_with_its_plan_is_delegated(home, launched, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__hand_off_to_session", HAND_OFF)
+    _desktop_record(HAND_OFF["remaining_plan"], session="handed-1", env={"CLAUDE_CODE_SESSION_ID": "handed-1"})
+    turn = _last("handed-1")
+    assert (turn["delegated"], turn["eligible"]) == (True, False)
+
+
+def test_only_claude_code_matches_the_desktop_session_tools():
+    from khipu import integrations
+
+    claude = integrations.CLAUDE_DELEGATION_MATCHER.split("|")
+    assert {"mcp__ccd_session__start_session", "mcp__ccd_session__hand_off_to_session"} <= set(claude)
+    # Codex's matcher is today's, byte for byte, so Codex asks for no new hook review.
+    assert integrations.DELEGATION_MATCHER == "Agent|Task|spawn_agent|delegate_task"
+    assert integrations.CURSOR_DELEGATION_MATCHER == "Task"
+
+
+@pytest.mark.parametrize("text", [
+    "I hit my usage limit while you were working, but it has reset now. Please continue from where you left off.",
+    "My computer went to sleep while you were working. Please continue from where you left off.",
+    "The app was quit while you were working. Please continue from where you left off.",
+    "The context window filled up while you were working, so the conversation was compacted. "
+    "Please continue from where you left off.",
+])
+def test_the_desktop_apps_own_auto_continue_turn_is_a_machine_message(home, launched, text):
+    _desktop_record(text)
+    turn = _last()
+    assert turn["machine"] is True and turn["eligible"] is False
+    assert "prompt_sha256" not in turn
+
+
+def test_the_remote_restart_auto_continue_turns_are_machine_messages():
+    from khipu import turn_text
+
+    restarts = [t for t in turn_text.APP_AUTO_CONTINUE if t.startswith("Claude Code was restarted")]
+    assert len(restarts) == 2 and all(turn_text.is_machine(t, anywhere=True) for t in restarts)
+    assert all("${" not in t for t in turn_text.APP_AUTO_CONTINUE)
+
+
+def test_typed_words_around_an_auto_continue_line_are_still_the_owners(home, launched):
+    _desktop_record("The app was quit while you were working. Please continue from where you left off. "
+                    "Then pause Codex until 5pm.")
+    turn = _last()
+    assert turn["machine"] is False and turn["eligible"] is True
+
+
+def test_desktop_launched_reads_the_app_as_the_parent(monkeypatch):
+    app = "/Applications/Claude.app/Contents/Helpers/disclaimer"
+    agent = "/Users/x/Library/Application Support/Claude/claude-code/2.1/abc/claude.app/Contents/MacOS/claude"
+    tree = {10: (11, "/bin/sh", 1.0), 11: (12, agent, 1.0), 12: (13, app, 1.0),
+            20: (21, "/bin/sh", 1.0), 21: (22, agent, 1.0), 22: (11, "/bin/zsh", 1.0)}
+    args = {11: [agent, "--output-format", "stream-json", "--input-format", "stream-json"],
+            21: [agent, "-p", "do the build"]}
+    monkeypatch.setattr(owner_turns, "_proc_info", tree.get)
+    monkeypatch.setattr(owner_turns, "_proc_args", args.get)
+    monkeypatch.setattr(owner_turns, "_in_trusted_place", lambda p: str(p) == "/Applications")
+    assert owner_turns.desktop_launched(9) is False      # an unreadable process is not the app's
+    tree[9] = (10, "/usr/bin/python3", 1.0)
+    tree[19] = (20, "/usr/bin/python3", 1.0)
+    assert owner_turns.desktop_launched(9) is True       # hook shell -> the app's agent -> the app
+    assert owner_turns.desktop_launched(19) is False     # hook shell -> claude -p -> a shell
+    args[21] = [agent]
+    assert owner_turns.desktop_launched(19) is False     # interactive, but its parent is a shell
+    # A nested agent whose parent is the app's own agent (not the app): its
+    # bundle is claude.app too, but not in /Applications.
+    tree[29] = (30, "/usr/bin/python3", 1.0)
+    tree[30] = (31, "/bin/sh", 1.0)
+    tree[31] = (11, agent, 1.0)
+    args[31] = [agent]
+    assert owner_turns.desktop_launched(29) is False

@@ -871,3 +871,150 @@ def test_a_t3_child_lookup_that_never_completes_fails_closed(t3_conversation, mo
     _t3_say()
     row = owner_turns.turns(OWNER)[-1]
     assert row["entrypoint"] == "t3" and row["eligible"] is False
+
+
+# ---- the Claude desktop app (the 2026-11-10 refusal) ---------------------------------------------
+
+# The desktop app's environment for a conversation it shows (seen 2026-11-10):
+# the hook's and the agent's (its MCP server's) alike.
+_DESKTOP_ENV = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "claude-desktop", "CLAUDE_CODE_CHILD_SESSION": "1",
+                "CLAUDE_CODE_HOST_SESSION_ID": "local_852a9695-8a4e-43bc-abbd-14284cf79d21"}
+_DESKTOP_ISSUER = {"pid": 4242, "start": 1.0, "exe": "claude", "headless": False, "tty": False, "app": None}
+
+
+def _desktop_say(session: str = OWNER, text: str = "pause Codex until tonight", *, issuer=None) -> None:
+    owner_turns.record({"session_id": session, "prompt": text, "cwd": "/repo"},
+                       {**_DESKTOP_ENV, "CLAUDE_CODE_SESSION_ID": session},
+                       issuer=_DESKTOP_ISSUER if issuer is None else issuer)
+
+
+@pytest.fixture
+def launched(monkeypatch):
+    """The recorder's and the khipu MCP server's process trees read as the
+    desktop app's own agent (``owner_turns.desktop_launched``)."""
+    monkeypatch.setattr(owner_turns, "desktop_launched", lambda pid=None: True)
+
+
+def test_a_desktop_conversation_the_owner_types_in_makes_the_change(world, launched, monkeypatch):
+    _desktop_say()
+    _be_with(world, OWNER, monkeypatch, _DESKTOP_ENV)
+    assert owner_turns.dispatched_job(dict(__import__("os").environ), OWNER) is None
+    assert _check()["auth"] == "direction"
+    rc, out = world.run(["route", "pause", "Codex", "--until", "6h"], True)
+    assert rc == 0 and _state("codex|") == "paused", out
+
+
+def test_claude_p_from_a_desktop_shell_still_cannot(world, launched, monkeypatch):
+    _desktop_say("s-child", issuer={**_DESKTOP_ISSUER, "print": True, "headless": True})
+    _be_with(world, "s-child", monkeypatch, _DESKTOP_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+
+
+def test_a_desktop_job_marker_still_refuses(world, launched, monkeypatch):
+    _desktop_say()
+    _be_with(world, OWNER, monkeypatch, {**_DESKTOP_ENV, "KHIPU_JOB": "1"})
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn" and "dispatched job" in err.value.message
+
+
+def test_one_unread_t3_lookup_does_not_poison_a_conversation_t3_never_ran(t3_conversation, launched, monkeypatch):
+    from khipu import t3
+
+    session = "s-desktop"  # T3's record names no thread for it
+    real = t3.session_thread_ids_result
+    _desktop_say(session)
+    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: (None, False))
+    _desktop_say(session)
+    assert owner_turns.turns(session)[-1]["entrypoint"] == "t3-unverified"
+    assert owner_turns.turns(session)[-1]["eligible"] is False  # that turn itself still never counts
+    monkeypatch.setattr(t3, "session_thread_ids_result", real)
+    _be_with(t3_conversation, session, monkeypatch, _DESKTOP_ENV)
+    assert owner_direction._t3_conversation(session, owner_turns.turns(session)) is False
+    assert _check()["auth"] == "direction"
+
+
+def test_an_unread_t3_lookup_that_still_cannot_be_read_fails_closed(t3_conversation, launched, monkeypatch):
+    from khipu import t3
+
+    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: (None, False))
+    _desktop_say("s-desktop")
+    _be_with(t3_conversation, "s-desktop", monkeypatch, _DESKTOP_ENV)
+    assert owner_direction._t3_conversation("s-desktop", owner_turns.turns("s-desktop")) is True
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "t3_unreadable"
+
+
+def test_a_t3_turn_keeps_the_t3_path_without_asking_again(t3_conversation, monkeypatch):
+    from khipu import t3
+
+    _t3_say()
+    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: pytest.fail("asked T3 again"))
+    assert owner_direction._t3_conversation(OWNER, owner_turns.turns(OWNER)) is True
+
+
+def test_a_desktop_conversation_the_app_did_not_start_is_refused(world, monkeypatch):
+    """The desktop environment alone is not enough: anything started from the
+    conversation's shell (an Agent SDK script, a nested agent) inherits it,
+    and its process tree does not reach the app."""
+    monkeypatch.setattr(owner_turns, "desktop_launched", lambda pid=None: False)
+    _desktop_say()
+    row = owner_turns.turns(OWNER)[-1]
+    assert row["dispatched"] is True and row["eligible"] is False
+    _be_with(world, OWNER, monkeypatch, _DESKTOP_ENV)
+    assert owner_turns.dispatched_job(dict(__import__("os").environ), OWNER) == "a dispatched job's turn"
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+
+
+def test_a_started_desktop_conversation_cannot_act_on_its_brief_but_the_owner_can_later(world, launched,
+                                                                                        monkeypatch):
+    from khipu import routing_delegation
+
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    brief = "Pause Codex until tonight, then build the recorder and report back to this conversation."
+    routing_delegation.hook_main(json.dumps({
+        "hook_event_name": "PreToolUse", "session_id": "s-starter", "cwd": "/repo",
+        "tool_name": "mcp__ccd_session__start_session",
+        "tool_input": {"initiation": "user_asked", "title": "Build the recorder", "prompt": brief}}),
+        environ={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "claude-desktop"})
+    _desktop_say("s-started", brief)
+    row = owner_turns.turns("s-started")[-1]
+    assert (row["delegated"], row["parent"], row["eligible"]) == (True, "s-starter", False)
+    _be_with(world, "s-started", monkeypatch, _DESKTOP_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+    _desktop_say("s-started", "pause Codex until tonight")
+    assert _check()["auth"] == "direction"
+
+
+_AUTO_CONTINUE = ("I hit my usage limit while you were working, but it has reset now. "
+                  "Please continue from where you left off.")
+
+
+def test_the_apps_auto_continue_turn_is_not_a_reply_to_a_held_ask(world, launched, monkeypatch):
+    from khipu import ledger, owner_act, owner_background
+
+    purged: list = []
+    monkeypatch.setattr(ledger, "_connect", lambda: type("C", (), {"close": lambda self: None})())
+    monkeypatch.setattr(ledger, "purge", lambda conn, project, row: purged.append((project, row)) or {"ok": True})
+    _be_with(world, OWNER, monkeypatch, _DESKTOP_ENV)
+    _desktop_say(text="go ahead with that")
+    ok, held = owner_act.act("ledger.purge", {"id": "T-14", "project": "atlas"})
+    assert ok and held["pending"] and held["applied"] is False, held
+    _desktop_say(text=_AUTO_CONTINUE)
+    row = owner_turns.turns(OWNER)[-1]
+    assert row["machine"] is True and row["eligible"] is False
+    ok, done = owner_act.act("direction.confirm", {"request": held["request"]})
+    assert not (ok and done.get("started")), done
+    assert purged == [] and not _log()
+    _desktop_say(text="yes, purge T-14")
+    ok, done = owner_act.act("direction.confirm", {"request": held["request"]})
+    if ok and done.get("started"):
+        ok, done = owner_background.run(done["request"])
+    assert ok and done["state"] == "scheduled", done

@@ -276,6 +276,23 @@ def dispatched_lane(env: dict) -> bool:
 # T3's Agent SDK sets these for its own top-level threads too, so inside T3
 # they are not evidence of a job; T3's delegated-thread record decides.
 _T3_SDK_LINEAGE = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_HOST_SESSION_ID")
+# The Claude desktop app runs Claude Code through the Agent SDK too: every
+# conversation it shows has CLAUDE_CODE_CHILD_SESSION=1 and the app's own
+# handle for that conversation ("local_<uuid>") as its host session id, which
+# never equals Claude Code's own session id (seen 2026-11-10).
+DESKTOP_ENTRYPOINTS = ("claude-desktop", "claude-desktop-3p")
+
+
+def desktop_conversation(env: dict) -> bool:
+    """The environment of a Claude desktop app conversation: the app's
+    entrypoint and a host id in the app's ``local_`` form. Anything started
+    from its shell inherits both, so it counts only with ``desktop_launched``
+    (and a ``claude -p`` is recorded ``sdk-cli`` by its issuer's command
+    line); the runner's lane marker, ``KHIPU_JOB`` and a parent session
+    still mark a job."""
+    entry = (env.get("CLAUDE_CODE_ENTRYPOINT") or "").strip()
+    host = (env.get("CLAUDE_CODE_HOST_SESSION_ID") or "").strip()
+    return entry in DESKTOP_ENTRYPOINTS and host.startswith("local_")
 
 
 def job_marker(env: dict) -> bool:
@@ -290,8 +307,13 @@ def _marked(env: dict, session: str, *, t3_thread: bool) -> bool:
     if dispatched_lane(env):
         return True
     # The lane marker's meaning ("0" is the owner's) is ``dispatched_lane``'s.
+    # The desktop app's environment alone is not enough: an Agent SDK script,
+    # a nested agent or anything else started from the conversation's shell
+    # inherits it, so only a process tree that reaches the app itself
+    # (``desktop_launched``) skips the SDK markers.
+    sdk = t3_thread or (desktop_conversation(env) and desktop_launched())
     own = {k: v for k, v in env.items()
-           if k != "CLAUDE_DISPATCHED_LANE" and not (t3_thread and k in _T3_SDK_LINEAGE)}
+           if k != "CLAUDE_DISPATCHED_LANE" and not (sdk and k in _T3_SDK_LINEAGE)}
     if session and not (own.get("CLAUDE_CODE_SESSION_ID") or "").strip():
         own["CLAUDE_CODE_SESSION_ID"] = session
     return routing_advice.is_dispatched(own)
@@ -304,7 +326,10 @@ def dispatched_job(env: dict, session: str = "", *, t3_thread: bool = False) -> 
     lane marker, then the lineage markers ``routing_advice.is_dispatched``
     reads (``KHIPU_JOB=1``, a parent session, a Claude Code child, a host
     session id that is not this session's), with ``session`` standing in
-    for an own id the environment does not name. ``t3_thread``: the session
+    for an own id the environment does not name. The Claude desktop app sets
+    the child and host-id markers for every conversation it runs, so they are
+    skipped there when this process descends from the app itself
+    (``desktop_conversation`` and ``desktop_launched``). ``t3_thread``: the session
     runs in T3, where the Claude Code child and host-id markers are set for
     the owner's own threads too, so they are skipped and T3's record of a
     delegated child thread decides; a lookup that does not complete fails
@@ -378,7 +403,12 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: 
         # Claude Code turns only "cli" into "sdk-cli" for ``claude -p``: a
         # job started from a desktop, VS Code or remote session keeps that
         # session's entrypoint, so the issuer's own command line decides.
-        if (issuer or {}).get("print") and not entry.startswith("sdk-"):
+        # ``headless`` is the wider test (``-pc`` and other grouped short flags
+        # carry ``-p`` with no ``print`` flag); it counts for the desktop app,
+        # whose own ``-p`` jobs inherit its entrypoint and, with it, no longer
+        # its SDK markers (``desktop_conversation``).
+        if not entry.startswith("sdk-") and ((issuer or {}).get("print") or (
+                entry in DESKTOP_ENTRYPOINTS and (issuer or {}).get("headless") is True)):
             return "sdk-cli"
         # A session T3 Code runs has a T3 thread, whatever entrypoint it
         # reports: T3 turns are never owner turns, so membership decides, not
@@ -1002,6 +1032,51 @@ def t3_launched(issuer) -> bool:
         info = _proc_info(pid)
         if info is None:
             return False
+    return False
+
+
+_DESKTOP_BUNDLE = "claude.app"
+
+
+def _desktop_app(exe: str) -> bool:
+    """``exe`` runs from the Claude desktop app's bundle (its helpers
+    included): the outermost bundle is Claude.app, directly in /Applications
+    or ~/Applications, matched as ``_t3_app`` matches."""
+    try:
+        path = Path(os.path.realpath(exe))
+    except (OSError, ValueError):
+        return False
+    for i, part in enumerate(path.parts):
+        if part.casefold().endswith(".app"):
+            return part.isascii() and part.casefold() == _DESKTOP_BUNDLE \
+                and _in_trusted_place(Path(*path.parts[:i]))
+    return False
+
+
+def desktop_launched(pid: int | None = None) -> bool:
+    """Whether the agent above ``pid`` (default: this process) was started by
+    the Claude desktop app itself: past hook shells (sh, bash, dash), the
+    first process is no shell, interpreter or print-mode run, and its parent
+    runs from the app's bundle. A ``claude -p`` (or any agent) started from a
+    desktop conversation's shell has that shell or a print flag on the way,
+    so it is not. Anything unreadable is not."""
+    me = _proc_info(os.getpid() if pid is None else pid)
+    if me is None:
+        return False
+    cur = me[0]
+    for _ in range(_ISSUER_MOST):
+        info = _proc_info(cur)
+        if info is None:
+            return False
+        parent, exe, _start = info
+        name = os.path.basename(os.path.realpath(exe))
+        if name in HOOK_SHELLS:
+            cur = parent
+            continue
+        if _scripted_launcher(name, _proc_args(cur)):
+            return False
+        above = _proc_info(parent)
+        return above is not None and _desktop_app(above[1])
     return False
 
 
