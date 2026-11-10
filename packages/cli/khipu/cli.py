@@ -1764,6 +1764,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     harness = getattr(args, "harness", None)
     via = getattr(args, "via", None)
     source = getattr(args, "source", None)
+    owner_words = bool(getattr(args, "owner_words", False))
     provenance = {"via": via} if via else {}
     try:
         from khipu.embed import hybrid_search
@@ -1771,7 +1772,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         payload = hybrid_search(
             args.query, limit=args.limit, mode=mode, kind=kind, project=project,
             since=since, until=until, session_id=session_id, harness=harness,
-            source=source, **provenance,
+            source=source, owner_words_only=owner_words, memory_fields=True, **provenance,
         )
     except ValueError as err:
         print(json.dumps({"ok": False, "error": str(err)}))
@@ -1782,6 +1783,10 @@ def cmd_search(args: argparse.Namespace) -> int:
         if kind == "library" or source:
             print(json.dumps({"ok": False, "error": (
                 "library search needs the hub; the offline snapshot holds no libraries")}))
+            return 2
+        if owner_words:
+            print(json.dumps({"ok": False, "error": (
+                "searching only your words needs the hub; the offline snapshot cannot do it")}))
             return 2
         try:
             payload = search_stale_payload(
@@ -5254,6 +5259,10 @@ def build_parser() -> argparse.ArgumentParser:
     se.add_argument("--session-id", dest="session_id", help="Episode session_id prefix match")
     se.add_argument("--harness", help="Prefix of session_id before the colon")
     se.add_argument("--via", help="Exact capture origin, e.g. t3")
+    se.add_argument(
+        "--owner-words", dest="owner_words", action="store_true",
+        help="Match only the owner's own lines (episodes only), in every mode",
+    )
     se.set_defaults(func=cmd_search)
 
     em = sub.add_parser(
