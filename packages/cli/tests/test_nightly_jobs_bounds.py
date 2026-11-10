@@ -290,7 +290,7 @@ def test_a_library_over_the_nightly_cap_is_not_a_failed_embed_step(monkeypatch):
 
 def test_failed_query_cache_and_ledger_steps_turn_a_doctor_row_red(monkeypatch):
     now = datetime.now(timezone.utc).isoformat()
-    names_ok = ["sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
+    names_ok = ["sessions_drain", "consolidate_nightly", "embed_backfill",
                 "snapshot_refresh"]
     steps = [{"name": n, "ok": True, "counts": None, "error": None, "ts": now} for n in names_ok]
     steps += [{"name": n, "ok": False, "counts": None, "error": "boom", "ts": now}

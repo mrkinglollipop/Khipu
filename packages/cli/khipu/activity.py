@@ -233,10 +233,14 @@ def activity_payload(*, limit: int = 40) -> dict:
                         }
                     )
             # The hub's deleted_at lags this Mac's forget list; an
-            # unreadable list shows no episode.
+            # unreadable list shows no episode. Fence first, then look up the
+            # display fields for the rows that remain: a forgotten
+            # conversation's text is never read.
+            from khipu.memory_rows import annotate_activity_rows
             from khipu.tombstones import withhold
 
-            recent = withhold(_recent_rows(cur, limit), fail_closed=False, episode_key="id")
+            recent = annotate_activity_rows(
+                cur, withhold(_recent_rows(cur, limit), fail_closed=False, episode_key="id"))
     try:
         from khipu.keychain import secrets_status
 
