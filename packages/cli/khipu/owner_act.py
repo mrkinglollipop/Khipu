@@ -850,7 +850,7 @@ def _answered_for_another_mac(request: dict, stamp: dict, answer: str) -> tuple[
                   "line": "Your answer is on its way to the other Mac, which applies it within a few minutes."}
 
 
-def _decline(args, *, terminal: bool = False) -> tuple[bool, dict]:
+def _decline(args, *, terminal: bool = False, app: bool = False) -> tuple[bool, dict]:
     from khipu import owner_direction
 
     if not isinstance(args, dict) or set(args) != {"request"} or not isinstance(args["request"], str):
@@ -859,7 +859,7 @@ def _decline(args, *, terminal: bool = False) -> tuple[bool, dict]:
     if settled:
         return True, settled
     try:
-        request = owner_direction.decline(args["request"], terminal=terminal)
+        request = owner_direction.decline(args["request"], terminal=terminal, app=app)
     except owner_direction.DirectionRefused as refused:
         return False, refused.refusal()
     if request.get("remote"):
@@ -900,6 +900,23 @@ def settle_terminal(action: str, args: dict) -> tuple[bool, dict]:
     except (owner_direction.DirectionRefused, Refused) as refused:
         return False, refused.refusal()
     return _confirm({"request": held["id"]}, terminal=True)
+
+
+def settle_from_app(action: str, args: dict) -> tuple[bool, dict]:
+    """Settle one Needs-you item on the owner's Yes or No in the app, once the
+    caller proved the app itself started this process (``routing._caller``,
+    the check every ``--from-app`` write makes). The app's answer takes the
+    place of the terminal's typed yes, so it runs the same hold and replay
+    (``settle_terminal``), as ``owner-direction answer --from-app`` does. A
+    no to a held request is recorded as the app's, as ``owner-direction
+    decline --from-app`` records it. An entry point, not a rule: what may be
+    settled and how is decided where it always was."""
+    if action == DECLINE:
+        request = args.get("request") if isinstance(args, dict) else None
+        if not isinstance(request, str):
+            return False, _bad("the held request is missing").refusal()
+        return _decline({"request": request}, app=True)
+    return settle_terminal(action, args)
 
 
 def _run(action: str, full: list[str]) -> tuple[bool, dict]:

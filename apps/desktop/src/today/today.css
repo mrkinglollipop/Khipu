@@ -1,6 +1,6 @@
 /* Today (slice A2). Classes start td-. Tokens are App.css's own. */
 .td-page { flex: 1; min-width: 0; overflow-y: auto; padding: var(--s8) var(--s8) var(--s8); }
-.td-page-in { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 40px; }
+.td-page-in { max-width: 1120px; margin: 0; display: flex; flex-direction: column; gap: 40px; }
 .td-line { display: flex; gap: var(--s4); align-items: flex-start; }
 .td-line > div { min-width: 0; }
 .td-dot { flex: none; width: 10px; height: 10px; border-radius: 50%; margin-top: 14px; background: var(--muted); }
@@ -14,7 +14,7 @@
 .td-link { display: inline-block; margin-top: var(--s3); padding: 2px 0; border: 0; background: none; font: inherit; font-size: var(--t-lg); color: var(--accent-text); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
 .td-link:focus-visible, .td-copy:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: var(--r-sm); }
 @media (hover: hover) and (pointer: fine) { .td-link:hover { color: var(--accent-hover); } .td-copy:not(:disabled):hover { background: var(--surface-2); } }
-.td-needs h2 { margin: 0; font-size: var(--t-lg); font-weight: 650; color: var(--text); }
+.td-needs h2 { margin: 0; line-height: 1.3; font-size: var(--t-lg); font-weight: 650; color: var(--text); }
 .td-needs .td-link { font-size: var(--t-md); margin-top: 0; }
 .td-panel { display: flex; flex-direction: column; gap: var(--s4); }
 .td-panel-sum { margin: 0; padding-bottom: var(--s4); border-bottom: 1px solid var(--border); font-size: var(--t-md); line-height: 1.5; color: var(--text-2); }
@@ -33,3 +33,58 @@
 .td-copy:disabled { opacity: 0.55; cursor: default; }
 @media (max-width: 899px) { .td-page { padding: var(--s6) var(--s4); } .td-sentence { font-size: 24px; } }
 @media (max-width: 639px) { .td-page { padding: var(--s5) var(--s4); } .td-link, .td-copy { min-height: 44px; } }
+
+/* Needs you (slice A3). Cards side by side; a subgrid lines up Yes and No
+   across a row. An item that can't be taken back takes a row to itself. */
+.td-needs-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s4); margin-bottom: var(--s4); }
+.td-count { color: var(--muted); font-size: var(--t-md); }
+.td-asks { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(400px, 100%), 1fr)); gap: var(--s4); }
+.td-ask { display: grid; grid-row: span 3; grid-template-rows: auto auto 1fr; padding: var(--s5) var(--s6); border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+@supports (grid-template-rows: subgrid) { .td-ask { grid-template-rows: subgrid; row-gap: 0; } }
+.td-ask[data-permanent="true"] { grid-column: 1 / -1; }
+.td-ask-q { margin: 0; font-size: 17px; line-height: 1.4; font-weight: 650; color: var(--text); overflow-wrap: anywhere; }
+.td-ask-who { margin: var(--s1) 0 0; font-size: var(--t-md); color: var(--muted); }
+.td-ask-notes { display: flex; flex-direction: column; gap: var(--s2); padding-top: var(--s3); }
+.td-ask-notes:empty { padding-top: 0; }
+.td-ask-c { margin: 0; padding: var(--s2) var(--s3); border-radius: var(--r-sm); background: var(--warn-soft); font-size: var(--t-md); line-height: 1.45; font-weight: 600; color: var(--text); }
+.td-ask-err { margin: 0; font-size: var(--t-md); line-height: 1.45; color: var(--err); }
+.td-ask-sending { margin: 0; font-size: var(--t-md); color: var(--muted); }
+.td-ask-choices { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s4) var(--s6); padding-top: var(--s4); align-self: start; }
+.td-choice { display: flex; flex-direction: column; align-items: flex-start; gap: var(--s2); min-width: 0; }
+.td-choice button { min-width: 88px; height: 36px; font-size: var(--t-lg); }
+.td-choice p, .td-ask-do { margin: 0; font-size: var(--t-md); line-height: 1.45; color: var(--text-2); }
+.td-ask-do { grid-column: 1 / -1; }
+.td-needs button[aria-disabled="true"], .td-changes button[aria-disabled="true"] { opacity: 0.55; cursor: default; }
+.td-ask-done { padding: 0; border: 0; background: none; }
+.td-ask-done > .td-receipt { grid-row: 1 / -1; }
+.td-receipt { display: flex; gap: var(--s3); align-items: flex-start; min-height: 100%; box-sizing: border-box; padding: var(--s4); border-radius: 12px; background: var(--ok-soft); color: var(--text); }
+.td-receipt > svg { flex: none; margin-top: 3px; color: var(--ok); }
+.td-receipt[data-undone="true"] { background: var(--surface-2); }
+.td-receipt[data-undone="true"] > svg { color: var(--text-2); }
+.td-receipt-b { flex: 1; min-width: 0; }
+.td-receipt-b p { margin: 0; font-size: var(--t-lg); line-height: 1.5; }
+.td-receipt-b .td-receipt-w { margin-top: var(--s1); font-size: var(--t-md); color: var(--text-2); }
+.td-receipt-b .td-receipt-err { margin-top: var(--s2); font-size: var(--t-md); color: var(--err); }
+.td-undo { flex: none; height: 32px; padding: 0 var(--s2); border: 0; background: none; color: var(--accent-text); font-weight: 600; font-size: var(--t-lg); }
+.td-undo:focus-visible { box-shadow: none; outline: 2px solid var(--ring); outline-offset: 2px; }
+.td-everything { grid-column: 1 / -1; margin: 0; padding-top: var(--s2); font-size: var(--t-lg); color: var(--text-2); }
+.td-everything b { color: var(--text); }
+.td-empty-h { margin: 0; font-size: var(--t-lg); font-weight: 650; color: var(--text); }
+.td-quiet { margin: var(--s2) 0 0; font-size: var(--t-lg); line-height: 1.45; color: var(--text-2); }
+.td-last { margin: var(--s4) 0 0; font-size: var(--t-md); line-height: 1.5; color: var(--muted); }
+.td-foot { margin: var(--s8) 0 0; font-size: var(--t-md); color: var(--muted); }
+.td-needs > .td-ask-err { margin-bottom: var(--s3); }
+@media (hover: hover) and (pointer: fine) { .td-undo:not([aria-disabled="true"]):hover { background: var(--accent-soft); border: 0; } }
+
+/* All changes (slice A3), in the docked panel. */
+.td-changes { list-style: none; margin: var(--s3) 0 0; padding: 0; }
+.td-change { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s4); padding: var(--s3) 0; border-top: 1px solid var(--border); }
+.td-change p { margin: 0; font-size: var(--t-lg); line-height: 1.45; color: var(--text); }
+.td-change .td-change-w { margin-top: 2px; font-size: var(--t-md); color: var(--muted); }
+.td-change[data-undone="true"] > div > p:first-child { color: var(--text-2); }
+@media (max-width: 639px) {
+  .td-asks { grid-template-columns: 1fr; }
+  .td-ask { padding: var(--s4); }
+  .td-choice button, .td-undo { min-height: 44px; }
+}
+.td-changes > .td-change:first-child { border-top: 0; }

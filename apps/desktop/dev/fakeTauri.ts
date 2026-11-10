@@ -7,7 +7,7 @@ import { DELIVERY_VIEW } from "./deliveryFake";
 import { fakeAnswer, isRaw, RAW } from "./fakes";
 import { config as fixtureRoutingConfig } from "../src/__tests__/routingSettingsFixtures";
 
-export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; worst?: boolean; routeReplication?: boolean; routeMacs?: "first" | "settled" | "off"; overrides?: boolean; welcome?: boolean; quiet?: boolean; accounts?: boolean; accountsProblem?: boolean; accountsAhead?: boolean; accountsRefuse?: boolean; healthProblem?: boolean; healthUnknown?: boolean; healthNone?: boolean; running?: boolean; runningSilent?: boolean; runningNone?: boolean; runningStale?: boolean; runningFail?: boolean };
+export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; worst?: boolean; routeReplication?: boolean; routeMacs?: "first" | "settled" | "off"; overrides?: boolean; welcome?: boolean; quiet?: boolean; accounts?: boolean; accountsProblem?: boolean; accountsAhead?: boolean; accountsRefuse?: boolean; healthProblem?: boolean; healthUnknown?: boolean; healthNone?: boolean; running?: boolean; runningSilent?: boolean; runningNone?: boolean; runningStale?: boolean; runningFail?: boolean; needsMore?: boolean; needsChanged?: boolean; needsSlow?: boolean };
 
 /** Values used by every routing-settings preview. They match the CLI's named
  * settings so every Change control is enabled with a real-looking value. */
@@ -369,6 +369,8 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
         return { ok: true };
     }
   })();
-  if (isRaw(answer)) return answer[RAW] as T;
-  return JSON.stringify(answer) as unknown as T;
+  // A fake may answer later (slice A3's slow answer): wait for it.
+  const settled = answer instanceof Promise ? await answer : answer;
+  if (isRaw(settled)) return settled[RAW] as T;
+  return JSON.stringify(settled) as unknown as T;
 }

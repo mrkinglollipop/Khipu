@@ -16,6 +16,9 @@ const make = (over: Partial<Health> = {}): Health => ({
   jobs_running: 2, silent_runners: [], free_gb: 80, last_backup_at: null, agent_note: "NOTE FOR AGENT", ...over,
 });
 
+// Nothing waits: Needs you has its own tests (NeedsCards.test.tsx).
+const NEEDS = { data: { total: 0, items: [], more: 0, this_mac: "M1", last_answer: null, unread: [] }, failed: false, loading: false, reload: async () => null };
+
 const store = new Map<string, string>();
 beforeEach(() => {
   invokeMock.mockReset();
@@ -67,7 +70,7 @@ describe("Today", () => {
   it("shows the stored answer at once, with its time, before the check returns", async () => {
     localStorage.setItem("khipu.today.health.v1", JSON.stringify(make()));
     invokeMock.mockReturnValue(new Promise(() => {})); // a very slow check
-    render(<Today active onOpen={() => {}} onOlderHome={() => {}} />);
+    render(<Today active onOpen={() => {}} needs={NEEDS} />);
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Everything is working.");
     expect(screen.getByText(/Checked 2 minutes ago on M1/)).toBeTruthy();
     expect(screen.queryByRole("alert")).toBeNull();
@@ -75,7 +78,7 @@ describe("Today", () => {
   it("keeps the last answer and shows no error when the check fails", async () => {
     localStorage.setItem("khipu.today.health.v1", JSON.stringify(make()));
     invokeMock.mockRejectedValue(new Error("boom"));
-    render(<Today active onOpen={() => {}} onOlderHome={() => {}} />);
+    render(<Today active onOpen={() => {}} needs={NEEDS} />);
     await waitFor(() => expect(screen.getByText(/Couldn’t refresh just now/)).toBeTruthy());
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Everything is working.");
     expect(screen.queryByText(/boom/)).toBeNull();
@@ -86,7 +89,7 @@ describe("Today", () => {
     invokeMock.mockResolvedValue(JSON.stringify(h));
     const write = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { clipboard: { writeText: write } });
-    render(<Today active onOpen={() => {}} onOlderHome={() => {}} />);
+    render(<Today active onOpen={() => {}} needs={NEEDS} />);
     await screen.findByText(/Everything we could check is working/);
     fireEvent.click(screen.getByRole("button", { name: "See the five checks" }));
     expect(screen.getByRole("complementary", { name: "How Khipu is doing" })).toBeTruthy();
@@ -97,7 +100,7 @@ describe("Today", () => {
   it("links Running now from the jobs area", async () => {
     invokeMock.mockResolvedValue(JSON.stringify(make()));
     const onOpen = vi.fn();
-    render(<Today active onOpen={onOpen} onOlderHome={() => {}} />);
+    render(<Today active onOpen={onOpen} needs={NEEDS} />);
     await screen.findByText("Checked 2 minutes ago on M1.");
     fireEvent.click(screen.getByRole("button", { name: "See the five checks" }));
     fireEvent.click(screen.getByRole("button", { name: "Open Running now" }));

@@ -447,6 +447,9 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   "app-problem": { title: "The whole window, something wrong", fake: { healthProblem: true }, render: () => <App /> },
   "app-unknown": { title: "The whole window, a check could not run", fake: { healthUnknown: true }, render: () => <App /> },
   "app-nocheck": { title: "The whole window, health check fails", fake: { healthNone: true }, render: () => <App /> },
+  "app-needs-more": { title: "Today: an item that can't be taken back, a sign-in, a shortened item", fake: { needsMore: true }, render: () => <App /> },
+  "app-needs-changed": { title: "Today: the rule changes after it was read", fake: { needsChanged: true }, render: () => <App /> },
+  "app-needs-slow": { title: "Today: answers take four seconds", fake: { needsSlow: true }, render: () => <App /> },
   "app-welcome": { title: "The whole window, first run", fake: { welcome: true }, render: () => <App /> },
   // Accounts (slice A4): open the window, then press Accounts in the sidebar.
   "app-accounts": { title: "The whole window, Accounts", fake: { accounts: true }, render: () => <App /> },
