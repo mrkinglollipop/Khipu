@@ -348,3 +348,67 @@ def test_doctor_is_green_when_loaded_startable_and_the_last_run_worked(monkeypat
 def test_doctor_still_says_not_installed_when_it_is_not_loaded(monkeypatch, tmp_path):
     row = _health_with(monkeypatch, tmp_path, None)
     assert row["ok"] is False and row["state"] == "not_installed" and "not installed" in row["error"]
+
+
+RUNNING_AFTER_78 = """gui/501/com.khipu.notes-watch = {
+\tstate = running
+\tprogram = /bin/sh
+\truns = 28
+\tpid = 4242
+\tlast exit code = 78: EX_CONFIG
+\tjob state = running
+\tproperties = inferred program
+}
+"""
+
+
+def test_keep_program_does_not_keep_apples_python(home):
+    """The plist the 2026-11-10 bug wrote is replaced, not kept, by the watcher's own refresh."""
+    dest = home / "Library" / "LaunchAgents" / f"{NOTES_LABEL}.plist"
+    broken = ["/usr/bin/python3", "-m", "khipu", "notes", "reconcile", "--changed-only"]
+    dest.write_bytes(plistlib.dumps({"Label": NOTES_LABEL, "ProgramArguments": broken, "WatchPaths": []}))
+    assert launchd_gen.install_job("notes_watch", keep_program=True)["ok"]
+    after = plistlib.loads(dest.read_bytes())
+    assert _interpreter(after) != "/usr/bin/python3"
+    assert after["ProgramArguments"][:2] == ["/bin/sh", "-c"]
+
+
+def test_a_running_job_with_an_old_exit_78_is_not_unspawnable():
+    got = jobs.parse_launchctl_print(RUNNING_AFTER_78)
+    assert got["job_state"] == "running" and got["last_exit"] == 78
+    assert got["spawn_failed"] is False
+    assert jobs.parse_launchctl_print(M1_STUCK)["spawn_failed"] is True
+
+
+def test_refresh_leaves_a_running_job_with_an_old_78_alone(home, monkeypatch):
+    assert launchd_gen.install_job("notes_watch")["ok"]
+    home.loads.clear()
+    monkeypatch.setattr(launchd_gen, "launchd_state",
+                        lambda label: {"loaded": True, **jobs.parse_launchctl_print(RUNNING_AFTER_78)})
+    out = launchd_gen.refresh_scheduled_jobs(["notes_watch"])
+    assert home.loads == []
+    assert out["current"] == ["notes_watch"]
+
+
+def test_ensure_leaves_a_running_job_with_an_old_78_alone(home, monkeypatch):
+    assert launchd_gen.install_job("notes_watch")["ok"]
+    home.loads.clear()
+    monkeypatch.setattr(launchd_gen, "launchd_state",
+                        lambda label: {"loaded": True, **jobs.parse_launchctl_print(RUNNING_AFTER_78)})
+    launchd_gen.ensure_scheduled_jobs(["notes_watch"])
+    assert home.loads == []
+
+
+def test_doctor_does_not_say_cannot_start_while_it_is_running(monkeypatch, tmp_path):
+    row = _health_with(monkeypatch, tmp_path, RUNNING_AFTER_78)
+    assert row.get("state") != "cannot_start"
+
+
+def test_doctor_is_red_when_the_launchd_state_read_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(jobs, "_job_entry", lambda name: {"plist_loaded": True, "err_log_path": str(tmp_path / "e.log")})
+    monkeypatch.setattr(jobs, "launchd_state",
+                        lambda label: {"loaded": False, "error": "TimeoutExpired: launchctl print timed out"})
+    monkeypatch.setattr(launchd_gen, "watch_list_drift", lambda: {"installed": [], "unwatched": [], "stale": []})
+    row = jobs.notes_watch_health()
+    assert row["ok"] is False
+    assert row["state"] == "check_failed"

@@ -121,7 +121,7 @@ def _exec_arguments(name: str, python: str, args: list[str]) -> list[str]:
     "Missing executable" (exit 78, EX_CONFIG) and wait for a one-shot "it is
     back" event. On 2026-11-10 that event fired for replica-refresh and never
     for notes-watch, which stayed unstartable until reloaded. Through sh a run
-    during the swap fails like any other run (exit 127) and the next one works,
+    during the swap fails like any other run (exit 126) and the next one works,
     the same way queue-drain (already started through sh) rode it out."""
     return ["/bin/sh", "-c", _EXEC_SCRIPT, name, python, *args]
 
@@ -426,6 +426,10 @@ def _render_keeping_program(job: str, environ: dict[str, str] | None) -> bytes |
     python = installed_interpreter(job)
     if not python:
         return None
+    if python == SYSTEM_PYTHON:
+        # Apple's 3.9 cannot run Khipu and nobody chose it: it is the program
+        # the 2026-11-10 bug wrote. Today's render replaces it.
+        return render_plist(job, environ)
     rendered = render_plist(job, environ, python=python)
     data = plistlib.loads(rendered)
     old_args = installed.get("ProgramArguments")

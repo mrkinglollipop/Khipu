@@ -186,8 +186,11 @@ def parse_launchctl_print(text: str) -> dict[str, Any]:
             out["runs"] = int(m.group(0)) if m else None
         elif key == "properties" and not out["properties"]:
             out["properties"] = value
+    # "last exit code" is the previous run's: a run in progress after launchd's
+    # own retry still shows 78, and that job has not failed to spawn.
     out["spawn_failed"] = (out["job_state"] == _LAUNCHD_SPAWN_FAILED
-                           or out["last_exit"] == _LAUNCHD_EX_CONFIG)
+                           or (out["last_exit"] == _LAUNCHD_EX_CONFIG
+                               and out["job_state"] != "running"))
     return out
 
 
@@ -1526,13 +1529,18 @@ def notes_watch_health() -> dict[str, Any]:
             return {"ok": False, "applicable": True, "state": "check_failed",
                     "error": f"could not read the notes watcher's launchd state: {type(exc).__name__}: {exc}",
                     "fix": fix}
-        if run.get("loaded") and run.get("spawn_failed"):
+        if not run.get("loaded"):
+            return {"ok": False, "applicable": True, "state": "check_failed", "launchd": run,
+                    "error": "could not read the notes watcher's launchd state: "
+                             + (run.get("error") or "launchctl no longer reports it loaded"),
+                    "fix": fix}
+        if run.get("spawn_failed"):
             return {"ok": False, "applicable": True, "state": "cannot_start", "launchd": run,
                     "error": "launchd cannot start the notes watcher"
                              f" (job state {run.get('job_state') or 'unknown'}, last exit code {run.get('last_exit')}),"
                              " so edited notes are not indexed",
                     "fix": fix}
-        last_exit = run.get("last_exit") if run.get("loaded") else None
+        last_exit = run.get("last_exit")
         if isinstance(last_exit, int) and last_exit != 0:
             said = _last_line(entry.get("err_log_path"))
             return {"ok": False, "applicable": True, "state": "last_run_failed", "launchd": run,
