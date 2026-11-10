@@ -120,20 +120,6 @@ if os.environ.get("KHIPU_LIVE_TESTS") != "1":
     os.environ["KHIPU_GH_CLI"] = _gh
     os.environ["PATH"] = _SHIM_DIR + os.pathsep + os.environ.get("PATH", "")
 
-# Routing slice 6 makes the page what routing delivers (``routing_page_file``).
-# The suite's earlier routing tests exercise the change pushes, which stay in
-# place until their removal is decided: they run with the page off. A test of
-# the page turns it on with the ``page_delivery`` fixture. An environment
-# variable, not a patched constant, so hook children and subprocesses see it.
-os.environ["KHIPU_ROUTING_PAGE"] = "0"
-
-
-@pytest.fixture
-def page_delivery(monkeypatch):
-    """Routing delivers the page (slice 6), in this process and its children."""
-    monkeypatch.setenv("KHIPU_ROUTING_PAGE", "1")
-
-
 @pytest.fixture(autouse=True)
 def _isolate_routing_inventory(monkeypatch):
     """Each hermetic runtime needs its own process-local helper inventory."""

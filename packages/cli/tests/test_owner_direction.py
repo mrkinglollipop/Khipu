@@ -558,6 +558,16 @@ def _marker() -> dict:
     return {"version": first["version"], "epoch": first["epoch"], "full_at": routing._iso(routing._now())}
 
 
+
+def _named(marker: dict) -> dict:
+    """The fixed-words lines naming who made each change after ``marker``
+    (``khipu_route since``): the routing page itself names no author."""
+    view = routing.read_view()
+    got = routing.since(marker["version"], view, epoch=marker["epoch"])
+    text = "\n".join(got["directions"])
+    return {"kind": "changes" if text else "none", "text": text, "version": view["version"],
+            "epoch": view["epoch"]}
+
 def test_the_next_routing_block_names_a_direction_once_in_fixed_words(world, khipu_app):
     marker = _marker()
     turn = world.say("pause Codex until tonight please")
@@ -565,29 +575,29 @@ def test_the_next_routing_block_names_a_direction_once_in_fixed_words(world, khi
     assert rc == 0
     events, _bad = routing.read_events()
     at = routing._clock(routing._parse(events[-1]["written_at"]), routing._now())
-    push = routing.prompt_push(marker, budget=5.0)
+    push = _named(marker)
     assert push["kind"] == "changes"
     assert f"Paused Codex by your direction in a Claude Code conversation, {at} (undo in Settings)." in push["text"]
     # Fixed words only: never the session, the turn or the owner's words.
     assert OWNER not in push["text"] and turn not in push["text"] and "tonight" not in push["text"]
     seen = {"version": push["version"], "epoch": push["epoch"], "full_at": marker["full_at"]}
-    assert routing.prompt_push(seen, budget=5.0)["kind"] == "none"
+    assert _named(seen)["kind"] == "none"
     # Its undo by direction is named the same way, and so is the app's own change.
     line = _log()[-1]
     world.say("undo that pause on Codex")
     rc, _ = world.run(["owner-direction", "undo", line["id"]], True)
     assert rc == 0
-    push = routing.prompt_push(seen, budget=5.0)
+    push = _named(seen)
     assert "Lifted the pause on Codex by your direction in a Claude Code conversation" in push["text"]
     seen = {"version": push["version"], "epoch": push["epoch"], "full_at": marker["full_at"]}
     khipu_app.as_app()
     rc, _ = world.run(["route", "note", "set", "builds go to Codex", "--from-app"])
     assert rc == 0
-    push = routing.prompt_push(seen, budget=5.0)
+    push = _named(seen)
     assert push["kind"] == "changes" and "by your direction" not in push["text"]
     assert push["text"].count("Set the note in the app") == 1 and "(undo in Settings)" in push["text"]
     seen = {"version": push["version"], "epoch": push["epoch"], "full_at": marker["full_at"]}
-    assert routing.prompt_push(seen, budget=5.0)["kind"] == "none"
+    assert _named(seen)["kind"] == "none"
 
 
 def test_the_next_routing_block_names_a_terminal_change_once(world, khipu_app, monkeypatch):
@@ -596,10 +606,10 @@ def test_the_next_routing_block_names_a_terminal_change_once(world, khipu_app, m
     monkeypatch.setattr(routing, "typed_yes", lambda prompt: True)
     rc, _ = world.run(["route", "pause", "Codex"])
     assert rc == 0
-    push = routing.prompt_push(marker, budget=5.0)
+    push = _named(marker)
     assert push["text"].count("Paused Codex on a terminal") == 1 and "(undo in Settings)" in push["text"]
     seen = {"version": push["version"], "epoch": push["epoch"], "full_at": marker["full_at"]}
-    assert routing.prompt_push(seen, budget=5.0)["kind"] == "none"
+    assert _named(seen)["kind"] == "none"
 
 
 def test_a_rule_by_direction_is_named_in_the_block(world):
@@ -607,7 +617,7 @@ def test_a_rule_by_direction_is_named_in_the_block(world):
     world.say("add a rule: never run the fast tier")
     rc, _ = world.run(["route", "rule", "add", "never run the fast tier"], True)
     assert rc == 0
-    push = routing.prompt_push(marker, budget=5.0)
+    push = _named(marker)
     assert "Added standing rule 1 by your direction in a Claude Code conversation" in push["text"]
 
 
@@ -673,7 +683,7 @@ def test_direction_attribution_and_uuid_undo_survive_event_envelopes(world, monk
     if route == "rule.add":
         assert line["after"]["entity"] == owner_direction._added_rule(line) == entity
         assert (out["n"] is None) == offline
-    push = routing.prompt_push(marker, budget=5.0)
+    push = _named(marker)
     assert verb in push["text"]
     assert "by your direction in a Claude Code conversation" in push["text"]
     assert "(undo in Settings)" in push["text"]

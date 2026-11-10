@@ -2,7 +2,7 @@
 import hashlib
 import json
 
-from khipu import routing, routing_gateway_copy
+from khipu import routing, routing_delivery, routing_gateway_copy
 from tests import routing_gateway_fixture as gateway_fixtures
 from tests import test_routing_acceptance as acceptance
 from tests.test_routing_s16_fix1 import AUTHOR, _gateway_off, _gateway_on, _outcomes
@@ -67,7 +67,9 @@ def test_delivery_rows_keep_safe_harness_and_last_delivery_point(replay, gateway
     routing.report(account="Codex", state="open", author=AUTHOR)
     _, _, info = replay.offer(session=session)
     replay.ack(info)
-    routing.start_push(moment="delegation", child_component="agent:child", child_session=session)
+    child = routing.start_push(moment="delegation", child_component="agent:child", child_session=session)
+    # Reserved by the hook once it holds the answer (``recall_rule._RoutingAtStart.text``).
+    routing_delivery.offer(child, session=session, component="agent:child", deferred=True)
     rows = routing.doctor_block(now=replay.now)["routing_delivery"]["identities"]
     assert len(rows) == 2
     expected = hashlib.sha256(session.encode()).hexdigest()

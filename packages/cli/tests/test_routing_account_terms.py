@@ -128,7 +128,9 @@ def test_an_account_leaves_the_order_when_its_plan_ends_and_nothing_is_written(r
     assert _order(after) == ["Kimi", "Glm"]  # the rest keep their places
     assert "Muse" in after["priority_ended"]
     assert "Muse" not in routing.priority_line(after["priority"], after_at)
-    assert "Muse" not in routing.summary(now=after_at)["text"].split("Priority", 1)[-1].split("\n", 1)[0]
+    from khipu import routing_page
+    order = routing_page.page(after, after_at).split("ACCOUNTS", 1)[1].split("Not in the owner's order", 1)[0]
+    assert "Muse" not in order
     assert all(e["label"] != "Muse" for e in routing.conversation_view(now=after_at)["priority"]["entries"])
     # The account itself is still tracked and the owner's line keeps it, so a
     # later ends (or its removal) brings it back with no rewrite.

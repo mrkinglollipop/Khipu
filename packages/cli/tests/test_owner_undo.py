@@ -323,6 +323,16 @@ def test_a_dismissed_report_comes_back_on_undo(world, khipu_app):
     assert routing.read_events()[0][-1]["type"] == "undismiss"
 
 
+
+def _named(marker: dict) -> dict:
+    """The fixed-words lines naming who made each change after ``marker``
+    (``khipu_route since``): the routing page itself names no author."""
+    view = routing.read_view()
+    got = routing.since(marker["version"], view, epoch=marker["epoch"])
+    text = "\n".join(got["directions"])
+    return {"kind": "changes" if text else "none", "text": text, "version": view["version"],
+            "epoch": view["epoch"]}
+
 def test_the_next_routing_block_names_an_undone_clear(world, khipu_app):
     routing.report(state="limited", account="Codex", until="2h", author=dict(REPORTER))
     khipu_app.as_app()
@@ -332,7 +342,7 @@ def test_the_next_routing_block_names_an_undone_clear(world, khipu_app):
     (line,) = owner_direction.actions()
     rc, _ = world.run(["owner-direction", "undo", line["id"], "--from-app"])
     assert rc == 0
-    push = routing.prompt_push(marker, budget=5.0)
+    push = _named(marker)
     assert "Undid the clear on Codex in the app" in push["text"], push
 
 

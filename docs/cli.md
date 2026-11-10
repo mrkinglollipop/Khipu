@@ -164,7 +164,7 @@ Usage normally reads the CLI's usage protocol. Claude may use a tiny Haiku turn 
 
 ### route
 
-Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `--brief` (text for a job-runner brief), `--account A`.
+Top-level flags: `--json`, `--since V`, `--page` (the routing page; `--summary` and `--brief` print the same page), `--account A`.
 
 - `check ACCOUNT`: check one account now; Claude may use the bounded tiny-turn fallback if its usage reply omits figures.
 - `report`: record a state. `--state limited|open|down`, `--account` or `--runner` with `--lane`, `--until`, `--window five-hour|weekly`, `--model`, `--message`, `--seen`, `--name`, `--evidence`. A runner lane must resolve through its provider/account declaration and local identity binding, or be named in `routing_lane_map`; unresolved or ambiguous declarations stay unmatched.

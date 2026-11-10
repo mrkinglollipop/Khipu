@@ -98,6 +98,12 @@ def _entry(usd=35.0, days=7, harness="deepseek"):
     return {"key": "deepseek|acct", "label": "DeepSeek", "harness": harness, "caps": caps}
 
 
+def _spend(entry, now):
+    """The measured-spend status the routing page's cap words are built from."""
+    (status,) = routing.cap_statuses({}, entry, now)
+    return status
+
+
 def _cap(ds, usd=35.0, days=7, view=None):
     ds.now = NOW
     (status,) = routing.cap_statuses(view or {}, _entry(usd, days), NOW)
@@ -865,9 +871,9 @@ def test_usage_measured_topup_keeps_spend_on_both_sides(ds):
     assert total["possible_miss_seconds"] == 120
     assert row["spend"]["last_7d_usd"] == 12
     assert _cap(ds)["verdict"] == "under"
-    assert routing.cap_line_for({}, _entry(), NOW) == (
-        "DeepSeek: $12 spent in the last 7 days of $35 (top-ups seen: 1; "
-        "possible missed spend within 120 seconds)")
+    spend = _spend(_entry(), NOW)
+    assert (spend["usd"], spend["days"], spend["cap_usd"]) == (12, 7, 35)
+    assert spend["topups_seen"] == 1 and spend["possible_miss_seconds"] == 120
 
 
 @pytest.mark.parametrize("days,partial", [(8, False), (1, True)])
@@ -884,9 +890,9 @@ def test_usage_measured_under_and_partial_allow_advice(ds, monkeypatch, days, pa
     assert status["since"] == usage._iso(_ago(days=days).timestamp())
     monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
     assert routing_advice.account_advice({}, dict(_entry(), state="open"), NOW, purpose=purpose)["verdict"] == "go"
-    line = routing.cap_line_for({}, _entry(), NOW)
-    assert "DeepSeek: $5 spent in the last 7 days of $35" in line
-    assert ("while history fills" in line) is partial
+    spend = _spend(_entry(), NOW)
+    assert (spend["usd"], spend["days"], spend["cap_usd"]) == (5, 7, 35)
+    assert bool(spend.get("partial")) is partial
 
 
 @pytest.mark.parametrize("failure", ["failed", "stale"])
@@ -1109,14 +1115,14 @@ def test_usage_deepseek_year_history_prompt_cache_budget(ds, monkeypatch, record
         return original(*args)
 
     monkeypatch.setattr(usage, "_deepseek_read", read)
-    expected = routing.cap_line_for({}, _entry(), NOW)
-    assert "$" in expected and "unknown" not in expected
+    expected = _spend(_entry(), NOW)
+    assert expected["verdict"] != "unknown" and isinstance(expected["usd"], (int, float))
     elapsed = []
     for seconds in (0, 1, 2):
         before = time.perf_counter()
-        line = routing.cap_line_for({}, _entry(), NOW + timedelta(seconds=seconds))
+        line = _spend(_entry(), NOW + timedelta(seconds=seconds))
         elapsed.append(time.perf_counter() - before)
-        assert line == expected
+        assert (line["usd"], line["verdict"]) == (expected["usd"], expected["verdict"])
     record_property("deepseek_warm_prompt_max_ms", max(elapsed) * 1000)
     print(f"DeepSeek unchanged year-history prompt max: {max(elapsed) * 1000:.3f} ms")
     assert max(elapsed) < 0.020
@@ -1145,10 +1151,10 @@ def test_usage_deepseek_folding_preserves_exact_year_sums(ds):
     assert json.dumps(data, sort_keys=True) == first, "folding must be idempotent"
     _store_deepseek_history(data)
     before = time.perf_counter()
-    line = routing.cap_line_for({}, _entry(), NOW)
+    line = _spend(_entry(), NOW)
     print(f"DeepSeek compact year-history cold prompt: {(time.perf_counter() - before) * 1000:.3f} ms; "
           f"{ds.history.stat().st_size} bytes")
-    assert "unknown" not in line and ds.seen == []
+    assert line["verdict"] != "unknown" and ds.seen == []
 
 
 @pytest.mark.parametrize("days", [7, 30, 366])
@@ -1349,7 +1355,9 @@ def test_usage_deepseek_forkserver_children_inherit_cache(ds, monkeypatch, recor
 
     def prompt_push(*args, **kwargs):
         before = time.perf_counter()
-        line = routing.cap_line_for({}, _entry(days=30), NOW)
+        spend = _spend(_entry(days=30), NOW)
+        line = ("spend unknown" if spend["verdict"] == "unknown" or not isinstance(spend.get("usd"), (int, float))
+                else f"${spend['usd']:g} spent")
         result = {"line": line, "seconds": time.perf_counter() - before, "read_pids": reads,
                   "child_pid": os.getpid()}
         return {"kind": "full", "text": json.dumps(result)}

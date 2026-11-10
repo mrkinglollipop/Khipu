@@ -575,8 +575,9 @@ def test_a_limits_end_with_no_file_changing_reaches_the_next_prompt_as_a_change(
     # The real helper prepares complete inventory before forking a prompt.
     agent_view.prepare_routing_table(refresh=True)
     push = routing.prompt_push(marker, budget=1.0)
-    assert push["kind"] == "changes", push
-    assert "Codex: probably open: its limit was due to end at 16:00Z" in push["text"]
+    # The page the poll's fold wrote says the limit's end, with no fold on the prompt.
+    assert push["kind"] == "full" and push["text"].startswith("ROUTING "), push
+    assert "Codex: PROBABLY OPEN" in push["text"], push["text"]
 
 
 def test_a_source_change_refolds(home, monkeypatch):

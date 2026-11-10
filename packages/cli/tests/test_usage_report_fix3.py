@@ -24,7 +24,7 @@ def test_a_monthly_cap_with_no_reading_is_unknown_not_a_crash(replay, kimi):  # 
     entry = next(e for e in replay.view()["accounts"] if e["key"] == "kimi:main")
     (month,) = [p for p in entry["pace"] if p["window"] == "monthly"]
     assert month["plan"]["verdict"] == "unknown" and month["pace_target"]["verdict"] == "unknown"
-    assert isinstance(routing.summary(now=replay.now)["text"], str)
+    assert isinstance(routing.light_status(now=replay.now)["text"], str)
 
 
 def test_compute_pace_of_an_unsized_window_is_unknown():

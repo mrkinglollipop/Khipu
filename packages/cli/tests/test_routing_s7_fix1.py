@@ -55,6 +55,7 @@ def _call(name, arguments=None):
 
 
 def _route(**args):
+    args.setdefault("full", True)  # the record; a bare khipu_route answers the routing page
     error, body = _call("khipu_route", args)
     assert not error, body
     return body
