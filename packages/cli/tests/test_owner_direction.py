@@ -1018,3 +1018,101 @@ def test_the_apps_auto_continue_turn_is_not_a_reply_to_a_held_ask(world, launche
     if ok and done.get("started"):
         ok, done = owner_background.run(done["request"])
     assert ok and done["state"] == "scheduled", done
+
+
+# ---- a T3 read the hook could not finish (the 2026-11-10 cold read) ----------------------------
+
+
+@pytest.fixture
+def cold_hook(t3_conversation, launched, monkeypatch):
+    """T3's record as it was on the M5 with T3 closed: the hook's 50 ms read
+    never finishes, a read under the owner budget does. The owner-budget
+    reads made are counted."""
+    from khipu import t3
+
+    real, owner_reads = t3.session_thread_ids_result, []
+
+    def cold(sid, **kw):
+        if not t3.owner_read_active():
+            return None, False
+        owner_reads.append(sid)
+        return real(sid, **kw)
+
+    monkeypatch.setattr(t3, "session_thread_ids_result", cold)
+    t3_conversation.owner_reads = owner_reads
+    return t3_conversation
+
+
+def test_a_cold_hook_read_is_judged_again_at_the_check(cold_hook, monkeypatch):
+    session = "s-desktop"  # T3's record names no thread for it
+    _desktop_say(session)
+    (row,) = owner_turns.turns(session)
+    assert (row["entrypoint"], row["native"], row["eligible"]) == ("t3-unverified", "claude-desktop", False)
+    _be_with(cold_hook, session, monkeypatch, _DESKTOP_ENV)
+    stamp = _check()
+    assert (stamp["auth"], stamp["session"], stamp["turn"]) == ("direction", session, row["turn"])
+    assert cold_hook.owner_reads == [session]  # one read, under the owner budget
+    rc, out = cold_hook.run(["route", "pause", "Codex", "--until", "6h"], True)
+    assert rc == 0 and _state("codex|") == "paused", out
+
+
+def test_a_cold_hook_read_in_a_conversation_t3_runs_keeps_the_t3_path(cold_hook, monkeypatch):
+    _desktop_say(OWNER)  # T3's record names a thread for OWNER
+    assert owner_turns.turns(OWNER)[-1]["entrypoint"] == "t3-unverified"
+    _be_with(cold_hook, OWNER, monkeypatch, _DESKTOP_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    # T3's own record of the owner's messages decides; here it can't be read (as for any T3 turn).
+    assert err.value.code == "t3_unreadable"
+
+
+def test_a_cold_hook_read_still_unreadable_at_the_check_is_refused(cold_hook, monkeypatch):
+    from khipu import t3
+
+    _desktop_say("s-desktop")
+    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: (None, False))
+    _be_with(cold_hook, "s-desktop", monkeypatch, _DESKTOP_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "t3_unreadable"
+
+
+def test_a_cold_hook_read_never_lifts_a_job_or_a_machine(cold_hook, monkeypatch):
+    owner_turns.record({"session_id": "s-job", "prompt": "pause Codex until tonight", "cwd": "/repo"},
+                       {**_DESKTOP_ENV, "CLAUDE_CODE_SESSION_ID": "s-job", "KHIPU_JOB": "1"}, issuer=_DESKTOP_ISSUER)
+    owner_turns.record({"session_id": "s-sdk", "prompt": "pause Codex until tonight", "cwd": "/repo"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts"}, issuer=_DESKTOP_ISSUER)
+    for session in ("s-job", "s-sdk"):
+        assert owner_turns.turns(session)[-1]["entrypoint"] == "t3-unverified"
+        _be_with(cold_hook, session, monkeypatch, {"CLAUDECODE": "1"})
+        with pytest.raises(owner_direction.DirectionRefused) as err:
+            _check()
+        assert err.value.code == "no_recorded_turn", session
+
+
+def test_a_cold_hook_read_in_an_untrusted_front_end_says_which(cold_hook, monkeypatch):
+    owner_turns.write_settings({"trusted": ["claude_code:cli"]})
+    _desktop_say("s-desktop")
+    _be_with(cold_hook, "s-desktop", monkeypatch, _DESKTOP_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn" and "claude_code:claude-desktop" in err.value.message
+
+
+def test_a_cold_hook_read_holds_and_confirms_a_change(cold_hook, monkeypatch):
+    from khipu import ledger, owner_act, owner_background
+
+    purged: list = []
+    monkeypatch.setattr(ledger, "_connect", lambda: type("C", (), {"close": lambda self: None})())
+    monkeypatch.setattr(ledger, "purge", lambda conn, project, row: purged.append((project, row)) or {"ok": True})
+    session = "s-terminal"  # T3's record names no thread for it
+    cold_hook.be(session)
+    cold_hook.say("go ahead with that", session=session)
+    assert owner_turns.turns(session)[-1]["entrypoint"] == "t3-unverified"
+    ok, held = owner_act.act("ledger.purge", {"id": "T-12", "project": "atlas"})
+    assert ok and held["pending"] and held["applied"] is False, held
+    cold_hook.say("yes, purge T-12", session=session)
+    ok, done = owner_act.act("direction.confirm", {"request": held["request"]})
+    if ok and done.get("started"):
+        ok, done = owner_background.run(done["request"])
+    assert ok and done["state"] == "scheduled", done

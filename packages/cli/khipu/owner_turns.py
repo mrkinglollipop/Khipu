@@ -266,9 +266,14 @@ def _t3_membership(session: str) -> str:
     return "unverified"
 
 
-def _t3_entry(session: str, native: str) -> str:
-    member = _t3_membership(session)
-    return {"t3": "t3", "unverified": "t3-unverified"}.get(member, native)
+def _t3_entry(session: str, native: str, found: dict | None = None) -> str:
+    """``native``, unless T3's record shows T3 runs ``session`` ("t3") or
+    could not be read ("t3-unverified"); then ``found["native"]`` keeps the
+    entrypoint the turn would have had with a settled "none"."""
+    entry = {"t3": "t3", "unverified": "t3-unverified"}.get(_t3_membership(session), native)
+    if entry == "t3-unverified" and found is not None:
+        found["native"] = native
+    return entry
 
 
 def dispatched_lane(env: dict) -> bool:
@@ -396,13 +401,17 @@ def _cursor_ide(issuer: dict | None, payload: dict) -> bool:
     return _in_app(issuer, "cursor") and _cursor_ide_version(payload)
 
 
-def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: dict | None = None) -> str:
+def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: dict | None = None, *,
+                  found: dict | None = None) -> str:
+    """The turn's entrypoint. When T3's record could not be read
+    ("t3-unverified"), ``found["native"]`` gets the entrypoint a settled
+    "none" would have given, from the same single T3 read."""
     if harness == "aegis":
-        entry = _t3_entry(session, "aegis")
+        headless = (issuer or {}).get("headless") is True
         # ``grok -p``: only when the hook's issuer is that process. A
         # shared Grok leader runs the hooks for every client, so a headless
         # client of a leader is not seen here.
-        return "aegis_print" if entry == "aegis" and (issuer or {}).get("headless") is True else entry
+        return _t3_entry(session, "aegis_print" if headless else "aegis", found)
     if harness == "claude_code":
         entry = (env.get("CLAUDE_CODE_ENTRYPOINT") or "unknown").strip() or "unknown"
         # Claude Code turns only "cli" into "sdk-cli" for ``claude -p``: a
@@ -418,30 +427,26 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: 
         # A session T3 Code runs has a T3 thread, whatever entrypoint it
         # reports: T3 turns are never owner turns, so membership decides, not
         # the native entrypoint. ``claude -p`` (sdk-cli) stays a machine.
-        return entry if entry == "sdk-cli" else _t3_entry(session, entry)
+        return entry if entry == "sdk-cli" else _t3_entry(session, entry, found)
     if harness == "codex":
         origin = _codex_originator(str(payload.get("transcript_path") or ""))
-        return "codex_exec" if origin == "codex_exec" else _t3_entry(session, origin or "unknown")
+        return "codex_exec" if origin == "codex_exec" else _t3_entry(session, origin or "unknown", found)
     if harness == "cursor":
         native = hook_shape.cursor_entrypoint(payload)
-        entry = _t3_entry(session, native)
-        if entry != native:
-            return entry
         if native == "cli":
-            return "cli" if _interactive(issuer) else "cursor_print"
-        if native == "ide":
-            return "ide" if _cursor_ide(issuer, payload) else "cursor_sdk"
-        return native
+            native = "cli" if _interactive(issuer) else "cursor_print"
+        elif native == "ide":
+            native = "ide" if _cursor_ide(issuer, payload) else "cursor_sdk"
+        return _t3_entry(session, native, found)
     if harness == "antigravity":
         surface = hook_shape.antigravity_entrypoint(payload)
-        entry = _t3_entry(session, surface)
-        if entry == "cli" and not _interactive(issuer):
-            return "antigravity_print"
+        if surface == "cli" and not _interactive(issuer):
+            surface = "antigravity_print"
         # The transcript path names the surface but anything can write one:
         # the App and the IDE are trusted only from inside their app bundle.
-        if entry in ("app", "ide") and not _in_app(issuer, "antigravity"):
-            return "antigravity_print"
-        return entry
+        elif surface in ("app", "ide") and not _in_app(issuer, "antigravity"):
+            surface = "antigravity_print"
+        return _t3_entry(session, surface, found)
     return "unknown"
 
 
@@ -621,11 +626,13 @@ def untrusted_why(key: str) -> str:
             "from a front end already on that list")
 
 
-def untrusted_front_end(turns_: list[dict], conf: dict | None = None) -> str | None:
+def untrusted_front_end(turns_: list[dict], conf: dict | None = None, *, t3_settled_none: bool = False) -> str | None:
     """The front end of the latest turn that would count but for its front
-    end not being trusted, as ``harness:entrypoint``; None when there is none."""
+    end not being trusted, as ``harness:entrypoint``; None when there is none.
+    ``t3_settled_none`` as for ``eligible``."""
     conf = conf or settings()
     for turn in reversed(turns_):
+        turn = _settled(turn, t3_settled_none)
         key = f"{turn.get('harness')}:{turn.get('entrypoint')}"
         if key in conf["trusted"] or turn.get("entrypoint") in MACHINE_ENTRYPOINTS:
             continue
@@ -634,9 +641,27 @@ def untrusted_front_end(turns_: list[dict], conf: dict | None = None) -> str | N
     return None
 
 
-def eligible(turn: dict, conf: dict | None = None) -> tuple[bool, str]:
-    """Whether a recorded turn can carry the owner's words now, and why not."""
+def _settled(turn: dict, t3_settled_none: bool) -> dict:
+    """``turn`` as judged once T3's record, read at the owner check, settles
+    that no T3 thread runs its session: a "t3-unverified" line with the
+    native entrypoint its recorder kept is read as that entrypoint. Any other
+    line, and every line when the record did not settle "none", is as it is."""
+    native = turn.get("native")
+    if t3_settled_none and turn.get("entrypoint") == "t3-unverified" and isinstance(native, str) \
+            and native and native not in ("t3", "t3-unverified"):
+        return dict(turn, entrypoint=native)
+    return turn
+
+
+def eligible(turn: dict, conf: dict | None = None, *, t3_settled_none: bool = False) -> tuple[bool, str]:
+    """Whether a recorded turn can carry the owner's words now, and why not.
+
+    ``t3_settled_none``: T3's record was read definitively just now and holds
+    no thread for this turn's session. Only then is a turn whose hook-time
+    T3 read did not finish (``t3-unverified``) judged by its native
+    entrypoint, through every check below; a failed read never sets it."""
     conf = conf or settings()
+    turn = _settled(turn, t3_settled_none)
     if turn.get("entrypoint") in MACHINE_ENTRYPOINTS:
         return False, "a machine entrypoint can never authorize owner changes"
     if turn.get("machine"):
@@ -1191,14 +1216,20 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
     text = "" if typed is None else typed
     if issuer is None:
         issuer = hook_issuer() or {"refused": "unknown"}
+    found: dict = {}
     turn = {
         "at": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "ts": now, "harness": harness, "session": session,
-        "entrypoint": entrypoint_of(harness, env, payload, session, issuer), "cwd": cwd,
+        "entrypoint": entrypoint_of(harness, env, payload, session, issuer, found=found), "cwd": cwd,
         "turn": secrets.token_hex(4),
         "typed": bool(text.strip()) and not machine,
         "machine": machine, "wrapped": wrapped, "helper": t3.is_helper_session(cwd), "issuer": issuer,
     }
+    if turn["entrypoint"] == "t3-unverified" and isinstance(found.get("native"), str):
+        # T3's record could not be read in time: the entrypoint a settled
+        # "none" would give, for the owner check to judge it by once it can
+        # read the record (``eligible``'s ``t3_settled_none``).
+        turn["native"] = found["native"]
     job = dispatched_job(env, session, t3_thread=turn["entrypoint"] == "t3")
     if job:
         turn["dispatched"] = True

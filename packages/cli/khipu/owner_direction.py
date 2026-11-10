@@ -205,10 +205,12 @@ def check(action: str, *, env=None, now: float | None = None, reading: bool = Fa
         return dict(confirmed["stamp"])
     from khipu import t3
 
+    recorded = owner_turns.turns(session, now)
     try:
-        turn = _recent_turn(session, conf, now)
+        turn = _recent_turn(session, conf, now, recorded)
     except DirectionRefused:
-        if _t3_conversation(session, owner_turns.turns(session, now)):
+        member = _t3_state(session, recorded)
+        if member == "t3":
             # A T3 conversation (or one whose hook could not read T3's record in
             # time, which T3's record is asked again here): its hook turns never
             # count directly; T3's own record of the owner's messages does
@@ -219,7 +221,12 @@ def check(action: str, *, env=None, now: float | None = None, reading: bool = Fa
             if stamp is not None:
                 return stamp
             raise DirectionRefused("confirm_needed", _ANSWER_HOLD_WHY) from None
-        raise
+        if member != "settled":
+            raise
+        # The hook could not read T3's record in time; read now, it settles
+        # that T3 does not run this conversation, so those turns are judged
+        # by the entrypoint they would have had.
+        turn = _recent_turn(session, conf, now, recorded, t3_settled_none=True)
     if not reading and action in SETTLE_ACTIONS and not REQUEST_APPLIED.get():
         _not_the_reading_turn(session, turn)
     stamp = {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
@@ -230,12 +237,14 @@ def check(action: str, *, env=None, now: float | None = None, reading: bool = Fa
     return stamp
 
 
-def _recent_turn(session: str, conf: dict, now: float, recorded: list[dict] | None = None) -> dict:
-    """The latest recorded eligible typed turn; an answer has no age cutoff."""
+def _recent_turn(session: str, conf: dict, now: float, recorded: list[dict] | None = None, *,
+                 t3_settled_none: bool = False) -> dict:
+    """The latest recorded eligible typed turn; an answer has no age cutoff.
+    ``t3_settled_none`` as for ``owner_turns.eligible`` (``_t3_state``)."""
     recorded = owner_turns.turns(session, now) if recorded is None else recorded
-    usable = [t for t in recorded if owner_turns.eligible(t, conf)[0]]
+    usable = [t for t in recorded if owner_turns.eligible(t, conf, t3_settled_none=t3_settled_none)[0]]
     if not usable:
-        untrusted = owner_turns.untrusted_front_end(recorded, conf)
+        untrusted = owner_turns.untrusted_front_end(recorded, conf, t3_settled_none=t3_settled_none)
         if untrusted:
             raise DirectionRefused("no_recorded_turn",
                                    f"The owner typed here, but in {untrusted}, which is not a front end that counts "
@@ -265,26 +274,42 @@ def _usable_t3_turn(t: dict) -> bool:
         t.get(k) for k in ("dispatched", "helper", "wrapped", "delegated", "machine"))
 
 
-def _t3_conversation(session: str, turns_: list[dict]) -> bool:
-    """Whether T3's record proves the owner in this conversation: a turn the
-    hook recorded as T3's, or a turn whose T3 lookup could not be read
-    (``t3-unverified``) unless T3's record, read now, settles that no thread
-    runs this session. A lookup that still can't be read keeps the T3 path,
-    which refuses (``t3_unreadable``). An unread turn never counts itself
-    (``owner_turns.eligible``); one unread lookup only stops poisoning a
-    conversation T3 never ran."""
+def _t3_state(session: str, turns_: list[dict]) -> str:
+    """Whose record proves the owner in this conversation, from at most one
+    bounded read of T3's record under the owner read budget:
+
+    - "t3": a turn the hook recorded as T3's, or a turn whose T3 lookup could
+      not be read (``t3-unverified``) and T3's record, read now, names a
+      thread for this session or still can't be read (the T3 path, which
+      refuses ``t3_unreadable`` when it can't read it either);
+    - "settled": unverified turns, and T3's record, read now definitively,
+      holds no thread for this session; those turns are judged by their
+      native entrypoint (``owner_turns.eligible``'s ``t3_settled_none``);
+    - "native": no turn needs T3's record, which is not read.
+
+    A failed read is never "settled"."""
     entries = {t.get("entrypoint") for t in turns_}
     if "t3" in entries:
-        return True
+        return "t3"
     if "t3-unverified" not in entries:
-        return False
+        return "native"
     from khipu import t3
 
-    for _ in range(_OWNER_T3_ATTEMPTS if t3.owner_read_active() else 2):
-        threads, definitive = t3.session_thread_ids_result(session)
-        if definitive:
-            return bool(threads)
-    return True
+    # The hook's 50 ms read is what failed (a cold page cache over T3's
+    # record when T3 is closed); this one gets the owner budget.
+    with t3.owner_read_budget():
+        for _ in range(_OWNER_T3_ATTEMPTS):
+            threads, definitive = t3.session_thread_ids_result(session)
+            if definitive:
+                return "t3" if threads else "settled"
+    return "t3"
+
+
+def _t3_conversation(session: str, turns_: list[dict]) -> bool:
+    """Whether T3's record proves the owner in this conversation (``_t3_state``
+    is "t3"). An unread turn never counts itself, so one unread lookup only
+    stops poisoning a conversation T3 never ran."""
+    return _t3_state(session, turns_) == "t3"
 
 
 def _t3_thread_of(session: str) -> str:
@@ -563,7 +588,7 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
             extra = {}
             if terminal or authorized is not None:
                 pass
-            elif _t3_conversation(session, turns_):
+            elif (member := _t3_state(session, turns_)) == "t3":
                 with t3.owner_read_budget():
                     thread, _ = _t3_bound(environ, session, now)
                     seeded = None if class_c(action, args) else _seed(thread, session, signature(action, args))
@@ -572,7 +597,8 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
             else:
                 if owner_turns.dispatched_job(environ, session):
                     raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
-                usable = [t for t in turns_ if owner_turns.eligible(t, conf)[0]]
+                usable = [t for t in turns_
+                          if owner_turns.eligible(t, conf, t3_settled_none=member == "settled")[0]]
                 if not usable:
                     raise DirectionRefused("no_recorded_turn",
                                            "The owner has not typed in this conversation, so it can't ask for an "
@@ -835,14 +861,19 @@ def _t3_turn(environ, session: str, now: float, action: str) -> dict | None:
 
 
 def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
+    """A confirm outside T3. Unverified turns are judged by their native
+    entrypoint only when this check's own read of T3's record settles that no
+    thread runs ``session`` (``_t3_state``)."""
     recorded = owner_turns.turns(session, now)
-    if _t3_conversation(session, recorded):
+    member = _t3_state(session, recorded)
+    if member == "t3":
         raise DirectionRefused("no_recorded_turn", "This conversation's turns were recorded as T3's, but T3's "
                                                    "record no longer shows it, so Khipu can't confirm here.")
     if owner_turns.dispatched_job(environ, session):
         raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
     conf = owner_turns.settings()
-    turn = next((t for t in reversed(recorded) if owner_turns.eligible(t, conf)[0]), None)
+    settled = member == "settled"
+    turn = next((t for t in reversed(recorded) if owner_turns.eligible(t, conf, t3_settled_none=settled)[0]), None)
     if turn is None:
         raise DirectionRefused("no_recorded_turn", "No typed owner reply was recorded in this conversation. Khipu's "
                                                    "prompt hook may not be installed in this front end.")
