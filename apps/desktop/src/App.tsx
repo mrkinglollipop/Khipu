@@ -22,6 +22,7 @@ import {
 import khipuIcon from "./assets/khipu-icon.png";
 import { Sidebar, TabBar, Toolbar } from "./shell";
 import { Today } from "./today/Today";
+import { useNeedsYou } from "./today/needs";
 import type { NavItem } from "./shell";
 import {
   Callout,
@@ -1226,6 +1227,8 @@ export default function App() {
   }, [tab]);
   // Configuration presence lets setup proceed; it does not prove the database answers.
   const [dsnOk, setDsnOk] = useState<boolean | null>(null);
+  // Needs you (slice A3): one read for Today's cards and the sidebar count.
+  const needs = useNeedsYou(dsnOk === true && tab !== "first-run", tab === "home" && !showOldHome);
   const [dbReachable, setDbReachable] = useState<boolean | null>(null);
   const [loading, setLoading] = useState<Partial<Record<CacheTab, boolean>>>(
     {},
@@ -3867,10 +3870,12 @@ export default function App() {
   const placeItem = (id: Tab, icon: ReactNode, hint: string, extra: Partial<NavItem> = {}): NavItem => ({
     id, label: PLACE_TITLES[id] ?? id, icon, hint, busy: tabBusy(id), ...extra,
   });
+  // Today's count is the Needs-you list itself (slice A3), the same read Today shows.
+  const needsCount = needs.data ? needs.data.total : null;
   const places: NavItem[] = [
     placeItem("home", <CircleCheck size={18} aria-hidden />, "What needs you, and whether Khipu is working", {
-      count: owedOpenCount,
-      countLabel: owedOpenCount === 1 ? "1 needs you" : `${owedOpenCount ?? 0} need you`,
+      count: needsCount,
+      countLabel: needsCount === 1 ? "1 needs you" : `${needsCount ?? 0} need you`,
     }),
     placeItem("routing", <Gauge size={18} aria-hidden />, "Which AI has room, and who gets what work"),
     placeItem("recall", <Search size={18} aria-hidden />, "Find what you said"),
@@ -3961,7 +3966,7 @@ export default function App() {
           <PaneBoundary key={paneRetryKeys["home"]} title="Today" onRetry={retryActivePane}>
             <Today
               active={tab === "home" && !showOldHome}
-              onOlderHome={() => setShowOldHome(true)}
+              needs={needs}
               onOpen={(link) => {
                 if (link === "running-now") setTab("work"); // until slice A5 lands Running now
                 else if (link === "accounts") setTab("routing");

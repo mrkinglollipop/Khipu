@@ -9,6 +9,7 @@
 // `raw()` for a command whose real answer is a bare value (e.g. `true`).
 import { shellFakes } from "./shell";
 import { todayFakes } from "./today";
+import { needsFakes } from "./needs";
 
 export type FakeSwitches = Record<string, unknown>;
 export type FakeHandler = (cmd: string, args: Record<string, unknown> | undefined, flags: FakeSwitches) => unknown | undefined;
@@ -16,7 +17,7 @@ export type FakeHandler = (cmd: string, args: Record<string, unknown> | undefine
 export { RAW, raw, isRaw } from "./raw";
 export type { Raw } from "./raw";
 
-export const FAKE_HANDLERS: FakeHandler[] = [shellFakes, todayFakes];
+export const FAKE_HANDLERS: FakeHandler[] = [shellFakes, todayFakes, needsFakes];
 
 export function fakeAnswer(cmd: string, args: Record<string, unknown> | undefined, flags: FakeSwitches): unknown | undefined {
   for (const handler of FAKE_HANDLERS) {
