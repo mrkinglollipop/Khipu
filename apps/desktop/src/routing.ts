@@ -1147,8 +1147,17 @@ export function ruleWords(text: string): string {
   return plain ? t.charAt(0).toLowerCase() + t.slice(1) : t;
 }
 
-export function quietRunners(view: RouteView): RouteRunner[] {
-  return (view.sources?.runners ?? []).filter((r) => r.silent || r.unreadable);
+/** A job runner silent for more than this is no longer news: Khipu says it once, quietly, and
+ *  Settings → Routing → Job runner folders keeps its Remove button. */
+const SILENT_RUNNER_QUIET_MS = 7 * 24 * 3600 * 1000;
+
+export function quietRunners(view: RouteView, now: Date = new Date()): RouteRunner[] {
+  return (view.sources?.runners ?? []).filter((r) => {
+    if (r.unreadable) return true;
+    if (!r.silent) return false;
+    const beat = r.heartbeat_at ? Date.parse(r.heartbeat_at) : NaN;
+    return Number.isNaN(beat) || now.getTime() - beat <= SILENT_RUNNER_QUIET_MS;
+  });
 }
 
 /** "Your Project B job runner stopped reporting at 2:12 PM." */

@@ -730,8 +730,10 @@ TOOLS: list[dict] = [
             "`view` for the full record. Do not combine `view` with `since`. "
             "`since` (a version, or epoch:version, as an earlier answer gave "
             "it) answers only what changed after it and is local-only — the "
-            "gateway refuses `since`; `account` narrows to one "
-            "account. The answer carries `routing_changes` (a batch issued to "
+            "gateway refuses `since`; `account` narrows the answer to "
+            "that account's part: its entry, its entry in the owner's priority with its exceptions, and the holds, "
+            "proposals and unmatched lanes that name it (what is left out is listed under `omitted`; pass "
+            "`view=<section>` for one whole section, or omit `account` for the full record). The answer carries `routing_changes` (a batch issued to "
             "this conversation's `mcp` component) and `delivery`; pass `ack` "
             "with that batch once you have read it, and only with your own "
             "batch. A caller with no session in its environment must pass "
@@ -2636,7 +2638,8 @@ def _tool_route_projected(args: dict) -> dict:
                                 "error": "That routing batch was not issued to this conversation; "
                                          "the batch stays where it was."})
     try:
-        out = routing.conversation_view(since_version=since, account=account or None, now=now, view=view)
+        out = routing.conversation_view(since_version=since, account=account or None, now=now, view=view,
+                                        only_account=not mode)
         if mode:
             out = routing.project_route_view(out, mode)
     except ValueError as exc:

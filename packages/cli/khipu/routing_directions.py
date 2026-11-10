@@ -21,6 +21,15 @@ action cites it (``facts.direction``) or the owner dismisses it. Anything
 else leaves it open. When the transcript and the recorder count a prompt's
 occurrences differently (a missed hook, a lost counter file), the direction
 is ``unjoined``: still open, with that reason, and nothing is guessed.
+
+What is listed or announced is narrower than what is stored (``listable``). A
+row is shown to the owner only while it is open, joined, marked ``typed``
+(capture saw a recorded turn of his own with those words: eligible by
+``owner_turns.eligible``, not a dispatched job's prompt, a brief or a machine's
+message; a row stored before the mark was added has none and is not shown) and
+no older than ``LISTED_FOR_S``. A row nobody settled in that time stays
+stored, only unlisted. The start-of-session line names only the starting
+conversation's own rows.
 """
 from __future__ import annotations
 
@@ -38,6 +47,9 @@ from khipu import owner_turns
 from khipu.turn_text import is_machine, owner_text
 
 STORE_NAME = "routing-directions.json"
+# An open direction nobody settled in this long stops being listed or announced
+# (its row stays in the store): a week is long enough to act on it.
+LISTED_FOR_S = 7 * 86400
 
 _NUMBERS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
             "seven": 7, "eight": 8, "nine": 9, "ten": 10}
@@ -440,15 +452,29 @@ def dismiss(direction_id: str) -> dict | None:
         return row
 
 
-def owed_items() -> list[dict]:
-    """The open directions as owed items, naming the owner's own words.
-    These are the only rows that carry prompt text, and they are shown
-    only to the owner."""
+def listable(row: dict, now: float | None = None) -> bool:
+    """Whether a stored direction is still shown to the owner: open, joined
+    to the recorder's count, tied to a prompt he typed himself (``typed``,
+    stamped at capture from his recorded turn) and no older than
+    ``LISTED_FOR_S``. A row with no time at all is not shown: its age cannot
+    be told."""
+    if row.get("status") != "open" or row.get("join") != "joined" or row.get("typed") is not True:
+        return False
+    basis = row.get("at") if type(row.get("at")) in (int, float) else row.get("seen_at")
+    if type(basis) not in (int, float) or not math.isfinite(basis):
+        return False
+    return (time.time() if now is None else now) - basis <= LISTED_FOR_S
+
+
+def owed_items(now: float | None = None) -> list[dict]:
+    """The directions the owner is still shown (``listable``) as owed items,
+    naming his own words. These are the only rows that carry prompt text,
+    and they are shown only to the owner."""
     from datetime import datetime, timezone
 
     out = []
     for row in directions():
-        if row.get("status") != "open":
+        if not listable(row, now):
             continue
         out.append({"id": row["id"], "kind": "routing_direction",
                     "text": f"Routing said here, not in Khipu: '{row['words']}'",
@@ -490,19 +516,26 @@ def _project_for(session, sha=None) -> str | None:
     return None
 
 
-def pushed_slice_ids(project, *, job: bool = False) -> list[str]:
-    """The open directions a pushed slice may name for ``project``: ids
-    only, never the words. A dispatched job's slice names none, and a
-    direction names only in its own project's slice."""
-    if job or not project:
+def _bare_session(session) -> str:
+    """A session id without its harness prefix (``claude_code:<id>`` and
+    ``<id>`` name the same conversation)."""
+    return str(session or "").rsplit(":", 1)[-1].strip()
+
+
+def pushed_slice_ids(project, *, job: bool = False, session: str | None = None,
+                     now: float | None = None) -> list[str]:
+    """The directions a pushed slice may name for ``project``: ids only,
+    never the words. A dispatched job's slice names none, a direction names
+    only in its own project's slice, and only the conversation that is
+    starting (``session``) hears of its own: with no session, none."""
+    if job or not project or not _bare_session(session):
         return []
     own: dict[tuple, str | None] = {}
     ids = []
     for row in directions():
-        if row.get("status") != "open":
+        if not listable(row, now) or _bare_session(row.get("session")) != _bare_session(session):
             continue
-        session = row.get("session")
-        key = (session, row.get("prompt_sha256"))
+        key = (row.get("session"), row.get("prompt_sha256"))
         row_project = row.get("project")
         if not row_project:
             if key not in own:
@@ -736,8 +769,12 @@ def _capture_scan_locked(session, turns, *, now, actions):
         occurrence = assigned[sha][counts[sha] - 1]
         for found in extract(typed, known):
             key = _direction_id(session, sha, occurrence, found["words"])
-            if key in rows or key in bad:
-                continue  # a dismissal (or a close) survives the next capture; a malformed row stays as written
+            if key in rows:
+                if sha in counted:
+                    rows[key]["typed"] = True  # a row stored before the mark: his recorded turn is seen now
+                continue  # a dismissal (or a close) survives the next capture
+            if key in bad:
+                continue  # a malformed row stays as written
             stale = next((k for k, r in list(rows.items())
                           if r.get("session") == session and r.get("prompt_sha256") == sha
                           and r.get("words") == found["words"] and r.get("status") == "open"
@@ -749,12 +786,17 @@ def _capture_scan_locked(session, turns, *, now, actions):
                 # it to the recorder's occurrence so it can join.
                 row = rows.pop(stale)
                 row.update({"id": key, "occurrence": occurrence})
+                if sha in counted:
+                    row["typed"] = True
                 rows[key] = row
                 continue
             rows[key] = {"id": key, "session": session, "prompt_sha256": sha,
                          "occurrence": occurrence, "words": found["words"], "target": found["target"],
                          "project": _project_from_cwd((recorded.get(sha) or {}).get("cwd")),
-                         "status": "open", "join": "joined", "at": at}
+                         "status": "open", "join": "joined", "at": at, "seen_at": now,
+                         # Only where capture saw a recorded turn of his own with these words (a
+                         # transcript turn no hook recorded may be an agent's brief): listed only then.
+                         "typed": sha in counted}
     for row in rows.values():
         if row.get("session") == session and not row.get("project"):
             row["project"] = _project_from_cwd((recorded.get(row.get("prompt_sha256")) or {}).get("cwd"))

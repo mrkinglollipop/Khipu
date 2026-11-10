@@ -80,6 +80,17 @@ describe("HealthChecksCard", () => {
     await waitFor(() => expect(input).toHaveValue("60"));
   });
 
+  it("says which checks use the window and that the recall row always judges the last 24 hours", async () => {
+    render(<HealthChecksCard active />);
+    await screen.findByLabelText("How far back rate checks look");
+    const help = await screen.findByText(/always looks at the last 24 hours/);
+    expect(help).toHaveTextContent("search falling back to keyword-only");
+    expect(help).toHaveTextContent("the check that decides whether an update may install");
+    expect(help).toHaveTextContent("The recall row in your health report always looks at the last 24 hours");
+    // The old text said the recall check judged only this window.
+    expect(help).not.toHaveTextContent("recall before each prompt");
+  });
+
   it("refuses a value out of range before calling Khipu", async () => {
     render(<HealthChecksCard active />);
     const input = await screen.findByLabelText("How far back rate checks look");

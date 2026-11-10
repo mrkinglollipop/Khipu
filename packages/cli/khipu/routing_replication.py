@@ -1028,6 +1028,9 @@ def _sync(*, hub=None, limit=500, max_pages=20):
             with routing._lock():
                 mac = routing._mac_locked()
                 local, _bad = routing._read_event_lines()
+                # What this Mac reads as unchecked goes as unchecked, so no
+                # other Mac reads it as checked (``routing._mark_unchecked``).
+                verdicts = routing.unchecked_local()
                 # Permanent historical bindings, including moves, matter here.
                 bindings, _forwards, _aliases = routing.account_identity.state(
                     routing._in_write_order(local), routing.accounts())
@@ -1062,7 +1065,8 @@ def _sync(*, hub=None, limit=500, max_pages=20):
                     # A deferred row is tried again once per sync, not every round.
                     if retry and (event.get("id") not in deferred or not first_round):
                         continue
-                    projected = routing.replication_payload([event], bindings=bindings)
+                    judged = dict(event, via=verdicts[event["id"]]) if event.get("id") in verdicts else event
+                    projected = routing.replication_payload([judged], bindings=bindings)
                     known = (uploaded.get(origin), deferred.get(event.get("id")))
                     if event.get("type") == "usage_sample":
                         # A reading goes when its bucket is due, or never: it

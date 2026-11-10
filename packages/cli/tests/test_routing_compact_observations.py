@@ -513,5 +513,8 @@ def test_doctor_names_what_it_keeps_when_it_cannot_shrink(world, monkeypatch):
     assert rc.compact(NOW)["result"] == "skipped"
     row = rc.health()
     assert row["level"] == "yellow"
-    assert "own history" in row["warning"] and "nothing is broken" in row["warning"]
-    assert "nothing to do" in row["warning"]
+    assert "own history" in row["note"] and "nothing is broken" in row["note"]
+    assert "nothing to do" in row["note"]
+    assert "warning" not in row  # kept history the record can't shrink is not something to do
+    monkeypatch.setattr(rc, "BYTES_HURT", 1)
+    assert "reading it is getting slow" in rc.health()["warning"]

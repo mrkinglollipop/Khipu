@@ -5,6 +5,8 @@ project's slice name nothing at all. Hermetic: a temp capture home and
 data dir, fake data only, no hub, no model."""
 from __future__ import annotations
 
+import contextvars
+
 import json
 import time
 
@@ -64,8 +66,9 @@ def test_a_job_slice_names_nothing(world):
     assert row["id"] not in text and "routing direction" not in text.lower()
 
 
-def test_the_owners_own_session_slice_names_only_a_count_and_the_id(world):
+def test_the_owners_own_session_slice_names_only_a_count_and_the_id(world, monkeypatch):
     row = say_and_scan()
+    monkeypatch.setattr(recall_rule, "_START_SESSION", contextvars.ContextVar("s", default=SESSION))
     text = recall_rule._pushed_memory_slice("/work")
     assert GLM not in text and "Routing said here" not in text
     assert f"1 routing direction not yet in Khipu: {row['id']}; khipu owed shows them" in text

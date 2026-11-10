@@ -368,6 +368,21 @@ describe("Home Routing card, the other states", () => {
   });
 });
 
+describe("Home Routing card, a job runner silent for more than a week", () => {
+  it("drops the runner from the health words once it has been silent past a week, and keeps one that just stopped", () => {
+    const base = { ...mainView(), accounts: [], changes: [] } as RouteView;
+    const week = (days: number) => new Date(AFTERNOON.getTime() - days * 24 * 3600 * 1000).toISOString();
+    const runnersFor = (...runners: object[]) => ({ ...base, sources: { runners } }) as RouteView;
+    const old = routingHealthRow(runnersFor({ name: "gear-tracker", heartbeat_at: week(8), silent: true }), AFTERNOON);
+    expect(old?.detail).not.toContain("gear-tracker");
+    const recent = routingHealthRow(runnersFor({ name: "gear-tracker", heartbeat_at: week(2), silent: true }), AFTERNOON);
+    expect(recent?.detail).toContain("Your gear-tracker job runner stopped reporting");
+    // Files Khipu can't read are something to fix at any age.
+    const unreadable = routingHealthRow(runnersFor({ name: "gear-tracker", heartbeat_at: week(30), silent: true, unreadable: true }), AFTERNOON);
+    expect(unreadable?.detail).toContain("gear-tracker");
+  });
+});
+
 describe("Home Routing card, two sources disagree and a rule may be broken", () => {
   function conflictView(): RouteView {
     const v = mainView();
