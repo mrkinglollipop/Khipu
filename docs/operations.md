@@ -10,7 +10,7 @@ Khipu runs its upkeep as macOS LaunchAgents. A fresh install (the Database step,
 
 | Job | When | What it does |
 |---|---|---|
-| `nightly` | Daily at 02:05 | Memory upkeep: capture-queue drain, consolidation, notes reconcile, embedding catch-up, query-cache prune, commitment hygiene, offline-copy refresh |
+| `nightly` | Daily at 02:05 | Memory upkeep: capture-queue drain, consolidation, embedding catch-up, query-cache prune, commitment hygiene, offline-copy refresh |
 | `monthly` | 1st of the month, 09:00 | Monthly organisation pass |
 | `notes_watch` | When watched note files change (30 s throttle) | Syncs edited notes |
 | `queue_drain` | Every 5 minutes | Drains the capture queue |

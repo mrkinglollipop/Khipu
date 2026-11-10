@@ -28,7 +28,7 @@ class NightlyStepHealthTest(unittest.TestCase):
         with mock.patch.object(jobs, "_is_index_sync_host", return_value=False):
             out = jobs.nightly_step_health()
         for key in (
-            "notes_reconcile_ok", "embed_provider_ok", "query_cache_prune_ok",
+            "embed_provider_ok", "query_cache_prune_ok",
             "provenance_backfill_ok",
             "ledger_ok",
         ):
@@ -48,17 +48,17 @@ class NightlyStepHealthTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             self._write_last(tmp, [
-                {"name": "notes_reconcile", "ok": True, "counts": {}, "error": None, "ts": old_ts},
+                {"name": "summary_kind_backfill", "ok": True, "counts": {}, "error": None, "ts": old_ts},
             ])
             with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
                     mock.patch.object(jobs, "ensure_data_dir", return_value=tmp):
                 out = jobs.nightly_step_health()
-        self.assertFalse(out["notes_reconcile_ok"]["ok"])
-        self.assertNotIn("skipped", out["notes_reconcile_ok"])
-        self.assertIn("the nightly has not run since", out["notes_reconcile_ok"]["error"])
-        self.assertIn("khipu jobs status", out["notes_reconcile_ok"]["fix"])
+        self.assertFalse(out["summary_kind_backfill_ok"]["ok"])
+        self.assertNotIn("skipped", out["summary_kind_backfill_ok"])
+        self.assertIn("the nightly has not run since", out["summary_kind_backfill_ok"]["error"])
+        self.assertIn("khipu jobs status", out["summary_kind_backfill_ok"]["fix"])
         # Stale, not skipped: it must not show up in the skipped/not_configured list.
-        self.assertNotIn("notes_reconcile", jobs.skipped_step_names(out))
+        self.assertNotIn("summary_kind_backfill", jobs.skipped_step_names(out))
 
     def test_a_recent_recording_under_36h_old_is_judged_on_its_own_ok(self):
         from datetime import datetime, timedelta, timezone
@@ -69,13 +69,13 @@ class NightlyStepHealthTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             self._write_last(tmp, [
-                {"name": "notes_reconcile", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
+                {"name": "summary_kind_backfill", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
             ])
             with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
                     mock.patch.object(jobs, "ensure_data_dir", return_value=tmp):
                 out = jobs.nightly_step_health()
-        self.assertTrue(out["notes_reconcile_ok"]["ok"])
-        self.assertNotIn("skipped", out["notes_reconcile_ok"])
+        self.assertTrue(out["summary_kind_backfill_ok"]["ok"])
+        self.assertNotIn("skipped", out["summary_kind_backfill_ok"])
 
     def test_a_failed_step_is_red_with_its_own_error_and_fix(self):
         from datetime import datetime, timezone
@@ -85,14 +85,14 @@ class NightlyStepHealthTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             self._write_last(tmp, [
-                {"name": "notes_reconcile", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
+                {"name": "summary_kind_backfill", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
                 {"name": "embed_backfill", "ok": False, "counts": {}, "error": "missing key", "ts": recent_ts},
                 {"name": "provenance_backfill", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
             ])
             with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
                     mock.patch.object(jobs, "ensure_data_dir", return_value=tmp):
                 out = jobs.nightly_step_health()
-        self.assertTrue(out["notes_reconcile_ok"]["ok"])
+        self.assertTrue(out["summary_kind_backfill_ok"]["ok"])
         self.assertFalse(out["embed_provider_ok"]["ok"])
         self.assertEqual(out["embed_provider_ok"]["error"], "missing key")
         self.assertIn("embedding provider", out["embed_provider_ok"]["fix"])
@@ -110,13 +110,13 @@ class NightlyStepHealthTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             self._write_last(tmp, [
-                {"name": "notes_reconcile", "ok": False, "counts": {}, "error": "old failure", "ts": recent_ts},
-                {"name": "notes_reconcile", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
+                {"name": "summary_kind_backfill", "ok": False, "counts": {}, "error": "old failure", "ts": recent_ts},
+                {"name": "summary_kind_backfill", "ok": True, "counts": {}, "error": None, "ts": recent_ts},
             ])
             with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
                     mock.patch.object(jobs, "ensure_data_dir", return_value=tmp):
                 out = jobs.nightly_step_health()
-        self.assertTrue(out["notes_reconcile_ok"]["ok"])
+        self.assertTrue(out["summary_kind_backfill_ok"]["ok"])
 
 
 class NightlyLogDualWriteTest(unittest.TestCase):

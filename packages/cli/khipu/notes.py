@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import sys
 import time
@@ -628,7 +627,6 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
     nightly, the Stop hook, the WatchPaths agent) decides how to surface
     that, same posture as every other write path in this package.
     """
-    scan_started = time.time()
     state = _read_state()
     files_state = state.get("files", {})
     raw_plan = _build_plan()
@@ -674,7 +672,6 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
         if changed_only:
             _write_state({
                 "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
-                "scanned_at": scan_started,
                 "files": dict((state or {}).get("files", {})),
             })
         return out
@@ -768,9 +765,6 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
     out["ok"] = not out["errors"]
     _write_state({
         "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
-        # Only a clean run moves the line the Stop hook's quick check reads;
-        # after an error the same files are looked at again next time.
-        "scanned_at": scan_started if not out["errors"] else state.get("scanned_at"),
         "files": new_files_state,
     })
     try:
@@ -783,65 +777,6 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
         out["organise"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         _log(f"organise.after_reconcile failed: {exc}")
     return out
-
-
-# The Stop hook asks for a notes reconcile after every stop. A full pass reads
-# and parses every note on the Mac (about 1,000 files, ~4.7 s), and nearly
-# every stop has nothing new. So the hook asks at most once per this many
-# seconds, and then only when a note file is newer than the last clean pass.
-HOOK_MIN_INTERVAL_S = 180.0
-# A note written while a pass was running has a modified time a little after
-# that pass started; a file this close to the line counts as new.
-HOOK_MTIME_SLACK_S = 2.0
-
-
-def _hook_stamp_path() -> Path:
-    return _state_path().with_name("notes-reconcile-hook.stamp")
-
-
-def _note_files_changed_since(since: float) -> bool:
-    """One stat per note file, no reads: is any note modified at or after
-    ``since`` (less the slack)? Costs about a quarter of a second for a
-    thousand notes; the parse it avoids costs several seconds."""
-    for path, _harness, _slug in _iter_note_file_candidates():
-        sig = _file_sig(path)
-        if sig is not None and sig["mtime"] >= since - HOOK_MTIME_SLACK_S:
-            return True
-    return False
-
-
-def hook_reconcile(*, now: float | None = None) -> dict[str, Any]:
-    """The Stop hook's notes step: ``reconcile(changed_only=True)`` when it can
-    matter, a one-line skip when it cannot.
-
-    Skips (and says why in ``skipped``) when a pass was started less than
-    ``HOOK_MIN_INTERVAL_S`` ago on this Mac, or when no note file is newer than
-    the last clean pass. A note written in a session is therefore picked up at
-    the first stop at least ``HOOK_MIN_INTERVAL_S`` after the last pass: a few
-    minutes at most while sessions keep stopping. If no session stops after
-    that, the notes-watch job (WatchPaths on the memory folders) and the
-    nightly full pass pick it up. A note copied in with an old modified time
-    (no change to the file's own time) is left to those two as well.
-    """
-    now = time.time() if now is None else now
-    try:
-        age = now - _hook_stamp_path().stat().st_mtime
-    except OSError:
-        age = None
-    if age is not None and 0 <= age < HOOK_MIN_INTERVAL_S:
-        return {"skipped": "recent", "age_s": round(age, 1)}
-    # Stamp before the work, so stops that overlap this one skip rather than
-    # each starting a pass of their own.
-    try:
-        stamp = _hook_stamp_path()
-        stamp.write_text(str(now), encoding="utf-8")
-        os.utime(stamp, (now, now))
-    except OSError:
-        pass
-    scanned_at = _read_state().get("scanned_at")
-    if isinstance(scanned_at, (int, float)) and not _note_files_changed_since(float(scanned_at)):
-        return {"skipped": "unchanged"}
-    return reconcile(dry_run=False, changed_only=True)
 
 
 def notes_freshness(cur) -> dict[str, Any]:

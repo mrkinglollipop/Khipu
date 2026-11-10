@@ -51,7 +51,7 @@ def test_non_applicable_nightly_steps_are_named_for_a_grey_row(monkeypatch):
     monkeypatch.setattr(jobs, "_is_index_sync_host", lambda: False)
     health = jobs.nightly_step_health()
     skipped = jobs.skipped_step_names(health)
-    assert "notes_reconcile" in skipped and "embed_provider" in skipped, (health, skipped)
+    assert "embed_provider" in skipped, (health, skipped)
 
 
 def test_held_verbatim_only_capture_with_open_loop_needs_recovery(tmp_path, monkeypatch):

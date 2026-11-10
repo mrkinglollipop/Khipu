@@ -66,9 +66,15 @@ def _capture(d: dict) -> str:
 
 
 def _jobs(d: dict) -> str:
-    bad = list(d.get("job_failures") or []) + [k.removesuffix("_ok") for k, v in (d.get("nightly_steps") or {}).items()
-                                               if isinstance(v, dict) and not v.get("ok")]
+    bad = list(d.get("job_failures") or []) + [
+        "notes_watch (not installed)" if k == "notes_reconcile_ok" else k.removesuffix("_ok")
+        for k, v in (d.get("nightly_steps") or {}).items() if isinstance(v, dict) and not v.get("ok")]
     return "failing: " + ", ".join(bad) if bad else "a background job is failing"
+
+
+def _jobs_fix(d: dict) -> str:
+    missing = not ((d.get("nightly_steps") or {}).get("notes_reconcile_ok") or {"ok": True}).get("ok", True)
+    return "run `khipu jobs install notes_watch`, then `khipu jobs status`" if missing else "run `khipu jobs status`"
 
 
 AREAS = ("Saving memory", "Finding things", "Routing", "Database and disk", "Jobs and other checks")
@@ -102,7 +108,7 @@ WORDS = {
     "schema_migrations_ok": (3, "the database has pending migrations", "apply them"),
     "dsn_file_ok": (3, "the database address file is stale", None),
     "jobs_ok": (4, _jobs, "run `khipu jobs status`"),
-    "nightly_steps_ok": (4, _jobs, "run `khipu jobs status`"),
+    "nightly_steps_ok": (4, _jobs, _jobs_fix),
     "synth_budget_ok": (4, "the summariser's daily limit is spent", "wait for UTC midnight or `khipu budget lift synth`"),
     "synth_provider_ok": (4, "the summariser's provider is not usable", None),
     "launchers_ok": (4, "an agent launcher points at a missing file", None),
