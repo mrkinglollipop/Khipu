@@ -7,7 +7,7 @@ import { DELIVERY_VIEW } from "./deliveryFake";
 import { fakeAnswer, isRaw, RAW } from "./fakes";
 import { config as fixtureRoutingConfig } from "../src/__tests__/routingSettingsFixtures";
 
-export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; worst?: boolean; routeReplication?: boolean; routeMacs?: "first" | "settled" | "off"; overrides?: boolean; welcome?: boolean; quiet?: boolean; accounts?: boolean; accountsProblem?: boolean; accountsAhead?: boolean; accountsRefuse?: boolean };
+export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; worst?: boolean; routeReplication?: boolean; routeMacs?: "first" | "settled" | "off"; overrides?: boolean; welcome?: boolean; quiet?: boolean; accounts?: boolean; accountsProblem?: boolean; accountsAhead?: boolean; accountsRefuse?: boolean; healthProblem?: boolean; healthUnknown?: boolean; healthNone?: boolean };
 
 /** Values used by every routing-settings preview. They match the CLI's named
  * settings so every Change control is enabled with a real-looking value. */

@@ -5139,6 +5139,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     d.set_defaults(func=cmd_doctor)
 
+    hf = sub.add_parser("health", help="The five checks the app shows, as plain rows (a view over doctor)")
+    hf.add_argument("--json", action="store_true", help="Print JSON (the only form)")
+    hf.set_defaults(func=lambda args: __import__("khipu.health_five", fromlist=["cmd_health"]).cmd_health(args))
+
     ny = sub.add_parser("needs-you", help="Everything waiting on the owner, in the app and MCP's own words")
     ny.add_argument("--json", action="store_true", help="Print the complete structured answer")
     choose = ny.add_mutually_exclusive_group()

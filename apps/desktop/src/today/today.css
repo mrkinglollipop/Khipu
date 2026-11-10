@@ -1,0 +1,35 @@
+/* Today (slice A2). Classes start td-. Tokens are App.css's own. */
+.td-page { flex: 1; min-width: 0; overflow-y: auto; padding: var(--s8) var(--s8) var(--s8); }
+.td-page-in { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 40px; }
+.td-line { display: flex; gap: var(--s4); align-items: flex-start; }
+.td-line > div { min-width: 0; }
+.td-dot { flex: none; width: 10px; height: 10px; border-radius: 50%; margin-top: 14px; background: var(--muted); }
+[data-tone="ok"] > .td-dot, [data-state="ok"] > .td-dot { background: var(--ok); }
+[data-tone="warn"] > .td-dot, [data-state="warn"] > .td-dot { background: var(--warn); }
+[data-tone="err"] > .td-dot, [data-state="err"] > .td-dot { background: var(--err); }
+[data-tone="unknown"] > .td-dot, [data-state="unknown"] > .td-dot { background: transparent; box-shadow: inset 0 0 0 2px var(--muted); }
+.td-sentence { margin: 0; font-size: 28px; line-height: 1.2; font-weight: 650; color: var(--text); letter-spacing: -0.01em; text-wrap: balance; }
+.td-sub { margin: var(--s2) 0 0; font-size: var(--t-lg); line-height: 1.45; color: var(--text-2); }
+.td-checked { color: var(--muted); font-size: var(--t-md); min-height: 1.45em; }
+.td-link { display: inline-block; margin-top: var(--s3); padding: 2px 0; border: 0; background: none; font: inherit; font-size: var(--t-lg); color: var(--accent-text); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.td-link:focus-visible, .td-copy:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: var(--r-sm); }
+@media (hover: hover) and (pointer: fine) { .td-link:hover { color: var(--accent-hover); } .td-copy:not(:disabled):hover { background: var(--surface-2); } }
+.td-needs h2 { margin: 0; font-size: var(--t-lg); font-weight: 650; color: var(--text); }
+.td-needs .td-link { font-size: var(--t-md); margin-top: 0; }
+.td-panel { display: flex; flex-direction: column; gap: var(--s4); }
+.td-panel-sum { margin: 0; padding-bottom: var(--s4); border-bottom: 1px solid var(--border); font-size: var(--t-md); line-height: 1.5; color: var(--text-2); }
+.td-areas { list-style: none; margin: 0; padding: 0; }
+.td-area { display: flex; gap: var(--s3); padding: var(--s4) 0; border-bottom: 1px solid var(--border); }
+.td-area .td-dot { margin-top: 6px; }
+.td-area h3 { margin: 0; font-size: var(--t-lg); font-weight: 650; color: var(--text); }
+.td-state { font-weight: 400; font-size: var(--t-sm); color: var(--muted); }
+.td-area p { margin: var(--s1) 0 0; font-size: var(--t-md); line-height: 1.5; color: var(--text-2); }
+.td-area p b { color: var(--text); font-weight: 650; }
+.td-area .td-link { font-size: var(--t-md); margin-top: var(--s2); }
+.td-more { color: var(--muted); }
+.td-panel-foot { display: flex; flex-direction: column; gap: var(--s2); align-items: flex-start; }
+.td-panel-foot p { margin: 0; font-size: var(--t-sm); }
+.td-copy { padding: 8px 14px; min-height: 36px; border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--surface); color: var(--text); font: inherit; font-size: var(--t-md); font-weight: 600; cursor: pointer; }
+.td-copy:disabled { opacity: 0.55; cursor: default; }
+@media (max-width: 899px) { .td-page { padding: var(--s6) var(--s4); } .td-sentence { font-size: 24px; } }
+@media (max-width: 639px) { .td-page { padding: var(--s5) var(--s4); } .td-link, .td-copy { min-height: 44px; } }

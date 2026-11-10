@@ -3006,6 +3006,10 @@ fn ledger_base(verb: &str, project: &str, write: bool) -> Result<Vec<String>, St
     Ok(argv)
 }
 
+fn health_argv() -> Vec<String> {
+    vec!["health".to_string(), "--json".to_string()]
+}
+
 fn work_view_argv() -> Vec<String> {
     vec!["work".to_string(), "--json".to_string()]
 }
@@ -3265,6 +3269,11 @@ async fn khipu_work_hidden() -> Result<String, String> {
 #[tauri::command]
 async fn khipu_work_check(path: String) -> Result<String, String> {
     run_khipu_cli_async(work_check_argv(&path)?).await
+}
+
+#[tauri::command]
+async fn khipu_health() -> Result<String, String> {
+    run_khipu_cli_async(health_argv()).await
 }
 
 #[tauri::command]
@@ -5466,6 +5475,7 @@ pub fn run() {
             khipu_route_priority,
             khipu_route_definition,
             khipu_work_view,
+            khipu_health,
             khipu_ledger_list,
             khipu_ledger_get,
             khipu_ledger_set,
@@ -8357,6 +8367,7 @@ mod work_command_tests {
     #[test]
     fn reads_are_fixed_and_join_the_project_to_its_flag() {
         assert_eq!(work_view_argv(), vec!["work", "--json"]);
+        assert_eq!(health_argv(), vec!["health", "--json"]);
         assert_eq!(ledger_list_argv("owner/atlas").unwrap(), vec!["ledger", "list", "--json", "--project=owner/atlas"]);
         assert_eq!(
             ledger_get_argv("atlas", "s-3.2").unwrap(),
