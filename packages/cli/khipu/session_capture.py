@@ -493,9 +493,9 @@ def _parse_antigravity(d: dict) -> list[tuple[str, str]] | None:
 # outer tag stripped) and never counted. ``task-notification`` (commandMode
 # ``task-notification``) and, with no origin, a monitor's tagged event
 # (<ci-monitor-event>) had copies only in system blocks or closed reminders,
-# which never reached the window, so they still yield nothing. The provisional
-# roles let ``read_window`` drop the attachment when the same text also
-# arrives as a later user line, and keep a peer's message out of the count.
+# which never reached the window, so they still yield nothing. ``_parse_line``
+# gives both kept kinds the role ``user``; ``read_window`` asks again here to
+# keep a peer's message out of the count.
 _QUEUED_USER = "queued:user"
 _QUEUED_PEER = "queued:peer"
 
@@ -505,6 +505,8 @@ def _queued_command(d: dict) -> list[tuple[str, str]]:
     if not isinstance(a, dict) or a.get("type") != "queued_command":
         return []
     prompt = a.get("prompt")
+    if isinstance(prompt, list):  # text pasted with an image: content blocks
+        prompt = _blocks_text(prompt)[0]
     if not isinstance(prompt, str) or not prompt.strip():
         return []
     origin = a.get("origin")
@@ -541,7 +543,7 @@ def _parse_line(d: dict) -> list[tuple[str, str]]:
     if isinstance(kind, str) and kind.startswith("api-request"):
         return []
     if kind == "attachment":
-        return _queued_command(d)
+        return [("user", text) for _, text in _queued_command(d)]
     antigravity = _parse_antigravity(d)
     if antigravity is not None:
         return antigravity
@@ -706,20 +708,6 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
         if not isinstance(d, dict) or d.get("isMeta"):
             continue
         parsed.extend((d, role, text, min(line_end, end)) for role, text in _parse_line(d))
-    if any(role in (_QUEUED_USER, _QUEUED_PEER) for _, role, _, _ in parsed):
-        # A queued message is a user message once: dropped when a later user
-        # line in this window carries the same text.
-        later: set[str] = set()
-        resolved: list[tuple[dict, str, str, int]] = []
-        for d, role, text, line_end in reversed(parsed):
-            if role in (_QUEUED_USER, _QUEUED_PEER):
-                if _clean_user_text(text).strip() in later:
-                    continue
-                role = "user"
-            elif role == "user":
-                later.add(_clean_user_text(text).strip())
-            resolved.append((d, role, text, line_end))
-        parsed = resolved[::-1]
     # Deduplicate only paired representations of the same turn (adjacent in
     # order, ignoring tools), never a later repeat that reuses the same text.
     # Index event_msg turns by (role, text, turn-ordinal) so matching is O(n).
