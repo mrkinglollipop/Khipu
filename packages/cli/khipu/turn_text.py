@@ -128,3 +128,34 @@ def is_machine(text: str, *, anywhere: bool = False) -> bool:
     if anywhere:
         return any(tag in text for tag in MACHINE_USER_TAGS)
     return text.lstrip().startswith(MACHINE_USER_TAGS)
+
+
+# A line that opens with a tagged envelope (``<task-notification>``,
+# ``<scheduled-task>``, ``<system-reminder>``): a harness message, not a prompt.
+# The per-prompt recall path and the "only my words" search share this one test.
+HARNESS_MESSAGE_RE = re.compile(r"\s*<[A-Za-z][\w-]*>")
+
+# Untagged openings a harness, a scheduler or another agent writes into a user
+# turn. Stored ``verbatim.quotes`` keep each message's opening, so these are
+# matched at the start only: a typed line that merely quotes one is the owner's.
+_AUTOMATED_OPENINGS = re.compile(
+    r"\s*(?:"
+    r"\[SYSTEM NOTIFICATION\b"                      # background-task notices
+    r"|\[notification:"                              # capture's stand-in for a machine message
+    r"|Delegated task\b"                             # "Delegated task ... [completed]"
+    r"|This session is being continued from a previous conversation"   # compaction summary
+    r"|[^\n(\"'?]{0,40}\(scheduled(?:,|\s+(?:task|run)\b)"   # "Lane check (scheduled, not Matt)..."
+    r"|Act as the [^\n.]{0,60}sub-?agent\b"           # a brief sent to a delegated job
+    r")",
+    re.I,
+)
+
+
+def is_automated(text: str) -> bool:
+    """True when a stored owner line was not typed by the owner: a harness
+    envelope, a machine notification, a scheduled-task prompt, a compaction
+    summary or a brief another agent sent to a job."""
+    if not isinstance(text, str):
+        return False
+    return (is_machine(text) or HARNESS_MESSAGE_RE.match(text) is not None
+            or _AUTOMATED_OPENINGS.match(text) is not None)

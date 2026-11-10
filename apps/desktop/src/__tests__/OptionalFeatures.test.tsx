@@ -10,14 +10,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
 }));
 
-const NAMES = [
-  "validity_ranking",
-  "time_interpretation",
-  "relevance_floor",
-  "rerank",
-  "graph_candidates",
-  "routing_push",
-];
+const NAMES = ["routing_push"];
 
 type Backend = {
   features: Record<string, { enabled: boolean; source: "env" | "file" | "default" }>;
@@ -33,7 +26,7 @@ const calls: Array<[string, Record<string, unknown> | undefined]> = [];
 function fresh(): Backend {
   return {
     features: Object.fromEntries(
-      NAMES.map((n) => [n, { enabled: n === "rerank", source: n === "rerank" ? "file" : "default" }]),
+      NAMES.map((n) => [n, { enabled: false, source: "default" }]),
     ) as Backend["features"],
     floor: { value: 0.65, source: "default", default: 0.65 },
     recallInstalled: false,
@@ -95,24 +88,12 @@ function switchFor(label: RegExp) {
 }
 
 describe("OptionalFeatures", () => {
-  it("shows the seven switches, the four recommended ones first, routing apart, then the rejected group", async () => {
+  it("shows the recall service and the one routing switch", async () => {
     render(<OptionalFeatures active />);
-    await waitFor(() => expect(screen.getAllByRole("switch")).toHaveLength(7));
+    await waitFor(() => expect(screen.getAllByRole("switch")).toHaveLength(2));
     const order = screen.getAllByRole("switch").map((el) => el.id);
-    expect(order).toEqual([
-      "feat-validity_ranking",
-      "feat-time_interpretation",
-      "feat-relevance_floor",
-      "feat-rerank",
-      "feat-recall-service",
-      "feat-routing_push",
-      "feat-graph_candidates",
-    ]);
-    const rejected = screen.getByText("Measured, not recommended").closest(".section-card") as HTMLElement;
-    expect(within(rejected).getAllByRole("switch")).toHaveLength(1);
-    expect(within(rejected).getByText(/59 to 4/)).toBeInTheDocument();
-    expect(within(rejected).queryByText(/1 transcript in 10 lost all its decisions/)).not.toBeInTheDocument();
-    expect(screen.getByText(/about 0\.8 s to a search/)).toBeInTheDocument();
+    expect(order).toEqual(["feat-recall-service", "feat-routing_push"]);
+    expect(screen.queryByText("Measured, not recommended")).toBeNull();
     const routing = screen.getByText("Routing", { selector: ".section-head" }).closest(".section-card") as HTMLElement;
     expect(within(routing).getByRole("switch", { name: /Tell conversations which accounts are open/ })).not.toBeChecked();
     expect(within(routing).getByText(/never chooses where work goes/)).toBeInTheDocument();
@@ -124,57 +105,54 @@ describe("OptionalFeatures", () => {
     expect(within(routing).getByText(/up to the routing prompt budget before a prompt/)).toBeInTheDocument();
   });
 
+  const ROUTING = /Tell conversations which accounts are open/;
+
   it("reflects what the CLI reports as on and off", async () => {
+    backend.features.routing_push = { enabled: true, source: "file" };
     render(<OptionalFeatures active />);
-    await waitFor(() => expect(switchFor(/Reorder top results/)).toBeChecked());
-    expect(switchFor(/Rank current decisions/)).not.toBeChecked();
+    await waitFor(() => expect(switchFor(ROUTING)).toBeChecked());
   });
 
   it("toggling calls khipu_feature_set with the name and the new value, then re-reads", async () => {
     render(<OptionalFeatures active />);
-    await waitFor(() => expect(switchFor(/Understand time phrases/)).not.toBeDisabled());
+    await waitFor(() => expect(switchFor(ROUTING)).not.toBeDisabled());
     const before = calls.filter(([c]) => c === "khipu_features_show").length;
-    fireEvent.click(switchFor(/Understand time phrases/));
-    await waitFor(() => expect(switchFor(/Understand time phrases/)).toBeChecked());
-    expect(calls).toContainEqual(["khipu_feature_set", { name: "time_interpretation", enabled: true }]);
+    fireEvent.click(switchFor(ROUTING));
+    await waitFor(() => expect(switchFor(ROUTING)).toBeChecked());
+    expect(calls).toContainEqual(["khipu_feature_set", { name: "routing_push", enabled: true }]);
     expect(calls.filter(([c]) => c === "khipu_features_show").length).toBe(before + 1);
-
-    fireEvent.click(switchFor(/Reorder top results/));
-    await waitFor(() => expect(switchFor(/Reorder top results/)).not.toBeChecked());
-    expect(calls).toContainEqual(["khipu_feature_set", { name: "rerank", enabled: false }]);
   });
 
   it("locks an environment-sourced switch and names the variable", async () => {
-    backend.features.rerank = { enabled: true, source: "env" };
+    backend.features.routing_push = { enabled: true, source: "env" };
     render(<OptionalFeatures active />);
-    // The switch is also disabled while the first read runs, so wait for both.
     await waitFor(() => {
-      expect(switchFor(/Reorder top results/)).toBeDisabled();
-      expect(switchFor(/Reorder top results/)).toBeChecked();
+      expect(switchFor(ROUTING)).toBeDisabled();
+      expect(switchFor(ROUTING)).toBeChecked();
     });
-    expect(screen.getByText("KHIPU_FEATURE_RERANK")).toBeInTheDocument();
-    fireEvent.click(switchFor(/Reorder top results/));
+    expect(screen.getByText("KHIPU_FEATURE_ROUTING_PUSH")).toBeInTheDocument();
+    fireEvent.click(switchFor(ROUTING));
     expect(calls.some(([c]) => c === "khipu_feature_set")).toBe(false);
   });
 
   it("shows the CLI's error text and leaves the switch where the CLI says it is", async () => {
-    backend.refuse = "unknown feature 'relevance_floor'; known: [...]";
+    backend.refuse = "unknown feature 'routing_push'; known: [...]";
     render(<OptionalFeatures active />);
-    await waitFor(() => expect(switchFor(/Return nothing when nothing matches/)).not.toBeDisabled());
-    fireEvent.click(switchFor(/Return nothing when nothing matches/));
-    expect(await screen.findByRole("alert")).toHaveTextContent("unknown feature 'relevance_floor'");
-    expect(switchFor(/Return nothing when nothing matches/)).not.toBeChecked();
+    await waitFor(() => expect(switchFor(ROUTING)).not.toBeDisabled());
+    fireEvent.click(switchFor(ROUTING));
+    expect(await screen.findByRole("alert")).toHaveTextContent("unknown feature 'routing_push'");
+    expect(switchFor(ROUTING)).not.toBeChecked();
   });
 
   it("shows an error when the Tauri command itself fails", async () => {
     render(<OptionalFeatures active />);
-    await waitFor(() => expect(switchFor(/Return nothing when nothing matches/)).not.toBeDisabled());
+    await waitFor(() => expect(switchFor(ROUTING)).not.toBeDisabled());
     const impl = invokeMock.getMockImplementation()!;
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "khipu_feature_set") throw "khipu exited 2: boom";
       return impl(cmd, args);
     });
-    fireEvent.click(switchFor(/Return nothing when nothing matches/));
+    fireEvent.click(switchFor(ROUTING));
     expect(await screen.findByRole("alert")).toHaveTextContent("khipu exited 2: boom");
   });
 
@@ -198,29 +176,6 @@ describe("OptionalFeatures", () => {
     backend.recallInstalled = true;
     render(<OptionalFeatures active />);
     expect(await screen.findByText("Not running")).toBeInTheDocument();
-  });
-
-  it("saves the cosine floor through khipu_config_set and refuses out-of-range input before calling", async () => {
-    render(<OptionalFeatures active />);
-    const field = (await screen.findByLabelText("Lowest match score that counts")) as HTMLInputElement;
-    await waitFor(() => expect(field.value).toBe("0.65"));
-
-    fireEvent.change(field, { target: { value: "1.5" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(/above 0 and up to 1/);
-    expect(calls.some(([c]) => c === "khipu_config_set")).toBe(false);
-
-    fireEvent.change(field, { target: { value: "0.7" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    await waitFor(() =>
-      expect(calls).toContainEqual(["khipu_config_set", { key: "relevance.cosine_floor", value: "0.7" }]),
-    );
-    const useDefault = await screen.findByRole("button", { name: "Use default" });
-    fireEvent.click(useDefault);
-    await waitFor(() =>
-      expect(calls).toContainEqual(["khipu_config_unset", { key: "relevance.cosine_floor" }]),
-    );
-    await waitFor(() => expect(field.value).toBe("0.65"));
   });
 
   it("makes no call while inactive", () => {

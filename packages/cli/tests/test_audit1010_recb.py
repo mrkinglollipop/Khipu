@@ -281,17 +281,6 @@ class RecallEvalContractTest(unittest.TestCase):
         self.assertEqual((result["changed"], result["diffs"][0]["status"]), (1, "removed"))
 
 
-class RelevanceEvalRegressionTest(unittest.TestCase):
-    def test_emptied_positive_tracks_lost_expected_hit_when_unrelated_result_survives(self):
-        searches = [
-            {"results": [{"id": "wanted"}, {"id": "other"}]},
-            {"results": [{"id": "other"}]},
-        ]
-        with mock.patch("khipu.embed.hybrid_search", side_effect=searches):
-            report = recall_eval.run_relevance_eval(
-                [{"query": "q", "expect": ["wanted"]}], ("explicit",), floor=True
-            )
-        self.assertEqual(report["paths"]["explicit"]["emptied_positives"], ["q"])
 
 
 class TopicHitsReadFailureTest(unittest.TestCase):

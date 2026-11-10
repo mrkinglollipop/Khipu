@@ -159,3 +159,18 @@ def test_a_paused_or_down_first_account_is_still_said_when_its_plan_is_nearly_us
     paused = "The first account in your priority, Codex, is paused by you."
     down = "The first account in your priority, Codex, is down: out of service."
     assert cli._without_repeated_limit([paused, down, FIRST], plans) == [paused, down]
+
+
+def test_the_priority_line_is_dropped_by_account_identity_when_the_labels_differ():
+    # The priority's label and the plan row's label come from different readers.
+    plans = {"accounts": [{"account": "Codex", "harness": "codex", "home": None, "used_pct": 100.0}]}
+    line = "The first account in your priority, Codex (ChatGPT), is limited until Wed 06:53Z, in 1 d 3 h."
+    first = {"label": "Codex (ChatGPT)", "harness": "codex", "home": None}
+    assert cli._without_repeated_limit([line, OTHER], plans, first) == [OTHER]
+    other_login = {"label": "Codex (ChatGPT)", "harness": "codex", "home": "/somewhere/else"}
+    assert cli._without_repeated_limit([line], plans, other_login) == [line]
+
+
+def test_the_priority_line_is_dropped_whatever_the_case_of_the_labels():
+    plans = {"accounts": [{"account": "codex", "used_pct": 100.0}]}
+    assert cli._without_repeated_limit([FIRST], plans) == []

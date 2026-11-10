@@ -275,9 +275,7 @@ def test_stale_filters_graph_and_outbox_do_not_leak(replica, tmp_path):
         path=tmp_path/(name+'.json')
         path.write_text(json.dumps({'payload':{'summary':'recall budget','t3_thread_id':thread,'via':'t3'}}))
         jobs.append(path)
-    def graph(con, rows):
-        return [*rows, {'kind':'episode','id':'99','snippet':'recall'}, {'kind':'topic','id':'recall','snippet':'recall'}], []
-    with mock.patch.object(outbox, 'jobs', return_value=jobs), mock.patch.object(hs,'_graph_candidates_snapshot',side_effect=graph):
+    with mock.patch.object(outbox, 'jobs', return_value=jobs):
         result=hs.search_stale_payload('recall', 10, t3_thread=THREAD, via='t3')
     assert {r['id'] for r in result['results']} == {'1','outbox:same'}
 
@@ -470,8 +468,7 @@ def test_hub_modes_use_thread_filters_on_each_candidate_leg(mode):
          mock.patch.object(embed,'_episode_schema_flags',return_value={'project':False,'harness':False,'deleted_at':False}), \
          mock.patch('khipu.topic_graph.enrich_search_results',side_effect=lambda c,rows:rows), \
          mock.patch('khipu.decisions.enrich_search_results',side_effect=lambda c,rows:rows), \
-         mock.patch('khipu.features.enabled',return_value=False), \
-         mock.patch('khipu.relevance.enabled',return_value=False):
+         mock.patch('khipu.relevance.gate',side_effect=lambda rows,n:(rows,None)):
         out=embed.hybrid_search('recall budget',mode=mode,t3_thread=THREAD,via='t3')
     assert [r['id'] for r in out['results']] == ['1']
     assert len(filters_seen) == (2 if mode == 'hybrid' else 1)
@@ -483,18 +480,6 @@ def test_replica_without_raw_fails_closed(replica):
     assert hs.search_snapshot('recall', 5, t3_thread=THREAD) == []
 
 
-def test_stale_semantic_graph_respects_thread(replica):
-    def graph(con, rows):
-        return [*rows, {'kind':'episode','id':'99','snippet':'recall'}], []
-    from khipu.profiles import ProfileSpec
-    spec = ProfileSpec('test', 'openai-compatible', 'test', 2, endpoint='http://127.0.0.1:9999')
-    with mock.patch.object(hs,'active_snapshot_profile_spec',return_value=spec), \
-         mock.patch('khipu.models.show_models', return_value={'embed': {
-             'provider': 'local', 'model_id': 'test', 'endpoint': spec.endpoint}}), \
-         mock.patch('khipu.embed.embed_one',return_value=[1.,0.]), \
-         mock.patch.object(hs,'_graph_candidates_snapshot',side_effect=graph):
-        out=hs.search_stale_payload('recall',5,semantic=True,t3_thread=THREAD,via='t3')
-    assert [r['id'] for r in out['results']] == ['1']
 
 
 def test_priority_lines_and_footer_reserve_exact_budget():

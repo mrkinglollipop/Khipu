@@ -24,6 +24,7 @@ import re
 from typing import Any
 
 QUOTE_LIMIT = 300
+PAGE_CAP = 6   # most SQL pages owner_candidates reads to find ``limit`` typed matches
 TITLE_LIMIT = 90
 
 TOOL_NAMES = {
@@ -54,6 +55,15 @@ def quotes_of(verbatim: Any) -> list[str]:
     return [q for q in verbatim if isinstance(q, str) and q.strip()]
 
 
+def typed_quotes(quotes: list[str]) -> list[str]:
+    """The owner lines the owner typed: ``verbatim.quotes`` holds every user-role
+    message of the window, scheduled prompts, notices and job briefs included,
+    and ``turn_text.is_automated`` is the one test that drops those."""
+    from khipu.turn_text import is_automated
+
+    return [q for q in quotes if not is_automated(q)]
+
+
 def query_terms(query: str) -> tuple[str, list[str]]:
     """(phrase, tokens) a line must contain, case-insensitively."""
     from khipu.search_text import explicit_search_tokens, search_phrase
@@ -70,8 +80,8 @@ def _line_matches(line: str, phrase: str, tokens: list[str]) -> bool:
 
 
 def owner_line(quotes: list[str], phrase: str, tokens: list[str]) -> str | None:
-    """The first owner line holding the whole phrase, or every query word."""
-    for q in quotes:
+    """The first typed owner line holding the whole phrase, or every query word."""
+    for q in typed_quotes(quotes):
         if _line_matches(q, phrase, tokens):
             return q
     return None
@@ -106,7 +116,8 @@ def title_of(summary: Any, quotes: list[str], verbatim_only: bool = False) -> st
 
     text = "" if verbatim_only or summary_text_is_empty(summary) else str(summary)
     if not text.strip() and quotes:
-        text = quotes[0]
+        # The first line the owner typed; the first stored quote only when none was typed.
+        text = (typed_quotes(quotes) or [quotes[0]])[0]
     for line in text.splitlines():
         line = line.strip().lstrip("#*- ").strip()
         if line:
@@ -231,7 +242,7 @@ def annotate_activity_rows(cur, rows: list[dict]) -> list[dict]:
     resolve = mac_resolver()
     for r in rows:
         f = facts.get(str(r.get("id"))) or {}
-        first = (f.get("quotes") or [None])[0]
+        first = (typed_quotes(f.get("quotes") or []) or [None])[0]
         _fill(r, f, resolve, _clip(first, QUOTE_LIMIT) if first else None)
         r["project"] = r["project"] or (str(r.get("scope") or "").strip() or None)
     return rows
@@ -266,26 +277,37 @@ def owner_candidates(cur, term: str, limit: int, filters=None) -> list[dict]:
     cur.execute("SELECT EXISTS (SELECT 1 FROM pg_index WHERE indexrelid = "
                 "to_regclass('public.idx_episodes_owner_words_trgm') AND indisvalid AND indisready)")
     indexed = bool(cur.fetchone()[0])
-    params["lim"] = max(1, int(limit))
-    cur.execute(
+    want = max(1, int(limit))
+    sql = (
         f"SELECT id::text, summary, topics, decisions, preferences, people, ts, {verbatim} AS verbatim "
         f"FROM episodes WHERE {cli._episode_live_clause(cur)}"
         + (" AND ".join(index_tests) + " AND " if indexed else "")
         + "CASE WHEN jsonb_typeof(" + verbatim + "->'quotes') = 'array' THEN EXISTS ("
         "SELECT 1 FROM jsonb_array_elements_text(" + verbatim + "->'quotes') AS q WHERE "
         + " AND ".join(line_tests) + ") ELSE false END "
-        f"AND ({ep_filter}) ORDER BY ts DESC NULLS LAST, id DESC LIMIT %(lim)s",
-        params,
+        f"AND ({ep_filter}) ORDER BY ts DESC NULLS LAST, id DESC LIMIT %(lim)s OFFSET %(off)s"
     )
-    out = []
-    for eid, summary, topics, decisions, preferences, people, ts, vb in cur.fetchall():
-        line = owner_line(quotes_of(vb), phrase, tokens)
-        if line is None:
-            continue
-        out.append({
-            "kind": "episode", "id": eid,
-            "label": clip_snippet(summary or "", LABEL_LIMIT),
-            "snippet": clip_snippet(summary or "", SNIPPET_LIMIT),
-            "rank_text": line, "exact_phrase": bool(phrase and phrase in line.casefold()),
-        })
-    return out
+    # A scheduled prompt that quotes the owner matches in SQL but is not his
+    # line, so the exact check can drop rows: read on until ``want`` typed
+    # matches, the hits run out, or PAGE_CAP pages have been read.
+    out: list[dict] = []
+    offset, page = 0, want
+    for _ in range(PAGE_CAP):
+        params["lim"], params["off"] = page, offset
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        for eid, summary, topics, decisions, preferences, people, ts, vb in rows:
+            line = owner_line(quotes_of(vb), phrase, tokens)
+            if line is None:
+                continue
+            out.append({
+                "kind": "episode", "id": eid,
+                "label": clip_snippet(summary or "", LABEL_LIMIT),
+                "snippet": clip_snippet(summary or "", SNIPPET_LIMIT),
+                "rank_text": line, "exact_phrase": bool(phrase and phrase in line.casefold()),
+            })
+        if len(out) >= want or len(rows) < page:
+            break
+        offset += page
+        page = max(want, 50)
+    return out[:want]
