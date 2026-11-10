@@ -81,10 +81,12 @@ def _queued(prompt, origin=None, mode="prompt"):
     att = {"type": "queued_command", "prompt": prompt, "commandMode": mode, "timestamp": "t"}
     if origin is not None:
         att["origin"] = origin
+    shown = prompt if isinstance(prompt, str) else " ".join(
+        b.get("text", "") for b in prompt if isinstance(b, dict))
     return {"type": "attachment", "attachment": att, "uuid": "u-" + str(len(prompt)), "sessionId": "s",
             "renderedRole": "system",
             "rendered": [{"content": "<system-reminder>\nThe user sent a new message while you were working:\n"
-                                     + prompt + "\n</system-reminder>"}]}
+                                     + shown + "\n</system-reminder>"}]}
 
 
 def _turn(text, mid):
@@ -117,7 +119,9 @@ def test_a_queued_command_without_origin_is_still_the_owners(tmp_path: Path):
     assert users == 2 and _user_texts(msgs)[-1] == QUEUED
 
 
-def test_the_same_text_arriving_later_as_a_user_line_is_not_doubled(tmp_path: Path):
+def test_the_same_text_typed_again_later_is_a_second_turn(tmp_path: Path):
+    """Claude Code writes no user line for a message it queued, so a later user
+    line with the same text is the owner typing it again: both are kept."""
     rows = [
         {"type": "user", "message": {"role": "user", "content": PROMPT}},
         _turn("Working.", "m1"),
@@ -127,9 +131,45 @@ def test_the_same_text_arriving_later_as_a_user_line_is_not_doubled(tmp_path: Pa
         _turn("Done.", "m3"),
     ]
     msgs, _, users = sc.read_window(_write(tmp_path / "q.jsonl", rows), 0, seen=[])
-    assert sum(t.count(QUEUED) for t in _user_texts(msgs)) == 1
+    assert _user_texts(msgs).count(QUEUED) == 2
+    assert users == 3
+    assert [r for r, _ in msgs] == ["user", "assistant", "user", "assistant", "user", "assistant"]
+
+
+def test_queued_text_pasted_with_an_image_is_kept(tmp_path: Path):
+    sentence = "Please also look at the idle sweep path before you finish."
+    image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x"}}
+    rows = [
+        {"type": "user", "message": {"role": "user", "content": PROMPT}},
+        _turn("Working.", "m1"),
+        _queued([image, {"type": "text", "text": sentence}], {"kind": "human"}),
+        _turn("Done.", "m2"),
+    ]
+    msgs, _, users = sc.read_window(_write(tmp_path / "q.jsonl", rows), 0, seen=[])
+    assert sum(sentence in t for t in _user_texts(msgs)) == 1
     assert users == 2
-    assert [r for r, _ in msgs] == ["user", "assistant", "user", "assistant"]   # kept at the later line
+    rows[2] = _queued([image], {"kind": "human"})
+    msgs, _, users = sc.read_window(_write(tmp_path / "q2.jsonl", rows), 0, seen=[])
+    assert users == 1
+
+
+def test_queued_and_retyped_across_two_windows_counts_the_same_as_one(tmp_path: Path):
+    rows = [
+        {"type": "user", "message": {"role": "user", "content": PROMPT}},
+        _turn("Working.", "m1"),
+        _queued(QUEUED, {"kind": "human"}),
+        _turn("Still working.", "m2"),
+    ]
+    p = _write(tmp_path / "w.jsonl", rows)
+    cut = p.stat().st_size
+    with p.open("a") as f:
+        f.write(json.dumps({"type": "user", "message": {"role": "user", "content": QUEUED}}) + "\n")
+        f.write(json.dumps(_turn("Done.", "m3")) + "\n")
+    _, _, n_all = sc.read_window(p, 0, seen=[])
+    st: dict = {}
+    _, off, n1 = sc.read_window(p, 0, seen=[], stats=st, end_offset=cut)
+    _, _, n2 = sc.read_window(p, off, seen=list(st["fresh"]), prefix=st.get("prefix"))
+    assert n_all == n1 + n2 == 3
 
 
 def test_non_human_queued_commands_are_not_typed_turns(tmp_path: Path):
