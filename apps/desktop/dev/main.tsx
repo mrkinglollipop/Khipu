@@ -445,6 +445,11 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   app: { title: "The whole window", render: () => <App /> },
   "app-quiet": { title: "The whole window, nothing needs you", fake: { quiet: true }, render: () => <App /> },
   "app-welcome": { title: "The whole window, first run", fake: { welcome: true }, render: () => <App /> },
+  // Accounts (slice A4): open the window, then press Accounts in the sidebar.
+  "app-accounts": { title: "The whole window, Accounts", fake: { accounts: true }, render: () => <App /> },
+  "app-accounts-problem": { title: "The whole window, Accounts, something wrong", fake: { accounts: true, accountsProblem: true }, render: () => <App /> },
+  "app-accounts-ahead": { title: "The whole window, Accounts, one conversation running ahead", fake: { accounts: true, accountsAhead: true }, render: () => <App /> },
+  "app-accounts-refuse": { title: "The whole window, Accounts, a pause is refused", fake: { accounts: true, accountsRefuse: true }, render: () => <App /> },
   "setup-signed-out": {
     title: "Setup: a default login that is not signed in",
     fake: { disc: discovery({ candidates: [] }), usage: { accounts: [
