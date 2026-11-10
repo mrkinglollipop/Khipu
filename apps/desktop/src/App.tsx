@@ -30,6 +30,7 @@ import { useRunning } from "./accounts/running";
 import { Today } from "./today/Today";
 import { useNeedsYou } from "./today/needs";
 import { ProjectLists } from "./memory/ProjectLists";
+import { OrderAndRules } from "./accounts/OrderAndRules";
 import type { NavItem } from "./shell";
 import {
   Callout,
@@ -4005,7 +4006,6 @@ export default function App() {
       <main className="main" aria-busy={workingLabel != null}>
         {tab === "routing" ? (
           <Toolbar title="Accounts">
-            {/* Order and rules (A6) opens its older screen until it lands. */}
             <ViewSwitch
               label="Accounts view"
               options={[
@@ -4014,7 +4014,7 @@ export default function App() {
                 { id: "rules", label: "Order and rules" },
               ]}
               value={acctView}
-              onChange={(v) => { if (v === "rules") setTab("routing-old"); else setAcctView(v); }}
+              onChange={setAcctView}
             />
           </Toolbar>
         ) : toolbarTitle && tab !== "memory" ? <Toolbar title={toolbarTitle} heading={false} /> : null}
@@ -5884,7 +5884,8 @@ export default function App() {
         <section className={`${panelClass("routing")} ac-panel`}>
           <PaneBoundary key={paneRetryKeys.routing} title={PANE_TITLES.routing} onRetry={retryActivePane}>
             {tab === "routing" && acctView === "running" ? <RunningNow hook={runningNow} /> : null}
-            {tab === "routing" && acctView !== "running" ? (
+            {tab === "routing" && acctView === "rules" ? <OrderAndRules active /> : null}
+            {tab === "routing" && acctView === "room" ? (
               <Accounts
                 routing={routing}
                 plans={plans.data}
