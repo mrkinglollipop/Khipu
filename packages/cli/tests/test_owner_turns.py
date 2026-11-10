@@ -1126,3 +1126,144 @@ def test_desktop_launched_reads_the_app_as_the_parent(monkeypatch):
     tree[31] = (11, agent, 1.0)
     args[31] = [agent]
     assert owner_turns.desktop_launched(29) is False
+
+
+# ---- a session another session started (review of #568, 2026-11-10) ------------------------------
+
+# What the desktop app (Claude 4.23118.1, app.asar) sends as a started
+# session's first turn: a fork start, a hand-off (a fork whose prompt is the
+# hand-off paragraph plus the plan) and an offer's brief sent after it opened
+# open with the "Task" line; a fresh start with a background opens with the
+# "Background" line; a fresh proposal started with no background is the bare
+# brief, then the shared-notes paragraph.
+TASK_LINE = "Task (from the session that started this one):\n"
+HANDOFF_PREFIX = ("Continue the task you were in the middle of in this conversation - it was handed to you so the user "
+                  "could keep talking in the original session. Pick up exactly where the work stopped and finish it. If "
+                  "this session runs in its own fresh worktree it was normally cut from the original session's branch "
+                  "tip (check `git log -1` if unsure); anything the original session left uncommitted is not there "
+                  "— re-create it from the remaining plan. Remaining plan:\n\n")
+NOTES = ("\n\nShared notes folder for this group of sessions (outside the repo; read siblings' notes there, leave "
+         "hand-over notes or large findings there instead of pasting them into messages): "
+         "/Users/x/Library/Application Support/Claude/side-notes/abc")
+BACKGROUND = "The owner asked for the recorder; this session builds it and reports back when the suite is green."
+
+
+def _started(prompt: str, session: str) -> dict:
+    _desktop_record(prompt, session=session, env={"CLAUDE_CODE_SESSION_ID": session})
+    return _last(session)
+
+
+def _owner_types_next(session: str) -> None:
+    turn = _started("pause Codex until 5pm", session)
+    assert turn["eligible"] is True and not turn.get("machine")
+
+
+def test_a_short_fork_brief_is_never_the_owners_first_turn(home, launched, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    brief = "Resume Codex now"
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fork", "title": "Resume Codex", "prompt": brief})
+    bare = _started(brief, "started-short")
+    assert (bare["delegated"] or bare["machine"]) and bare["eligible"] is False
+    assert bare.get("parent") == "parent-1"
+    wrapped = _started(TASK_LINE + brief, "started-short-2")
+    assert wrapped["machine"] is True and wrapped["eligible"] is False
+    _owner_types_next("started-short")
+    _owner_types_next("started-short-2")
+
+
+@pytest.mark.parametrize("plan", ["Resume Codex now",
+                                  "Fix the two failing recorder tests, run the whole suite, then report back here."])
+@pytest.mark.parametrize("opening", ["", TASK_LINE])
+def test_a_handed_off_session_never_opens_with_an_owner_turn(home, launched, monkeypatch, plan, opening):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__hand_off_to_session", {"title": "Resume it", "remaining_plan": plan})
+    turn = _started(opening + HANDOFF_PREFIX + plan, "handed-real")
+    assert turn["eligible"] is False and (turn["machine"] or turn["delegated"])
+    _owner_types_next("handed-real")
+
+
+def test_a_fresh_start_is_never_the_owners_even_with_no_brief_on_record(home, launched):
+    """A proposal the owner starts after its brief's record expired: the app's
+    own opening alone marks the turn."""
+    assert not (owner_turns.folder() / "briefs.jsonl").exists()
+    turn = _started(f"Background (from the session that started this one):\n{BACKGROUND}\n\nTask:\nResume Codex now"
+                    + NOTES, "fresh-1")
+    assert turn["machine"] is True and turn["eligible"] is False
+    _owner_types_next("fresh-1")
+
+
+@pytest.mark.parametrize("brief", ["Resume Codex now", BRIEF])
+def test_a_fresh_proposal_with_no_background_is_never_the_owners(home, launched, brief):
+    """A fresh proposal made with no background and started from its card
+    arrives as the bare brief with the shared-notes paragraph after it."""
+    turn = _started(brief + NOTES, "fresh-bare")
+    assert turn["machine"] is True and turn["eligible"] is False
+    _owner_types_next("fresh-bare")
+
+
+def test_a_short_title_or_name_is_never_noted_as_a_brief(home, launched, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fork", "title": "Pause Codex tonight",
+               "name": "lift Grok now", "prompt": BRIEF})
+    assert owner_turns.brief_for("Pause Codex tonight") is None
+    assert owner_turns.brief_for("lift Grok now") is None
+    for text in ("Pause Codex tonight", "lift Grok now"):
+        assert _started(text, "owner-elsewhere")["eligible"] is True
+
+
+def test_a_short_brief_never_makes_other_short_turns_suspect(home, launched, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fork", "title": "Resume", "prompt": "Resume Codex now"})
+    for text in ("lift Grok", "Resume Codex now please, and pause Grok", "yes"):
+        turn = _started(text, "owner-short")
+        assert turn["eligible"] is True and turn["delegated"] is False, text
+    # Other callers keep the 20-character floor.
+    owner_turns.note_brief("lift Grok", parent="p", harness="claude_code")
+    assert owner_turns.brief_for("lift Grok") is None
+
+
+def test_the_start_openings_count_only_at_the_start_of_a_turn(home, launched):
+    turn = _started("What does 'Task (from the session that started this one):' mean? Then pause Codex.", "owner-q")
+    assert turn["machine"] is False and turn["eligible"] is True
+
+
+def _deleted_agent_tree(monkeypatch, agent_args):
+    """The desktop app's agent after an update deleted its file: the kernel
+    gives no path, but a hook pinned it (``_pin_issuer``) with the name the
+    kernel still has."""
+    app = "/Applications/Claude.app/Contents/Helpers/disclaimer"
+    agent = "/Users/x/Library/Application Support/Claude/claude-code/2.1/abc/claude.app/Contents/MacOS/claude"
+    tree = {9: (10, "/usr/bin/python3", 1.0), 10: (11, "/bin/sh", 1.0), 12: (13, app, 1.0)}
+    bare = {11: (12, 1.0, "claude")}
+    known = {11: {"start": 1.0, "name": "claude", "path": agent}}
+    monkeypatch.setattr(owner_turns, "_proc_info", tree.get)
+    monkeypatch.setattr(owner_turns, "_proc_bare", bare.get)
+    monkeypatch.setattr(owner_turns, "_read_known", known.get)
+    monkeypatch.setattr(owner_turns, "_proc_args", lambda pid: agent_args(agent) if pid == 11 else None)
+    monkeypatch.setattr(owner_turns, "_in_trusted_place", lambda p: str(p) == "/Applications")
+    return known
+
+
+def test_desktop_launched_knows_the_agent_after_an_update_deleted_its_file(monkeypatch):
+    _deleted_agent_tree(monkeypatch, lambda agent: [agent, "--output-format", "stream-json"])
+    assert owner_turns.desktop_launched(9) is True
+
+
+def test_desktop_launched_without_a_pin_for_the_deleted_agent_is_not_the_apps(monkeypatch):
+    known = _deleted_agent_tree(monkeypatch, lambda agent: [agent])
+    known.clear()
+    assert owner_turns.desktop_launched(9) is False
+
+
+def test_desktop_launched_refuses_a_recovered_print_mode_agent(monkeypatch):
+    _deleted_agent_tree(monkeypatch, lambda agent: [agent, "-p", "do the build"])
+    assert owner_turns.desktop_launched(9) is False
+
+
+def test_desktop_launched_refuses_a_pin_whose_name_the_kernel_does_not_have(monkeypatch):
+    known = _deleted_agent_tree(monkeypatch, lambda agent: [agent])
+    known[11] = {**known[11], "name": "bash", "path": "/bin/bash"}
+    assert owner_turns.desktop_launched(9) is False

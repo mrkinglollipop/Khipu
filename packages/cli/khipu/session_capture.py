@@ -82,7 +82,8 @@ if not hasattr(_t3, 'cache_thread'):
     import importlib
     importlib.reload(_t3)
 from khipu.t3 import cache_thread, is_helper_session
-from khipu.turn_text import INJECTED_CONTEXT_TAGS, MACHINE_USER_TAGS, clean_user_text, is_machine  # noqa: F401
+from khipu.turn_text import (INJECTED_CONTEXT_TAGS, MACHINE_USER_TAGS, clean_user_text, is_machine,  # noqa: F401
+                             started_session)
 
 HARNESSES = ("claude_code", "cursor", "codex", "aegis", "grok_build", "antigravity")
 
@@ -403,6 +404,10 @@ def _machine_user_message(text: str) -> str | None:
     head = text.lstrip()
     if not is_machine(head):
         return None
+    if started_session(head):
+        # Another session's brief, as the app delivered it: what this session
+        # was asked to do, so its words stay, but it is not a turn typed here.
+        return f"[notification: session-start] {head.strip()}"
     m = _TAG_NAME.match(head)
     tag = m.group(1) if m else "notification"
     if tag.startswith("cross-session-"):

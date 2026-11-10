@@ -529,15 +529,17 @@ def _hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def note_brief(text: str, *, parent: str, harness: str, now: float | None = None) -> None:
+def note_brief(text: str, *, parent: str, harness: str, now: float | None = None, short: bool = False) -> None:
     """A delegation's brief (the delegation hook calls this): a turn whose
     text is this brief is a dispatched job's, never the owner's, and the
     brief names the parent session the job was started from. Only hashes
-    of the brief are kept."""
+    of the brief are kept. ``short`` (a desktop session tool's own brief
+    field only): kept under 20 characters too, where it matches only a turn
+    whose whole text is the brief (``brief_for``)."""
     norm = _norm(text or "")
     # Kept while owner direction is off too: a turn that could turn it back
     # on is recorded then, and a brief must never pass for one.
-    if len(norm) < 20 or not parent:
+    if not norm or not parent or (len(norm) < 20 and not short):
         return
     head = norm[:_HEAD]
     line = {"ts": time.time() if now is None else now, "sha": _hash(norm), "head_sha": _hash(head),
@@ -1059,13 +1061,15 @@ def desktop_launched(pid: int | None = None) -> bool:
     first process is no shell, interpreter or print-mode run, and its parent
     runs from the app's bundle. A ``claude -p`` (or any agent) started from a
     desktop conversation's shell has that shell or a print flag on the way,
-    so it is not. Anything unreadable is not."""
+    so it is not. The agent may be known by its pinned record after an
+    update deleted its file (``_known_info``, as ``hook_issuer``); its
+    parent, the app, only as the kernel has it. Anything unreadable is not."""
     me = _proc_info(os.getpid() if pid is None else pid)
     if me is None:
         return False
     cur = me[0]
     for _ in range(_ISSUER_MOST):
-        info = _proc_info(cur)
+        info = _known_info(cur)
         if info is None:
             return False
         parent, exe, _start = info

@@ -502,6 +502,11 @@ def hook_main(raw: str, environ=None) -> tuple[dict, dict | None, str | None]:
 # fixture yet, so every text value in its input long enough to be a brief is
 # noted: a field under any name still marks the job's first turn.
 _BRIEF_FIELDS = {"Agent": ("prompt",), "Task": ("prompt",), "spawn_agent": ("message",)}
+# The field each desktop session tool hands its brief in: noted whatever its
+# length (``owner_turns.note_brief``'s ``short``). Its other text values keep
+# the four-word floor, so a title or a name never becomes a brief.
+_START_BRIEF_FIELDS = {"mcp__ccd_session__start_session": "prompt",
+                       "mcp__ccd_session__hand_off_to_session": "remaining_plan"}
 
 
 def _texts(value: Any, depth: int = 0) -> list[str]:
@@ -518,6 +523,10 @@ def briefs_of(payload: dict) -> list[str]:
     tool_input = payload.get("tool_input") or payload.get("toolInput")
     if name is None or not isinstance(tool_input, dict):
         return []
+    if name in _START_BRIEF_FIELDS:
+        field = _START_BRIEF_FIELDS[name]
+        brief = start_brief(payload)
+        return ([brief] if brief else []) + _texts({k: v for k, v in tool_input.items() if k != field})
     if _is_delegate_task(name) or name in START_SESSION_TOOLS:
         return _texts(tool_input)
     if name in _BRIEF_FIELDS:
@@ -525,6 +534,15 @@ def briefs_of(payload: dict) -> list[str]:
             if isinstance(tool_input.get(field), str):
                 return [tool_input[field]]
     return []
+
+
+def start_brief(payload: dict) -> str | None:
+    """A desktop session tool's own brief field (``_START_BRIEF_FIELDS``),
+    when it holds text."""
+    tool_input = payload.get("tool_input") or payload.get("toolInput")
+    field = _START_BRIEF_FIELDS.get(_tool_name(payload) or "")
+    value = tool_input.get(field) if field and isinstance(tool_input, dict) else None
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def note_brief(payload: dict, env) -> None:
@@ -538,8 +556,9 @@ def note_brief(payload: dict, env) -> None:
 
         parent = str(hook_shape.session_id(payload))
         harness = owner_turns.harness_of(env, payload)
+        own = start_brief(payload)
         for brief in briefs_of(payload):
-            owner_turns.note_brief(brief, parent=parent, harness=harness)
+            owner_turns.note_brief(brief, parent=parent, harness=harness, short=brief == own)
     except Exception:  # noqa: BLE001 - noting a brief never fails the call
         pass
 
