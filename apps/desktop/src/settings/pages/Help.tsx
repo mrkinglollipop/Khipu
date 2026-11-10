@@ -1,8 +1,8 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { SettingsCtx } from "../context";
 
-/** The public page for Khipu. The only public address the repo records. */
-export const HELP_URL = "https://github.com/mrkinglollipop/Khipu";
+/** Khipu's website. */
+export const HELP_URL = "https://kinglollipop.com/khipu";
 
 export function HelpPage({ ctx }: { ctx: Pick<SettingsCtx, "onOpenGuides" | "onFeedback"> }) {
   return (

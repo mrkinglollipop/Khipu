@@ -2,7 +2,8 @@
 //   khipu_macs   -> one entry per Mac (this one live, the other from the shared record)
 //   khipu_health -> the five checks, free space, last backup, and the agent note
 // Shapes are exactly what `khipu macs --json` and `khipu health --json` print.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useHealth } from "../shared/healthCache";
 import { callCli } from "../settingsCli";
 
 export type AreaState = "ok" | "warn" | "err" | "unknown";
@@ -59,39 +60,29 @@ export type HealthDoc = {
 
 export type Loaded<T> = { data: T | null; error: string | null; loading: boolean };
 
-/** Read both documents once the page is open. `khipu health` runs the full
- *  doctor (about a minute with a live hub), so the Macs list shows first and
- *  the health fields fill in when they arrive. */
+/** The health answer as the pages read it: the last one at once, with its time. */
+export type HealthState = { data: HealthDoc | null; at: number | null; refreshing: boolean; error: string | null };
+
+/** `khipu macs` is quick, so it loads on open. `khipu health` runs the whole
+ *  doctor (about a minute on a real Mac): its last answer shows at once and
+ *  refreshes in the background (see shared/healthCache.ts). */
 export function useSettingsData(active: boolean) {
   const [macs, setMacs] = useState<Loaded<MacsDoc>>({ data: null, error: null, loading: false });
-  const [health, setHealth] = useState<Loaded<HealthDoc>>({ data: null, error: null, loading: false });
-  const seq = useRef(0);
+  const h = useHealth<HealthDoc>(active);
+  const health: HealthState = { data: h.doc, at: h.at, refreshing: h.refreshing, error: h.error };
+  const started = useRef(false);
 
-  const reload = useCallback(() => {
-    const mine = ++seq.current;
+  useEffect(() => {
+    if (!active || started.current) return;
+    started.current = true;
     setMacs((p) => ({ ...p, loading: true }));
-    setHealth((p) => ({ ...p, loading: true }));
     void callCli<MacsDoc>("khipu_macs").then((res) => {
-      if (mine !== seq.current) return;
       if (res.ok && res.data && Array.isArray(res.data.macs)) setMacs({ data: res.data, error: null, loading: false });
       else setMacs({ data: null, error: res.ok ? "Khipu gave an unreadable answer." : res.error, loading: false });
     });
-    void callCli<HealthDoc>("khipu_health").then((res) => {
-      if (mine !== seq.current) return;
-      if (res.ok && res.data && Array.isArray(res.data.areas)) setHealth({ data: res.data, error: null, loading: false });
-      else setHealth({ data: null, error: res.ok ? "Khipu gave an unreadable answer." : res.error, loading: false });
-    });
-  }, []);
+  }, [active]);
 
-  const started = useRef(false);
-  useEffect(() => {
-    if (active && !started.current) {
-      started.current = true;
-      reload();
-    }
-  }, [active, reload]);
-
-  return { macs, health, reload };
+  return { macs, health };
 }
 
 export function thisMacRow(doc: MacsDoc | null): MacRow | null {

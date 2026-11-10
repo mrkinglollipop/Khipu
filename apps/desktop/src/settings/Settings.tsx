@@ -49,7 +49,7 @@ export function Settings({ ctx, active }: { ctx: SettingsCtx; active: boolean })
     { id: "summaries", label: "Who writes the summaries", value: synthName },
     { id: "meaning", label: "Search by meaning", value: "" },
     { id: "books", label: "Include your books in search", value: "" },
-    { id: "backups", label: "Backups", value: lastBackup ? `Last ${fmtAgoSince(lastBackup) ?? "recorded"}` : health.loading ? "Checking…" : "None recorded" },
+    { id: "backups", label: "Backups", value: lastBackup ? `Last ${fmtAgoSince(lastBackup) ?? "recorded"}` : health.refreshing ? "Checking…" : "None recorded" },
     { id: "where", label: "Where memory is kept", value: ctx.dsnOk === false ? "Not set up" : ctx.dbReachable === false ? "Not reachable" : ctx.dbReachable ? "Connected" : "" },
     { id: "look", label: "Look", note: `Only on ${mac}`, value: look === "system" ? "Follows this Mac" : look === "dark" ? "Dark" : "Light" },
     { id: "login", label: `Open Khipu when ${mac} starts`, note: `Only on ${mac}`, value: "" },

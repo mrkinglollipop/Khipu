@@ -1,17 +1,18 @@
 import { Tag } from "../../ui";
-import type { HealthDoc, Loaded, MacsDoc } from "../data";
+import type { HealthState, Loaded, MacsDoc } from "../data";
+import { CheckedLine } from "./CheckedLine";
 import { macName } from "../data";
 import { fmtAgoSince } from "../../time";
 
 /** Read-only: the newest successful backup and the free space, from the status
  *  commands. Nothing here says how often backups run; Khipu does not report it. */
-export function BackupsPage({ macs, health }: { macs: Loaded<MacsDoc>; health: Loaded<HealthDoc> }) {
+export function BackupsPage({ macs, health }: { macs: Loaded<MacsDoc>; health: HealthState }) {
   const area = health.data?.areas.find((a) => a.key === "database") ?? null;
   const rows = macs.data?.macs ?? [];
   const mine = rows.find((m) => m.this_mac);
   const lastBackup = health.data?.last_backup_at ?? mine?.health?.last_backup_at ?? null;
   const when = (iso: string | null | undefined) => (iso ? fmtAgoSince(iso) ?? "at an unknown time" : "none recorded");
-  if ((macs.loading && !macs.data) && (health.loading && !health.data)) return <p className="st-muted" role="status">Reading…</p>;
+  if (macs.loading && !macs.data && !health.data) return <p className="st-muted" role="status">Reading…</p>;
   return (
     <>
       <div className="st-kvs">
@@ -33,7 +34,8 @@ export function BackupsPage({ macs, health }: { macs: Loaded<MacsDoc>; health: L
         <p className={area.state === "ok" ? "st-muted" : undefined}>
           {area.line}{area.khipu_doing ? ` ${area.khipu_doing}` : ""}
         </p>
-      ) : health.loading ? <p className="st-muted" role="status">Checking the database and disk…</p> : health.error ? <p className="st-muted">The full check did not finish: {health.error}</p> : null}
+      ) : null}
+      <CheckedLine health={health} />
     </>
   );
 }
