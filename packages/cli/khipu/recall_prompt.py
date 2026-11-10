@@ -162,7 +162,7 @@ def _is_trivial(tokens: list[str]) -> bool:
 # tagged envelope) is not something the user asked. Both are abstentions
 # (outcome no_match), not gates: the prompt was read and needs nothing.
 LONG_PROMPT_CHARS = 800
-_HARNESS_MESSAGE_RE = re.compile(r"\s*<[A-Za-z][\w-]*>")
+from khipu.turn_text import HARNESS_MESSAGE_RE as _HARNESS_MESSAGE_RE  # noqa: E402  one test, shared with owner-words search
 
 
 def _self_contained(prompt: str) -> str | None:
