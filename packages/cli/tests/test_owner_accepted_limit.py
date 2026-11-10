@@ -65,6 +65,16 @@ def test_a_claude_p_job_turn_is_never_eligible(world):
     _nothing_changed()
 
 
+
+def _named(marker: dict) -> dict:
+    """The fixed-words lines naming who made each change after ``marker``
+    (``khipu_route since``): the routing page itself names no author."""
+    view = routing.read_view()
+    got = routing.since(marker["version"], view, epoch=marker["epoch"])
+    text = "\n".join(got["directions"])
+    return {"kind": "changes" if text else "none", "text": text, "version": view["version"],
+            "epoch": view["epoch"]}
+
 def test_a_forged_harness_change_is_always_visible_and_undoable(world, khipu_app):
     """The sixth review's P1 probes, as the accepted limit: a same-user Node
     process runs the stock shim with invented words, so the turn names Node
@@ -88,7 +98,7 @@ def test_a_forged_harness_change_is_always_visible_and_undoable(world, khipu_app
     rc, listed = world.run(["owner-direction", "actions", "--json"])
     assert rc == 0 and [(x["id"], x.get("no_undo")) for x in listed["actions"]] == [(line["id"], None)]
     # The next routing block.
-    push = routing.prompt_push(marker, budget=5.0)
+    push = _named(marker)
     assert push["kind"] == "changes" and "Paused Codex by your direction" in push["text"]
     assert "(undo in Settings)" in push["text"]
     # The owner's Undo in the app reverses it.

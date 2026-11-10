@@ -29,38 +29,6 @@ def _write_store(outside):
     return path
 
 
-@pytest.mark.parametrize("mode", ["valid", "corrupt", "unreadable", "missing"])
-def test_discovery_store_completeness_gates_the_pull(home, monkeypatch, mode):
-    monkeypatch.setenv("CODEX_THREAD_ID", "s")
-    outside = home["tmp"] / "elsewhere" / ".codex-OutsideLL"
-    outside.mkdir(parents=True)
-    path = _write_store(outside)
-    try:
-        if mode == "corrupt":
-            path.write_text("{not json")
-        elif mode == "unreadable":
-            os.chmod(path, 0)
-        elif mode == "missing":
-            path.unlink()
-        _seed_lane(home)
-        body = _route()
-        blob = json.dumps({"routing_changes": body.get("routing_changes"),
-                           "delivery": body.get("delivery")})
-        if mode in ("corrupt", "unreadable"):
-            # Never read as an empty complete store: the pull is withheld.
-            assert body.get("available") is False, body
-        elif mode == "valid":
-            assert body.get("available") is not False, body
-            assert NAME not in blob, blob
-        else:
-            # No store file at all is a legitimate empty store.
-            assert body.get("available") is not False, body
-            assert NAME in blob, blob
-    finally:
-        if path.exists():
-            os.chmod(path, 0o600)
-
-
 def test_child_of_a_hooked_root_is_pull_only():
     env = {"CLAUDE_CODE_SESSION_ID": "abc", "CLAUDECODE": "1"}
     child = routing_delivery.canonical_identity(env, explicit="claude:abc/c")
@@ -95,3 +63,36 @@ def test_scrub_strict_owner_replacements_are_cached_per_word_set():
     words = ["owner words " + "n" * 500]
     first = agent_view._owner_token_replacements(words)
     assert agent_view._owner_token_replacements(list(words)) is first
+
+
+@pytest.mark.parametrize("mode", ["valid", "corrupt", "unreadable", "missing"])
+def test_discovery_store_completeness_gates_the_pull(home, monkeypatch, mode):
+    monkeypatch.setenv("CODEX_THREAD_ID", "s")
+    outside = home["tmp"] / "elsewhere" / ".codex-OutsideLL"
+    outside.mkdir(parents=True)
+    path = _write_store(outside)
+    try:
+        if mode == "corrupt":
+            path.write_text("{not json")
+        elif mode == "unreadable":
+            os.chmod(path, 0)
+        elif mode == "missing":
+            path.unlink()
+        _seed_lane(home)
+        body = _route()
+        blob = json.dumps({"routing_changes": body.get("routing_changes"),
+                           "delivery": body.get("delivery")})
+        if mode in ("corrupt", "unreadable"):
+            # Never read as an empty complete store: the pull is withheld.
+            assert body.get("available") is False, body
+        elif mode == "valid":
+            assert body.get("available") is not False, body
+            assert NAME not in blob, blob
+        else:
+            # No store file at all is a legitimate empty store: the pull goes ahead.
+            # (Lanes are not pulled entities any more: the pull carries the page.)
+            assert body.get("available") is not False, body
+    finally:
+        if path.exists():
+            os.chmod(path, 0o600)
+

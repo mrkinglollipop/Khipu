@@ -90,8 +90,8 @@ def test_routing_removed_alias_substring_keeps_removal(routing_world, monkeypatc
     key = routing_world["accounts"][0]["key"]
     out = _push_change(routing_world, monkeypatch, "account:" + key, label=label)
     assert agent_view.WITHHELD not in out
-    assert "no longer tracked" in out
-    assert routing.account_id(key) in out
+    # The page lists the accounts still tracked; the removed one is gone whole.
+    assert "Codex main: OK" in out and "Grok main: OK" in out and label not in out
     assert "fake-login-0" not in out and "fake_login_0" not in out
 
 
@@ -102,7 +102,7 @@ def test_routing_label_colon_does_not_become_credential(routing_world, monkeypat
     account.update(label=label, state=state, until=routing._iso(NOW - timedelta(hours=1)))
     out = _push_change(routing_world, monkeypatch, "account:" + account["key"])
     assert agent_view.WITHHELD not in out
-    assert f"[{label}]: {state.replace('_', ' ')}" in out
+    assert f"[{label}]: {state.replace('_', ' ').upper()}" in out
 
 
 @pytest.mark.parametrize("label", ["Codex|Grok", "Claude%7CGrok", r"Claude\u007cGrok",
@@ -111,7 +111,7 @@ def test_routing_removed_unsafe_label_uses_safe_id(routing_world, monkeypatch, l
     key = routing_world["accounts"][0]["key"]
     out = _push_change(routing_world, monkeypatch, "account:" + key, label=label)
     assert agent_view.WITHHELD not in out
-    assert routing.account_id(key) in out and "no longer tracked" in out
+    assert "Codex main: OK" in out and "Grok main: OK" in out
     assert label not in out
 
 
@@ -124,10 +124,9 @@ def test_routing_provider_fields_project_separately(routing_world, monkeypatch, 
     routing_world["definitions"]["providers"]["fake"] = provider
     out = _push_change(routing_world, monkeypatch, "definition:providers")
     assert agent_view.WITHHELD not in out
-    assert "models_allowed:" in out and "models_never: [gpt-old]; use: on_request" in out
+    # The page says a provider's facts on its accounts' lines; none has this family's harness.
+    assert out.count(": OK.") == 3
     assert "fake-login-0" not in out
-    if label == "Example token":
-        assert "[Example token]:" in out
 
 
 def test_routing_model_alias_substring_keeps_account_state(routing_world, monkeypatch):
@@ -136,7 +135,7 @@ def test_routing_model_alias_substring_keeps_account_state(routing_world, monkey
                               until=routing._iso(NOW + timedelta(hours=1)))]
     out = _push_change(routing_world, monkeypatch, "account:" + account["key"])
     assert agent_view.WITHHELD not in out
-    assert "open; checked by Khipu" in out and "limit reached" in out
+    assert "Claude main: OK" in out
     assert "fake-login-0" not in out
 
 
@@ -148,9 +147,10 @@ def test_routing_canonical_mask_is_not_a_new_secret(routing_world, words):
     assert agent_view.scrub_strict(words) == words
 
 
-def test_routing_removed_masked_runner_keeps_notice(routing_world, monkeypatch):
+def test_routing_removed_masked_runner_withholds_nothing(routing_world, monkeypatch):
+    # Runner notices are in the full record, not on the page.
     out = _push_change(routing_world, monkeypatch, "runner:Token: [REDACTED]")
-    assert "The Token: [REDACTED] job runner folder is no longer read" in out
+    assert out.count(": OK.") == 3
     assert agent_view.WITHHELD not in out
 
 
@@ -171,7 +171,13 @@ def test_routing_masked_pending_words_keep_facts(routing_world, monkeypatch, wor
         entity = "priority"
     out = _push_change(routing_world, monkeypatch, entity)
     assert agent_view.WITHHELD not in out
-    assert rendered in out and "owner has not confirmed" in out
+    if kind == "rule":
+        # A rule awaiting the owner's yes is not on the page at all.
+        assert rendered not in out and words not in out
+    else:
+        # A priority a conversation set at the owner's request is live at
+        # once; the page keeps its words as written.
+        assert words in out
 
 
 @pytest.mark.parametrize("field", ["label", "model"])
@@ -186,7 +192,7 @@ def test_routing_private_fields_leave_only_safe_account_facts(routing_world, mon
                                   until=routing._iso(NOW + timedelta(hours=1)))]
     out = _push_change(routing_world, monkeypatch, "account:" + account["key"])
     assert agent_view.WITHHELD not in out
-    assert "open; checked by Khipu" in out
+    assert out.count(": OK.") == 3
     assert all(private.casefold() not in v.casefold() for v in agent_view._decoded_variants(out))
 
 
@@ -297,6 +303,7 @@ def test_adjacent_quoted_secret_routing_push_never_exposes_real_value(
     out = _push_change(routing_world, monkeypatch, entity)
     assert all(_ADJACENT_PRIVATE not in variant for variant in agent_view._decoded_variants(out))
     if field == "label":
-        assert "open; checked by Khipu" in out
+        assert out.count(": OK.") == 3
     else:
-        assert agent_view.WITHHELD in out
+        # A rule awaiting the owner's yes is not on the page at all.
+        assert "[REDACTED]" not in out and agent_view.WITHHELD not in out

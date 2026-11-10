@@ -23,6 +23,7 @@ from khipu import mcp_server as ms
 from khipu import routing
 from khipu import usage as usage_mod
 from khipu.mcp_server import handle_message
+from tests.routing_page_text import page_text
 
 gateway_hub = gateway_fixtures.gateway_hub
 hub = gateway_fixtures.hub
@@ -85,6 +86,7 @@ def _call(name: str, arguments: dict | None = None) -> tuple[bool, dict]:
 
 
 def _route(**arguments) -> dict:
+    arguments.setdefault("full", True)  # the record; a bare khipu_route answers the routing page
     is_error, body = _call("khipu_route", arguments)
     assert not is_error, body
     return body
@@ -131,7 +133,7 @@ def test_conversation_rule_is_live_pending_and_cannot_impersonate_the_owner(home
     rule = view["rules"][0]
     assert rule["pending"] and rule["pending_kind"] == "added"
     assert rule["pending_by"] == "a Claude Code conversation"
-    assert "owner has not confirmed" in routing.summary()["text"]
+    assert "Keep deployment work local." not in page_text()  # pending: not on the page until the owner's yes
     event = _events()[-1]
     assert event["owner_request"] == "The owner asked for this during review."
     assert event["written_by"]["kind"] == "conversation"
@@ -255,7 +257,7 @@ def test_the_author_of_every_mcp_write_is_set_by_khipu(home, monkeypatch):
     # A name the conversation gives itself is kept beside the author, never
     # in its place, and never pushed.
     assert events[0]["written_by"]["name"] == "night builder"
-    assert "night builder" not in routing.summary()["text"]
+    assert "night builder" not in page_text()
     # Another harness's server says another author: still nothing from arguments.
     monkeypatch.delenv("CLAUDECODE")
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
@@ -276,8 +278,10 @@ def test_khipu_route_returns_the_words_the_push_leaves_out(home, monkeypatch):
     _report(state="limited", account="Codex", until="1h", name="release runner",
             evidence="job 41 ended on a usage limit after the third retry")
     _report(action="hold", scope="all", reason="disk-low", text="no new builds until the disk is cleaned")
-    pushed = routing.summary()["text"]
-    for words in ("release runner", "job 41 ended", "no new builds until the disk is cleaned"):
+    pushed = page_text()
+    # A conversation's name and evidence stay in the full record; its hold's
+    # words print on the page only as its quoted words.
+    for words in ("release runner", "job 41 ended"):
         assert words not in pushed, words
     view = _route()
     codex = next(a for a in view["accounts"] if a["label"] == "Codex")
@@ -335,17 +339,15 @@ def test_the_gateway_answers_available_false(home, monkeypatch, gateway_hub):
 _NO_PRIOR_WORK = {"items": [], "text": None, "meta": {}}
 
 
-def test_the_light_status_payload_carries_the_routing_summary(home):
+def test_the_light_status_payload_carries_the_routing_page(home):
     _a_full_record()
     with mock.patch("khipu.db.connect", side_effect=RuntimeError("no hub in this test")), \
             mock.patch("khipu.recall_prompt.prior_work_for_prompt", return_value=_NO_PRIOR_WORK):
         out = ms._tool_status({"prompt": "where should the build go"})
     routing_field = out["routing"]
-    expected = routing.summary()
-    assert routing_field["text"] == expected["text"] and routing_field["version"] == expected["version"]
-    assert routing_field["text"].startswith("## Routing at 15:00Z (Khipu's routing record, version ")
-    assert "Builds go to Codex this week" in routing_field["text"]  # the owner's note, whole
-    assert "hold new launches while load1" not in routing_field["text"]  # a conversation's words: never pushed
+    # The routing page, the same text every conversation and subagent gets.
+    assert routing_field["text"] == page_text() and routing_field["version"] == routing.read_view()["version"]
+    assert routing_field["text"].startswith("ROUTING 15:00Z. The owner's record.")
 
 
 def test_a_routing_failure_never_breaks_the_light_status(home):
@@ -358,7 +360,7 @@ def test_a_routing_failure_never_breaks_the_light_status(home):
 
 def test_no_record_on_this_mac_is_said_and_nothing_is_written(home):
     out = routing.light_status()
-    assert "No routing record on this Mac." in out["text"]
+    assert "no routing record on this Mac." in out["text"]
     view = _route()
     assert view["record"] is False and view["version"] == 0
     assert not routing.events_file().exists() and not routing.view_file().exists()
@@ -730,7 +732,7 @@ def test_an_mcp_write_from_an_undetected_harness_is_never_a_shell_command(home):
     assert [e["written_by"]["harness"] for e in _events()] == ["unknown", "unknown"]
     view = _route()
     line = next(a for a in view["accounts"] if a["label"] == "Claude")["line"]
-    for text in (line, view["holds"][0]["line"], routing.summary()["text"]):
+    for text in (line, view["holds"][0]["line"], page_text()):
         assert "a shell command" not in text, text
     assert "a conversation from an unknown harness" in line
     # A shell's own write is still a shell's.
@@ -756,7 +758,7 @@ def test_a_held_routing_lock_never_costs_khipu_status_its_routing(home):
             took = time.monotonic() - started
     finally:
         os.close(fd)
-    assert "routing" in out and out["routing"]["text"].startswith("## Routing at"), out.get("routing")
+    assert "routing" in out and out["routing"]["text"].startswith("ROUTING "), out.get("routing")
     assert took < 1.5, took
 
 
@@ -901,10 +903,9 @@ def test_the_owners_words_are_whole_and_the_same_in_khipu_route_and_the_light_st
     assert f"\u201ckeep {third} free\u201d" in view["holds"][0]["line"]
     light = routing.light_status()["text"]
     assert ms._routing_light()["text"] == light
-    for words in (note, rule):
-        assert words in light, (words, light)
-    # The push clips the hold's line first, so a cut path is said as "a folder".
-    assert f"keep {third}" in light or "keep a folder" in light, light
+    assert rule in light, light  # the owner's rule, whole; his note is in the full record
+    # The page clips a hold's words to fit; the hold itself is still there.
+    assert "Hold on all work: until lifted: \u201ckeep" in light, light
     # Outside the owner's words, no path in either answer.
     for text in [light.replace(note, "").replace(rule, "").replace(held, "")] + [
             t for t in _strings(view) if note not in t and rule not in t and held not in t]:
@@ -1007,7 +1008,7 @@ def test_no_mcp_answer_holds_a_configured_path_or_an_account_key(home):
                 assert not _outside_owner_words(text, needle, owner_words), (needle, text)
     # The owner's words are whole in every answer that carries them.
     view = _route()
-    assert view["note"]["text"] == note and note in routing.light_status()["text"]
+    assert view["note"]["text"] == note  # whole in the record; the page carries rules, not the note
     held = next(h for h in view["holds"] if h["owner"])
     third = next(a for a in view["accounts"] if a["label"] == "Claude third")
     assert held["text"] == third["id"] and f"“{third['id']}”" in held["line"]

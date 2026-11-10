@@ -65,7 +65,7 @@ def test_child_ack_and_mcp_ack_do_not_clear_hooked_parent(replay):
     out = planned()
     for _ in range(4):
         delivery.offer(out, session="s1")
-    child = delivery.child_offer(out, session="s1", component="agent:c", now=T0)
+    child = delivery.offer(out, session="s1", component="agent:c")
     assert delivery.acknowledge("s1", child["routing_changes"], now=T0)
     changes, _ = delivery.pull_offer(out, session="s1", counting_component="main", now=T0)
     assert delivery.pull_acknowledge("s1", changes["batch"], now=T0) == "acked"
@@ -121,12 +121,12 @@ def test_legacy_missing_proof_never_green(replay, state):
 
 def test_child_pruning_keeps_receipt_proof_and_does_not_hide_damage(replay):
     out = planned()
-    answer = delivery.child_offer(out, session="s1", component="agent:ok", now=T0)
+    answer = delivery.offer(out, session="s1", component="agent:ok")
     assert delivery.acknowledge("s1", answer["routing_changes"], now=T0)
     state = delivery.snapshot("s1", "agent:ok")
     assert state["done_shown"] == state["done"]
     assert health.component_health(state, T0)["status"] == "green"
-    delivery.child_offer(out, session="s1", component="agent:damaged", now=T0)
+    delivery.offer(out, session="s1", component="agent:damaged")
     with delivery._transaction("s1") as data:
         entry = next(iter(data["agent:damaged"]["entries"].values()))
         entry.update(acked=True, offset=len(entry["text"]), shown_offset=0)

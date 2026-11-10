@@ -230,23 +230,6 @@ def test_a_view_inventory_that_raises_falls_back_to_the_parse(record, monkeypatc
     assert ("grok", record["bound"]) in expected
 
 
-def test_child_page_push_parses_the_entries_before_the_fork(record, monkeypatch):
-    """The forked child inherits the parent's parsed entries, so its budget
-    times the read, not the parse (``_start_view`` -> ``_inputs()``)."""
-    _cold()
-    seen: dict = {}
-
-    def fake_fork():
-        seen["entries"] = dict(routing._ENTRY_INPUTS)
-        raise OSError("no fork in the test")
-
-    monkeypatch.setattr(routing, "push_off", lambda *_a, **_k: False)
-    monkeypatch.setattr(routing, "prompt_budget", lambda: 5.0)
-    monkeypatch.setattr(os, "fork", fake_fork)
-    assert routing.child_page_push("s1", "a1") is None
-    assert seen["entries"], "the entry cache was empty at the fork"
-
-
 def test_a_bound_login_folder_name_is_redacted_without_a_saved_view(record):
     """An owner-defined account's bare login-folder name comes from the
     config's bindings, not only from a saved view.json."""

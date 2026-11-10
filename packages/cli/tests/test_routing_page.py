@@ -498,9 +498,13 @@ def test_khipu_route_page_prints_the_page_from_the_record(replay, capsys):
     assert "Blind second opinions." in out
     assert cli.main(["route", "--page", "--json"]) == 0
     assert '"chars"' in capsys.readouterr().out
-    for other in (["--summary"], ["--brief"], ["--since", "1"], ["--view", "rules"]):
+    for other in (["--since", "1"], ["--view", "rules"]):
         assert cli.main(["route", "--page", *other]) != 0
         capsys.readouterr()
+    # --summary and --brief print the same page.
+    for other in (["--summary"], ["--brief"]):
+        assert cli.main(["route", *other]) == 0
+        assert capsys.readouterr().out.startswith("ROUTING ")
 
 
 def test_second_opinions_only_comes_from_the_provider_fact_not_the_role_words():

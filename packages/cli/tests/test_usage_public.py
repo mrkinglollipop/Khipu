@@ -155,9 +155,8 @@ def test_routing_surfaces_never_carry_a_login_folder(owner, monkeypatch):
         "khipu_route": routing.conversation_view(),
         "khipu_route one": routing.conversation_view(account="Claude zqprivate"),
         "khipu_route since": routing.conversation_view(since_version="0"),
-        "summary": routing.summary(),
-        "brief summary": routing.summary(brief=True),
-        "start push": routing.light_status(start=True),
+        "start page": routing._start_page(routing.read_view(), now),
+        "khipu_status routing": routing.light_status(),
         "prompt push": routing.prompt_push(None, budget=5, now=now + timedelta(seconds=1)),
     }
     payload: dict = {}

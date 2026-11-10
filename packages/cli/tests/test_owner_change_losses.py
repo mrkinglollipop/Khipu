@@ -39,7 +39,7 @@ def test_a_new_rule_with_base_is_live_not_crossed(home):
     """An addition has nothing to be stale against: a caller-sent ``base`` is
     not recorded, so the request becomes a live pending rule."""
     routing.add_rule("An existing rule.", via="app")
-    shown = mcp_server._tool_route({})
+    shown = mcp_server._tool_route({"full": True})
     # Agents often send a revision they just read; for an add that value is
     # never the new rule's owner revision ("0"), and today marks it crossed.
     bogus = shown["rules"][0]["owner_revision"]
@@ -62,7 +62,7 @@ def test_a_new_rule_with_base_is_live_not_crossed(home):
 
 def test_a_crossed_rule_edit_answer_says_it_did_not_take_effect(home):
     routing.add_rule("OWNER E1", via="app")
-    observed = mcp_server._tool_route({})["rules"][0]["owner_revision"]
+    observed = mcp_server._tool_route({"full": True})["rules"][0]["owner_revision"]
     routing.edit_rule(1, "OWNER E2", via="app")
     out = mcp_server._tool_route_rule({
         "text": "Stale proposal.", "rule": 1,
@@ -79,7 +79,7 @@ def test_a_crossed_rule_edit_answer_says_it_did_not_take_effect(home):
 
 def test_a_crossed_priority_answer_says_it_did_not_take_effect(home):
     routing.set_priority([{"account": "Claude"}], via="app", expect=routing.priority_version())
-    observed = mcp_server._tool_route({})["priority_owner_revision"]
+    observed = mcp_server._tool_route({"full": True})["priority_owner_revision"]
     routing.set_priority([{"account": "Codex"}], via="app", expect=routing.priority_version())
     out = mcp_server._tool_route_priority({
         "entries": [{"account": "Grok"}],
@@ -122,7 +122,7 @@ def test_an_old_rule_add_with_a_real_base_stays_crossed_on_replay(home):
 def test_a_crossed_notice_includes_the_owner_request_words(home, monkeypatch):
     routing.add_rule("OWNER E1", via="app")
     monkeypatch.setenv("KHIPU_SESSION_ID", "notice-author")
-    observed = mcp_server._tool_route({})["rules"][0]["owner_revision"]
+    observed = mcp_server._tool_route({"full": True})["rules"][0]["owner_revision"]
     routing.edit_rule(1, "OWNER E2", via="app")
     words = "set Cursor (xAI) to 90 percent for the week"
     mcp_server._tool_route_rule({

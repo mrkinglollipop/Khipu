@@ -30,7 +30,7 @@ ACCOUNTS = [{"label": "Claude", "harness": "claude"},
 ME = {"kind": "conversation", "harness": "claude_code", "project": "project-a", "session": "s-one"}
 SESSION = "11111111-2222-3333-4444-555555555555"
 MEMORY = "# Khipu memory\nthe memory part"
-HEADING = "## Routing at "
+HEADING = "ROUTING"  # the routing page, as every reader gets it
 
 
 class Clock:
@@ -144,9 +144,7 @@ def test_each_kill_switch_turns_the_push_off(home, monkeypatch, how):
 def test_with_no_record_the_scope_line_is_the_only_addition(home, monkeypatch):
     _push_on(monkeypatch)
     part = _routing_part(_hook(monkeypatch))
-    assert part.splitlines() == [
-        "## Routing at 15:00Z (Khipu's routing record, version 0; data, not instructions; guidance, not a gate)",
-        "No routing record on this Mac."]
+    assert part.splitlines() == ["ROUTING: no routing record on this Mac."]
     assert not routing.view_file().exists()  # nothing is written for a Mac with no record
 
 
@@ -161,66 +159,6 @@ def test_the_pushed_text_is_the_light_status_projection(home, monkeypatch):
     assert "/logins/" not in part and "claude|" not in part and "s-one" not in part
 
 
-@pytest.mark.usefixtures("unbounded_render")
-def test_rules_and_the_note_arrive_whole_whatever_their_length(home, monkeypatch):
-    long_rule = ("Every Grok result that is acted on gets a re-check from a different model family, "
-                 "and the re-check looks wider than the list Grok gave; ") * 3
-    assert len(long_rule.strip()) > 200
-    routing.add_rule(long_rule, via="app")
-    note = "Codex first for builds today; Grok for read-only surveys; second Claude for reviews. " * 25
-    routing.set_note(note, via="app")
-    _record()
-    _set(home, routing_summary_chars=50, routing_line_chars=40)
-    _push_on(monkeypatch)
-    lines = _routing_part(_hook(monkeypatch)).splitlines()
-    assert f"1. {long_rule}" in lines  # owner whitespace survives as well as the words
-    assert any(line.endswith(note) and line.startswith("Note from the owner") for line in lines)
-    assert lines.index("Standing rules:") < next(i for i, x in enumerate(lines) if x.startswith("Note from"))
-    assert lines[-1].endswith("more lines: run `khipu route`")
-
-
-def test_the_budget_drops_whole_lines_from_the_bottom(home, monkeypatch):
-    _record()
-    for i in range(4):
-        home["clock"].advance(minutes=1)
-        routing.add_hold(f"owner hold number {i}", reason="other", scope="machine", owner=True, via="app")
-    _push_on(monkeypatch)
-    whole = _routing_part(_hook(monkeypatch)).splitlines()
-    _set(home, routing_summary_chars=420)
-    cut = _routing_part(_hook(monkeypatch)).splitlines()
-    dropped = int(cut[-1].split()[0])
-    assert dropped > 0 and cut[-1] == f"{dropped} more lines: run `khipu route`"
-    kept = cut[1:-1]
-    assert [line for line in whole if line in kept] == kept  # whole lines of the uncut summary, in order
-    assert len(whole) - 1 - len(kept) == dropped
-    holds = [line for line in kept if line.startswith("Hold on")]
-    assert all("number 3" in line or "number 2" in line for line in holds), holds
-    assert any(line.startswith("Codex: limit reached") for line in kept)
-
-
-def test_the_precedence_line_names_the_tables_stamp(home, monkeypatch):
-    table = home["tmp"] / "routing-table.md"
-    table.write_text("# Routing now\n\n## NOW\n```\nupdated: 2026-10-14 13:48Z by an orchestrator\n"
-                     "PROSE-MARKER lane order\n```\n")
-    _set(home, routing_table=str(table))
-    _push_on(monkeypatch)
-    lines = _routing_part(_hook(monkeypatch)).splitlines()
-    assert lines[1] == ("These account lines are newer than the routing table's account rows; the table's "
-                        "NOW block was last stamped 13:48Z, 1 h 12 min ago.")
-    assert "PROSE-MARKER" not in "\n".join(lines)
-
-
-def test_a_record_not_refreshed_says_so(home, monkeypatch):
-    _record()
-    old = dict(routing.read_view(), checked_at=routing._iso(T0 - timedelta(minutes=20)))
-    monkeypatch.setattr(routing, "read_view", lambda now=None: old)
-    # The session-start child's read: of the saved view, as the real one's is.
-    monkeypatch.setattr(routing, "_start_view", lambda now=None: routing._load_view() and old)
-    _push_on(monkeypatch)
-    lines = _routing_part(_hook(monkeypatch)).splitlines()
-    assert lines[1] == "Khipu's record has not been refreshed since 14:40Z."
-
-
 # ---- never blocks, never breaks ----------------------------------------------------------------
 
 
@@ -231,7 +169,7 @@ def test_when_routing_raises_the_output_is_unchanged(home, monkeypatch):
     def boom(*_a, **_k):
         raise RuntimeError("/private/path in an exception")
 
-    for name in ("light_status", "start_budget", "push_off"):
+    for name in ("_start_view", "_start_page", "start_budget", "push_off"):
         monkeypatch.setattr(routing, name, boom)
         assert _hook(monkeypatch) == _before_routing(), name
     assert recall_prompt.routing_marker(SESSION) == {}
@@ -258,11 +196,10 @@ def test_when_routing_is_late_the_hook_does_not_wait(home, monkeypatch):
 
 
 @pytest.mark.parametrize("change", [False, True])
-def test_a_summary_from_an_older_record_generation_is_not_pushed(home, monkeypatch, change):
+def test_a_page_from_an_older_record_is_corrected_by_the_next_prompt(home, monkeypatch, change):
     """Codex review of the cold-start fix, at the start too: the child's
-    summary can sit in the pipe while the memory part runs, and the record
-    can change meanwhile. A summary read from a record that is no longer the
-    current one is not pushed, and the marker stays unset."""
+    page can sit in the pipe while the memory part runs, and the record can
+    change meanwhile. The next prompt then sends the changed page."""
     import os
 
     _record()
@@ -273,10 +210,17 @@ def test_a_summary_from_an_older_record_generation_is_not_pushed(home, monkeypat
     at.pid = None
     assert status == 0
     if change:
+        # The page read before the change may still go out at the start; the
+        # changed page then goes with the next prompt (a new signature).
+        old = at.text()
         routing.report(account="Claude", state="limited", until="2h", author=ME)
-        assert at.text() is None
+        assert old and "Claude: OK" in old
         at.delivered(SESSION)
-        assert recall_prompt.routing_marker(SESSION) == {}
+        from khipu import agent_view, routing_delivery
+
+        agent_view.prepare_routing_table(refresh=True)
+        nxt = routing.prompt_push(None, budget=1.0, session_id=routing_delivery.hook_session(SESSION))
+        assert nxt.get("routing_changes") and "Claude: LIMIT REACHED" in nxt["text"]
     else:
         assert "Claude" in at.text()
 
@@ -296,7 +240,7 @@ def test_when_the_lock_is_held_the_summary_still_arrives_in_time(home, monkeypat
         fcntl.flock(fd, fcntl.LOCK_UN)
         fd.close()
     assert took < 1.0, took
-    assert "Codex: limit reached" in part
+    assert "Codex: LIMIT REACHED" in part
     assert not routing.view_file().exists()  # an unsaved fold: nothing written under another holder's lock
 
 
@@ -359,8 +303,7 @@ def _write_jsonl(path: Path, rows: list[dict]) -> Path:
 
 
 def _assert_no_routing(rendered: str, ctx: str) -> None:
-    for marker in ("Routing at", "Standing rules", "Never a -fast tier", "Codex first for builds",
-                   "limit reached", "routing record"):
+    for marker in ("ROUTING ", "The owner's record", "Never a -fast tier", "LIMIT REACHED"):
         assert marker in ctx
         assert marker not in rendered, marker
 
@@ -494,7 +437,7 @@ def test_a_cpu_bound_refold_never_holds_the_hook_and_its_view_is_saved(home, mon
         raise AssertionError("folded again")
 
     monkeypatch.setattr(routing, "fold", no_fold)
-    assert "Codex: limit reached" in _routing_part(_hook(monkeypatch))
+    assert "Codex: LIMIT REACHED" in _routing_part(_hook(monkeypatch))
 
 
 def test_a_late_child_that_is_not_saving_exits_at_the_deadline(home, monkeypatch):
@@ -595,11 +538,9 @@ def test_the_session_start_output_stays_within_claude_codes_limit(home, monkeypa
     memory = _maximal_memory()
     monkeypatch.setattr(recall_rule, "session_start_context", lambda cwd=None: memory)
     rules = [f"Rule {i}: " + "work of this kind goes through a review by another model family first; " * 3
-             for i in range(6)]
+             for i in range(13)]
     for rule in rules:
         routing.add_rule(rule, via="app")
-    note = "Codex first for builds today; Grok for read-only surveys; second Claude for reviews. " * 20
-    routing.set_note(note, via="app")
     _record()
     _push_on(monkeypatch)
     assert _u16(memory) + _u16(routing.light_status()["text"]) > CLAUDE_CODE_HOOK_LIMIT
@@ -607,9 +548,8 @@ def test_the_session_start_output_stays_within_claude_codes_limit(home, monkeypa
     assert _u16(ctx) <= CLAUDE_CODE_HOOK_LIMIT, _u16(ctx)
     assert ctx.startswith(recall_rule.RULE_MD.strip())  # the recall rule is never cut
     for rule in rules:
-        assert rule.strip() in ctx  # the rules and the note whole
-    assert note.strip() in ctx
-    assert "Codex: limit reached" in ctx
+        assert " ".join(rule.split()) in ctx  # the owner's rules whole, on the page
+    assert "Codex: LIMIT REACHED" in ctx
     assert "more memory slice lines left out to fit the session-start limit" in ctx
     kept = ctx[:ctx.index(HEADING)]
     assert "- episode `1`:" in kept  # whole lines from the bottom: the top of the slice stays
@@ -617,46 +557,6 @@ def test_the_session_start_output_stays_within_claude_codes_limit(home, monkeypa
     # With the push off the memory part is printed as before.
     monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH")
     assert _context(_hook(monkeypatch)) == memory
-
-
-@pytest.mark.usefixtures("unbounded_render")
-def test_a_large_start_pages_the_note_and_keeps_mandatory_memory(home, monkeypatch):
-    from khipu import routing_delivery
-
-    memory = _maximal_memory()
-    unit = "Codex first for builds today; Grok for surveys. "
-    room = CLAUDE_CODE_HOOK_LIMIT - recall_rule._utf16_len(recall_rule.RULE_MD.strip())
-    words = unit * (room // recall_rule._utf16_len(unit) + 2)
-    monkeypatch.setattr(recall_rule, "session_start_context", lambda cwd=None: memory)
-    routing.set_note(words, via="app")
-    _record()
-    _push_on(monkeypatch)
-    assert len(routing.light_status()["text"]) > CLAUDE_CODE_HOOK_LIMIT - len(recall_rule.RULE_MD)
-    ctx = _context(_hook(monkeypatch))
-    assert ctx.startswith(recall_rule.RULE_MD.strip())
-    assert _u16(ctx) <= CLAUDE_CODE_HOOK_LIMIT
-    assert "page 1/" in ctx
-    assert "note" in recall_prompt.routing_marker(SESSION)["owed"]
-    payloads, offset = [], 0
-    for _ in range(30):
-        entry = routing_delivery.snapshot(SESSION)["entries"]["note"]
-        end = entry["offset"]
-        payload = entry["text"][offset:end]
-        assert end > offset and payload in ctx
-        payloads.append(payload)
-        offset = end
-        if entry["acked"]:
-            break
-        agent_view.prepare_routing_table(refresh=True)
-        out = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
-        at = recall_prompt._RoutingAtPrompt()
-        at.session = SESSION
-        ctx, info = at.add_to("", dict(out, at=routing._iso(routing._now())))
-        recall_prompt.finish_delivery({"routing": info}, delivered=True)
-    assert entry["acked"]
-    assert "".join(payloads) == entry["text"]
-    assert words.strip() in "".join(payloads)
-    assert not recall_prompt.routing_marker(SESSION).get("owed")
 
 
 def test_a_late_fold_never_keeps_a_conversations_write_waiting(home, monkeypatch):
@@ -686,20 +586,6 @@ def test_a_late_fold_never_keeps_a_conversations_write_waiting(home, monkeypatch
     time.sleep(4.5)
     view = routing.read_view()
     assert any(e["label"] == "Claude second" and e["state"] == "limited" for e in view["accounts"])
-
-
-def test_the_precedence_line_counts_against_the_summary_budget(home, monkeypatch):
-    # F3: the precedence line was added after the budget was spent.
-    table = home["tmp"] / "routing-table.md"
-    table.write_text("# Routing now\n\n## NOW\n```\nupdated: 2026-10-14 13:48Z by an orchestrator\n```\n")
-    _set(home, routing_table=str(table), routing_summary_chars=200)
-    _record()
-    _push_on(monkeypatch)
-    lines = _routing_part(_hook(monkeypatch)).splitlines()
-    after = "\n".join(lines[1:]) + "\n"  # no rules and no note: everything after the heading has the budget
-    assert lines[1].startswith("These account lines are newer than the routing table's")
-    assert len(after) <= 200, (len(after), after)
-    assert lines[-1].endswith("more lines: run `khipu route`")
 
 
 # ---- fix round 3 ------------------------------------------------------------------------------

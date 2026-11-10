@@ -30,8 +30,9 @@ T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
 ACCOUNTS = [{"label": "Claude", "harness": "claude"}, {"label": "Codex", "harness": "codex"}]
 ME = {"kind": "conversation", "harness": "claude_code", "project": "project-a", "session": "s-one"}
 SESSION = "11111111-2222-3333-4444-555555555555"
-FULL = "## Routing at "
-CHANGES = "## Routing changes at "
+# Every routing block is the routing page now.
+FULL = "ROUTING "
+CHANGES = "ROUTING "
 LAUNCHER = Path(__file__).resolve().parents[1] / "bin" / "khipu-delegation-hook"
 
 
@@ -109,6 +110,14 @@ def _marker() -> dict:
 
 
 def _seen_now() -> dict:
+    """The per-prompt push delivered the current page, as the hook records it."""
+    from khipu import routing_delivery
+
+    agent_view.prepare_routing_table(refresh=True)
+    session = routing_delivery.hook_session(SESSION)
+    out = routing.prompt_push(None, budget=1.0, session_id=session)
+    if out.get("routing_changes"):
+        assert routing_delivery.acknowledge(session, out["routing_changes"], take=True)
     view = routing.read_view()
     assert recall_prompt.mark_routing_seen(SESSION, version=view["version"], epoch=view["epoch"],
                                            full_at=routing._iso(routing._now()))
@@ -224,14 +233,15 @@ def test_the_seen_marker_is_shared_with_the_per_prompt_push(home, monkeypatch):
     routing.report(account="Claude", state="limited", until="2h", author=ME)
     out = _run(_call("delegate_task", {"target": {}}), monkeypatch)
     _never_a_decision(out)
-    lines = _ctx(out).splitlines()
-    assert lines[0].startswith(CHANGES) and len(lines) == 2 and lines[1].startswith("Claude: limit reached")
+    text = _ctx(out)
+    assert text.startswith(CHANGES) and "Claude: LIMIT REACHED" in text
     marker = _marker()
     assert marker["version"] == routing.read_view()["version"]
-    assert marker["full_at"] == "2026-10-14T15:00:00Z"
-    # The per-prompt push reads the same marker: the change is not repeated at the next prompt.
+    # The per-prompt push reads the same ledger: the page is not repeated at the next prompt.
+    from khipu import routing_delivery
+
     agent_view.prepare_routing_table(refresh=True)
-    assert routing.prompt_push(marker, budget=1.0)["kind"] == "none"
+    assert routing.prompt_push(None, budget=1.0, session_id=routing_delivery.hook_session(SESSION))["kind"] == "none"
 
 
 def test_a_block_the_per_prompt_push_did_not_deliver_is_sent_at_delegation(home, monkeypatch):
@@ -240,7 +250,7 @@ def test_a_block_the_per_prompt_push_did_not_deliver_is_sent_at_delegation(home,
     routing.report(account="Codex", state="open", author=ME)
     # The prompt's block was not delivered: its marker did not move, so delegation sends it.
     out = _run(_call("delegate_task", {"target": {}}), monkeypatch)
-    assert "Codex: open" in _ctx(out)
+    assert "Codex: OK" in _ctx(out)
 
 
 def test_an_unmatched_call_prints_nothing_and_leaves_the_marker(home, monkeypatch):
@@ -254,26 +264,14 @@ def test_an_unmatched_call_prints_nothing_and_leaves_the_marker(home, monkeypatc
 
 
 def test_a_subagents_calls_never_repeat_the_push(home, monkeypatch):
-    # No marker at all: a parent call would get the full summary; a subagent's gets nothing.
-    for call in (_call("Agent", agent_id="a1", agent_type="probe"),
-                 _call("delegate_task", {"target": {}}, agent_id="a1")):
-        assert _run(call, monkeypatch) == {}
+    # A subagent whose start Khipu never saw gets the page once, in its own
+    # ledger component, and never again until it changes; the parent's
+    # marker does not move for it.
+    first = _run(_call("Agent", agent_id="a1", agent_type="probe"), monkeypatch)
+    assert _ctx(first).startswith(FULL)
+    assert _run(_call("delegate_task", {"target": {}}, agent_id="a1"), monkeypatch) == {}
     assert _marker() == {}
     assert _run(_call("Agent"), monkeypatch) != {}  # the parent still hears it
-
-
-def test_the_budget_of_a_change_block_is_the_per_prompt_one(home, monkeypatch):
-    seen = _seen_now()
-    _set(home, routing_prompt_chars=150)
-    home["clock"].advance(minutes=1)
-    routing.add_hold("keep it for the audit", reason="keep", scope="machine", owner=True, via="app")
-    routing.report(account="Claude", state="limited", until="2h", author=ME)
-    routing.report(account="Codex", state="open", author=ME)
-    lines = _ctx(_run(_call("Agent"), monkeypatch)).splitlines()
-    assert lines[0].startswith(CHANGES)
-    assert lines[1].startswith("Claude: limit reached")
-    assert lines[-1].endswith(f"more changes: `khipu_route` since {seen['version']}")
-    assert len(lines) < 5 and sum(len(x) + 1 for x in lines[1:]) <= 150
 
 
 def test_a_read_past_the_time_budget_sends_nothing_and_keeps_the_marker(home, monkeypatch):
@@ -343,8 +341,7 @@ def test_the_launcher_refuses_inside_aegis_by_every_route():
     assert out["ok"], out
 
 
-@pytest.mark.parametrize("page", ["0", "1"])
-def test_the_launcher_delivers_and_never_fails_the_call(tmp_path, page):
+def test_the_launcher_delivers_and_never_fails_the_call(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
     (data / "config.json").write_text(json.dumps({"usage_accounts": ACCOUNTS, "routing_prompt_budget_ms": 1000,
@@ -355,14 +352,12 @@ def test_the_launcher_delivers_and_never_fails_the_call(tmp_path, page):
            if not k.startswith(("KHIPU_", "ROUTING_", "GROK_", "CLAUDE_"))}
     env.update(HOME=str(tmp_path), KHIPU_DATA_DIR=str(data), KHIPU_CAPTURE_HOME=str(capture),
                KHIPU_FEATURE_ROUTING_PUSH="1", KHIPU_PYTHON=sys.executable,
-               PYTHONPATH=os.pathsep.join(p for p in sys.path if p),
-               # Slice 6: the page (1) or the earlier summary (0) the suite's switch selects.
-               KHIPU_ROUTING_PAGE=page)
+               PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
     try:
         subprocess.run([sys.executable, "-c", "from khipu import routing; routing.report(account='Codex', "
                         "state='limited', until='1h', author={'kind': 'owner'})"], env=env, check=True,
                        capture_output=True, timeout=60)
-        for payload, want in ((_call("Agent"), "ROUTING " if page == "1" else FULL), (_call("Read", {"file_path": "/a"}), None),
+        for payload, want in ((_call("Agent"), FULL), (_call("Read", {"file_path": "/a"}), None),
                               ("not json", None)):
             p = subprocess.run([str(LAUNCHER)], input=payload if isinstance(payload, str) else json.dumps(payload),
                                capture_output=True, text=True, env=env, timeout=60)
