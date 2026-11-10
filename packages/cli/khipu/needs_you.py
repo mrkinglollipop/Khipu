@@ -109,6 +109,8 @@ ALSO = "Explicit asks are included here and in khipu_owed; older Owed items rema
 # was cut for the item being built, so nothing is ever cut without saying so.
 _WHOLE: ContextVar[bool] = ContextVar("khipu_needs_you_whole", default=False)
 _CLIPPED: ContextVar[bool] = ContextVar("khipu_needs_you_clipped", default=False)
+# Set only by the app's read (``needs_you_app.read``): each item also says where it came from.
+FOR_APP: ContextVar[bool] = ContextVar("khipu_needs_you_for_app", default=False)
 
 
 def _said(text, most: int) -> str:
@@ -706,6 +708,11 @@ def _finished(item: dict, caller: str, now: datetime) -> dict:
     by = item.get("_by")
     asked = "Khipu noticed this" if by is None else _who(by, caller)
     out["asked_by"] = {"who": asked, "at": item.get("at"), "when": _ago(item.get("at"), now)}
+    if FOR_APP.get():
+        # The app's three fields (``needs_you_app``); the MCP answer never has them.
+        from khipu import needs_you_app
+
+        out.update(needs_you_app.item_fields(by, asked, out["asked_by"]["when"]))
     return out
 
 
