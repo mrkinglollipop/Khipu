@@ -25,7 +25,8 @@ const done = (over: Record<string, unknown> = {}) =>
 function route(reads: string[], answers: Array<string | Promise<string> | Error> = [], extra: Record<string, unknown> = {}) {
   let r = 0;
   let a = 0;
-  invokeMock.mockImplementation((cmd: string) => {
+  invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+    if (cmd === "khipu_needs_you" && args?.key && typeof extra.whole === "function") return (extra.whole as (k: unknown) => unknown)(args.key);
     if (cmd === "khipu_needs_you") return Promise.resolve(reads[Math.min(r++, reads.length - 1)]);
     if (cmd === "khipu_needs_you_answer") {
       const next = answers[a++];
@@ -39,7 +40,8 @@ function route(reads: string[], answers: Array<string | Promise<string> | Error>
     return Promise.reject(new Error(`unexpected ${cmd}`));
   });
 }
-const calls = (cmd: string) => invokeMock.mock.calls.filter((c) => c[0] === cmd);
+const calls = (cmd: string) => invokeMock.mock.calls.filter((c) => c[0] === cmd && !(cmd === "khipu_needs_you" && c[1]?.key));
+const wholeReads = () => invokeMock.mock.calls.filter((c) => c[0] === "khipu_needs_you" && c[1]?.key);
 
 function Host({ onAllChanges = () => {} }: { onAllChanges?: () => void }) {
   const needs = useNeedsYou(true, true);
@@ -233,12 +235,14 @@ describe("other cards", () => {
     await waitFor(() => expect(calls("khipu_account_sign_in")).toEqual([["khipu_account_sign_in", { harness: "kimi", home: null }]]));
     await screen.findByText(/^Signed in/);
   });
-  it("a shortened item offers no Yes or No: its whole words can't be shown here", async () => {
+  it("a shortened item offers Read all of it and no Yes or No until it is read whole", async () => {
     route([listOf([item("held:r2", { cut: true })])]);
     render(<Host />);
     await screen.findByText("Words of held:r2.");
     expect(screen.queryByRole("button", { name: /^(Yes|No)$/ })).toBeNull();
     expect(screen.getByText(/shortened these words/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Read all of it" })).toBeTruthy();
+    expect(wholeReads()).toHaveLength(0); // never read on load
   });
   it("the empty list shows the last answer and opens All changes", async () => {
     const onAll = vi.fn();
@@ -287,5 +291,87 @@ describe("All changes", () => {
         expect(hasRemovedWord(words), `${action} ${target}: ${words}`).toBe(false);
       }
     }
+  });
+});
+
+describe("a shortened item, read whole", () => {
+  const short = item("rule:9", { cut: true, words: "A conversation proposed a standing rule: “Send every …”", expect: "pin-r9" });
+  const full = item("rule:9", { cut: false, words: "A conversation proposed a standing rule: “Send every review of Claude’s work to Codex, and every review of Codex’s work to Claude, until Friday.”", expect: "pin-r9" });
+  const wholeOf = (it: NeedsItem) => () => Promise.resolve(JSON.stringify({ ok: true, key: it.key, total: 1, items: [it] }));
+
+  it("shows the whole words, then Yes and No below them, and answers with the full read's pin", async () => {
+    route([listOf([item("rule:1"), short]), listOf([item("rule:1")])], [done()], { whole: wholeOf(full) });
+    render(<Host />);
+    await screen.findByText(short.words);
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Read all of it" })); });
+    expect(wholeReads()).toEqual([["khipu_needs_you", { key: "rule:9" }]]);
+    const words = await screen.findByText(full.words);
+    expect(screen.queryByText(short.words)).toBeNull();
+    const box = card(full.words);
+    const yes = within(box).getByRole("button", { name: "Yes" });
+    const no = within(box).getByRole("button", { name: "No" });
+    for (const b of [yes, no]) expect(words.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(within(box).queryByRole("button", { name: "Read all of it" })).toBeNull();
+    await act(async () => { fireEvent.click(yes); });
+    expect(calls("khipu_needs_you_answer")).toEqual([["khipu_needs_you_answer", { key: "rule:9", answer: "yes", expect: "pin-r9" }]]);
+    await screen.findByText("You said yes. Done here.");
+  });
+  it("a whole read that finds nothing says so, reads the list again, and offers no Yes or No", async () => {
+    route([listOf([short]), listOf([])], [], {
+      whole: () => Promise.resolve(JSON.stringify({ ok: false, code: "not_found", key: "rule:9", error: "gone" })),
+    });
+    render(<Host />);
+    await screen.findByText(short.words);
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Read all of it" })); });
+    expect((await screen.findByRole("alert")).textContent).toContain("no longer waiting");
+    expect(calls("khipu_needs_you")).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: /^(Yes|No)$/ })).toBeNull();
+    expect(calls("khipu_needs_you_answer")).toHaveLength(0);
+  });
+  it("a whole read that fails, or comes back still shortened, says so and offers no Yes or No", async () => {
+    for (const whole of [() => Promise.reject(new Error("timeout")), wholeOf({ ...full, cut: true }), wholeOf({ ...full, key: "rule:other" })]) {
+      invokeMock.mockReset();
+      route([listOf([short])], [], { whole });
+      const view = render(<Host />);
+      await screen.findByText(short.words);
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Read all of it" })); });
+      expect((await screen.findByRole("alert")).textContent).toContain("couldn’t give the whole question");
+      expect(screen.queryByRole("button", { name: /^(Yes|No)$/ })).toBeNull();
+      expect(screen.getByRole("button", { name: "Read all of it" })).toBeTruthy(); // the owner may try again
+      expect(calls("khipu_needs_you").length).toBeGreaterThanOrEqual(2); // the list was read again
+      expect(calls("khipu_needs_you_answer")).toHaveLength(0);
+      view.unmount();
+    }
+  });
+  it("keeps the rules: in flight every button ignores presses, one press sends one answer", async () => {
+    let release: (v: string) => void = () => {};
+    route([listOf([item("rule:1"), short]), listOf([item("rule:1")])], [new Promise<string>((r) => { release = r; })], { whole: wholeOf(full) });
+    render(<Host />);
+    await screen.findByText(short.words);
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Read all of it" })); });
+    await screen.findByText(full.words);
+    const no = within(card(full.words)).getByRole("button", { name: "No" });
+    fireEvent.click(no);
+    fireEvent.click(no);
+    fireEvent.click(within(card("Words of rule:1.")).getByRole("button", { name: "Yes" }));
+    for (const b of screen.getAllByRole("button", { name: /^(Yes|No)$/ })) expect(b.getAttribute("aria-disabled")).toBe("true");
+    expect(calls("khipu_needs_you_answer")).toEqual([["khipu_needs_you_answer", { key: "rule:9", answer: "no", expect: "pin-r9" }]]);
+    await act(async () => { release(done({ undoable: false })); });
+    await screen.findByText("You said yes. Done here.");
+  });
+  it("changed: reads the list again and the card is shortened again until it is read again", async () => {
+    const shortNew = { ...short, words: "A conversation proposed a standing rule: “Send no …”", expect: "pin-r9b" };
+    route([listOf([short]), listOf([shortNew])], [JSON.stringify({ ok: false, code: "changed", key: "rule:9", error: "changed" })], { whole: wholeOf(full) });
+    render(<Host />);
+    await screen.findByText(short.words);
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Read all of it" })); });
+    await screen.findByText(full.words);
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Yes" })); });
+    await screen.findByText(shortNew.words);
+    expect(screen.getByRole("alert").textContent).toContain("This changed since you saw it, so nothing was changed.");
+    expect(screen.queryByText(full.words)).toBeNull();
+    expect(screen.queryByRole("button", { name: /^(Yes|No)$/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Read all of it" })).toBeTruthy();
+    expect(calls("khipu_needs_you_answer")).toHaveLength(1);
   });
 });

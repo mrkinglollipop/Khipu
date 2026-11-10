@@ -14,7 +14,7 @@ import { callCli } from "../settingsCli";
 import { signInOutcome } from "../PlansCard";
 import { Receipt } from "./Receipt";
 import {
-  mergeOrder, offers, sendAnswer, signinLabel,
+  mergeOrder, offers, readWhole, sendAnswer, signinLabel,
   type NeedsHook, type NeedsItem, type Receipt as ReceiptData,
 } from "./needs";
 
@@ -36,29 +36,32 @@ function plural(n: number): string {
 }
 
 function AskCard({
-  item, note, busy, anyBusy, signing, onAnswer, onSignIn,
+  item, note, busy, anyBusy, signing, reading, onAnswer, onSignIn, onReadAll,
 }: {
   item: NeedsItem;
   note: string | null;
   busy: boolean;
   anyBusy: boolean;
   signing: boolean;
+  reading: boolean;
   onAnswer: (item: NeedsItem, said: "yes" | "no") => void;
   onSignIn: (item: NeedsItem) => void;
+  onReadAll: (item: NeedsItem) => void;
 }) {
   const can = offers(item);
   const id = `td-ask-${item.key.replace(/[^A-Za-z0-9_-]/g, "_")}`;
   const who = whoLine(item);
-  // A shortened item is not offered here: the owner would agree to words they
-  // could not read. The app's read can't fetch the whole item yet.
-  const cut = !!item.cut;
+  // A shortened item offers no Yes or No: the owner would agree to words they
+  // could not read. "Read all of it" reads it whole by its key; only then,
+  // with the whole words above them, do Yes and No appear.
+  const cut = item.cut === true;
   const ignore = anyBusy || signing;
   return (
     <article
       className="td-ask"
       data-permanent={item.permanent ? "true" : undefined}
       aria-labelledby={`${id}-q`}
-      aria-busy={busy || signing ? "true" : undefined}
+      aria-busy={busy || signing || reading ? "true" : undefined}
     >
       <div className="td-ask-h">
         <p className="td-ask-q" id={`${id}-q`}>{item.words}</p>
@@ -69,17 +72,28 @@ function AskCard({
           <p className="td-ask-c">This can’t be taken back. Yes answers only this question.</p>
         ) : null}
         {cut ? (
-          <p className="td-ask-c">
-            Khipu shortened these words, and the app can’t show the whole question yet. Ask an agent to read it to you
-            in full, and answer there.
-          </p>
+          <p className="td-ask-c">Khipu shortened these words. Read all of it before you answer.</p>
         ) : null}
         {note ? <p className="td-ask-err" role="alert">{note}</p> : null}
         {busy ? <p className="td-ask-sending" role="status">Sending your answer…</p> : null}
         {signing ? <p className="td-ask-sending" role="status">Finish signing in in the window that opened.</p> : null}
+        {reading ? <p className="td-ask-sending" role="status">Reading the whole question…</p> : null}
       </div>
       <div className="td-ask-choices">
-        {cut ? null : can.signin ? (
+        {cut ? (
+          <div className="td-choice">
+            <button
+              type="button"
+              aria-disabled={reading ? "true" : undefined}
+              aria-describedby={`${id}-r`}
+              onKeyDown={noRepeat}
+              onClick={() => { if (!reading) onReadAll(item); }}
+            >
+              Read all of it
+            </button>
+            <p id={`${id}-r`}>Yes and No appear once the whole question is here.</p>
+          </div>
+        ) : can.signin ? (
           <div className="td-choice">
             <button
               type="button"
@@ -140,6 +154,10 @@ export function NeedsCards({ needs, onAllChanges }: { needs: NeedsHook; onAllCha
   const [gone, setGone] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [signing, setSigning] = useState<string | null>(null);
+  // Items read whole by their key ("Read all of it"), and the one being read.
+  const [whole, setWhole] = useState<Record<string, NeedsItem>>({});
+  const [reading, setReading] = useState<string | null>(null);
+  const readingNow = useRef<string | null>(null);
   // Set at once on a press, before React re-renders, so a second press in the
   // same moment never sends a second answer.
   const sending = useRef<string | null>(null);
@@ -161,6 +179,37 @@ export function NeedsCards({ needs, onAllChanges }: { needs: NeedsHook; onAllCha
       return out;
     });
 
+  const dropWhole = (key: string) =>
+    setWhole((prev) => {
+      if (!(key in prev)) return prev;
+      const out = { ...prev };
+      delete out[key];
+      return out;
+    });
+
+  const readAll = async (item: NeedsItem) => {
+    if (readingNow.current) return;
+    readingNow.current = item.key;
+    setReading(item.key);
+    setNote(item.key, null);
+    setGone(null);
+    try {
+      const out = await readWhole(item.key);
+      if (out.kind === "whole") {
+        setWhole((prev) => ({ ...prev, [item.key]: out.item }));
+        return;
+      }
+      // Not read whole: say so, read the list again, and offer no Yes or No.
+      dropWhole(item.key);
+      setNote(item.key, out.sentence);
+      const fresh = await needs.reload();
+      if (fresh && !fresh.items.some((it) => it.key === item.key)) setGone(out.sentence);
+    } finally {
+      readingNow.current = null;
+      setReading(null);
+    }
+  };
+
   const answer = async (item: NeedsItem, said: "yes" | "no") => {
     if (sending.current) return;
     sending.current = item.key;
@@ -170,6 +219,7 @@ export function NeedsCards({ needs, onAllChanges }: { needs: NeedsHook; onAllCha
     try {
       const out = await sendAnswer(item, said);
       if (out.kind === "done") {
+        dropWhole(item.key);
         setAnswered((prev) => ({ ...prev, [item.key]: { receipt: out.receipt, undone: false } }));
         await needs.reload();
         return;
@@ -201,6 +251,9 @@ export function NeedsCards({ needs, onAllChanges }: { needs: NeedsHook; onAllCha
       }
       setNote(item.key, out.sentence);
       if (out.kind === "failed" || out.reread) {
+        // Changed or not known: whatever was read whole is stale. A shortened
+        // item is shortened again until it is read again.
+        dropWhole(item.key);
         const fresh = await needs.reload();
         if (fresh && !fresh.items.some((it) => it.key === item.key)) setGone(out.sentence);
       }
@@ -221,6 +274,14 @@ export function NeedsCards({ needs, onAllChanges }: { needs: NeedsHook; onAllCha
   const waiting = listed.filter((it) => !shownReceipts.includes(it.key));
   const left = Math.max(0, (data?.total ?? 0) - (listed.length - waiting.length));
   const byKey = new Map(listed.map((it) => [it.key, it]));
+  /** The card's item: the whole read when the list's copy is shortened and
+   *  the whole read carries the same pin; otherwise the list's own copy. */
+  const shown = (k: string): NeedsItem => {
+    const listedItem = byKey.get(k) as NeedsItem;
+    const w = whole[k];
+    if (listedItem.cut === true && w && (w.expect ?? null) === (listedItem.expect ?? null)) return w;
+    return listedItem;
+  };
   const slots = order.current.filter((k) => shownReceipts.includes(k) || byKey.has(k));
   const unread = data?.unread ?? [];
 
@@ -260,7 +321,7 @@ export function NeedsCards({ needs, onAllChanges }: { needs: NeedsHook; onAllCha
                 </div>
               );
             }
-            const item = byKey.get(k) as NeedsItem;
+            const item = shown(k);
             return (
               <AskCard
                 key={k}
@@ -269,8 +330,10 @@ export function NeedsCards({ needs, onAllChanges }: { needs: NeedsHook; onAllCha
                 busy={busy === k}
                 anyBusy={busy !== null}
                 signing={signing === k}
+                reading={reading === k}
                 onAnswer={(it, said) => void answer(it, said)}
                 onSignIn={signIn}
+                onReadAll={(it) => void readAll(it)}
               />
             );
           })}

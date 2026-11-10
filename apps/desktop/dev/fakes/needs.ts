@@ -11,6 +11,9 @@
 import type { FakeHandler } from "./index";
 
 type Item = Record<string, unknown> & { key: string; expect: string | null };
+
+// The shortened item's words whole, as `khipu_needs_you(key)` gives them.
+const WHOLE_ASK = "A conversation asked to change the priority, and it is held until you answer. It asks: “Put Codex first until Friday, then Claude, then Claude second, then Grok for audits only, then Kimi for first reviews where the checks allow it, then GLM one job at a time, then DeepSeek only when every other subscription is held or out. Keep Muse for blind second opinions on the riskiest pull requests until its plan ends on 13 November, and never send privacy, sign-in, permission or money code to Grok, GLM, DeepSeek or Kimi.”";
 type Line = Record<string, unknown> & { id: string };
 
 const iso = (minAgo: number) => new Date(Date.now() - minAgo * 60000).toISOString();
@@ -57,7 +60,7 @@ function start(flags: Record<string, unknown>): Item[] {
         from_words: "Khipu noticed this on M5.", mac: "M5", ago: null, expect: null,
       },
       {
-        kind: "held", key: "held:req-9f8e7d6c5b4a", sort: "confirmation", cut: true,
+        kind: "held", key: "held:req-9f8e7d6c5b4a", sort: "confirmation", cut: true, whole: WHOLE_ASK,
         words: "A conversation asked to change the priority, and it is held until you answer. It asks: “Put Codex first until Friday, then Claude, then Claude second, then Grok for audits only, then …”",
         confirm_does: "Makes the change: change the priority.", undo_does: "Drops the held request. Nothing changes.",
         settle: { confirm: { action: "direction.confirm", args: { request: "req-9f8e7d6c5b4a" } }, undo: { action: "direction.decline", args: { request: "req-9f8e7d6c5b4a" } } },
@@ -123,10 +126,16 @@ function answer(args: Record<string, unknown>, flags: Record<string, unknown>) {
   return { ok: true, key, answer: said, applied: said === "yes", receipt: { text, action_id: id, undoable: said === "yes", saved_on: ["M5"], not_reached: [] } };
 }
 
-function read(flags: Record<string, unknown>) {
+function read(flags: Record<string, unknown>, key?: unknown) {
   const all = list(flags);
+  if (typeof key === "string") {
+    const one = all.find((it) => it.key === key);
+    if (!one) return { ok: false, code: "not_found", key, error: "That item is no longer waiting. Nothing was changed; read the list again." };
+    const { whole: words, ...rest } = one;
+    return { ok: true, key, total: 1, matching: 1, this_mac: "M5", items: [{ ...rest, words: words ?? one.words, cut: false }] };
+  }
   const out: Record<string, unknown> = {
-    ok: true, total: all.length, matching: all.length, offset: 0, counts: {}, items: all.map((it) => ({ ...it })), more: 0,
+    ok: true, total: all.length, matching: all.length, offset: 0, counts: {}, items: all.map(({ whole: _whole, ...it }) => ({ cut: false, ...it })), more: 0,
     this_mac: "M5",
   };
   if (!all.length) {
@@ -140,7 +149,7 @@ const later = <T,>(value: T, ms: number) => new Promise<T>((r) => setTimeout(() 
 export const needsFakes: FakeHandler = (cmd, args, flags) => {
   switch (cmd) {
     case "khipu_needs_you":
-      return read(flags);
+      return read(flags, args?.key);
     case "khipu_needs_you_answer": {
       const out = answer(args ?? {}, flags);
       return flags.needsSlow ? later(out, 4000) : out;

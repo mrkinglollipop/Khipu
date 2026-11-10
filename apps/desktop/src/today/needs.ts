@@ -173,6 +173,41 @@ export async function sendAnswer(item: NeedsItem, said: "yes" | "no"): Promise<A
   return readAnswer(text, said);
 }
 
+export type WholeRead =
+  | { kind: "whole"; item: NeedsItem }
+  | { kind: "gone"; sentence: string }
+  | { kind: "failed"; sentence: string };
+
+export const WHOLE_GONE = "This is no longer waiting, so there is nothing to answer. Nothing was changed.";
+export const WHOLE_FAILED =
+  "Khipu couldn’t give the whole question just now, so it can’t be answered here yet. Nothing was changed.";
+
+/** One item read whole by its key (`khipu_needs_you(key)`). Only an answer
+ *  with that same key, its words whole (`cut: false`), counts as whole. */
+export async function readWhole(key: string): Promise<WholeRead> {
+  let text: unknown;
+  try {
+    text = await invoke<string>("khipu_needs_you", { key });
+  } catch {
+    return { kind: "failed", sentence: WHOLE_FAILED };
+  }
+  let v: Record<string, unknown>;
+  try {
+    v = JSON.parse(String(text)) as Record<string, unknown>;
+  } catch {
+    return { kind: "failed", sentence: WHOLE_FAILED };
+  }
+  if (v && v.ok === false) {
+    return v.code === "not_found" ? { kind: "gone", sentence: WHOLE_GONE } : { kind: "failed", sentence: WHOLE_FAILED };
+  }
+  const items = Array.isArray(v?.items) ? (v.items as NeedsItem[]) : [];
+  const one = items.length === 1 ? items[0] : null;
+  if (!one || one.key !== key || one.cut !== false || typeof one.words !== "string") {
+    return { kind: "failed", sentence: WHOLE_FAILED };
+  }
+  return { kind: "whole", item: one };
+}
+
 export type NeedsHook = {
   data: NeedsRead | null;
   /** The last read failed; what was read before stays on screen. */
