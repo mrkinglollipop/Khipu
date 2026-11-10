@@ -24,6 +24,7 @@ from khipu.jobs import (
     _JOB_SPECS,
     _launchagents_dir,
     _log_paths,
+    launchd_state,
     _plist_path,
     _plist_loaded,
 )
@@ -108,6 +109,34 @@ done
     return ["/bin/sh", "-c", script, _DRAIN_WRAPPER_NAME, python, "sessions", "drain"]
 
 
+_NOTES_WRAPPER_NAME = "khipu-notes-watch"
+_EXEC_SCRIPT = 'exec "$@"'
+
+
+def _exec_arguments(name: str, python: str, args: list[str]) -> list[str]:
+    """Start a job through ``/bin/sh``, which then execs the interpreter, so
+    launchd's Program is a binary that always exists. A job whose Program is
+    the app's bundled Python is spawned by launchd only while that file
+    exists: replacing the app while the job is loaded makes launchd record
+    "Missing executable" (exit 78, EX_CONFIG) and wait for a one-shot "it is
+    back" event. On 2026-11-10 that event fired for replica-refresh and never
+    for notes-watch, which stayed unstartable until reloaded. Through sh a run
+    during the swap fails like any other run (exit 126) and the next one works,
+    the same way queue-drain (already started through sh) rode it out."""
+    return ["/bin/sh", "-c", _EXEC_SCRIPT, name, python, *args]
+
+
+def _wrapped_interpreter(job: str, args: list[Any]) -> str | None:
+    """The interpreter inside a Khipu ``/bin/sh`` start (queue-drain's retry
+    wrapper or the plain exec one), or None when ``args`` is not one."""
+    if len(args) >= 5 and args[:2] == ["/bin/sh", "-c"]:
+        if job == "queue_drain" and args[3] == _DRAIN_WRAPPER_NAME:
+            return str(args[4])
+        if args[2] == _EXEC_SCRIPT and args[3] == _NOTES_WRAPPER_NAME:
+            return str(args[4])
+    return None
+
+
 def queue_drain_startup_failures() -> dict[str, Any]:
     """Count startup EINTRs in a bounded log tail, including legacy direct runs."""
     data = _installed_plist(_plist_path(PLIST_QUEUE_DRAIN)) or {}
@@ -168,6 +197,30 @@ def _install_root() -> Path:
     return live_root() or _repo_root()
 
 
+# Apple's /usr/bin/python3 (3.9 from the command line tools) cannot import
+# Khipu's vendored libraries. It is the first ``python3`` on launchd's PATH
+# (/usr/bin:/bin:/usr/sbin:/sbin), which is how a render from inside a job
+# wrote it into the notes-watch plist on 2026-11-10.
+SYSTEM_PYTHON = "/usr/bin/python3"
+# Where the hook launchers look when there is no bundled Python
+# (khipu.promote._hook_python): fixed paths, not the caller's PATH.
+_UNBUNDLED_PYTHONS = ("/opt/homebrew/bin/python3.11", "/usr/local/bin/python3.11")
+
+
+def _unbundled_python() -> str:
+    """The interpreter for a checkout without a bundled Python. The same
+    answer from a terminal, from the app and from inside a launchd job: the
+    fixed Homebrew paths first, then PATH, never Apple's 3.9."""
+    for candidate in _UNBUNDLED_PYTHONS:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    for name in ("python3.11", "python3"):
+        found = shutil.which(name)
+        if found and os.path.realpath(found) != os.path.realpath(SYSTEM_PYTHON) and found != SYSTEM_PYTHON:
+            return found
+    return sys.executable or "python3"
+
+
 def _bundled_python(root: Path | None = None) -> Path:
     root = _install_root() if root is None else root
     for rel in (
@@ -177,7 +230,7 @@ def _bundled_python(root: Path | None = None) -> Path:
         candidate = root / rel
         if candidate.is_file():
             return candidate
-    return Path(shutil.which("python3.11") or shutil.which("python3") or "python3")
+    return Path(_unbundled_python())
 
 
 def render_context(root: Path | None = None) -> dict[str, str]:
@@ -307,13 +360,16 @@ def watch_list_drift() -> dict[str, Any]:
 
 def refresh_watch_list() -> dict[str, Any]:
     """Rewrite and reload the notes-watch job with today's folders, by running
-    ``khipu jobs install notes_watch`` (the same code as the command) detached.
-    The caller is that very job, and the reload stops it, so the install runs
-    in its own session and the caller does not wait for it. Whether it worked
-    is read back later from ``watch_list_drift``."""
+    ``khipu jobs install notes_watch --keep-program`` (the same code as the
+    command) detached. The caller is that very job, and the reload stops it,
+    so the install runs in its own session and the caller does not wait for
+    it. ``--keep-program`` keeps the installed interpreter and program: this
+    runs inside launchd's environment, where a fresh interpreter choice once
+    picked Apple's /usr/bin/python3 (2026-11-10). Whether it worked is read
+    back later from ``watch_list_drift``."""
     try:
         subprocess.Popen(
-            [sys.executable, "-m", "khipu", "jobs", "install", "notes_watch"],
+            [sys.executable, "-m", "khipu", "jobs", "install", "notes_watch", "--keep-program"],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
@@ -322,7 +378,9 @@ def refresh_watch_list() -> dict[str, Any]:
     return {"ok": True, "started": True}
 
 
-def render_plist(job: str, environ: dict[str, str] | None = None) -> bytes:
+def render_plist(job: str, environ: dict[str, str] | None = None, *, python: str | None = None) -> bytes:
+    """``python`` overrides the interpreter (``--keep-program`` passes the
+    installed one); everything else renders as usual."""
     template_name = _JOB_TEMPLATE.get(job)
     if not template_name:
         raise ValueError(f"unknown scheduled job: {job}")
@@ -331,6 +389,8 @@ def render_plist(job: str, environ: dict[str, str] | None = None) -> bytes:
         raise FileNotFoundError(f"missing launchd template: {template_path}")
     text = template_path.read_text(encoding="utf-8")
     ctx = render_context()
+    if python:
+        ctx["KHIPU_PYTHON"] = python
     for key, value in ctx.items():
         text = text.replace(f"{{{{{key}}}}}", escape(value))
     spec = _JOB_SPECS.get(job, {})
@@ -348,7 +408,43 @@ def render_plist(job: str, environ: dict[str, str] | None = None) -> bytes:
         data = plistlib.loads(text.encode("utf-8"))
         data["ProgramArguments"] = _queue_drain_arguments(ctx["KHIPU_PYTHON"])
         return plistlib.dumps(data)
+    if job == "notes_watch":
+        data = plistlib.loads(text.encode("utf-8"))
+        args = [str(a) for a in data["ProgramArguments"]]
+        data["ProgramArguments"] = _exec_arguments(_NOTES_WRAPPER_NAME, args[0], args[1:])
+        return plistlib.dumps(data)
     return text.encode("utf-8")
+
+
+def _render_keeping_program(job: str, environ: dict[str, str] | None) -> bytes | None:
+    """Today's render of ``job`` with the installed plist's interpreter and
+    program kept exactly: only what is not the program (the watch list, the
+    environment, the logs) may change. None when nothing usable is installed."""
+    installed = _installed_plist(_plist_path(_LABELS[job]))
+    if not installed:
+        return None
+    python = installed_interpreter(job)
+    if not python:
+        return None
+    if python == SYSTEM_PYTHON:
+        # Apple's 3.9 cannot run Khipu and nobody chose it: it is the program
+        # the 2026-11-10 bug wrote. Today's render replaces it.
+        return render_plist(job, environ)
+    rendered = render_plist(job, environ, python=python)
+    data = plistlib.loads(rendered)
+    old_args = installed.get("ProgramArguments")
+    if (isinstance(old_args, list) and old_args != data.get("ProgramArguments")) \
+            or installed.get("Program") != data.get("Program"):
+        # An older start form: keep it byte for byte rather than re-shape it.
+        # The app's launch refresh re-renders it in today's form.
+        if isinstance(old_args, list):
+            data["ProgramArguments"] = old_args
+        if "Program" in installed:
+            data["Program"] = installed["Program"]
+        else:
+            data.pop("Program", None)
+        return plistlib.dumps(data)
+    return rendered
 
 
 def _launchctl_load(label: str, plist_path: Path) -> dict[str, Any]:
@@ -425,10 +521,20 @@ def _installed_required_driver(job: str) -> Path | None:
     return path if path is not None and path.is_file() else None
 
 
-def install_job(job: str, *, environ: dict[str, str] | None = None) -> dict[str, Any]:
+def install_job(job: str, *, environ: dict[str, str] | None = None,
+                keep_program: bool = False) -> dict[str, Any]:
+    """Render, write and reload ``job``. ``keep_program`` (the notes watcher's
+    own watch-list refresh) keeps the installed interpreter and program and
+    refuses when there is no installed plist to keep them from."""
     label = _LABELS.get(job)
     if not label:
         return {"ok": False, "error": "unknown_job", "job": job}
+    body: bytes | None = None
+    if keep_program:
+        body = _render_keeping_program(job, environ)
+        if body is None:
+            return {"ok": False, "error": "nothing_installed_to_keep", "job": job,
+                    "detail": f"--keep-program needs an installed {label} plist with a readable program"}
     required_env = _REQUIRED_DRIVER_ENV.get(job)
     if required_env:
         env = os.environ if environ is None else environ
@@ -447,7 +553,7 @@ def install_job(job: str, *, environ: dict[str, str] | None = None) -> dict[str,
     if job == "replica_refresh":
         replica_heal.ensure_wake_file()  # launchd watches a file that exists
     previous = dest.read_bytes() if dest.is_file() else None
-    dest.write_bytes(render_plist(job, environ))
+    dest.write_bytes(body if body is not None else render_plist(job, environ))
     loaded = _launchctl_load(label, dest)
     if not loaded.get("ok"):
         if previous is not None:
@@ -490,11 +596,11 @@ def uninstall_job(job: str) -> dict[str, Any]:
     return {"ok": True, "job": job, "removed": str(dest)}
 
 
-def install_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
+def install_scheduled_jobs(jobs: list[str] | None = None, *, keep_program: bool = False) -> dict[str, Any]:
     names = jobs or list(_DEFAULT_JOBS)
     results: list[dict[str, Any]] = []
     for job in names:
-        results.append(install_job(job))
+        results.append(install_job(job, keep_program=keep_program))
     failed = [r for r in results if not r.get("ok")]
     if failed:
         return {"ok": False, "results": results, "error": "install_partial_failure"}
@@ -541,7 +647,7 @@ def ensure_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
                     "error": "required_driver_unavailable",
                     "detail": "installed plist has no resolvable scheduled driver",
                 })
-            elif not _plist_loaded(label):
+            elif not _plist_loaded(label) or cannot_spawn(label):
                 r = install_job(job, environ=_refresh_environ(job))
                 out["results"].append(r)
                 if r.get("ok"):
@@ -568,6 +674,33 @@ def _installed_plist(dest: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def cannot_spawn(label: str) -> bool:
+    """True when launchd has the job loaded but reports it cannot start it
+    (``job state = spawn failed`` or exit 78). Only a reload clears that, so
+    a refresh reloads such a job even when its plist is already current."""
+    try:
+        return bool(launchd_state(label).get("spawn_failed"))
+    except Exception:  # noqa: BLE001 - unknown is not a reason to reload
+        return False
+
+
+def installed_interpreter(job: str) -> str | None:
+    """The Python the installed plist for ``job`` runs (through a Khipu sh
+    start or directly), None when nothing is installed."""
+    label = _LABELS.get(job)
+    data = _installed_plist(_plist_path(label)) if label else None
+    if not data:
+        return None
+    args = data.get("ProgramArguments") or []
+    if not isinstance(args, list):
+        return None
+    wrapped = _wrapped_interpreter(job, args)
+    if wrapped:
+        return wrapped
+    prog = data.get("Program") or (args[0] if args else "")
+    return str(prog) or None
+
+
 def plist_external(job: str) -> bool:
     """True when the installed plist was not rendered by this app: its
     interpreter lives outside any .app bundle and is not the one this render
@@ -580,14 +713,14 @@ def plist_external(job: str) -> bool:
     data = _installed_plist(dest) if dest and dest.is_file() else None
     if not data:
         return False
-    args = data.get("ProgramArguments") or []
-    prog = str(args[0]) if args else ""
     # The wrapper's shell is not the interpreter used to classify ownership.
     # Keep older wrapper bodies recognizable when the generator is updated.
-    if (job == "queue_drain" and len(args) >= 5
-            and args[:2] == ["/bin/sh", "-c"] and args[3] == _DRAIN_WRAPPER_NAME):
-        prog = str(args[4])
+    prog = installed_interpreter(job) or ""
     if not prog or ".app/Contents/" in prog:
+        return False
+    # Apple's 3.9 cannot run Khipu, so no maintainer chose it: only an older
+    # Khipu render from inside a launchd job wrote it. Ours to repair.
+    if prog == SYSTEM_PYTHON:
         return False
     # Same interpreter this render would use (a source checkout run by a
     # maintainer, or a test): it is ours to manage after all.
@@ -653,16 +786,23 @@ def refresh_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
     refreshed: list[str] = []
     current: list[str] = []
     external: list[str] = []
+    unspawnable: list[str] = []
     results: list[dict[str, Any]] = []
     for job in names:
         if plist_external(job):
             external.append(job)
             continue
-        if plist_current(job) is False or not _plist_loaded(_LABELS[job]):
+        stale = plist_current(job) is False or not _plist_loaded(_LABELS[job])
+        stuck = not stale and cannot_spawn(_LABELS[job])
+        if stale or stuck:
+            # A current plist is still reloaded when launchd cannot start it:
+            # writing identical bytes alone would leave launchd's stuck state.
             result = install_job(job, environ=_refresh_environ(job))
             results.append(result)
             if result.get("ok"):
                 refreshed.append(job)
+                if stuck:
+                    unspawnable.append(job)
         else:
             current.append(job)
     failed = [r for r in results if not r.get("ok")]
@@ -671,6 +811,7 @@ def refresh_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
         "refreshed": refreshed,
         "current": current,
         "external": external,
+        "reloaded_unspawnable": unspawnable,
         "missing": missing,
         "results": results,
         "startup_failures": (
