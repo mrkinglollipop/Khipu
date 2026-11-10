@@ -13037,6 +13037,10 @@ def run_cli(args) -> int:
                     out = project_route_view(out, mode)
                 elif narrowed:
                     out = only_account_part(out, account)
+                if args.json and not mode:
+                    from khipu import mac_names
+
+                    out["this_mac"] = mac_names.this_mac()  # the app's "On M5"; null when unreadable
                 _print_json(out)
             else:
                 _print_view(view, now, account)

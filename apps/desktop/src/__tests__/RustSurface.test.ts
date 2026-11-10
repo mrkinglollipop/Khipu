@@ -41,3 +41,30 @@ describe("webview-facing path and policy gates", () => {
     expect(body).toMatch(/canonicalize/);
   });
 });
+
+describe("the run-ahead grant and its picker", () => {
+  // Presence guard only: the cargo tests next to route_override_act_argv test behaviour.
+  it("the app's grant names an account, a conversation and an end, and is the owner path's own --from-app", () => {
+    const body = fnBody("route_override_act_argv");
+    expect(body).toMatch(/a run-ahead needs an end time/);
+    expect(body).toMatch(/route_override_grant_argv\(/);
+    const grant = fnBody("route_override_grant_argv");
+    expect(grant).toMatch(/route_base\("override"\)/);
+    expect(grant).toMatch(/checked_route_until\(until\)/);
+    expect(grant).toMatch(/checked_override_subject\(subject\)/);
+    expect(grant).not.toMatch(/indefinite/);
+  });
+
+  it("a subject is rebuilt from checked fields: a conversation only, never a folder or an extra key", () => {
+    const body = fnBody("checked_override_subject");
+    expect(body).toMatch(/"thread" && kind != "session"/);
+    expect(body).toMatch(/"kind" \| "id" \| "harness" \| "mac"/);
+  });
+
+  it("the picker's read and the grant are registered commands", () => {
+    expect(lib).toMatch(/async fn khipu_route_override_candidates\(account: String\)/);
+    expect(lib).toMatch(/async fn khipu_route_override_act\(\s*verb: String,\s*id: Option<String>,/);
+    const handler = lib.slice(lib.indexOf("generate_handler!"));
+    expect(handler).toMatch(/khipu_route_override_act,\s*khipu_route_override_candidates,/);
+  });
+});

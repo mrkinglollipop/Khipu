@@ -1450,6 +1450,78 @@ def actions() -> list[dict]:
     return [line for line in _merged(read_log()).values() if line.get("kind") == "action"]
 
 
+# The other Mac's routing changes, as they appear in the owner-actions list: its record's event type -> the action
+# id the list already words (``ACTIONS``).  Only changes the owner made there and that took effect.
+_OTHER_MAC_ACTIONS = {
+    "rule_add": "route.rule.add", "rule_edit": "route.rule.edit", "rule_retire": "route.rule.retire",
+    "rule_restore": "route.rule.restore", "rule_confirm": "route.rule.confirm", "rule_undo": "route.rule.undo",
+    "rule_dismiss": "route.rule.dismiss", "hold": "route.hold.add", "hold_end": "route.hold.end",
+    "cap_set": "route.cap.set", "cap_remove": "route.cap.remove", "priority_set": "route.priority.set",
+    "priority_confirm": "route.priority.confirm", "priority_undo": "route.priority.undo",
+    "priority_clear": "route.priority.clear", "pause": "route.pause", "lift": "route.lift", "clear": "route.clear",
+    "note_set": "route.note.set", "note_end": "route.note.end",
+}
+OTHER_MAC_LINES_MOST = 100
+OTHER_MAC_NO_UNDO = "This was made on another Mac; undo it there."
+
+
+def _other_mac_target(event: dict) -> str:
+    kind = event.get("type")
+    if kind.startswith("priority_"):
+        return "priority"
+    if kind.startswith("note_"):
+        return "note"
+    for key in ("n", "entity", "account", "target", "id"):
+        if isinstance(event.get(key), (str, int)) and not isinstance(event.get(key), bool):
+            return str(event[key])
+    return ""
+
+
+def _other_mac_lines() -> list[dict]:
+    """The other Macs' owner changes to the routing record, newest first, as owner-actions lines: read from the
+    copy of their record this Mac already holds (the hub's receipts).  An event from a build that writes no Mac,
+    or none of ours to tell apart, is left out; a replica that can't be read adds nothing."""
+    from khipu import mac_names, routing, routing_replication
+
+    try:
+        mine = routing._local_mac()
+        events = routing_replication.remote_events()
+    except Exception:  # noqa: BLE001 - the other Mac's changes are a nicety; this Mac's list stands
+        return []
+    out = []
+    for event in events:
+        kind, mac, at = event.get("type"), event.get("mac"), event.get("written_at")
+        if (not isinstance(kind, str) or kind not in _OTHER_MAC_ACTIONS or not isinstance(mac, str) or not mac
+                or mac == mine or not isinstance(at, str) or event.get("pending") is True
+                or (event.get("written_by") or {}).get("kind") != "owner" or not isinstance(event.get("id"), str)):
+            continue
+        out.append({"kind": "action", "id": f"other-mac:{event['id']}", "at": at, "action": _OTHER_MAC_ACTIONS[kind],
+                    "target": _other_mac_target(event), "auth": "other_mac", "state": "applied", "undo": None,
+                    "no_undo": OTHER_MAC_NO_UNDO, "mac": mac_names.name_of(mac) or "Your other Mac"})
+    out.sort(key=lambda x: x["at"], reverse=True)
+    return out[:OTHER_MAC_LINES_MOST]
+
+
+def listing() -> list[dict]:
+    """Every owner action newest first, as the app lists them: each line carries ``mac`` (the Mac the change was
+    made on: this one, or the one a "same change as there" line names; ``None`` when a line doesn't say), and the
+    other Mac's routing changes are merged in.  Read only."""
+    from khipu import mac_names
+
+    here = mac_names.this_mac()
+    rows = []
+    for line in reversed(actions()):
+        mac = line.get("mac")
+        if not isinstance(mac, str) or not mac:
+            from_ = (line.get("facts") or {}).get("from") if isinstance(line.get("facts"), dict) else None
+            mac = from_ if line.get("auth") == "other_mac" and isinstance(from_, str) and from_ else \
+                None if line.get("auth") == "other_mac" else here
+        rows.append(dict(line, mac=mac))
+    merged = rows + _other_mac_lines()
+    merged.sort(key=lambda x: str(x.get("at") or ""), reverse=True)  # stable: equal times keep log order
+    return merged
+
+
 def line_state(line_id: str) -> str | None:
     """A logged action's (or undo's) state now: ``applied``, ``scheduled``,
     ``done``, ``cancelled``, ``undone``, ``failed`` (it did not happen),
@@ -3402,8 +3474,7 @@ def run_cli(args) -> int:
         return 0
     if cmd == "actions":
         run_due()
-        rows = actions()
-        rows.reverse()
+        rows = listing()
         if getattr(args, "json", False):
             _print({"ok": True, "actions": rows})
         else:

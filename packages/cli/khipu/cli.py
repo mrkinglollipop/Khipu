@@ -2437,6 +2437,10 @@ def cmd_route(args: argparse.Namespace) -> int:
     it never chooses, refuses, launches or reorders work."""
     from khipu import routing
 
+    if getattr(args, "route_cmd", None) == "override" and getattr(args, "action", None) == "candidates":
+        from khipu import conversation_overrides
+
+        return conversation_overrides.candidates_cli(args)
     return routing.run_cli(args)
 
 
@@ -5723,8 +5727,8 @@ def build_parser() -> argparse.ArgumentParser:
     _owner_flags(hold)
     rover = rt_sub.add_parser("override", help="Owner: let one conversation run ahead of pace on an account "
                               "(grant ACCOUNT --subject JSON --until T | --indefinite), end one early (end ID) "
-                              "or keep one with no end (keep ID); list and walk are the app's reads", parents=[rt_json])
-    rover.add_argument("action", choices=("grant", "end", "keep", "list", "walk"))
+                              "or keep one with no end (keep ID); list, walk and candidates are the app's reads", parents=[rt_json])
+    rover.add_argument("action", choices=("grant", "end", "keep", "list", "walk", "candidates"))
     rover.add_argument("params", nargs="*")
     rover.add_argument("--subject", default=None, metavar="JSON", help="Who it is for, as the ask showed it")
     rover.add_argument("--effect", default="ahead_of_pace")
@@ -5736,6 +5740,7 @@ def build_parser() -> argparse.ArgumentParser:
     rover.add_argument("--reason", default=None)
     rover.add_argument("--ref", default=None)
     rover.add_argument("--request", default=None, help="The owner's words, one line")
+    rover.add_argument("--account", default=None, metavar="A", help="candidates: the account the conversations could run ahead on")
     rover.add_argument("--leave", default=None, metavar="KEY", help="walk: set this item aside")
     rover.add_argument("--keep", default=None, metavar="KEY", help="walk: keep this pair of twins as they are")
     rover.add_argument("--restart", action="store_true", help="walk: forget what was set aside")
