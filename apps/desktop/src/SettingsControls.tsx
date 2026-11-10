@@ -177,7 +177,7 @@ async function unsetConfig(key: string, reload: () => Promise<unknown>): Promise
 const CAPTURE_MODE_OPTIONS: ReadonlyArray<readonly [string, string, string]> = [
   ["legacy", "Files only", "The older capture script writes session files. Khipu stores nothing."],
   ["dual", "Files and Khipu", "The capture script writes files and Khipu stores each capture too."],
-  ["hub", "Khipu only", "Khipu stores each capture. The session files are rebuilt from Khipu."],
+  ["hub", "Khipu only", "Khipu stores each capture. Each night it adds new captures to the session files."],
 ];
 
 const SIMILARITY_ENV = {

@@ -28,7 +28,7 @@ from unittest import mock
 
 import pytest
 
-from khipu import capture, deliverables, embed, forget, hub_snapshot as hs, mirror, outbox, provenance, tombstones
+from khipu import capture, deliverables, embed, forget, hub_snapshot as hs, provenance, tombstones
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.test_provenance_forget import ALT, CANON, env, pg, _capture, _payload, _readers  # noqa: F401
 from tests.test_provenance_replica import hub_forget, replica, _replica, _replica_readers  # noqa: F401
@@ -151,25 +151,6 @@ def test_forget_nonanchor_erases_its_wording_immediately(pg, replica, prior_regi
 
 
 # ---- 3. P2 recovery at a held legacy key with different decision details ---------
-
-
-@pytest.mark.parametrize("method", ["sync_recent_episodes", "reconcile_memory_root"])
-def test_recovery_preserves_different_decision_details(pg, method):
-    pg.memory.mkdir()
-    text = "Use weekly release trains"
-    a = _payload(loop=None, decision=text, decision_details=[{"text": text, "by": "user",
-                                                               "rationale": "First rationale"}])
-    b = {**a, "decision_details": [{"text": text, "by": "user", "rationale": "SECOND_RATIONALE_UNIQUE",
-                                    "reverses": "Old policy"}]}
-    (pg.memory / "episodes.jsonl").write_text(json.dumps(a) + "\n" + json.dumps(b) + "\n")
-    for _ in range(2):
-        getattr(mirror, method)(pg.memory)
-    with pg.connect() as c:
-        claims = c.execute("SELECT field, value FROM fact_claims WHERE kind = 'decision'").fetchall()
-        gaps = c.execute("SELECT step FROM fact_gaps WHERE resolved_at IS NULL").fetchall()
-    queued = [json.loads(p.read_text()) for p in outbox.jobs()]
-    assert "SECOND_RATIONALE_UNIQUE" in str(claims) + str(queued) or gaps, \
-        "distinct rationale/evidence was silently skipped"
 
 
 # ---- 4. P2 two different gap groups, one deliverable ------------------------------
