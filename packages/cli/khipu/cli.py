@@ -3067,6 +3067,28 @@ def cmd_hygiene(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refresh_notes_watch_list() -> dict:
+    """The watcher's pass: if the folders the installed job watches differ from
+    the memory folders that exist now, rewrite and reload the job (once), and
+    say so on stderr. A failure here never stops the pass."""
+    try:
+        from khipu import launchd_gen
+
+        drift = launchd_gen.watch_list_drift()
+        if drift["installed"] is None or not (drift["unwatched"] or drift["stale"]):
+            return {"changed": False}
+        result = launchd_gen.refresh_watch_list()
+    except Exception as e:  # noqa: BLE001 — the pass has already done its work
+        result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        drift = {"unwatched": [], "stale": []}
+    if result.get("ok"):
+        print(f"[khipu-notes] watch list differs ({len(drift['unwatched'])} new, {len(drift['stale'])} gone): "
+              "reloading the notes-watch job", file=sys.stderr)
+    else:
+        print(f"[khipu-notes] watch list refresh failed: {result.get('error')}", file=sys.stderr)
+    return {"changed": True, "unwatched": drift["unwatched"], "stale": drift["stale"], **result}
+
+
 def cmd_notes(args: argparse.Namespace) -> int:
     """W4.3 + Phase 5 (organisation without the user): `khipu notes ...`.
 
@@ -3085,6 +3107,8 @@ def cmd_notes(args: argparse.Namespace) -> int:
             dry_run=bool(getattr(args, "dry_run", False)),
             changed_only=bool(getattr(args, "changed_only", False)),
         )
+        if getattr(args, "changed_only", False) and not getattr(args, "dry_run", False):
+            report["watch_list"] = _refresh_notes_watch_list()
         print(json.dumps(report, indent=2, default=str))
         return 0
     if cmd == "index":

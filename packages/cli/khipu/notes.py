@@ -26,9 +26,11 @@ Phase 4 (F5) — tombstones a ``note:`` topic whose ``source_path`` file no
 longer exists on disk, bounded by the same circuit-breaker style the wiki
 reconcile uses (never more than 20% of note topics in one run; see
 ``_tombstone_missing_notes``). ``changed_only=True`` (F1) skips writes whose
-file signature and resolved identity match the last run. Identity resolution
-uses the complete note inventory so unchanged collision partners remain visible.
-The nightly still calls the full (``changed_only=False``) reconcile. Never
+file signature and resolved identity match the last run, and reads no note
+file at all when none changed. The notes-watch job (``khipu notes reconcile
+--changed-only``, on a folder change and every 30 minutes) is the only thing
+that runs it by itself; the full (``changed_only=False``) pass is the explicit
+``khipu notes reconcile``. The stop hook and the nightly do not call either. Never
 runs against the live hub in a test: every test here injects a temp dir and
 mocks ``khipu.db.connect`` with a fake cursor, same as every other write
 path in this package.
@@ -661,21 +663,29 @@ def _deleted_indexed_notes(files_state: dict, present_paths: set[str]) -> tuple[
 def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str, Any]:
     """Mirror every harness-native note into ``topics``.
 
-    ``changed_only=True`` (F1) parses the complete inventory for stable note
-    identities, then skips writes whose signature and slug match the state
-    file. A run that finds nothing changed never opens a DB connection. The full
-    (``changed_only=False``, what the nightly calls) reconcile also runs the
-    F5 tombstone sweep (``_tombstone_missing_notes``), which needs every
-    live note topic's row and so is not part of the cheap path. Fail-open at
-    the per-file level (one bad note is reported in ``errors`` and does not
-    sink the batch) but lets a connection-level failure (no hub reachable at
-    all) propagate — the caller (`cli.cmd_notes` interactively, `jobs`
-    nightly, the Stop hook, the WatchPaths agent) decides how to surface
-    that, same posture as every other write path in this package.
+    ``changed_only=True`` (the notes-watch job's pass) first looks for files
+    whose signature differs from the state file, with one ``stat()`` each. If
+    none do, no note is opened and no database connection is made; it still
+    lists the folders to see deleted and renamed notes. If some do, it parses
+    the complete inventory for stable note identities (collision partners must
+    stay visible) and writes only the changed ones, then retires indexed notes
+    whose file is gone. The full pass (``changed_only=False``, the explicit
+    ``khipu notes reconcile``) rewrites every note and runs the F5 tombstone
+    sweep over every live note topic. Neither runs from the Stop hook or the
+    nightly. Fail-open at the per-file level (one bad note is reported in
+    ``errors`` and does not sink the batch) but lets a connection-level failure
+    (no hub reachable at all) propagate to the caller (`cli.cmd_notes`).
     """
     state = _read_state()
     files_state = state.get("files", {})
-    raw_plan = _build_plan()
+    if changed_only and not _build_plan(changed_only=True, state=state):
+        # Nothing changed: skip parsing every file. The folders are still
+        # listed (stat only) so a deleted or renamed note is seen below.
+        raw_plan = []
+        present_paths = {str(p) for p, _h, _s in _iter_note_file_candidates()}
+    else:
+        raw_plan = _build_plan()
+        present_paths = None
     for item in raw_plan:
         item["base_slug"] = item["parsed"]["slug"]
         prev = files_state.get(item["path"], {})
@@ -698,7 +708,8 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
     if changed_only:
         # The watcher fires when a note is deleted or renamed, so this pass also
         # retires indexed notes whose file is gone (folder listings only).
-        deleted_paths, unlisted = _deleted_indexed_notes(files_state, {i["path"] for i in plan})
+        deleted_paths, unlisted = _deleted_indexed_notes(
+            files_state, present_paths if present_paths is not None else {i["path"] for i in plan})
         live_slugs = {i["parsed"]["slug"] for i in plan}
         deleted_slugs = {sl for sl in deleted_paths.values() if sl not in live_slugs}
     else:
