@@ -1657,6 +1657,31 @@ async fn khipu_owner_answer(request: String, answer: String) -> Result<String, S
 /// never counts as the owner having been shown it in a conversation.
 const NEEDS_YOU_ARGV: &[&str] = &["needs-you", "--json", "--from-app"];
 
+/// A Needs-you item's key as the app sends it: it starts with a letter or
+/// digit, so it can never read as a flag, and may hold the spaces, colons and
+/// slashes item keys use, never a control character.
+fn checked_needs_you_key(key: &str) -> Result<&str, String> {
+    let plain = !key.is_empty()
+        && key.chars().count() <= 400
+        && key.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && !has_control(key);
+    if plain {
+        Ok(key)
+    } else {
+        Err(format!("not a Needs-you item: {key:?}"))
+    }
+}
+
+/// The list, or with `key` that one item with its words whole (`--item`,
+/// the terminal's own single-item read), joined to its flag.
+fn needs_you_argv(key: Option<&str>) -> Result<Vec<String>, String> {
+    let mut argv = fixed_argv(NEEDS_YOU_ARGV);
+    if let Some(key) = key {
+        argv.push(format!("--item={}", checked_needs_you_key(key)?));
+    }
+    Ok(argv)
+}
+
 /// The owner's Yes or No in the app to one Needs-you item, by its key
 /// (`khipu needs-you --from-app --answer KEY yes|no`). The CLI checks that
 /// the app itself started it, as every `--from-app` write does. A key starts
@@ -1666,13 +1691,7 @@ const NEEDS_YOU_ARGV: &[&str] = &["needs-you", "--json", "--from-app"];
 /// with none), sent back joined to its flag so it can never read as one; the
 /// CLI refuses a missing or moved pin as `changed`.
 fn needs_you_answer_argv(key: &str, answer: &str, expect: Option<&str>) -> Result<Vec<String>, String> {
-    let plain = !key.is_empty()
-        && key.chars().count() <= 400
-        && key.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && !has_control(key);
-    if !plain {
-        return Err(format!("not a Needs-you item: {key:?}"));
-    }
+    let key = checked_needs_you_key(key)?;
     if !matches!(answer, "yes" | "no") {
         return Err(format!("not an answer: {answer:?}"));
     }
@@ -1694,8 +1713,8 @@ fn needs_you_answer_argv(key: &str, answer: &str, expect: Option<&str>) -> Resul
 }
 
 #[tauri::command]
-async fn khipu_needs_you() -> Result<String, String> {
-    run_khipu_cli_async(fixed_argv(NEEDS_YOU_ARGV)).await
+async fn khipu_needs_you(key: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(needs_you_argv(key.as_deref())?).await
 }
 
 #[tauri::command]
@@ -6452,6 +6471,15 @@ mod settings_command_tests {
     #[test]
     fn needs_you_reads_and_answers_by_key_with_fixed_argv() {
         assert_eq!(NEEDS_YOU_ARGV, ["needs-you", "--json", "--from-app"]);
+        assert_eq!(needs_you_argv(None).unwrap(), ["needs-you", "--json", "--from-app"]);
+        assert_eq!(
+            needs_you_argv(Some("rule:rule-1")).unwrap(),
+            ["needs-you", "--json", "--from-app", "--item=rule:rule-1"]
+        );
+        assert_eq!(needs_you_argv(Some("plan:Claude client")).unwrap()[3], "--item=plan:Claude client");
+        assert!(needs_you_argv(Some("--yes")).is_err());
+        assert!(needs_you_argv(Some("")).is_err());
+        assert!(needs_you_argv(Some("rule:x\n--answer")).is_err());
         assert_eq!(
             needs_you_answer_argv("setting:routing_replication_live", "yes", Some("sr-0123456789abcdef")).unwrap(),
             ["needs-you", "--from-app", "--json", "--answer", "setting:routing_replication_live", "yes",
@@ -8173,7 +8201,8 @@ esac
         std::env::set_var("KHIPU_CAPTURE_HOME", dir.join("capture"));
         std::env::set_var("KHIPU_KEYCHAIN", "0");
         std::env::set_var("HOME", dir.join("home"));
-        let list = tauri::async_runtime::block_on(khipu_needs_you());
+        let list = tauri::async_runtime::block_on(khipu_needs_you(None));
+        let one = tauri::async_runtime::block_on(khipu_needs_you(Some("priority".to_string())));
         let yes = tauri::async_runtime::block_on(khipu_needs_you_answer("priority".to_string(), "yes".to_string(), Some("p1".to_string())));
         let bad = tauri::async_runtime::block_on(khipu_needs_you_answer("--yes".to_string(), "yes".to_string(), None));
         for (key, value) in keys.iter().zip(saved) {
@@ -8187,6 +8216,9 @@ esac
         let parsed: serde_json::Value = serde_json::from_str(&list).expect("the CLI answered in JSON");
         assert_eq!(parsed["ok"], true, "{list}");
         assert!(parsed["this_mac"].is_string(), "{list}");
+        let one = one.expect("a missing item is JSON the page reads");
+        let parsed: serde_json::Value = serde_json::from_str(&one).expect("the CLI answered in JSON");
+        assert_eq!(parsed["code"], "not_found", "{one}");
         let out = yes.expect("a refusal is JSON the page reads, not a failed invoke");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("the CLI answered in JSON");
         assert_eq!(parsed["ok"], false, "{out}");
