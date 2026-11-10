@@ -212,6 +212,10 @@ class _Refused(Exception):
 
 
 class RecallService:
+    # Recall requests being answered now. A class default as well as an
+    # instance value, so a service built without __init__ still counts.
+    _in_flight = 0
+
     def __init__(
         self,
         path: Path,
