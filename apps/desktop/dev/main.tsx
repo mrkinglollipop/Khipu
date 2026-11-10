@@ -450,6 +450,8 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   "app-needs-more": { title: "Today: an item that can't be taken back, a sign-in, a shortened item", fake: { needsMore: true }, render: () => <App /> },
   "app-needs-changed": { title: "Today: the rule changes after it was read", fake: { needsChanged: true }, render: () => <App /> },
   "app-needs-slow": { title: "Today: answers take four seconds", fake: { needsSlow: true }, render: () => <App /> },
+  // Memory: open the window, then pick Memory in the sidebar. Answers from fakes/memory.ts.
+  "app-memory-offline": { title: "The whole window, Only my words refused", fake: { memOffline: true }, render: () => <App /> },
   "app-welcome": { title: "The whole window, first run", fake: { welcome: true }, render: () => <App /> },
   // Accounts (slice A4): open the window, then press Accounts in the sidebar.
   "app-accounts": { title: "The whole window, Accounts", fake: { accounts: true }, render: () => <App /> },

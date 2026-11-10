@@ -73,6 +73,7 @@ import type { OwedOwner } from "./OwedBulk";
 import { OptionalFeatures } from "./OptionalFeatures";
 import { OwnerActions } from "./OwnerActions";
 import { PendingForgets } from "./PendingForgets";
+import { Memory } from "./memory/Memory";
 import { ProjectsSettings, askedCount } from "./ProjectsSettings";
 import { requireCliSuccess, requireMigrationSuccess, useCliState } from "./settingsCli";
 import type { ProjectsList } from "./ProjectsSettings";
@@ -114,6 +115,7 @@ type Tab =
   | "first-run"
   | "home"
   | "work"
+  | "memory"
   | "recall"
   | "activity"
   | "harnesses"
@@ -152,7 +154,7 @@ class PaneBoundary extends Component<PaneBoundaryProps, { failed: boolean }> {
 }
 
 const PANE_TITLES: Record<Tab, string> = {
-  "first-run": "Setup", home: "Home", activity: "Activity", recall: "Recall",
+  "first-run": "Setup", home: "Home", activity: "Activity", memory: "Memory", recall: "Recall",
   revisions: "Revisions", work: "Work", harnesses: "Harnesses", routing: "Accounts", "routing-old": "Accounts and routing", settings: "Settings", guides: "Guides",
 };
 
@@ -394,7 +396,7 @@ function RailIcon({ d }: { d: ReactNode }) {
   );
 }
 
-const NAV_ICONS: Record<Exclude<Tab, "first-run" | "revisions" | "routing-old">, ReactNode> = {
+const NAV_ICONS: Record<Exclude<Tab, "first-run" | "revisions" | "routing-old" | "memory">, ReactNode> = {
   home: <RailIcon d={<path d="M3 8.5 8 4l5 4.5V13H3z" />} />,
   recall: (
     <RailIcon
@@ -1221,7 +1223,7 @@ export default function App() {
   // Today is the new place on tab "home"; the old Home sits under Older screens.
   const [showOldHome, setShowOldHome] = useState(false);
   const [paneRetryKeys, setPaneRetryKeys] = useState<Record<Tab, number>>({
-    "first-run": 0, home: 0, activity: 0, recall: 0, revisions: 0, work: 0, harnesses: 0, routing: 0, "routing-old": 0, settings: 0, guides: 0,
+    "first-run": 0, home: 0, activity: 0, memory: 0, recall: 0, revisions: 0, work: 0, harnesses: 0, routing: 0, "routing-old": 0, settings: 0, guides: 0,
   });
   // Every screen shares one scroll container (`.main-content`), so a screen
   // would open scrolled to wherever the last one was left. A layout effect runs
@@ -2640,13 +2642,14 @@ export default function App() {
   }, [dsnOk, tab, owedStatus, loadOwed]);
 
   /** The window's places and the old screens still reachable. Ids are Tab
-   *  ids: Today shows the old Home, Accounts the old routing screen, Memory
-   *  the old Recall and Settings the old Settings, until each is replaced.
+   *  ids: Today shows the old Home, Accounts the old routing screen and
+   *  Settings the old Settings, until each is replaced. Memory is new (slice
+   *  A7); the old Recall is under Older screens.
    *  Revisions is a drill-in from Home; it is listed under Older screens so
    *  nothing is unreachable. Welcome is a first-run flow. */
   const PLACE_TITLES: Partial<Record<Tab, string>> = {
-    home: "Today", routing: "Accounts", recall: "Memory", settings: "Settings",
-    "routing-old": "Accounts and routing", work: "Work", activity: "Activity", harnesses: "Harnesses", guides: "Guides", revisions: "Conflicting edits",
+    home: "Today", routing: "Accounts", memory: "Memory", settings: "Settings",
+    "routing-old": "Accounts and routing", recall: "Recall", work: "Work", activity: "Activity", harnesses: "Harnesses", guides: "Guides", revisions: "Conflicting edits",
   };
 
   const [dataDir, setDataDir] = useState("");
@@ -3446,6 +3449,7 @@ export default function App() {
       case "settings": await Promise.all([refreshDsn(true), loadPaths(), loadGraphSources(), loadModels(), loadSecretsPresence()]); break;
       case "first-run": await refreshDsn(true); break;
       case "guides": await guideSignals.reload(); break;
+      case "memory": break;
       case "recall": break;
     }
     setPaneRetryKeys((keys) => ({ ...keys, [activeTab]: keys[activeTab] + 1 }));
@@ -3886,7 +3890,7 @@ export default function App() {
       countLabel: needsCount === 1 ? "1 needs you" : `${needsCount ?? 0} need you`,
     }),
     placeItem("routing", <Gauge size={18} aria-hidden />, "Which AI has room, and who gets what work"),
-    placeItem("recall", <Search size={18} aria-hidden />, "Find what you said"),
+    placeItem("memory", <Search size={18} aria-hidden />, "Find what you said"),
   ];
   const settingsItem = placeItem("settings", <SlidersHorizontal size={18} aria-hidden />, "Capture, models, data and this Mac");
   const workWaiting = work.data?.counts.waiting ?? 0;
@@ -3904,6 +3908,7 @@ export default function App() {
         </span>
       ) : undefined,
     }),
+    placeItem("recall", <Search size={18} aria-hidden />, "The old search and graph screen"),
     placeItem("activity", NAV_ICONS.activity, "Every session Khipu recorded"),
     placeItem("harnesses", NAV_ICONS.harnesses, "Claude Code · Cursor · Aegis · Codex", {
       badge: harnessBadge ? <span className={harnessBadge.quiet ? "nav-count quiet" : "nav-count"}>{harnessBadge.n}</span> : undefined,
@@ -3962,7 +3967,7 @@ export default function App() {
               onChange={(v) => { if (v === "rules") setTab("routing-old"); else setAcctView(v); }}
             />
           </Toolbar>
-        ) : toolbarTitle ? <Toolbar title={toolbarTitle} heading={false} /> : null}
+        ) : toolbarTitle && tab !== "memory" ? <Toolbar title={toolbarTitle} heading={false} /> : null}
         <WorkingBanner label={workingLabel} />
         <div className="main-content">
         <section className={panelClass("first-run")}>
@@ -3993,7 +3998,7 @@ export default function App() {
               onOpen={(link) => {
                 if (link === "running-now") { setAcctView("running"); setTab("routing"); }
                 else if (link === "accounts") setTab("routing");
-                else if (link === "search") setTab("recall");
+                else if (link === "search") setTab("memory");
                 else setTab("settings");
               }}
             />
@@ -4741,6 +4746,17 @@ export default function App() {
               <RawBlock text={activityText} />
             </Disclosure>
           </div>
+          </PaneBoundary>
+        </section>
+
+        <section className={`${panelClass("memory")} fill`}>
+          <PaneBoundary key={paneRetryKeys["memory"]} title={PANE_TITLES["memory"]} onRetry={retryActivePane}>
+            {tab === "memory" ? (
+              <Memory
+                run={runKhipu}
+                onForgotten={(id) => setActivityList((rows) => rows.filter((row) => row.id !== id))}
+              />
+            ) : null}
           </PaneBoundary>
         </section>
 

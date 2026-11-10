@@ -4,8 +4,8 @@
 // has moved there. Slice A11 deletes the older screens and these names with them.
 import { fireEvent, screen, within } from "@testing-library/react";
 
-const PLACES: Record<string, string> = { Recall: "Memory", Settings: "Settings" };
-const OLDER = ["Home", "Work", "Activity", "Harnesses", "Guides", "Conflicting edits", "Accounts and routing"];
+const PLACES: Record<string, string> = { Settings: "Settings" };
+const OLDER = ["Home", "Work", "Recall", "Activity", "Harnesses", "Guides", "Conflicting edits", "Accounts and routing"];
 
 export async function openScreen(old: string | RegExp): Promise<HTMLElement> {
   const main = await screen.findByRole("navigation", { name: "Main" });

@@ -314,7 +314,7 @@ describe("App — doctor reads", () => {
     await openScreen("Harnesses");
     fireEvent.click(await screen.findByRole("button", { name: "Search T3 captures" }));
 
-    expect(within(screen.getByRole("navigation", { name: "Main" })).getByRole("button", { name: "Memory" })).toHaveAttribute("aria-current", "page");
+    expect(within(screen.getByRole("navigation", { name: "Main" })).getByRole("button", { name: "Recall" })).toHaveAttribute("aria-current", "page");
     const query = await screen.findByRole("textbox", { name: "Search" });
     expect(query).toHaveFocus();
     fireEvent.change(query, { target: { value: "open commitments" } });

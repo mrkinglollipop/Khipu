@@ -7,6 +7,7 @@
 // the CLI prints it, or `undefined` to pass. The first handler that answers
 // wins. Answers are sent as JSON text, like the real `invoke`; wrap one in
 // `raw()` for a command whose real answer is a bare value (e.g. `true`).
+import { memoryFakes } from "./memory";
 import { shellFakes } from "./shell";
 import { accountsFakes } from "./accounts";
 import { todayFakes } from "./today";
@@ -19,7 +20,7 @@ export type FakeHandler = (cmd: string, args: Record<string, unknown> | undefine
 export { RAW, raw, isRaw } from "./raw";
 export type { Raw } from "./raw";
 
-export const FAKE_HANDLERS: FakeHandler[] = [shellFakes, accountsFakes, todayFakes, runningFakes, needsFakes];
+export const FAKE_HANDLERS: FakeHandler[] = [shellFakes, accountsFakes, todayFakes, runningFakes, needsFakes, memoryFakes];
 
 export function fakeAnswer(cmd: string, args: Record<string, unknown> | undefined, flags: FakeSwitches): unknown | undefined {
   for (const handler of FAKE_HANDLERS) {
