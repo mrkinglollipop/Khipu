@@ -565,22 +565,25 @@ def _redirect_topic_dict(old_slug: str, new_slugs: list[str]) -> dict[str, Any]:
     }
 
 
-def _tombstone_missing_notes(cur) -> dict[str, Any]:
+def _tombstone_missing_notes(cur, only_slugs: set[str] | None = None) -> dict[str, Any]:
     """F5: mark a ``note:`` topic ``deleted_at = now()`` when its
     ``source_path`` file no longer exists. Circuit-broken the same way the
     wiki reconcile is (``khipu.mirror.reconcile_from_files``'s mass-tombstone
     guard): never more than ``TOMBSTONE_MAX_FRACTION`` of live note topics in
     one run — a mount blip that makes every memory dir read as empty must
     not silently empty the corpus. Only the full (non ``changed_only``)
-    reconcile calls this; it needs every live note topic's row, which a
-    Stop-hook-cheap changed-only pass does not fetch."""
+    reconcile calls this with no ``only_slugs``; the watcher's changed-only
+    pass calls it with just the slugs whose files it saw disappear
+    (``_deleted_indexed_notes``), so the same checks and the same circuit
+    breaker apply to both."""
     cur.execute(
         "SELECT slug, source_path FROM topics WHERE slug LIKE %s AND deleted_at IS NULL",
         (NOTE_SLUG_PREFIX + "%",),
     )
     rows = cur.fetchall()
     total = len(rows)
-    missing = [slug for slug, path in rows if not path or not Path(path).is_file()]
+    missing = [slug for slug, path in rows
+               if (only_slugs is None or slug in only_slugs) and (not path or not Path(path).is_file())]
     out: dict[str, Any] = {"checked": total, "missing": len(missing), "tombstoned": 0, "skipped": False}
     if not missing:
         return out
@@ -613,6 +616,29 @@ def _any_memory_root_exists() -> bool:
     return bool(cursor_memory_roots()) or bool(aegis_memory_roots())
 
 
+def _deleted_indexed_notes(files_state: dict, present_paths: set[str]) -> tuple[dict[str, str], list[str]]:
+    """Indexed notes (from the state file) whose file is gone, found by listing
+    each note's folder only: no note is opened. Returns ``({path: slug}, folders
+    that could not be listed)``. A folder that is missing or unreadable at this
+    moment (an unmounted volume, a permission error) contributes nothing to the
+    first result, so a blip cannot tombstone its notes."""
+    listings: dict[str, set[str] | None] = {}
+    gone: dict[str, str] = {}
+    for path, entry in files_state.items():
+        if path in present_paths or not isinstance(entry, dict) or not entry.get("slug"):
+            continue
+        parent = str(Path(path).parent)
+        if parent not in listings:
+            try:
+                listings[parent] = set(os.listdir(parent))
+            except OSError:
+                listings[parent] = None
+        names = listings[parent]
+        if names is not None and Path(path).name not in names:
+            gone[path] = entry["slug"]
+    return gone, sorted(p for p, names in listings.items() if names is None)
+
+
 def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str, Any]:
     """Mirror every harness-native note into ``topics``.
 
@@ -628,7 +654,6 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
     nightly, the Stop hook, the WatchPaths agent) decides how to surface
     that, same posture as every other write path in this package.
     """
-    scan_started = time.time()
     state = _read_state()
     files_state = state.get("files", {})
     raw_plan = _build_plan()
@@ -649,6 +674,16 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
     for redirect in collision_report["redirects"]:
         redirect["new_slugs"] = sorted(item["parsed"]["slug"] for item in plan if item["base_slug"] == redirect["old_slug"])
     inventory = plan
+    deleted_paths: dict[str, str] = {}
+    unlisted: list[str] = []
+    if changed_only:
+        # The watcher fires when a note is deleted or renamed, so this pass also
+        # retires indexed notes whose file is gone (folder listings only).
+        deleted_paths, unlisted = _deleted_indexed_notes(files_state, {i["path"] for i in plan})
+        live_slugs = {i["parsed"]["slug"] for i in plan}
+        deleted_slugs = {sl for sl in deleted_paths.values() if sl not in live_slugs}
+    else:
+        deleted_slugs = set()
     if changed_only:
         plan = [item for item in plan if item["signature"] != {k: files_state.get(item["path"], {}).get(k) for k in ("mtime", "size")}
                 or item["parsed"]["slug"] != files_state.get(item["path"], {}).get("slug")]
@@ -666,15 +701,19 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
         "slugs": [p["parsed"]["slug"] for p in plan],
         "duplicate_copies": collision_report["duplicate_copies"],
         "collisions_reslugged": collision_report["collisions_reslugged"],
+        "deleted": len(deleted_paths),
+        "folders_not_listed": unlisted,
     }
+    if unlisted:
+        _log(f"changed-only pass: {len(unlisted)} folder(s) could not be listed, "
+             f"no note from them was tombstoned: {', '.join(unlisted[:5])}")
     if dry_run:
         return out
     run_tombstone = (not changed_only) and _any_memory_root_exists()
-    if not plan and not run_tombstone:
+    if not plan and not run_tombstone and not deleted_paths:
         if changed_only:
             _write_state({
                 "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
-                "scanned_at": scan_started,
                 "files": dict((state or {}).get("files", {})),
             })
         return out
@@ -764,13 +803,15 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
                     _log(f"redirect write failed for {redirect['old_slug']}: {exc}")
             if run_tombstone:
                 out["tombstone"] = _tombstone_missing_notes(cur)
+            elif deleted_paths:
+                out["tombstone"] = _tombstone_missing_notes(cur, only_slugs=deleted_slugs)
+                if not out["tombstone"].get("skipped"):
+                    for gone in deleted_paths:
+                        new_files_state.pop(gone, None)
         conn.commit()
     out["ok"] = not out["errors"]
     _write_state({
         "last_reconcile_at": datetime.now(timezone.utc).isoformat(),
-        # Only a clean run moves the line the Stop hook's quick check reads;
-        # after an error the same files are looked at again next time.
-        "scanned_at": scan_started if not out["errors"] else state.get("scanned_at"),
         "files": new_files_state,
     })
     try:
@@ -783,65 +824,6 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
         out["organise"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         _log(f"organise.after_reconcile failed: {exc}")
     return out
-
-
-# The Stop hook asks for a notes reconcile after every stop. A full pass reads
-# and parses every note on the Mac (about 1,000 files, ~4.7 s), and nearly
-# every stop has nothing new. So the hook asks at most once per this many
-# seconds, and then only when a note file is newer than the last clean pass.
-HOOK_MIN_INTERVAL_S = 180.0
-# A note written while a pass was running has a modified time a little after
-# that pass started; a file this close to the line counts as new.
-HOOK_MTIME_SLACK_S = 2.0
-
-
-def _hook_stamp_path() -> Path:
-    return _state_path().with_name("notes-reconcile-hook.stamp")
-
-
-def _note_files_changed_since(since: float) -> bool:
-    """One stat per note file, no reads: is any note modified at or after
-    ``since`` (less the slack)? Costs about a quarter of a second for a
-    thousand notes; the parse it avoids costs several seconds."""
-    for path, _harness, _slug in _iter_note_file_candidates():
-        sig = _file_sig(path)
-        if sig is not None and sig["mtime"] >= since - HOOK_MTIME_SLACK_S:
-            return True
-    return False
-
-
-def hook_reconcile(*, now: float | None = None) -> dict[str, Any]:
-    """The Stop hook's notes step: ``reconcile(changed_only=True)`` when it can
-    matter, a one-line skip when it cannot.
-
-    Skips (and says why in ``skipped``) when a pass was started less than
-    ``HOOK_MIN_INTERVAL_S`` ago on this Mac, or when no note file is newer than
-    the last clean pass. A note written in a session is therefore picked up at
-    the first stop at least ``HOOK_MIN_INTERVAL_S`` after the last pass: a few
-    minutes at most while sessions keep stopping. If no session stops after
-    that, the notes-watch job (WatchPaths on the memory folders) and the
-    nightly full pass pick it up. A note copied in with an old modified time
-    (no change to the file's own time) is left to those two as well.
-    """
-    now = time.time() if now is None else now
-    try:
-        age = now - _hook_stamp_path().stat().st_mtime
-    except OSError:
-        age = None
-    if age is not None and 0 <= age < HOOK_MIN_INTERVAL_S:
-        return {"skipped": "recent", "age_s": round(age, 1)}
-    # Stamp before the work, so stops that overlap this one skip rather than
-    # each starting a pass of their own.
-    try:
-        stamp = _hook_stamp_path()
-        stamp.write_text(str(now), encoding="utf-8")
-        os.utime(stamp, (now, now))
-    except OSError:
-        pass
-    scanned_at = _read_state().get("scanned_at")
-    if isinstance(scanned_at, (int, float)) and not _note_files_changed_since(float(scanned_at)):
-        return {"skipped": "unchanged"}
-    return reconcile(dry_run=False, changed_only=True)
 
 
 def notes_freshness(cur) -> dict[str, Any]:

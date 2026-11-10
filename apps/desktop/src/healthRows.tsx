@@ -71,7 +71,7 @@ const LABELS: Record<string, string> = {
   schema_migrations_ok: "Database has every update this version expects",
   // Phase 6 (honesty): per-nightly-step evidence (D1), instead of trusting
   // only the legacy driver's exit code.
-  notes_reconcile_ok: "Notes reconciled by the nightly",
+  notes_reconcile_ok: "Notes watcher installed",
   embed_provider_ok: "Embedding provider reachable",
   synth_provider_ok: "Summariser provider ready",
   synth_budget_ok: "Summariser within today's call ceiling",
