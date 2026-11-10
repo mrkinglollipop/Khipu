@@ -4,16 +4,17 @@
 // has moved there. Slice A11 deletes the older screens and these names with them.
 import { fireEvent, screen, within } from "@testing-library/react";
 
-const PLACES: Record<string, string> = { Settings: "Settings" };
-const OLDER = ["Home", "Work", "Recall", "Activity", "Harnesses", "Guides", "Conflicting edits", "Accounts and routing"];
+// "Settings" in an old test means the old Settings, now "Settings (older)" under Older screens.
+const PLACES: Record<string, string> = { Settings: "Settings (older)" };
+const OLDER = ["Home", "Work", "Recall", "Activity", "Harnesses", "Guides", "Conflicting edits", "Accounts and routing", "Settings (older)"];
 
 export async function openScreen(old: string | RegExp): Promise<HTMLElement> {
   const main = await screen.findByRole("navigation", { name: "Main" });
-  const label = typeof old === "string" ? old : OLDER.find((o) => old.test(o));
+  const label = typeof old === "string" ? PLACES[old] ?? old : OLDER.find((o) => old.test(o));
   if (label && OLDER.includes(label)) {
     const toggle = within(main).getByRole("button", { name: "Older screens" });
     if (toggle.getAttribute("aria-expanded") !== "true") fireEvent.click(toggle);
-    const button = await within(main).findByRole("button", { name: old });
+    const button = await within(main).findByRole("button", { name: label });
     fireEvent.click(button);
     return button;
   }

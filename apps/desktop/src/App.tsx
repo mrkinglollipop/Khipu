@@ -1,3 +1,6 @@
+import { LookPage } from "./settings/pages/Look";
+import { Settings } from "./settings/Settings";
+import type { SettingsCtx } from "./settings/context";
 import { Component, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -628,6 +631,7 @@ type SettingsSection =
   | "another-mac"
   | "components"
   | "updates"
+  | "look"
   | "advanced";
 
 const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
@@ -642,6 +646,7 @@ const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
   ["another-mac", "Another Mac"],
   ["components", "Components"],
   ["updates", "Updates"],
+  ["look", "Look"],
   ["advanced", "Advanced"],
 ] as const;
 
@@ -2690,6 +2695,14 @@ export default function App() {
     ipv4?: string;
   } | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("database");
+  // The new Settings (13 rows) is the Settings place; the old one stays under
+  // Older screens until a later slice deletes it.
+  const [oldSettings, setOldSettings] = useState(false);
+  const openOldSettings = (section?: SettingsSection) => {
+    if (section) setSettingsSection(section);
+    setOldSettings(true);
+    setTab("settings");
+  };
   // Routing delivery is part of doctor, not `khipu route --json`; read the
   // existing cached report whenever this Settings group becomes active.
   useEffect(() => {
@@ -2734,7 +2747,7 @@ export default function App() {
       if (t.section === "routing") setTab("routing-old");
       else {
         setSettingsSection(t.section as SettingsSection);
-        setTab("settings");
+        openOldSettings();
       }
     }
   };
@@ -2810,7 +2823,7 @@ export default function App() {
       if (target.section === "routing") setTab("routing-old");
       else {
         setSettingsSection(target.section);
-        setTab("settings");
+        openOldSettings();
       }
       if (target.group) revealSettingsGroup(target.group);
     } else {
@@ -3875,6 +3888,12 @@ export default function App() {
       return;
     }
     setShowOldHome(false);
+    if (id === "settings-old") {
+      setOldSettings(true);
+      setTab("settings");
+      return;
+    }
+    if (id === "settings") setOldSettings(false);
     setTab(id as Tab);
   };
   // The name the owner gave this Mac comes with the routing record (`this_mac`);
@@ -3921,6 +3940,7 @@ export default function App() {
     }),
     placeItem("routing-old", NAV_ICONS.routing, "Accounts, routing rules, and what needs your attention", {}),
     placeItem("revisions", <RailIcon d={<path d="M4 3v10M12 3v10M4 8h8" />} />, "Edits to the same memory made in two places"),
+    { id: "settings-old", label: "Settings (older)", icon: <SlidersHorizontal size={18} aria-hidden />, hint: "The earlier Settings screen" },
   ];
   // What the old rail's foot carried; each moves out as its new home lands.
   const olderExtra = (
@@ -3940,6 +3960,35 @@ export default function App() {
     </>
   );
   const toolbarTitle = tab === "home" && showOldHome ? "Home" : PLACE_TITLES[tab];
+  const settingsCtx: SettingsCtx = {
+    appVersion,
+    thisMac,
+    runKhipu,
+    onToast: (m) => setError(m),
+    liveness,
+    recallProbe,
+    t3: t3Health,
+    refreshHealth: () => loadDoctor(true),
+    onSearchT3Captures: openT3Captures,
+    onOpenGuide: (id) => openGuide(id, id === "grok_bot" ? guideSignals.grok.current : undefined),
+    synth: models.synth,
+    modelsError: models.models_error,
+    modelsSaving,
+    modelsMsg,
+    onSynthChange: (patch) => updateModelRole("synth", patch),
+    onSaveModels: saveModels,
+    secretsPresence,
+    secretsPresenceMsg,
+    modelCheck,
+    onKeySaved,
+    doctorSynth: (doctorParsed?.synth_provider as DoctorSynthProvider | undefined) ?? null,
+    dsnOk,
+    dbReachable,
+    onMoveMemory: () => setMoveOpen(true),
+    onOpenGuides: () => setTab("guides"),
+    onFeedback: () => setFeedbackOpen(true),
+    onOpenOldSettings: (section) => openOldSettings(section as SettingsSection | undefined),
+  };
 
   return (
     <div className="shell sh-window">
@@ -4053,7 +4102,7 @@ export default function App() {
                 }}
                 onSeeAll={() => {
                   setSettingsSection("updates");
-                  setTab("settings");
+                  openOldSettings();
                 }}
               />
             ) : null}
@@ -4102,7 +4151,7 @@ export default function App() {
                             setStorageReportOpen(true);
                           } else if (a.fix?.kind === "work-settings") {
                             setSettingsSection("work");
-                            setTab("settings");
+                            openOldSettings();
                           }
                         }}
                       >
@@ -4427,7 +4476,7 @@ export default function App() {
                     setStorageReportOpen(true);
                   } else if (fix.kind === "work-settings") {
                     setSettingsSection("work");
-                    setTab("settings");
+                    openOldSettings();
                   }
                 }}
               />
@@ -5603,7 +5652,7 @@ export default function App() {
             }}
             onOpenWorkSettings={() => {
               setSettingsSection("work");
-              setTab("settings");
+              openOldSettings();
             }}
             owedSection={
               <>
@@ -5826,7 +5875,7 @@ export default function App() {
             onOpenGuide={(id) => openGuide(id, id === "grok_bot" ? guideSignals.grok.current : undefined)}
             onAnotherMac={() => {
               setSettingsSection("another-mac");
-              setTab("settings");
+              openOldSettings();
             }}
           />
           </PaneBoundary>
@@ -5867,6 +5916,7 @@ export default function App() {
 
         <section className={panelClass("settings")}>
           <PaneBoundary key={paneRetryKeys["settings"]} title={PANE_TITLES["settings"]} onRetry={retryActivePane}>
+          {!oldSettings ? <Settings ctx={settingsCtx} active={tab === "settings"} /> : <>
           <PanelHeader
             title="Settings"
             lede="Capture, models, data and this Mac."
@@ -5894,6 +5944,7 @@ export default function App() {
               </div>
 
               <div className="settings-pane">
+                {settingsSection === "look" ? <LookPage /> : null}
                 {settingsSection === "database" ? (
                   <>
                     <div className="section-card">
@@ -6458,6 +6509,7 @@ export default function App() {
               </div>
             </div>
           </div>
+          </>}
           </PaneBoundary>
         </section>
         </div>

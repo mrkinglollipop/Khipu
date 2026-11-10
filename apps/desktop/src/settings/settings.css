@@ -1,0 +1,27 @@
+/* Settings: list on the left, page on the right. Tokens come from App.css. */
+.st-cap { margin: 4px 12px 10px; color: var(--muted); font-size: var(--t-md); }
+.st-list { padding: 8px; }
+.st-fill { display: flex; height: calc(100dvh - 52px); min-height: 0; }
+@media (max-width: 639px) { .st-fill { height: calc(100dvh - 108px); } }
+.st-row { height: auto; min-height: 44px; display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+.st-rk { font-weight: 600; display: flex; flex-direction: column; gap: 2px; }
+.st-rk small { font-weight: 400; color: var(--muted); font-size: var(--t-sm); }
+.st-rv { color: var(--text-2); text-align: right; font-size: var(--t-md); overflow-wrap: anywhere; }
+.st-rv.warn { color: var(--warn); }
+.st-page { padding: 24px 0 48px; display: flex; flex-direction: column; gap: 16px; }
+.st-h { margin: 0 0 8px; font-size: 22px; font-weight: 650; }
+.st-back { display: none; align-items: center; gap: 4px; align-self: flex-start; background: none; border: 0; padding: 4px 0; color: var(--accent-text); font: inherit; cursor: pointer; }
+@media (max-width: 899px) { .st-back { display: inline-flex; } .st-page { padding-top: 12px; } }
+.st-page p { margin: 0; }
+.st-muted { color: var(--muted); font-size: var(--t-md); }
+.st-kvs { border-top: 1px solid var(--border); }
+.st-kv { padding: 12px 0; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
+.st-k { font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.st-sub { font-weight: 400; color: var(--muted); }
+.st-v { color: var(--text-2); }
+.st-inline { margin-left: 12px; display: inline-flex; gap: 8px; align-items: center; }
+.st-group { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+.st-group h3 { margin: 0; font-size: 15px; display: flex; gap: 8px; align-items: center; }
+.st-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.st-switch { display: flex; gap: 12px; align-items: center; font-weight: 600; }
+.st-note { margin: 0; padding: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md); font: var(--t-sm) var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 40vh; overflow: auto; }

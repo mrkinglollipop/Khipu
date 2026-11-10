@@ -31,6 +31,7 @@ import {
 import type { AccountRefs } from "../src/FoundAccounts";
 import App from "../src/App";
 import { ProjectLists } from "../src/memory/ProjectLists";
+import { applyStoredLook } from "../src/settings/lookModel";
 import { RoutingSettings } from "../src/RoutingSettings";
 import { OfflineBanner, SavedOnThisMac, WaitingToSync } from "../src/OfflineBanner";
 import { OfflineWaitsCard } from "../src/SettingsControls";
@@ -70,6 +71,8 @@ import type { Fake } from "./fakeTauri";
 
 const READING: Support = { state: "reading" };
 const HERE: Support = { state: "here", status: status9B() };
+
+applyStoredLook();
 
 function setFake(f: Fake) {
   (window as unknown as { __khipuFake?: Fake }).__khipuFake = f;
@@ -456,6 +459,10 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   // Memory › Project work lists on its own, and with no project holding a list.
   "worklists": { title: "Project work lists", render: () => <ProjectLists /> },
   "worklists-none": { title: "Project work lists, none yet", fake: { noProjects: true }, render: () => <ProjectLists /> },
+  "app-settings": { title: "The whole window; open Settings from the sidebar", render: () => <App /> },
+  "app-settings-stale": { title: "Settings, the other Mac quiet for 40 minutes", fake: { settings: "stale" }, render: () => <App /> },
+  "app-settings-one": { title: "Settings, no other Mac", fake: { settings: "one" }, render: () => <App /> },
+  "app-settings-problem": { title: "Settings, a sign-in and the database need a look", fake: { settings: "problem" }, render: () => <App /> },
   "app-welcome": { title: "The whole window, first run", fake: { welcome: true }, render: () => <App /> },
   // Accounts (slice A4): open the window, then press Accounts in the sidebar.
   "app-accounts": { title: "The whole window, Accounts", fake: { accounts: true }, render: () => <App /> },

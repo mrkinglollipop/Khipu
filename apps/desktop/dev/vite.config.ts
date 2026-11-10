@@ -20,6 +20,7 @@ export default defineConfig({
       "@tauri-apps/api/app": here("./fakeTauriMisc.ts"),
       "@tauri-apps/api/path": here("./fakeTauriMisc.ts"),
       "@tauri-apps/plugin-updater": here("./fakeTauriMisc.ts"),
+      "@tauri-apps/plugin-autostart": here("./fakeAutostart.ts"),
       "@tauri-apps/plugin-process": here("./fakeTauriMisc.ts"),
     },
   },
