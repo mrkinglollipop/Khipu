@@ -35,16 +35,6 @@ READ_MOST = 64 * 1024
 # A page older than this is sent with its age, and the child that read it
 # asks for a refold off the prompt path (``routing.refold_in_background``).
 OLD_AFTER_S = 60.0
-OFF_WORDS = ("0", "off", "false", "no")
-
-
-def enabled(environ=None) -> bool:
-    """Whether the page is what routing delivers (the default). Off only
-    with ``KHIPU_ROUTING_PAGE=0``: the test suite's switch for the tests of
-    the earlier change pushes, which stay in place until their removal is
-    decided."""
-    env = os.environ if environ is None else environ
-    return str(env.get("KHIPU_ROUTING_PAGE", "1")).strip().lower() not in OFF_WORDS
 
 
 def path() -> Path:

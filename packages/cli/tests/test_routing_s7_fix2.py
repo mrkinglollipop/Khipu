@@ -40,28 +40,6 @@ def test_owner_substring_cannot_hide_a_pending_secret(home, monkeypatch, error):
     assert not any(i["entity"].startswith("rule:") for i in body.get("routing_changes", {}).get("items", []))
 
 
-@pytest.mark.parametrize("error", [False, True])
-def test_secret_is_scanned_before_paging_and_never_acknowledged(home, monkeypatch, error):
-    monkeypatch.setenv("CODEX_THREAD_ID", "pages")
-    _configure(home, routing_prompt_chars=400)
-    secret = "sk-proj-" + "Q" * 40
-    routing.request_rule("x" * 329 + " " + secret + "y" * 650,
-                         author={"kind": "conversation", "harness": "codex", "session": "pages"})
-    args = {"since": "bad"} if error else {"since": "0"}
-    _, body = _call("khipu_route", args)
-    chunks = []
-    for _ in range(12):
-        changes = body.get("routing_changes")
-        if not changes:
-            break
-        chunks.extend(i.get("text", "") for i in changes["items"])
-        _, body = _call("khipu_route", dict(args, ack=changes["batch"]))
-    assert secret not in "".join(chunks)
-    entry = next(e for k, e in routing_delivery.snapshot("codex:pages", "mcp")["entries"].items()
-                 if k.startswith("rule:"))
-    assert entry["offset"] == 0 and not entry["acked"]
-
-
 @pytest.mark.parametrize("inventory", ["broken"])
 @pytest.mark.parametrize("error", [False, True])
 def test_unknown_alias_is_withheld_in_all_fields_without_complete_table(home, monkeypatch, inventory, error):
@@ -77,29 +55,6 @@ def test_unknown_alias_is_withheld_in_all_fields_without_complete_table(home, mo
     _, body = _call("khipu_route", {"since": "bad"} if error else {})
     assert alias not in json.dumps(body)
     assert not any(i["entity"].startswith("lane:") for i in body.get("routing_changes", {}).get("items", []))
-
-
-@pytest.mark.parametrize("error", [False, True])
-def test_owner_page_provenance_survives_final_mcp_scrub(home, monkeypatch, error):
-    monkeypatch.setenv("CODEX_THREAD_ID", "owner-pages")
-    _configure(home, routing_prompt_chars=400)
-    words = ("codex|owner-words " * 65).strip()
-    routing.add_rule(words, via="app")
-    args = {"since": "bad"} if error else {"since": "0"}
-    _, body = _call("khipu_route", args)
-    chunks = []
-    for _ in range(12):
-        changes = body.get("routing_changes")
-        if not changes:
-            break
-        rule_items = [i for i in changes["items"] if i["entity"].startswith("rule:")]
-        chunks.extend(i["text"] for i in rule_items)
-        assert all("[redacted]" not in i["text"] for i in rule_items)
-        _, body = _call("khipu_route", dict(args, ack=changes["batch"]))
-    assert "".join(chunks) == "1. " + words
-    entry = next(e for k, e in routing_delivery.snapshot("codex:owner-pages", "mcp")["entries"].items()
-                 if k.startswith("rule:"))
-    assert entry["acked"]
 
 
 def test_session_start_writer_uses_shared_identity(home, monkeypatch):
@@ -167,23 +122,6 @@ def test_complete_table_failure_with_existing_inventory_consumes_nothing(home, m
     error, body = _call("khipu_route", {"ack": batch})
     assert not error and body.get("available") is False, body
     assert routing_delivery.snapshot("codex:inventory", "mcp")["flight"]["out"]["routing_changes"]["batch"] == batch
-
-
-def test_legacy_withheld_batch_cannot_ack_original_characters(home, monkeypatch):
-    monkeypatch.setenv("CODEX_THREAD_ID", "legacy")
-    routing.request_rule("Use codex|unknown-login", author={"kind": "conversation", "harness": "codex"})
-    view = routing.read_view()
-    # Reserve as the old writer did, before its final MCP projection.
-    with monkeypatch.context() as old:
-        old.setattr(routing, "_for_agents", lambda value, view=None: value)
-        planned = routing_delivery.plan({"kind": "full", "text": "", "version": view["version"],
-                                         "epoch": view["epoch"]}, view, home["clock"].now, routing.settings())
-        changes, _ = routing_delivery.pull_offer(planned, session="codex:legacy")
-    _route(ack=changes["batch"])
-    entry = next(e for k, e in routing_delivery.snapshot("codex:legacy", "mcp")["entries"].items()
-                 if k.startswith("rule:"))
-    assert not entry["acked"] and entry["offset"] == 0
-    assert changes["batch"] not in routing_delivery.snapshot("codex:legacy", "mcp").get("batches", {})
 
 
 def test_stale_owner_exemption_cannot_authorize_pending_page(home, monkeypatch):

@@ -232,18 +232,15 @@ def test_a_glm_candidate_is_checked_by_the_quota_read(mac, z):  # noqa: F811
 # ---- routing --------------------------------------------------------------------------------
 
 
-def test_the_routing_summary_lists_glm_by_pace(home):  # noqa: F811
+def test_the_routing_page_lists_glm(home):  # noqa: F811
     config = json.loads((home["data"] / "config.json").read_text())
     config["usage_accounts"].append({"label": "GLM", "harness": "glm"})
     (home["data"] / "config.json").write_text(json.dumps(config))
     rows = json.loads((home["data"] / "state" / "usage.json").read_text())["rows"]
     rows["glm|"] = _row("GLM", "glm", None, _week(5, T0 + timedelta(days=1)), plan="pro")
     _cache(home, rows)
+    # The routing page lists GLM beside the other accounts (the owner's
+    # order, when set, decides the order; there is no pace order).
     text = _summary(home)
-    line = next(x for x in text.splitlines() if x.startswith("GLM"))
-    assert "95% of its week left" in line
-    lines = text.splitlines()
-    head = lines.index("Accounts by how soon their allowance runs out unused (Khipu's arithmetic, not your "
-                       "priority):")
-    assert "GLM" in [x.split(":")[0] for x in lines[head + 1:]]
+    assert any(x.startswith("- GLM: ") for x in text.splitlines()), text
     assert routing.resolve_account("glm", routing.accounts()) == "glm:main"

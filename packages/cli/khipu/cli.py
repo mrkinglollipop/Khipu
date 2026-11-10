@@ -2440,6 +2440,14 @@ def cmd_route(args: argparse.Namespace) -> int:
     return routing.run_cli(args)
 
 
+def cmd_route_say(args: argparse.Namespace) -> int:
+    """`khipu route say --from-app --preview WORDS | --apply TOKEN`: say a
+    change to the order or the rules, see it, save it (the app's entry)."""
+    from khipu import routing_say
+
+    return routing_say.run_cli(args)
+
+
 def _needs_item(selector: str) -> tuple[dict, dict, int] | None:
     """One whole needs-you item by stable key or 1-based list number.
 
@@ -5665,8 +5673,8 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("--json", action="store_true", help="Print JSON")
     rt.add_argument("--since", default=None, metavar="V",
                     help="The current state of everything that changed after version V (or EPOCH:V)")
-    rt.add_argument("--summary", action="store_true", help="The summary a conversation gets at its start")
-    rt.add_argument("--brief", action="store_true", help="The text a job runner puts into a brief")
+    rt.add_argument("--summary", action="store_true", help="The routing page (as --page): what a conversation gets at its start")
+    rt.add_argument("--brief", action="store_true", help="The routing page (as --page), to paste into a brief")
     rt.add_argument("--page", action="store_true",
                     help="The routing page: the accounts in the owner's order, then the owner's rules (at most 4,500 characters)")
     rt.add_argument("--full", action="store_true",
@@ -5864,6 +5872,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="set: when the cap stops applying (a time, or 2d, 30h); the cap it replaced applies again")
     rcap.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rcap)
+    rsay = rt_sub.add_parser("say", parents=[rt_json], help=argparse.SUPPRESS)
+    rsay.add_argument("--preview", default=None, metavar="WORDS", help="The change, in the owner's words")
+    rsay.add_argument("--apply", default=None, metavar="TOKEN", help="Save the change a preview showed")
+    rsay.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    rsay.set_defaults(func=cmd_route_say)
     radv = rt_sub.add_parser("advise", parents=[rt_json],
                              help="Launch advice per account (advisory only; it never blocks anything)")
     radv.add_argument("account", nargs="?", default=None, help="One account (its label or its id)")

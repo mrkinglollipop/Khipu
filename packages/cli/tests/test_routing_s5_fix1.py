@@ -4,6 +4,8 @@ the conversation read), never by injecting events or fields.
 """
 from __future__ import annotations
 
+from tests.routing_page_text import page_text
+
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -142,7 +144,7 @@ def test_f4_replacement_is_delivered_once_in_the_authors_conversation_response(h
     told = [p for p in answer.get("proposals") or [] if p["status"] == "replaced"]
     assert told and "Claude Code" in told[0]["notify"]
     assert told[0]["rule"] == 1
-    assert "was replaced by a newer proposal" not in routing.summary()["text"]
+    assert "was replaced by a newer proposal" not in page_text()
 
 
 # ---- finding 5: Dismiss works for a changed-rule proposal -----------------------

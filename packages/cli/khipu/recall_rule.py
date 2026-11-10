@@ -536,8 +536,8 @@ def fit_start_context(memory: str, routing_text: str | None,
     return memory, False
 
 
-ROUTING_TOO_LONG = ("## Routing\nKhipu's routing summary (the owner's standing rules, the note and every "
-                    "account's state) is too long to arrive at session start. Call `khipu_route` to read it.")
+ROUTING_TOO_LONG = ("## Routing\nKhipu's routing page (every account's state in the owner's order, and his "
+                    "standing rules) is too long to arrive at session start. Call `khipu_route` to read it.")
 
 
 def start_context_fits(routing_text: str, budget: int = _HOOK_CONTEXT_BUDGET) -> bool:
@@ -695,10 +695,15 @@ class _RoutingAtStart:
 
             if not recall_prompt._routing_generation_current(out.get("generation")):
                 return None  # the record changed since the child read it
-            if self.session and not self.child_component and out.get("delivery_plan"):
+            if self.session and out.get("delivery_plan") and (not self.child_component or self._child_ledger):
+                # Reserved only now, with the text in hand before the
+                # deadline: a read that came back late reserves nothing.
                 from khipu.routing_delivery import offer
 
-                out = offer(out, session=self.session)
+                if self.child_component:
+                    out = offer(out, session=self.session, component=self.child_component, deferred=True)
+                else:
+                    out = offer(out, session=self.session)
                 text = out.get("text")
             self.out = out
             lean = out.get("lean_text") if isinstance(out, dict) else None

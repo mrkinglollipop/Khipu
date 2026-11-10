@@ -17,7 +17,6 @@ import pytest
 from khipu import db, forget, owner_act, owner_direction, owner_files, owner_turns, routing as r
 from khipu import routing_advice as ra, routing_delivery as rd
 from khipu import routing_directions as directions, routing_gateway_copy as gc
-from khipu import routing_pace, routing_replication
 
 NOW = datetime(2026, 10, 22, 12, tzinfo=timezone.utc)
 
@@ -78,41 +77,6 @@ def test_routing_forecasts_ack_only_complete_delivered_text(field, prefix):
     assert rd.acknowledge("forecasts", answer["routing_changes"], now=NOW)
     acked = rd.snapshot("forecasts").get(prefix + "_acked", {})
     assert set(acked) == shown
-
-
-def test_routing_full_push_does_not_ack_unshown_hold_back_advice(monkeypatch):
-    caps = [dict(kind="pace_target", window="weekly", purpose="job", pct=65, slack=5, revision="cap1")]
-    # Cover the full trailing day with fresh readings, well above the weekly
-    # target's allowance but below any reached level or imminent crossing.
-    readings = [dict(t=NOW - timedelta(minutes=minutes), used=18 + (1440 - minutes) / 120,
-                     reset=NOW + timedelta(days=6), mac="fake", source="probe", cycle=None, t_err=0)
-                for minutes in range(1440, -1, -30)]
-    account = dict(key="fake", harness="claude", label="Fake", state="open", caps=caps,
-                   pace=[routing_pace.compute_pace(readings, caps, NOW, "weekly")])
-    view = dict(accounts=[account], priority=dict(entries=[dict(account="fake")]), holds=[],
-                effective={"account:fake": "open"}, record=True, epoch="fake-epoch", version=1)
-    cfg = dict(r.settings(), routing_line_chars=1000, routing_summary_chars=8000,
-               routing_prompt_chars=4000, routing_delivery_lease=60)
-    monkeypatch.setattr(r, "settings", lambda: cfg)
-    monkeypatch.setattr(r, "account_id", lambda *a: "fake:main")
-    monkeypatch.setattr(r, "_for_agents", lambda value, *a: value)
-    monkeypatch.setattr(r, "plan_facts", lambda *a: {})
-    monkeypatch.setattr(r, "_replacement_notices", lambda *a: [])
-    monkeypatch.setattr(r, "_current_line", lambda *a: "Fake: open")
-    monkeypatch.setattr(r, "account_line", lambda *a, **kw: "Fake: open")
-    monkeypatch.setattr(r, "priority_line", lambda *a, **kw: "Owner priority: Fake")
-    monkeypatch.setattr(routing_replication, "age_line", lambda *a: None)
-    assert ra.account_advice(view, account, NOW)["verdict"] == "hold_back"
-    owners = []
-    full = dict(r.summary(view, now=NOW, session_id="full", owners=owners),
-                kind="full", line_entities=owners)
-    adjusted = r._advice_push_adjust(full, view, NOW, "full", "main")
-    first = rd.offer(rd.plan(adjusted, view, NOW, cfg, session="full"), session="full")
-    assert "Advice for jobs" not in first["text"]
-    assert rd.acknowledge("full", first["routing_changes"], now=NOW)
-    assert "advice:fake" not in rd.snapshot("full").get("advice_acked", {})
-    second = r._advice_push_adjust(dict(kind="none", text=None), view, NOW, "full", "main")
-    assert second["advice_forecasts"]["advice:fake"]["verdict"] == "hold_back"
 
 
 def test_routing_new_owner_hold_preempts_live_rule_lease():

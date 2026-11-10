@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
 
 import pytest
 
-from khipu import agent_view
 from khipu import mcp_server, owner_act, owner_direction, routing, routing_events
 from tests.routing_s4_cost_workload import T0, build
 
@@ -173,56 +171,3 @@ def test_parsed_line_cache_reparses_an_incomplete_final_line_without_rewriting_i
     assert [row["id"] for row in routing._read_event_lines()[0]] == ["one"]
     assert path.read_bytes() == partial + b"}\n" and len(calls) == 2
 
-
-@pytest.mark.parametrize("with_definition", [False, True])
-def test_changed_log_prompt_with_source_append_reads_and_orders_once(replay, monkeypatch, with_definition):
-    replay.configure(routing_stale_after=4)
-    path = routing.events_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(row) + "\n" for row in build(20_000, routing)))
-    if with_definition:
-        routing.set_definition("account", {"id": "codex:main", "label": "Codex", "provider": "codex"}, via="app")
-    reset = T0 + timedelta(days=6)
-    replay.usage(witness=T0, reset=reset)
-    view = replay.view()  # warm baseline and persist the first source observation
-    marker = {"version": view["version"], "epoch": view["epoch"], "full_at": routing._iso(replay.now)}
-    replay.advance(1)
-    replay.usage(witness=replay.now, reset=reset)  # the same quota period has a strictly newer witness
-    with path.open("a") as stream:
-        stream.write(json.dumps({"type": "evidence", "id": "changed", "account": "grok|", "state": "open",
-                                 "source": "report", "written_at": routing._iso(replay.now),
-                                 "written_by": {"kind": "conversation", "harness": "codex", "project": "p", "session": "z"},
-                                 "via": "mcp"}) + "\n")
-    calls = {"read": 0, "order": 0}
-    read, order = routing._read_event_lines, routing._in_write_order
-
-    def counted_read(*args, **kwargs):
-        calls["read"] += 1
-        return read(*args, **kwargs)
-
-    def counted_order(*args, **kwargs):
-        calls["order"] += 1
-        return order(*args, **kwargs)
-
-    # The helper's preparation is outside the prompt's measured read boundary.
-    agent_view.prepare_routing_table(refresh=True)
-    # ...but preparation may itself read the log (a definition makes the
-    # inventory ask for the record's definitions) and leave the parsed events
-    # in ``_ENTRY_INPUTS``. Whether it gets that far depends on its own 250 ms
-    # deadline, so start the measured prompt from a cold entry cache: the one
-    # read and one ordering counted below must be the prompt's own.
-    monkeypatch.setattr(routing, "_ENTRY_INPUTS", {})
-    monkeypatch.setattr(routing, "_read_event_lines", counted_read)
-    monkeypatch.setattr(routing, "_in_write_order", counted_order)
-    replay.advance(1)
-    replay.usage(witness=replay.now, reset=reset)
-    pushed = routing.prompt_push(marker, budget=1.0, now=replay.now)
-    monkeypatch.setattr(routing, "_read_event_lines", read)
-    monkeypatch.setattr(routing, "_in_write_order", order)
-    events = routing.read_events()[0]
-    assert calls == {"read": 1, "order": 1}
-    assert pushed["kind"] in {"changes", "full"} and pushed["version"] > marker["version"]
-    renewals = [event for event in events if event["type"] == "observation_renew"]
-    assert renewals and renewals[-1]["witness_at"] == routing._iso(replay.now)
-    assert [event["seq"] for event in events if event.get("seq") is not None] == sorted(
-        event["seq"] for event in events if event.get("seq") is not None)
