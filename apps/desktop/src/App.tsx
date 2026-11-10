@@ -7,16 +7,25 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   CircleMinus,
+  CircleCheck,
+  Gauge,
   Loader2,
   MessageSquare,
   RefreshCw,
   Search,
+  SlidersHorizontal,
   Stethoscope,
   Trash2,
   Waypoints,
   X,
 } from "lucide-react";
 import khipuIcon from "./assets/khipu-icon.png";
+import { Sidebar, TabBar, Toolbar, ViewSwitch } from "./shell";
+import { Accounts } from "./accounts/Accounts";
+import { RunningNow } from "./accounts/RunningNow";
+import { useRunning } from "./accounts/running";
+import { Today } from "./today/Today";
+import type { NavItem } from "./shell";
 import {
   Callout,
   Chip,
@@ -108,6 +117,7 @@ type Tab =
   | "activity"
   | "harnesses"
   | "routing"
+  | "routing-old"
   | "settings"
   | "guides"
   | "revisions";
@@ -142,7 +152,7 @@ class PaneBoundary extends Component<PaneBoundaryProps, { failed: boolean }> {
 
 const PANE_TITLES: Record<Tab, string> = {
   "first-run": "Setup", home: "Home", activity: "Activity", recall: "Recall",
-  revisions: "Revisions", work: "Work", harnesses: "Harnesses", routing: "Accounts and routing", settings: "Settings", guides: "Guides",
+  revisions: "Revisions", work: "Work", harnesses: "Harnesses", routing: "Accounts", "routing-old": "Accounts and routing", settings: "Settings", guides: "Guides",
 };
 
 type CacheTab = "status" | "activity" | "revisions" | "doctor" | "rightNow";
@@ -383,7 +393,7 @@ function RailIcon({ d }: { d: ReactNode }) {
   );
 }
 
-const NAV_ICONS: Record<Exclude<Tab, "first-run" | "revisions">, ReactNode> = {
+const NAV_ICONS: Record<Exclude<Tab, "first-run" | "revisions" | "routing-old">, ReactNode> = {
   home: <RailIcon d={<path d="M3 8.5 8 4l5 4.5V13H3z" />} />,
   recall: (
     <RailIcon
@@ -1207,8 +1217,10 @@ const OwedRow = memo(function OwedRow({
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("home");
+  // Today is the new place on tab "home"; the old Home sits under Older screens.
+  const [showOldHome, setShowOldHome] = useState(false);
   const [paneRetryKeys, setPaneRetryKeys] = useState<Record<Tab, number>>({
-    "first-run": 0, home: 0, activity: 0, recall: 0, revisions: 0, work: 0, harnesses: 0, routing: 0, settings: 0, guides: 0,
+    "first-run": 0, home: 0, activity: 0, recall: 0, revisions: 0, work: 0, harnesses: 0, routing: 0, "routing-old": 0, settings: 0, guides: 0,
   });
   // Every screen shares one scroll container (`.main-content`), so a screen
   // would open scrolled to wherever the last one was left. A layout effect runs
@@ -2624,22 +2636,15 @@ export default function App() {
     };
   }, [dsnOk, tab, owedStatus, loadOwed]);
 
-  /** Six destinations, one per named job (audit IA). Revisions is reachable
-   *  from Home, not from here; Welcome is a first-run flow with a "Run setup
-   *  again" button in Settings. */
-  const navItems = useMemo(
-    () =>
-      [
-        ["home", "Home", "Is memory working right now?"],
-        ["work", "Work", WORK_LEDE],
-        ["recall", "Recall", "What does the agent remember about this?"],
-        ["activity", "Activity", "Every session Khipu recorded"],
-        ["harnesses", "Harnesses", "Claude Code · Cursor · Aegis · Codex"],
-        ["routing", "Accounts and routing", "Accounts, routing rules and what needs you"],
-        ["settings", "Settings", "Capture, models, data and this Mac"],
-      ] as const,
-    [],
-  );
+  /** The window's places and the old screens still reachable. Ids are Tab
+   *  ids: Today shows the old Home, Accounts the old routing screen, Memory
+   *  the old Recall and Settings the old Settings, until each is replaced.
+   *  Revisions is a drill-in from Home; it is listed under Older screens so
+   *  nothing is unreachable. Welcome is a first-run flow. */
+  const PLACE_TITLES: Partial<Record<Tab, string>> = {
+    home: "Today", routing: "Accounts", recall: "Memory", settings: "Settings",
+    "routing-old": "Accounts and routing", work: "Work", activity: "Activity", harnesses: "Harnesses", guides: "Guides", revisions: "Conflicting edits",
+  };
 
   const [dataDir, setDataDir] = useState("");
   const [dataFiles, setDataFiles] = useState<
@@ -2681,7 +2686,7 @@ export default function App() {
   // Routing delivery is part of doctor, not `khipu route --json`; read the
   // existing cached report whenever this Settings group becomes active.
   useEffect(() => {
-    if (dsnOk && tab === "routing") void loadDoctor(false);
+    if (dsnOk && tab === "routing-old") void loadDoctor(false);
   }, [dsnOk, tab, loadDoctor]);
   // Read once at start, so the count beside Projects shows before it is opened.
   const projects = useCliState<ProjectsList>("khipu_projects_list", true);
@@ -2701,7 +2706,7 @@ export default function App() {
         ? "work"
         : tab === "guides"
           ? "guides"
-          : tab === "routing"
+          : tab === "routing" || tab === "routing-old"
           ? "settings"
           : null,
   );
@@ -2719,7 +2724,7 @@ export default function App() {
     if (t.kind === "guide") openGuide(t.id);
     else if (t.kind === "harnesses") setTab("harnesses");
     else {
-      if (t.section === "routing") setTab("routing");
+      if (t.section === "routing") setTab("routing-old");
       else {
         setSettingsSection(t.section as SettingsSection);
         setTab("settings");
@@ -2730,7 +2735,10 @@ export default function App() {
   // Home and every minute while Home stays open. Its attention items warn and
   // block nothing (the record is guidance, not a gate).
   // Accounts and routing is its own rail destination; Work shows the accounts too.
-  const routing = useRouting(tab === "home" || tab === "work");
+  const routing = useRouting(tab === "home" || tab === "work" || tab === "routing");
+  // Accounts view: Room right now or Running now (Order and rules is still its older screen).
+  const [acctView, setAcctView] = useState<"room" | "running" | "rules">("room");
+  const runningNow = useRunning(tab === "routing");
   // Work (docs/plans/2026-10-15-work-view.md, phase 4): the live view, read
   // every few seconds while Work is open and once a minute for the rail
   // badge otherwise. The Owed tab folded into Work as its own section
@@ -2792,7 +2800,7 @@ export default function App() {
     if (target.kind === "home") setTab("home");
     else if (target.kind === "harnesses") setTab("harnesses");
     else if (target.kind === "settings") {
-      if (target.section === "routing") setTab("routing");
+      if (target.section === "routing") setTab("routing-old");
       else {
         setSettingsSection(target.section);
         setTab("settings");
@@ -3430,7 +3438,8 @@ export default function App() {
       case "revisions": await loadRevisions(true); break;
       case "work": await Promise.all([work.load(true), loadOwed("open", true)]); break;
       case "harnesses": await loadDoctor(true); break;
-      case "routing": await Promise.all([loadDoctor(true), plans.load()]); break;
+      case "routing": await Promise.all([routing.load(true), plans.load()]); break;
+      case "routing-old": await Promise.all([loadDoctor(true), plans.load()]); break;
       case "settings": await Promise.all([refreshDsn(true), loadPaths(), loadGraphSources(), loadModels(), loadSecretsPresence()]); break;
       case "first-run": await refreshDsn(true); break;
       case "guides": await guideSignals.reload(); break;
@@ -3851,104 +3860,104 @@ export default function App() {
     </div>
   );
 
+  const goTab = (id: string) => {
+    if (id === "oldhome") {
+      setShowOldHome(true);
+      setTab("home");
+      return;
+    }
+    setShowOldHome(false);
+    setTab(id as Tab);
+  };
+  // The name the owner gave this Mac comes with the routing record (`this_mac`);
+  // until it has been read the sidebar says "On this Mac".
+  const thisMac: string | null = routing.data?.this_mac ?? null;
+  const placeItem = (id: Tab, icon: ReactNode, hint: string, extra: Partial<NavItem> = {}): NavItem => ({
+    id, label: PLACE_TITLES[id] ?? id, icon, hint, busy: tabBusy(id), ...extra,
+  });
+  const places: NavItem[] = [
+    placeItem("home", <CircleCheck size={18} aria-hidden />, "What needs you, and whether Khipu is working", {
+      count: owedOpenCount,
+      countLabel: owedOpenCount === 1 ? "1 needs you" : `${owedOpenCount ?? 0} need you`,
+    }),
+    placeItem("routing", <Gauge size={18} aria-hidden />, "Which AI has room, and who gets what work"),
+    placeItem("recall", <Search size={18} aria-hidden />, "Find what you said"),
+  ];
+  const settingsItem = placeItem("settings", <SlidersHorizontal size={18} aria-hidden />, "Capture, models, data and this Mac");
+  const workWaiting = work.data?.counts.waiting ?? 0;
+  const workBlocking = work.data?.counts.blocking ?? 0;
+  const workQuiet = work.data?.counts.quiet ?? 0;
+  const harnessBadge = harnessesBadge(liveness, claudeHomes, t3Gap);
+  const olderItems: NavItem[] = [
+    placeItem("home", <CircleCheck size={18} aria-hidden />, "The home screen from before Today", { id: "oldhome", label: "Home" }),
+    placeItem("work", NAV_ICONS.work, WORK_LEDE, {
+      badge: workWaiting + workQuiet > 0 ? (
+        <span className={workWaiting ? "nav-badge" : "nav-badge quiet"}
+          aria-label={badgeLabel(workWaiting, workBlocking, workQuiet)} title={badgeLabel(workWaiting, workBlocking, workQuiet)}>
+          {workBlocking > 0 ? <span className="bdot" aria-hidden /> : null}
+          {(workWaiting + workQuiet).toLocaleString()}
+        </span>
+      ) : undefined,
+    }),
+    placeItem("activity", NAV_ICONS.activity, "Every session Khipu recorded"),
+    placeItem("harnesses", NAV_ICONS.harnesses, "Claude Code · Cursor · Aegis · Codex", {
+      badge: harnessBadge ? <span className={harnessBadge.quiet ? "nav-count quiet" : "nav-count"}>{harnessBadge.n}</span> : undefined,
+    }),
+    placeItem("guides", NAV_ICONS.guides, "Step-by-step help for setting up Khipu and each tool it works with", {
+      badge: guidesBadge > 0 ? (
+        <span className="nav-count" aria-label={guidesBadge === 1 ? "1 setup left" : `${guidesBadge} setups left`}>{guidesBadge}</span>
+      ) : undefined,
+    }),
+    placeItem("routing-old", NAV_ICONS.routing, "Accounts, routing rules, and what needs your attention", {}),
+    placeItem("revisions", <RailIcon d={<path d="M4 3v10M12 3v10M4 8h8" />} />, "Edits to the same memory made in two places"),
+  ];
+  // What the old rail's foot carried; each moves out as its new home lands.
+  const olderExtra = (
+    <>
+      <div className="rail-health">
+        <span className={`hdot ${railHealth.tone}`} aria-hidden />
+        <span>{railHealth.text}</span>
+        {anyLoading ? <Loader2 size={12} className="spin rail-spin" aria-hidden /> : null}
+      </div>
+      <div className="rail-meta">
+        <button ref={feedbackButtonRef} type="button" className="rail-feedback" onClick={() => setFeedbackOpen(true)}>
+          <MessageSquare size={14} aria-hidden />
+          Feedback
+        </button>
+        <span className="version-chip">v{appVersion}</span>
+      </div>
+    </>
+  );
+  const toolbarTitle = tab === "home" && showOldHome ? "Home" : PLACE_TITLES[tab];
+
   return (
-    <div className="shell">
-      <nav className="rail" aria-label="Primary" data-tauri-drag-region>
-        <div className="rail-drag" data-tauri-drag-region />
-        <div className="brand" data-tauri-drag-region>
-          <BrandMark />
-          <span className="brand-name" data-tauri-drag-region>
-            Khipu
-          </span>
-        </div>
-        <div className="rail-nav" data-tauri-drag-region>
-          <div className="nav-group" data-tauri-drag-region>
-            {navItems.map(([id, label, hint]) => {
-              const waitingN = work.data?.counts.waiting ?? 0;
-              const blockingN = work.data?.counts.blocking ?? 0;
-              const quietN = work.data?.counts.quiet ?? 0;
-              const badge =
-                id === "harnesses"
-                    ? harnessesBadge(liveness, claudeHomes, t3Gap)
-                    : null;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  className={tab === id ? "nav active" : "nav"}
-                  title={hint}
-                  aria-current={tab === id ? "page" : undefined}
-                  onClick={() => setTab(id)}
-                >
-                  {NAV_ICONS[id]}
-                  <span className="nav-label">{label}</span>
-                  {id === "work" && waitingN + quietN > 0 ? (
-                    <span className={waitingN ? "nav-badge" : "nav-badge quiet"}
-                      aria-label={badgeLabel(waitingN, blockingN, quietN)} title={badgeLabel(waitingN, blockingN, quietN)}>
-                      {blockingN > 0 ? <span className="bdot" aria-hidden /> : null}
-                      {(waitingN + quietN).toLocaleString()}
-                    </span>
-                  ) : null}
-                  {badge ? (
-                    <span
-                      className={badge.quiet ? "nav-count quiet" : "nav-count"}
-                    >
-                      {badge.n}
-                    </span>
-                  ) : null}
-                  {tabBusy(id) ? (
-                    <Loader2 size={12} className="spin nav-spin" aria-hidden />
-                  ) : null}
-                </button>
-              );
-            })}
-          </div>
-          <div className="nav-group" data-tauri-drag-region>
-            <div className="nav-divider" role="separator" />
-            <button
-              type="button"
-              className={tab === "guides" ? "nav active" : "nav"}
-              title="Step-by-step help for setting up Khipu and each tool it works with"
-              aria-current={tab === "guides" ? "page" : undefined}
-              onClick={() => setTab("guides")}
-            >
-              {NAV_ICONS.guides}
-              <span className="nav-label">Guides</span>
-              {guidesBadge > 0 ? (
-                <span
-                  className="nav-count"
-                  aria-label={guidesBadge === 1 ? "1 setup left" : `${guidesBadge} setups left`}
-                >
-                  {guidesBadge}
-                </span>
-              ) : null}
-            </button>
-          </div>
-        </div>
-        <div className="rail-foot" data-tauri-drag-region>
-          <div className="rail-health">
-            <span className={`hdot ${railHealth.tone}`} aria-hidden />
-            <span>{railHealth.text}</span>
-            {anyLoading ? (
-              <Loader2 size={12} className="spin rail-spin" aria-hidden />
-            ) : null}
-          </div>
-          <div className="rail-meta">
-            <button
-              ref={feedbackButtonRef}
-              type="button"
-              className="rail-feedback"
-              onClick={() => setFeedbackOpen(true)}
-            >
-              <MessageSquare size={14} aria-hidden />
-              Feedback
-            </button>
-            <span className="version-chip">v{appVersion}</span>
-          </div>
-        </div>
-      </nav>
+    <div className="shell sh-window">
+      <Sidebar
+        brand={<BrandMark />}
+        items={places}
+        current={tab === "home" && showOldHome ? "oldhome" : tab}
+        onGo={goTab}
+        settings={settingsItem}
+        macName={thisMac}
+        older={{ items: olderItems, extra: olderExtra }}
+      />
 
       <main className="main" aria-busy={workingLabel != null}>
+        {tab === "routing" ? (
+          <Toolbar title="Accounts">
+            {/* Order and rules (A6) opens its older screen until it lands. */}
+            <ViewSwitch
+              label="Accounts view"
+              options={[
+                { id: "room", label: "Room right now" },
+                { id: "running", label: "Running now" },
+                { id: "rules", label: "Order and rules" },
+              ]}
+              value={acctView}
+              onChange={(v) => { if (v === "rules") setTab("routing-old"); else setAcctView(v); }}
+            />
+          </Toolbar>
+        ) : toolbarTitle ? <Toolbar title={toolbarTitle} heading={false} /> : null}
         <WorkingBanner label={workingLabel} />
         <div className="main-content">
         <section className={panelClass("first-run")}>
@@ -3971,7 +3980,22 @@ export default function App() {
           </PaneBoundary>
         </section>
 
-        <section className={panelClass("home")}>
+        <section className={tab === "home" && !showOldHome ? "panel fill today-panel" : "panel is-hidden"}>
+          <PaneBoundary key={paneRetryKeys["home"]} title="Today" onRetry={retryActivePane}>
+            <Today
+              active={tab === "home" && !showOldHome}
+              onOlderHome={() => setShowOldHome(true)}
+              onOpen={(link) => {
+                if (link === "running-now") { setAcctView("running"); setTab("routing"); }
+                else if (link === "accounts") setTab("routing");
+                else if (link === "search") setTab("recall");
+                else setTab("settings");
+              }}
+            />
+          </PaneBoundary>
+        </section>
+
+        <section className={tab === "home" && showOldHome ? "panel" : "panel is-hidden"}>
           <PaneBoundary key={paneRetryKeys["home"]} title={PANE_TITLES["home"]} onRetry={retryActivePane}>
           <PanelHeader title="Home" lede="Is memory working right now?">
             {loading.status || loading.doctor ? <Spinner /> : null}
@@ -4033,7 +4057,7 @@ export default function App() {
                 void routing.load();
               }}
               onOpenAccounts={() => {
-                setTab("routing");
+                setTab("routing-old");
                 revealSettingsGroup("accounts");
               }}
             />
@@ -4136,7 +4160,7 @@ export default function App() {
               noneTracked={noneTracked}
               onAddAccount={() => setAddAccountSignal((n) => n + 1)}
               onOpenAccounts={() => {
-                setTab("routing");
+                setTab("routing-old");
                 revealSettingsGroup("accounts");
               }}
             />
@@ -4145,7 +4169,7 @@ export default function App() {
               state={routing}
               plans={plans.data}
               onOpenAccounts={() => {
-                setTab("routing");
+                setTab("routing-old");
                 revealSettingsGroup("accounts");
               }}
             />
@@ -5551,7 +5575,7 @@ export default function App() {
               setSnoozeTarget(owedOpenRows.find((c) => String(c.id) === id) ?? { id: Number(id), text: title })
             }
             onOpenRouting={() => {
-              setTab("routing");
+              setTab("routing-old");
             }}
             onOpenWorkSettings={() => {
               setSettingsSection("work");
@@ -5784,11 +5808,27 @@ export default function App() {
           </PaneBoundary>
         </section>
 
-        <section className={panelClass("routing")}>
+        <section className={`${panelClass("routing")} ac-panel`}>
           <PaneBoundary key={paneRetryKeys.routing} title={PANE_TITLES.routing} onRetry={retryActivePane}>
+            {tab === "routing" && acctView === "running" ? <RunningNow hook={runningNow} /> : null}
+            {tab === "routing" && acctView !== "running" ? (
+              <Accounts
+                routing={routing}
+                plans={plans.data}
+                thisMac={thisMac}
+                onReloadPlans={() => plans.load()}
+                onOpenOlder={() => setTab("routing-old")}
+                running={runningNow}
+              />
+            ) : null}
+          </PaneBoundary>
+        </section>
+
+        <section className={panelClass("routing-old")}>
+          <PaneBoundary key={paneRetryKeys["routing-old"]} title={PANE_TITLES["routing-old"]} onRetry={retryActivePane}>
           <PanelHeader title="Accounts and routing" lede="Accounts, routing rules, and what needs your attention." />
           <div className="panel-body wide">
-            {tab === "routing" ? <RoutingSettings
+            {tab === "routing-old" ? <RoutingSettings
               active
               plansState={plans}
               onSetUpAccounts={openAccountsStepInFirstRun}
@@ -6398,6 +6438,7 @@ export default function App() {
         </section>
         </div>
       </main>
+      <TabBar items={places} current={tab} onGo={goTab} />
 
       <FeedbackForm
         open={feedbackOpen}

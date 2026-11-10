@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
+import { openScreen } from "./nav";
 
 const invokeMock = vi.fn();
 
@@ -104,7 +105,7 @@ describe("App — doctor reads", () => {
     });
     render(<App />);
     await waitFor(() => expect(statusReads).toBeGreaterThan(0));
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    await openScreen("Settings");
     const before = statusReads;
     fireEvent.click(await screen.findByRole("button", { name: "Recheck connection" }));
     await waitFor(() => expect(statusReads).toBeGreaterThan(before));
@@ -174,7 +175,7 @@ describe("App — doctor reads", () => {
       return JSON.stringify({ ok: true });
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    await openScreen("Settings");
     fireEvent.click(screen.getByRole("tab", { name: "Data & backups" }));
     fireEvent.change(screen.getByPlaceholderText("~/Downloads/khipu-local-….zip"), { target: { value: "/tmp/backup.zip" } });
     fireEvent.click(screen.getByRole("button", { name: "Restore…" }));
@@ -310,10 +311,10 @@ describe("App — doctor reads", () => {
       return "{}";
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Harnesses" }));
+    await openScreen("Harnesses");
     fireEvent.click(await screen.findByRole("button", { name: "Search T3 captures" }));
 
-    expect(screen.getByRole("button", { name: "Recall" })).toHaveAttribute("aria-current", "page");
+    expect(within(screen.getByRole("navigation", { name: "Main" })).getByRole("button", { name: "Memory" })).toHaveAttribute("aria-current", "page");
     const query = await screen.findByRole("textbox", { name: "Search" });
     expect(query).toHaveFocus();
     fireEvent.change(query, { target: { value: "open commitments" } });

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
+import { openScreen } from "./nav";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
@@ -30,7 +31,7 @@ describe("App — Join advertise", () => {
       return JSON.stringify({ ok: true });
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    await openScreen("Settings");
     fireEvent.click(screen.getByRole("tab", { name: "Another Mac" }));
     fireEvent.change(await screen.findByLabelText("Join kit passphrase"), { target: { value: "phrase" } });
     fireEvent.click(await screen.findByRole("button", { name: /Advertise nearby/ }));
@@ -54,7 +55,7 @@ function mockRemoteHub() {
 
 async function openAnotherMac() {
   render(<App />);
-  fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+  await openScreen("Settings");
   fireEvent.click(screen.getByRole("tab", { name: "Another Mac" }));
   await screen.findByText("Set up another Mac");
   // IntegrationsPanel has its own "Save join kit…" shortcut; scope to this card.

@@ -17,6 +17,10 @@ export default defineConfig({
     alias: {
       "@tauri-apps/api/core": here("./fakeTauri.ts"),
       "@tauri-apps/plugin-dialog": here("./fakeDialog.ts"),
+      "@tauri-apps/api/app": here("./fakeTauriMisc.ts"),
+      "@tauri-apps/api/path": here("./fakeTauriMisc.ts"),
+      "@tauri-apps/plugin-updater": here("./fakeTauriMisc.ts"),
+      "@tauri-apps/plugin-process": here("./fakeTauriMisc.ts"),
     },
   },
   server: { port: 1440, strictPort: false, fs: { allow: [here("..")] } },

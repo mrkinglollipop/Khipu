@@ -6,6 +6,7 @@ import App from "../App";
 import { readFileSync } from "node:fs";
 import { WELCOME_DONE_KEY } from "../Welcome";
 import { parseStatusRows } from "../IntegrationsPanel";
+import { openScreen } from "./nav";
 
 const appCss: string = readFileSync(
   `${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/App.css`,
@@ -126,10 +127,10 @@ function visiblePanel() {
 function assertPane(heading: string) {
   expect(within(visiblePanel()).getByRole("heading", { name: heading })).toBeVisible();
   expect(visiblePanel().textContent!.trim().length).toBeGreaterThan(heading.length);
-  expect(screen.getByRole("navigation", { name: "Primary" })).toBeVisible();
+  expect(screen.getByRole("navigation", { name: "Main" })).toBeVisible();
 }
 async function select(label: typeof primaryViews[number]) {
-  fireEvent.click(screen.getByRole("button", { name: label }));
+  await openScreen(label);
   await waitFor(() => assertPane(label));
 }
 async function everyPane(mode: Mode) {
@@ -160,6 +161,7 @@ describe("App loading and recovery", () => {
   it.each(["late", "reject", "native-timeout", "empty"] as const)("keeps all eight top-level panes visible for %s reads", async (mode) => {
     script(mode);
     render(<App />);
+    await openScreen("Home"); // Today opens first; these reads belong to the older Home
     if (mode === "late") {
       const failed = await within(visiblePanel()).findByText("Couldn't read recent captures");
       fireEvent.click(within(failed.closest<HTMLElement>(".callout")!).getByRole("button", { name: "Retry" }));
@@ -173,6 +175,7 @@ describe("App loading and recovery", () => {
     let retryReady = false;
     script("ok", { status: () => retryReady ? status : Promise.race([raw.promise, deadline.promise]) });
     render(<App />);
+    await openScreen("Home");
     await waitFor(() => expect(document.querySelector(".working-banner")).toHaveTextContent("counts"));
     await act(async () => { deadline.reject(new Error("Khipu CLI timed out after 60 seconds")); });
     const failure = await within(visiblePanel()).findByText("Couldn't read recent captures");

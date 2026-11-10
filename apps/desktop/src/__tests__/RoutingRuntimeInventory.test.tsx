@@ -7,6 +7,7 @@ import { checksView, lanesConfig, lanesView, setting } from "./routingSettingsFi
 import { discovery, status9B } from "./accountsFixtures";
 // @ts-expect-error node:fs has no types in the desktop project
 import { readFileSync } from "node:fs";
+import { openScreen } from "./nav";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
@@ -133,13 +134,13 @@ describe("Runtime parity for every approved scope inventory row", () => {
   it("keeps a probe for every row, including the deliberately removed fold controls", () => expect(probes).toHaveLength(scopeRows.length));
   it.each(scopeRows.map((row, i) => [i + 1, row, probes[i]] as const))("row %i: %s", async (_i, _row, probe) => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await openScreen("Accounts and routing");
     await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
     await probe();
   });
   it.each([['accounts', 'accounts'], ['priority', 'work'], ['rules', 'work'], ['holds', 'work'], ['checks', 'wrong'], ['telling', 'conversations'], ['resets', 'rare'], ['runners', 'wrong'], ['table', 'rare'], ['changes', 'changes'], ['pace', 'accounts']])("legacy link %s selects %s and focuses its visible control", async (group, page) => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await openScreen("Accounts and routing");
     await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
     revealSettingsGroup(group);
     const target = document.querySelector<HTMLElement>(`[data-settings-group="${group}"]`)!;
@@ -151,7 +152,7 @@ describe("Runtime parity for every approved scope inventory row", () => {
   it("removing the last ordered account reaches the existing clear writer", async () => {
     record.priority = { entries: [{ account: "codex|", label: "Codex", role: "Builds" }], version: "last-entry" };
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await openScreen("Accounts and routing");
     await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
     const p = await home("Who gets what work");
     fireEvent.click(p.getByRole("button", { name: "Remove Codex from your priority" }));
@@ -159,7 +160,7 @@ describe("Runtime parity for every approved scope inventory row", () => {
   });
   it("the start-of-conversation switch reaches its unchanged writer", async () => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await openScreen("Accounts and routing");
     await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
     const p = await home("Conversations");
     fireEvent.click(p.getByRole("switch", { name: "At the start of a conversation, and after it is compacted" }));
@@ -167,7 +168,7 @@ describe("Runtime parity for every approved scope inventory row", () => {
   });
   it("finds settings by their old homes and opens the matching page", async () => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await openScreen("Accounts and routing");
     await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
     const find = screen.getByRole("searchbox", { name: "Find a setting" });
     fireEvent.change(find, { target: { value: "routing copy" } });
@@ -186,7 +187,7 @@ describe("Runtime parity for every approved scope inventory row", () => {
 
   it("says on each rarely needed setting whether it is the same on every Mac or this Mac only", async () => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await openScreen("Accounts and routing");
     await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
     const p = await rare("Sizes and timing");
     const row = (name: string) => p.getByRole("button", { name: `Change: ${name}` }).closest(".route-limit") as HTMLElement;
@@ -197,7 +198,7 @@ describe("Runtime parity for every approved scope inventory row", () => {
   it("lists copied old-file rules once under When you have time without asking for confirmation", async () => {
     record.rules = [{ n: 77, text: "Never use a fast tier.", seeded: true, confirmed: false }];
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await openScreen("Accounts and routing");
     await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
     const needs = await home("Needs you");
     const later = needs.getByRole("list", { name: "When you have time" });
@@ -211,7 +212,7 @@ describe("Runtime parity for every approved scope inventory row", () => {
   it("the rule's More control reveals all words and origin in place without changing its writer buttons", async () => {
     record.rules![0].text = "Keep the complete original wording, including extraordinarilylongunbrokenwordsandpaths0123456789. ".repeat(40);
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await openScreen("Accounts and routing");
     await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
     const p = await home("Who gets what work");
     const more = p.getByRole("button", { name: "More about rule 3" });
@@ -227,7 +228,7 @@ describe("Runtime parity for every approved scope inventory row", () => {
 
   it("page changes reset the shared scroll container, and the work jump row focuses its destination", async () => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await openScreen("Accounts and routing");
     await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
     const main = document.querySelector<HTMLElement>(".main-content")!;
     Object.defineProperty(main, "scrollTo", { configurable: true, value: ({ top }: { top: number }) => { main.scrollTop = top; } });

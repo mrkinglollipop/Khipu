@@ -41,7 +41,7 @@ describe("App — Revisions", () => {
       return "{}";
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /Conflicting edits/ }));
+    fireEvent.click((await screen.findAllByRole("button", { name: /Conflicting edits/ })).find((b) => b.closest("main"))!);
     await screen.findByText("unfiltered row");
     const filter = screen.getByPlaceholderText("filter slug (optional)");
     fireEvent.change(filter, { target: { value: "a" } });
@@ -80,7 +80,7 @@ describe("App — Revisions", () => {
       return "{}";
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /Conflicting edits/ }));
+    fireEvent.click((await screen.findAllByRole("button", { name: /Conflicting edits/ })).find((b) => b.closest("main"))!);
     await screen.findByText("unfiltered row");
     const filter = screen.getByPlaceholderText("filter slug (optional)");
     fireEvent.change(filter, { target: { value: "old" } });

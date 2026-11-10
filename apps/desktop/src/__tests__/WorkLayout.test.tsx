@@ -5,9 +5,10 @@
 // @ts-expect-error node:fs has no types here
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
+import { openScreen } from "./nav";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
@@ -73,7 +74,7 @@ describe("the Owed table", () => {
       return payload?.args?.[0] === "owed" ? JSON.stringify([restated]) : "{}";
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Work/ }));
+    await openScreen(/^Work/);
     const text = (await screen.findAllByText("Send the signed form")).find((el) => el.classList.contains("owed-text"));
     expect(text).toBeDefined();
     const seen = text!.parentElement!.querySelector(".owed-seen");

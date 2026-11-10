@@ -570,6 +570,8 @@ export type RouteView = {
   definitions?: { providers?: Record<string, RouteProvider>; accounts?: Record<string, unknown> };
   record?: boolean;
   version?: number;
+  /** The name the owner gave this Mac ("M5"), else its short name; null when unreadable. */
+  this_mac?: string | null;
   /** The priority's version, also when none is set (`version_moved` guard). */
   priority_version?: string | null;
   checked_at?: string;
