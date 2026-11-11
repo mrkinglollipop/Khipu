@@ -165,9 +165,10 @@ class Session:
             command = shlex.join([sys.executable, str(hook)])
             hooks = {name: [{"hooks": [{"type": "command", "command": command, "timeout": 10}]}]
                      for name in ("SessionStart", "SubagentStart", "PreToolUse")}
-            from khipu.integrations import DELEGATION_MATCHER
+            from khipu.integrations import CLAUDE_DELEGATION_MATCHER, DELEGATION_MATCHER
 
-            hooks["PreToolUse"][0]["matcher"] = DELEGATION_MATCHER
+            hooks["PreToolUse"][0]["matcher"] = CLAUDE_DELEGATION_MATCHER if harness == "claude" \
+                else DELEGATION_MATCHER
             (root / "probe.txt").write_text(TOOL_SENTINEL + "\n")
             (root / "routing-absent-probe.txt").write_text("Second child routing hook control.\n")
             session_id = str(uuid.uuid4())

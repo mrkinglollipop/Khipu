@@ -82,7 +82,8 @@ if not hasattr(_t3, 'cache_thread'):
     import importlib
     importlib.reload(_t3)
 from khipu.t3 import cache_thread, is_helper_session
-from khipu.turn_text import INJECTED_CONTEXT_TAGS, MACHINE_USER_TAGS, clean_user_text, is_machine  # noqa: F401
+from khipu.turn_text import (INJECTED_CONTEXT_TAGS, MACHINE_USER_TAGS, clean_user_text, is_machine,  # noqa: F401
+                             started_session)
 
 HARNESSES = ("claude_code", "cursor", "codex", "aegis", "grok_build", "antigravity")
 
@@ -232,13 +233,29 @@ def parent_session_id(env: dict, osenv: dict | None = None, *, harness: str = ""
     if explicit:
         return explicit
     host_id = (osenv.get("CLAUDE_CODE_HOST_SESSION_ID") or "").strip()
-    if host_id and host_id != sid:
+    if host_id and host_id != sid and not _desktop_own_handle(osenv):
         return f"claude_code:{host_id}"
     return canonical_session_ref(str(_get(
         env, "parentSessionId", "parent_session_id",
         "agentSessionId", "agent_session_id", "parentId", "parent_id",
         default="",
     ) or ""), harness)
+
+
+def _desktop_own_handle(osenv: dict) -> bool:
+    """A Claude desktop app conversation's own host id: the app sets its
+    handle for the conversation (``local_<uuid>``) and the child marker on
+    every conversation it runs, so the host id names this conversation, not a
+    parent. Only when the app itself started this agent
+    (``owner_turns.desktop_launched``): a ``claude -p`` run from a desktop
+    conversation's shell inherits the same environment and stays its job.
+    Never raises; unknown keeps the host id as lineage."""
+    try:
+        from khipu import owner_turns
+
+        return owner_turns.desktop_conversation(osenv) and owner_turns.desktop_launched()
+    except Exception:  # noqa: BLE001 - lineage must never fail a hook
+        return False
 
 
 def canonical_session_ref(value: str, harness: str) -> str:
@@ -387,6 +404,10 @@ def _machine_user_message(text: str) -> str | None:
     head = text.lstrip()
     if not is_machine(head):
         return None
+    if started_session(head):
+        # Another session's brief, as the app delivered it: what this session
+        # was asked to do, so its words stay, but it is not a turn typed here.
+        return f"[notification: session-start] {head.strip()}"
     m = _TAG_NAME.match(head)
     tag = m.group(1) if m else "notification"
     if tag.startswith("cross-session-"):
