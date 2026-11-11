@@ -33,6 +33,64 @@ MACHINE_USER_TAGS = (
     "<command-name>",
 )
 
+# Plain first-person "user" turns the Claude desktop app writes when it resumes
+# work by itself (after a usage limit resets, the Mac sleeps, the app quits,
+# the context window fills, Claude Code restarts on a remote host). The owner
+# never typed them, but nothing marks them: a turn whose whole text is one of
+# these is the app's. Copied from the app's bundle (Claude 4.23118.1,
+# app.asar, 2026-11-10); a new or reworded string is one more entry here.
+_RESTART_RUNNING = (
+    "Commands that you started before the restart may still be running, even foreground ones and even if they "
+    "read as interrupted or stopped. Your process list may be blind to them: if it shows only your own processes, "
+    "a missing process proves nothing. So before you start one again in any form, always look twice at what it "
+    "writes or changes, at least a minute apart, longer if it writes rarely. If you see its process or a change, "
+    "it still runs: start no second copy; if you need it finished, keep checking until it stops. If you see "
+    "neither and your list is blind, you cannot tell: say so first, and run it again only if the task allows two "
+    "copies and they surely do no harm; otherwise leave it and do what does not need it.")
+APP_AUTO_CONTINUE = (
+    "I hit my usage limit while you were working, but it has reset now. Please continue from where you left off.",
+    "My computer went to sleep while you were working. Please continue from where you left off.",
+    "The app was quit while you were working. Please continue from where you left off.",
+    "The context window filled up while you were working, so the conversation was compacted. "
+    "Please continue from where you left off.",
+    f"Claude Code was restarted on the remote host while you were working. {_RESTART_RUNNING} "
+    "Then continue from where you left off.",
+    "Claude Code was restarted on the remote host while you were working. If your last tool call reads as refused "
+    "or interrupted by the user, that was written by the restart: nobody refused it, and it may have run in part "
+    f"before it was cut off. {_RESTART_RUNNING} Check what your last tool call did before you run it again, then "
+    "continue from where you left off.",
+)
+_APP_AUTO_CONTINUE = frozenset(" ".join(t.split()) for t in APP_AUTO_CONTINUE)
+
+# The first turn of a session another session started (``start_session``,
+# ``hand_off_to_session``): the desktop app wraps the brief in one of these
+# fixed openings, so the turn is the app's whatever the brief's length and
+# however long ago it was written. A fork start, a hand-off (a fork whose
+# prompt is the hand-off paragraph, then the plan) and an offer's brief sent
+# after its session opened open with the "Task" line; a fresh start with a
+# background opens with the "Background" line; the hand-off paragraph's own
+# opening is kept too. Copied from the app's bundle (Claude 4.23118.1,
+# app.asar, 2026-11-10). Matched at the start of the turn only.
+APP_SESSION_START = (
+    "Task (from the session that started this one):\n",
+    "Background (from the session that started this one):\n",
+    "Continue the task you were in the middle of in this conversation - it was handed to you so the user could "
+    "keep talking in the original session.",
+)
+# What the app adds after a fresh start's text when the group has a notes
+# folder: the turn's last paragraph, one line ending in the folder's path. It
+# also marks a fresh proposal started with no background, whose turn is the
+# bare brief and then this paragraph.
+APP_SHARED_NOTES = ("Shared notes folder for this group of sessions (outside the repo; read siblings' notes there, "
+                    "leave hand-over notes or large findings there instead of pasting them into messages): ")
+_SHARED_NOTES_TAIL = re.compile(r"(?:\A|\n\n)" + re.escape(APP_SHARED_NOTES) + r"[^\n]*\s*\Z")
+
+
+def started_session(text: str) -> bool:
+    """True when a cleaned user turn is the desktop app's delivery of another
+    session's brief (``APP_SESSION_START``, ``APP_SHARED_NOTES``)."""
+    return text.lstrip().startswith(APP_SESSION_START) or _SHARED_NOTES_TAIL.search(text) is not None
+
 
 def _blocks(tags: tuple[str, ...]) -> re.Pattern:
     return re.compile(r"<(" + "|".join(re.escape(t) for t in tags) + r")(?:\s[^>]*)?>.*?</\1>", re.S)
@@ -122,9 +180,14 @@ def owner_text(text: str) -> str | None:
 
 def is_machine(text: str, *, anywhere: bool = False) -> bool:
     """True when a cleaned user turn is a message the harness wrote: it opens
-    with one of ``MACHINE_USER_TAGS``. ``anywhere`` (the owner-turn recorder):
-    one of them anywhere in the turn, since text inside a wrapper is never
-    the owner's and a turn that mixes the two can't say which words are."""
+    with one of ``MACHINE_USER_TAGS``, its whole text is one of the desktop
+    app's ``APP_AUTO_CONTINUE`` turns, or it is the app's delivery of a
+    started session's brief (``started_session``). ``anywhere`` (the
+    owner-turn recorder): a tag anywhere in the turn, since text inside a
+    wrapper is never the owner's and a turn that mixes the two can't say
+    which words are."""
+    if " ".join(text.split()) in _APP_AUTO_CONTINUE or started_session(text):
+        return True
     if anywhere:
         return any(tag in text for tag in MACHINE_USER_TAGS)
     return text.lstrip().startswith(MACHINE_USER_TAGS)
