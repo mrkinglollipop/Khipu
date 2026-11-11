@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from khipu import db, jobs, mirror, notes, outbox, provenance
+from khipu import db, jobs, mirror, notes, outbox
 from khipu.capture_identity import payload_sha256
 from tests.test_notes import _FakeConn, _FakeTopicsCursor
 from tests.test_outbox_legacy_projection import ORIGINAL, REASON, projection, world  # noqa: F401
@@ -107,23 +107,6 @@ def test_warm_archive_index_does_not_suppress_direct_capture_or_different_origin
     assert direct.parent == outbox.outbox_dir()
     direct.unlink()
     assert outbox.enqueue(queued, origin="local:synthetic", recovery=True).parent == outbox.outbox_dir()
-
-
-def test_mirror_skips_both_archived_payloads_but_queues_distinct_evidence(world, monkeypatch):  # noqa: F811
-    _path, record = archive()
-    monkeypatch.setattr(provenance, "ready", lambda cur: True)
-    conflicts = Mock(side_effect=lambda cur, lines: [obj for obj, _key in lines])
-    queue = Mock()
-    monkeypatch.setattr(mirror, "_legacy_key_conflicts", conflicts)
-    monkeypatch.setattr(mirror, "_queue_conflict", queue)
-    distinct = {**record["queued_evidence"]["payload"], "preferences": ["keep this extra fact"]}
-    lines = [(payload, (payload["ts"], "synthetic")) for payload in (
-        record["payload"], record["queued_evidence"]["payload"], distinct)]
-    assert mirror._queue_key_conflicts(object(), lines) == 1
-    queue.assert_called_once_with(distinct)
-    assert conflicts.call_args.args[1] == [lines[-1]]
-
-
 
 
 @pytest.mark.parametrize("errors,expected", [

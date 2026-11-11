@@ -94,11 +94,11 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | --- | --- |
 | `ledger` | Project work rows: add, set, get, list, loose-ends, needs-owner (alias needs-matt), render, check, remove, removed, restore, purge, projects, project, import, and export. |
 | `owner-direction` | Direction settings, owner-actions log, and Undo; see below. |
-| `capture` | Capture an episode from a JSON payload on stdin. Routed by `capture_mode`. Flags: `--payload-file`, `--mode legacy|dual|hub`. `capture now` flags a session for capture at its next Stop, whatever the cadence (`--note`, `--harness`, `--session-id`; the last two default to the most recently active local session). |
+| `capture` | Capture an episode from a JSON payload on stdin. Routed by `capture_mode`. Flags: `--payload-file`, `--mode legacy|dual|hub`. `capture now` flags a session for capture at its next Stop, whatever the cadence (`--note`, `--harness`, `--session-id`; the last two default to the most recently active local session). `capture export` adds a line to the session files for every live hub episode that has none, append-only; the nightly runs it (`--dry-run` counts without writing, `--json`). |
 | `episode` | `episode forget ID` soft-deletes an episode and removes its vectors. `episode edit ID --summary S` corrects it and re-embeds. |
 | `topic` | `topic purge SLUG --yes` hard-deletes an already tombstoned topic from the hub database (with its revisions and vectors). It immediately purges this Mac's replica too; a replica failure is reported as partial, and that copy then needs a successful full refresh. |
 | `notes` | Index per-project harness notes as topics: `reconcile` (`--dry-run`, `--changed-only`), `index` (`--project`, `--cap`, `--dry-run`, `--force`), `split PATH`, `stale` (`--project`), `supersede OLD NEW`. |
-| `reconcile` | Full sync of memory files into Postgres. |
+| `reconcile` | Full sync of the memory folder's topic pages (`topics/*.md`) into Postgres. Episodes go the other way, through `capture export`. |
 | `regen-memory` | Write the `MEMORY.from-khipu.md` sidecar from topics. `--index` rebuilds the live `MEMORY.md`. |
 | `provenance` | Fact provenance maintenance: `backfill` proves legacy restaters' claims; `index` indexes episode source identities and sweeps refused carriers. |
 | `outbox` | The offline queue for captures whose database write failed: `drain`, `status` and `retry-dead`. `retry-dead` leaves jobs refused for not announcing their source identities held. |

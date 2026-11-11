@@ -109,6 +109,12 @@ ALSO = "Explicit asks are included here and in khipu_owed; older Owed items rema
 # was cut for the item being built, so nothing is ever cut without saying so.
 _WHOLE: ContextVar[bool] = ContextVar("khipu_needs_you_whole", default=False)
 _CLIPPED: ContextVar[bool] = ContextVar("khipu_needs_you_clipped", default=False)
+# Set only by the app's read (``needs_you_app.read``): each item also says where it came from.
+FOR_APP: ContextVar[bool] = ContextVar("khipu_needs_you_for_app", default=False)
+# Set only by the app's full read of one item once the app itself started the process
+# (``routing._caller``): a forget item shows the hub's summary, as ``episode forget-pending
+# --from-app`` does for the same caller.
+APP_SUMMARIES: ContextVar[bool] = ContextVar("khipu_needs_you_app_summaries", default=False)
 
 
 def _said(text, most: int) -> str:
@@ -516,6 +522,9 @@ def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
                     continue
                 same_target = True
                 if offered["args"] == args:
+                    # The item's own pin stays on the item: direction.confirm carries none, and with
+                    # both answers held nothing else would (``needs_you_app.item_fields``).
+                    item.setdefault("_pin", (offered["args"] or {}).get("expect"))
                     item["settle"][side] = _act("direction.confirm", request=request)
                     item["held"] = {"answers": side, "request": request, "decline": decline}
                     placed = True
@@ -546,9 +555,9 @@ def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
 
 
 def _forgets() -> list[dict]:
-    from khipu import owner_act
+    from khipu import forget, owner_act
 
-    listed = owner_act._forget_list()
+    listed = forget.unsent_forgets() if APP_SUMMARIES.get() else owner_act._forget_list()
     out = []
     strings = listed.get("strings") or []
     if strings:
@@ -702,10 +711,16 @@ def _local_confirmations(view: dict, now: datetime) -> list[dict]:
 
 
 def _finished(item: dict, caller: str, now: datetime) -> dict:
-    out = {k: v for k, v in item.items() if k not in ("_by", "at")}
+    out = {k: v for k, v in item.items() if k not in ("_by", "_pin", "at")}
     by = item.get("_by")
     asked = "Khipu noticed this" if by is None else _who(by, caller)
     out["asked_by"] = {"who": asked, "at": item.get("at"), "when": _ago(item.get("at"), now)}
+    if FOR_APP.get():
+        # The app's three fields (``needs_you_app``); the MCP answer never has them.
+        from khipu import needs_you_app
+
+        out.update(needs_you_app.item_fields(by, asked, out["asked_by"]["when"], out.get("settle"),
+                                             pin=item.get("_pin")))
     return out
 
 

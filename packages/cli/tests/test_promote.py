@@ -1326,14 +1326,13 @@ def test_the_gate_never_reads_a_key_or_token_variable(home, monkeypatch, tmp_pat
 
 
 def test_gate_mode_stop_hook_background_drains_and_does_nothing_else(home, monkeypatch, tmp_path):
-    from khipu import hook_background, mirror, notes, outbox
+    from khipu import hook_background, notes, outbox
     from khipu import embed as embed_mod
 
     monkeypatch.setenv("KHIPU_ISOLATED_DIR", str(tmp_path / "iso"))
     monkeypatch.setenv("KHIPU_GATE", "1")
     drained = []
     monkeypatch.setattr(hook_background, "_drain", lambda sid, harness: drained.append(sid))
-    monkeypatch.setattr(mirror, "sync_recent_episodes", lambda *a, **k: pytest.fail("mirror ran"))
     monkeypatch.setattr(outbox, "jobs", lambda *a, **k: pytest.fail("outbox replay ran"))
     monkeypatch.setattr(outbox, "drain", lambda *a, **k: pytest.fail("outbox replay ran"))
     monkeypatch.setattr(notes, "reconcile", lambda *a, **k: pytest.fail("notes reconcile ran"))
