@@ -494,6 +494,9 @@ def _run_nightly_locked() -> int:
     _capture_previous_receipts()
     drain_result = _step_result(_drain_sessions())
     _record_nightly_step(steps, "sessions_drain", **drain_result)
+    # Before the outside consolidate script, so its git sync carries tonight's
+    # new lines offsite tonight. A failure is recorded and the night goes on.
+    _record_nightly_step(steps, "capture_export", **_step_result(_capture_export()))
     driver_error = None
     try:
         rc = _run_script(
@@ -732,6 +735,30 @@ def _drain_sessions() -> dict[str, Any]:
         return {"ok": out["failed"] == 0 and not out.get("time_budget_exhausted"), **out}
     except Exception as exc:  # noqa: BLE001 — capture failure cannot block consolidation
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _capture_export() -> dict[str, Any]:
+    """The append-only hub → session-file export (khipu.capture_export).
+    Skipped, not failed, where no file wiki is configured."""
+    try:
+        from khipu.config import path_setting
+
+        mem = path_setting("memory_root")
+        if mem is None:
+            return {"ok": True, "skipped": "memory_root not configured"}
+        from khipu.capture_export import export_new_lines
+
+        out = export_new_lines(mem)
+        _nightly_log(f"[khipu-capture-export] {'ok' if out.get('ok') else 'FAILED'} "
+                     + json.dumps({k: v for k, v in out.items() if k != "target"}, sort_keys=True))
+        return out
+    except Exception as exc:  # noqa: BLE001 - the export cannot block the rest of the night
+        error = f"{type(exc).__name__}: {exc}"
+        try:
+            _nightly_log(f"[khipu-capture-export] FAILED {error}")
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": False, "error": error}
 
 
 def _nightly_log(line: str) -> None:
@@ -1171,6 +1198,10 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
     "snapshot_refresh_ok": (
         "snapshot_refresh",
         "run `khipu snapshot refresh` and check the error",
+    ),
+    "capture_export_ok": (
+        "capture_export",
+        "run `khipu capture export --dry-run` and check the error",
     ),
 }
 

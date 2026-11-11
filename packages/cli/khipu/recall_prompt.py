@@ -3721,7 +3721,7 @@ _OUTCOMES_TIMEOUT_RATE_RED = 0.5
 # summary lines plus free-form diagnostics from other _log calls in this
 # module) at realistic call volumes, while staying a bounded, cheap read
 # regardless of how large the log has grown — same seek-from-the-end tail
-# pattern as khipu.mirror.sync_recent_episodes.
+# pattern the Stop hook's old episodes.jsonl tail sync used.
 _OUTCOMES_TAIL_BYTES = 2 * 1024 * 1024
 
 # Matches the summary line hook_main logs: "<stamp> [khipu-prompt-recall]

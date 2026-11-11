@@ -4,7 +4,10 @@ The read is ``needs_you.waiting`` as the MCP tool gives it, never recorded as
 a conversation's read, with three fields more on each item: ``from_words``
 (who asked and on which Mac, in words), ``mac`` and ``ago``, and ``expect``:
 the pin the item's own confirm or undo already carries (``expect`` in its
-args), or null when its actions carry none. The MCP answer never carries them.
+args), kept when held answers replaced both (``direction.confirm`` carries
+none), or null when its actions carry none. The MCP answer never carries them.
+The app's full read of one item, once the app itself asked, shows a forget
+item's hub summary, as ``episode forget-pending --from-app`` does.
 
 An answer is one item by its key, Yes or No, from the app. The CLI first
 proves the app itself started the process (``routing._caller``, the check
@@ -54,9 +57,10 @@ def pin_of(settle) -> str | None:
     return None
 
 
-def item_fields(by, who: str, ago: str | None, settle=None) -> dict:
-    """``from_words``, ``mac``, ``ago`` and ``expect`` for one item (``needs_you._finished``)."""
-    pin = pin_of(settle)
+def item_fields(by, who: str, ago: str | None, settle=None, pin: str | None = None) -> dict:
+    """``from_words``, ``mac``, ``ago`` and ``expect`` for one item (``needs_you._finished``).
+    ``pin`` is the item's own pin when held answers replaced its actions, which then carry none."""
+    pin = str(pin) if pin is not None else pin_of(settle)
     if isinstance(by, dict) and by.get("kind") == "other_mac":
         mac = by.get("mac") or "your other Mac"
         return {"from_words": f"From {who}.", "mac": mac, "ago": ago, "expect": pin}
@@ -94,15 +98,19 @@ def last_answer() -> dict | None:
     return None
 
 
-def read(key: str | None = None) -> dict:
+def read(key: str | None = None, *, summaries: bool = False) -> dict:
     """The list as the app shows it, or with ``key`` that one item with its
     words whole (the read ``needs-you --item`` makes). Each item says whether
     its words were cut (``cut``); an item read by its key never is. Reading
-    changes nothing."""
+    changes nothing. ``summaries``: the app itself asked (``routing._caller``),
+    so a forget item shows the hub's summary, as ``episode forget-pending
+    --from-app`` does."""
     token = needs_you.FOR_APP.set(True)
+    shown = needs_you.APP_SUMMARIES.set(summaries)
     try:
         answer = needs_you.waiting(key=key, record_read=False)
     finally:
+        needs_you.APP_SUMMARIES.reset(shown)
         needs_you.FOR_APP.reset(token)
     if isinstance(answer, dict):
         answer["this_mac"] = this_mac()
@@ -117,10 +125,11 @@ def read(key: str | None = None) -> dict:
 NOT_FOUND = "That item is no longer waiting. Nothing was changed; read the list again."
 
 
-def read_one(key: str) -> tuple[int, dict]:
+def read_one(key: str, *, app: bool = False) -> tuple[int, dict]:
     """(exit code, JSON) for one item read whole by its key; ``not_found``
-    when no item has that key now."""
-    answer = read(key)
+    when no item has that key now. ``app``: the app itself started this
+    process, so a forget item's words include the hub's summary."""
+    answer = read(key, summaries=app)
     items = answer.get("items") if isinstance(answer, dict) else None
     if not items or len(items) != 1 or items[0].get("key") != key:
         return _no("not_found", NOT_FOUND, key=key)
@@ -193,7 +202,8 @@ def answer(key: str, said: str, expect: str | None = None) -> tuple[int, dict]:
     if not items or len(items) != 1 or items[0].get("key") != key:
         return _no("not_found", NOT_FOUND)
     item = items[0]
-    pin = pin_of(item.get("settle"))
+    # The item's own pin, whatever its settle actions are now (held answers carry none).
+    pin = item.get("expect")
     if pin is not None and expect != pin:
         return _no("changed", CHANGED, key=key)
     if item["kind"] == "signin":
@@ -250,5 +260,5 @@ def run_cli(args) -> int:
     if args.yes or args.no:
         return say(*_no("bad_args", "The app answers with --answer KEY yes or no."))
     if args.item:
-        return say(*read_one(args.item))
+        return say(*read_one(args.item, app=bool(args.from_app and routing._caller()["app"])))
     return say(0, read())

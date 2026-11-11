@@ -108,10 +108,10 @@ class OutboxUnitTest(unittest.TestCase):
                 mock.patch.object(cap, "run_capture_v2", lambda p, suppress_mirror, **_: ran.append(suppress_mirror) or 0):
             self.assertEqual(cap.capture(payload, mode="dual"), 0)
             self.assertEqual(cap.capture(payload, mode="hub"), 0)
-        self.assertEqual(ran, [False, False])              # file leg ran, mirror left ON
+        self.assertEqual(ran, [False])                     # dual: file leg ran, mirror left ON; hub: none (row 11)
         self.assertEqual(outbox.status()["pending"], 1)      # one identity, queued once
 
-    def test_hub_reverse_mirrors_to_file_by_default(self):
+    def test_hub_never_runs_the_file_leg(self):
         from khipu import capture as cap
 
         ran = []
@@ -120,7 +120,7 @@ class OutboxUnitTest(unittest.TestCase):
             self.assertEqual(cap.capture({"summary": "x", "ts": "2026-10-10T00:00:00Z"}, mode="hub"), 0)
             with mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "0"}):
                 self.assertEqual(cap.capture({"summary": "x", "ts": "2026-10-10T00:00:00Z"}, mode="hub"), 0)
-        self.assertEqual(ran, [True])                       # once with mirror suppressed; off when disabled
+        self.assertEqual(ran, [])                           # row 11: the nightly export writes the line
 
     def test_legacy_mirror_leg_queues_instead_of_losing(self):
         from khipu import mirror

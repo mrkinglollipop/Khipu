@@ -3340,6 +3340,30 @@ def cmd_capture(args: argparse.Namespace) -> int:
     return capture(load_payload(raw), mode=args.mode)
 
 
+def cmd_capture_export(args: argparse.Namespace) -> int:
+    """``khipu capture export [--dry-run] [--json]``: the nightly's
+    append-only hub → session-file export, run by hand."""
+    from khipu.capture_export import export_new_lines
+
+    mem = _require_memory_root(args)
+    if mem is None:
+        return 2
+    out = export_new_lines(mem, dry_run=bool(args.dry_run))
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+    elif not out.get("ok"):
+        print(f"capture export failed: {out.get('error')}")
+    else:
+        verb = "would add" if out["dry_run"] else "added"
+        n = out["would_add"] if out["dry_run"] else out["added"]
+        print(f"{verb} {n} line(s) to {out['target']}; "
+              f"{out['present_identical']} identical, {out['present_different']} different (left alone), "
+              f"{out['matched_via_sources']} matched through episode_sources, "
+              f"{out['matches_forgotten']} match a forgotten episode (left alone), "
+              f"{out['file_only']} with no hub row")
+    return 0 if out.get("ok") else 1
+
+
 def cmd_capture_now(args: argparse.Namespace) -> int:
     """K1: `khipu capture now [--note TEXT] [--harness H --session-id ID]` —
     flags a session for capture on its next Stop/PreCompact/SessionEnd,
@@ -5600,7 +5624,7 @@ def build_parser() -> argparse.ArgumentParser:
     rem.set_defaults(func=cmd_sources)
     src.set_defaults(func=cmd_sources)
 
-    rc = sub.add_parser("reconcile", help="Full file→PG episodes/topics sync")
+    rc = sub.add_parser("reconcile", help="Full topics/*.md → PG topic sync (episodes flow hub → files: capture export)")
     rc.add_argument("--memory-root", default=_memory_root_default())
     rc.set_defaults(func=cmd_reconcile)
 
@@ -5789,10 +5813,14 @@ def build_parser() -> argparse.ArgumentParser:
                                parents=[rt_json])
     rpause.add_argument("account")
     rpause.add_argument("--until", default=None, metavar="T")
+    rpause.add_argument("--expect", default=None, metavar="PIN",
+                        help="The account's pause as read; refused if it changed since")
     rpause.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rpause)
     rlift = rt_sub.add_parser("lift", help="Owner: lift a pause (asks for a typed confirmation)", parents=[rt_json])
     rlift.add_argument("account")
+    rlift.add_argument("--expect", default=None, metavar="PIN",
+                       help="The account's pause as read; refused if it changed since")
     rlift.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rlift)
     rclear = rt_sub.add_parser("clear", help="Owner: clear an account, or dismiss one report (--report ID)",
@@ -5865,7 +5893,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="A conversation: the owner's request, in one line (rule add or edit; stays unconfirmed)")
     rrule.add_argument("--base", default=None, help="Owner revision read when preparing a rule edit request")
     rrule.add_argument("--expect", default=None, metavar="REVISION",
-                       help="Rule revision shown when confirming; refused if it changed since")
+                       help="Rule revision shown when confirming (add: the rules as read); refused if it changed since")
     rrule.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rrule)
 
@@ -5906,6 +5934,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Check allowance: only caller-declared sensitive code")
     rcap.add_argument("--until", default=None, metavar="T",
                       help="set: when the cap stops applying (a time, or 2d, 30h); the cap it replaced applies again")
+    rcap.add_argument("--expect", default=None, metavar="PIN",
+                      help="set: the window's share caps as read; refused if they changed since")
     rcap.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rcap)
     rsay = rt_sub.add_parser("say", parents=[rt_json], help=argparse.SUPPRESS)
@@ -6148,6 +6178,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Defaults to the most recently active local session's id",
     )
     cap_now.set_defaults(func=cmd_capture_now)
+    cap_export = cap_sub.add_parser(
+        "export",
+        help="Add a session-file line for every live hub episode that has none "
+             "(append-only; the nightly runs it)",
+    )
+    cap_export.add_argument("--memory-root", default=_memory_root_default())
+    cap_export.add_argument(
+        "--dry-run", action="store_true",
+        help="Count only: changes nothing in the Memory files or the hub "
+             "(and writes no hub-reachability note)")
+    cap_export.add_argument("--json", action="store_true", help="Print the counts as JSON")
+    cap_export.set_defaults(func=cmd_capture_export)
     cap.set_defaults(func=cmd_capture)
 
     gt = sub.add_parser(

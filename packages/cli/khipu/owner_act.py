@@ -268,6 +268,12 @@ def _with_frozen_subject(args) -> dict:
         raise _bad("route.override.grant takes arguments")
     if "subject" in args:
         raise _bad("the conversation an override is for is Khipu's to name, not the call's")
+    from khipu import routing
+
+    try:
+        routing._ensure_local_mac()  # the frozen subject names this Mac as it will be after the first routing write
+    except routing.RouteError as err:
+        raise Refused("unknown_conversation", str(err)) from None
     subject, why = conversation_overrides.subject(scope="project" if args.get("whole_folder") is True else "conversation")
     if subject is None:
         raise Refused("unknown_conversation", why or "Khipu can't tell which conversation this is.")
@@ -859,16 +865,33 @@ def _decline(args, *, terminal: bool = False, app: bool = False) -> tuple[bool, 
     if settled:
         return True, settled
     try:
-        request = owner_direction.decline(args["request"], terminal=terminal, app=app)
+        request = owner_direction.decline(args["request"], terminal=terminal, app=app, receipt_after_send=True)
     except owner_direction.DirectionRefused as refused:
         return False, refused.refusal()
     if request.get("remote"):
         from khipu import routing_replication
 
         try:
-            routing_replication.answer_remote(request, None, "decline")
-        except Exception:  # noqa: BLE001 - the no is recorded here; the other Mac's request ends by itself
-            pass
+            sent = routing_replication.answer_remote(request, None, "decline") is True
+        except Exception:  # noqa: BLE001 - said plainly below; the request waits again
+            sent = False
+        if not sent:
+            # Not recorded for the other Mac, so the no was not given: the request waits again,
+            # and no routing receipt was written for it.
+            back = owner_direction.reopen_declined(request["id"], request.get("owner_action"))
+            if not back["waiting"]:
+                error = ("Khipu could not record your no to send to your other Mac, so the no was not sent and "
+                         "nothing was changed. Khipu also could not put the request back on your list here, so "
+                         "look at it on your other Mac.")
+            elif not back["marked"]:
+                error = ("Khipu could not record your no to send to your other Mac, so the no was not sent and "
+                         "nothing was changed. The request still waits for your answer, though Khipu's list of "
+                         "owner actions may still show the no as given.")
+            else:
+                error = ("Khipu could not record your no to send to your other Mac. Nothing was "
+                         "changed, and the request still waits for your answer.")
+            return False, {"ok": False, "code": "not_sent", "sent": False, "request": request["id"], "error": error}
+        owner_direction.write_decline_receipt(request)
         return True, {"ok": True, "declined": True, "applied": False, "sent": True, "request": request["id"],
                       "line": "Your no is on its way to the other Mac, which drops the request. Nothing was changed.",
                       "owner_action": request.get("owner_action"), "receipt": request.get("receipt")}

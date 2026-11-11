@@ -441,3 +441,206 @@ def test_the_mcp_list_and_the_terminal_item_read_are_unchanged_by_the_full_read(
     code, out = _cli(capsys, "--json", "--item", by["rule"]["key"])
     assert code == 0 and "THE TAIL" in out["items"][0]["words"]
     assert "cut" not in out["items"][0] and not APP_FIELDS & set(out["items"][0])
+
+
+# ---- PR 538 review: the pin under held answers, the forget summary, a No not sent ----------------
+
+
+def _rule_with_both_answers_held(world, khipu_app) -> tuple[dict, dict]:
+    """(the item as the app first showed it, the item now): the app showed "Docs go to Sonnet",
+    then a conversation proposed "Docs go to Opus" and held both its answers."""
+    from khipu import routing as r
+
+    number = _rule_changed(world)
+    _app(world, khipu_app)
+    old = next(i for i in needs_you_app.read()["items"] if i["kind"] == "rule")
+    assert "Docs go to Sonnet" in old["words"]
+    _be(world, OTHER)
+    rule = next(x for x in r.conversation_view()["rules"] if x["n"] == number)
+    r.request_rule("Docs go to Opus", n=number, owner_request="new proposal",
+                   author=r.conversation_author(), via="mcp", base=rule["owner_revision"])
+    fresh = needs_you_app.read(old["key"])["items"][0]
+    assert fresh["expect"] != old["expect"]
+    for side in ("confirm", "undo"):
+        ok, held = _ask_in_t3(world, "direction.request", fresh["settle"][side])
+        assert ok and held["pending"], held
+    _app(world, khipu_app)
+    current = needs_you_app.read(old["key"])["items"][0]
+    assert {o["action"] for o in current["settle"].values()} == {"direction.confirm"}
+    return old, current
+
+
+def test_a_stale_pin_is_still_checked_when_both_answers_are_held(world, khipu_app, capsys):
+    old, current = _rule_with_both_answers_held(world, khipu_app)
+    # The item keeps its own pin although both its actions are now held confirms.
+    assert current["expect"] is not None and current["expect"] != old["expect"]
+    log = len(owner_direction.actions())
+    code, out = _answer(capsys, old["key"], "yes", expect=old["expect"])
+    assert code == 2 and out["code"] == "changed", (code, out)
+    rule = next(r for r in routing.read_view()["rules"] if r["text"] == "Docs go to Opus")
+    assert rule["pending"] is True
+    assert len(owner_direction.actions()) == log
+
+
+def test_a_held_item_whose_pin_still_matches_is_answered(world, khipu_app, capsys):
+    old, current = _rule_with_both_answers_held(world, khipu_app)
+    code, out = _answer(capsys, current["key"], "yes", expect=current["expect"])
+    assert code == 0 and out["ok"] is True, (code, out)
+    rule = next(r for r in routing.read_view()["rules"] if r["text"] == "Docs go to Opus")
+    assert not rule.get("pending"), rule
+
+
+def test_the_mcp_list_has_no_pin_field_when_answers_are_held(world, khipu_app):
+    _rule_with_both_answers_held(world, khipu_app)
+    for item in needs_you.waiting(record_read=False)["items"]:
+        assert "expect" not in item and "_pin" not in item
+
+
+FORGOTTEN = {"ok": True, "strings": [], "ids": [{"id": 41, "summary": "A made-up hub conversation about Zorblax"}],
+             "at": "2026-11-01T00:00:00Z", "count": 1, "facts_hidden": True}
+
+
+def test_the_apps_full_forget_read_shows_the_summary_it_can_already_read(world, khipu_app, capsys, monkeypatch):
+    from khipu import forget
+
+    monkeypatch.setattr(forget, "unsent_forgets", lambda: json.loads(json.dumps(FORGOTTEN)))
+    _app(world, khipu_app)
+    args = cli.build_parser().parse_args(["episode", "forget-pending", "--from-app"])
+    assert args.func(args) == 0
+    direct = json.loads(capsys.readouterr().out)
+    assert direct["ids"][0]["summary"] == FORGOTTEN["ids"][0]["summary"]
+    code, full = _cli(capsys, "--from-app", "--item=forget:41")
+    assert code == 0 and full["items"][0]["cut"] is False
+    assert FORGOTTEN["ids"][0]["summary"] in full["items"][0]["words"], full
+
+
+@pytest.mark.parametrize("argv", [("--from-app", "--item=forget:41"), ("--json", "--item=forget:41"),
+                                  ("--from-app",)])
+def test_a_caller_that_is_not_the_app_still_gets_no_forget_summary(world, capsys, monkeypatch, argv):
+    from khipu import forget
+
+    monkeypatch.setattr(forget, "unsent_forgets", lambda: json.loads(json.dumps(FORGOTTEN)))
+    args = cli.build_parser().parse_args(["needs-you", *argv])
+    args.func(args)
+    out = capsys.readouterr().out
+    assert "Zorblax" not in out and "forget:41" in out
+
+
+@pytest.mark.parametrize("failure", [False, OSError("fictional connection failure")])
+def test_a_no_to_another_macs_request_that_could_not_be_recorded_is_not_sent(world, khipu_app, capsys,
+                                                                              monkeypatch, failure):
+    ident = _held_pause(world)
+    path = owner_direction.requests_path()
+    state = json.loads(path.read_text())
+    row = next(r for r in state["requests"] if r["id"] == ident)
+    row["remote"] = {"mac": "m1-id", "request": "req-remote", "sig": "s" * 16}
+    path.write_text(json.dumps(state))
+    from khipu import routing_replication
+
+    monkeypatch.setattr(routing_replication, "mac_label", lambda mac: "M1")
+    attempts = []
+
+    def refuse(*args):
+        attempts.append(args)
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+
+    monkeypatch.setattr(routing_replication, "answer_remote", refuse)
+    _app(world, khipu_app)
+    code, out = _answer(capsys, "held:" + ident, "no")
+    assert attempts
+    assert code == 2 and out["ok"] is False and out["code"] == "not_sent" and out.get("sent") is not True, out
+    # The item stays answerable, and nothing says the no was given.
+    assert _request(ident)["state"] == "pending"
+    assert any(i["key"] == "held:" + ident for i in needs_you_app.read()["items"])
+    assert not [a for a in owner_direction.actions()
+                if a.get("action") == owner_direction.DECLINE_ACTION and a.get("state") != "failed"]
+    assert needs_you_app.last_answer() is None
+
+
+def _held_on_another_mac(world) -> str:
+    """A held request this Mac only mirrors: the M1 holds it (fictional)."""
+    ident = _held_pause(world)
+    path = owner_direction.requests_path()
+    state = json.loads(path.read_text())
+    next(r for r in state["requests"] if r["id"] == ident)["remote"] = {
+        "mac": "m1-id", "request": "req-remote", "sig": "s" * 16}
+    path.write_text(json.dumps(state))
+    from khipu import routing_replication
+
+    world["mp"].setattr(routing_replication, "mac_label", lambda mac: "M1")
+    return ident
+
+
+def _decline_receipts(line_ids) -> list[dict]:
+    return [r for r in routing.recent_receipts(routing.read_view(), routing._now()) if r["id"] in line_ids]
+
+
+def test_a_no_that_was_not_sent_leaves_no_receipt_in_the_routing_record(world, khipu_app, capsys, monkeypatch):
+    from khipu import routing_replication
+
+    ident = _held_on_another_mac(world)
+    monkeypatch.setattr(routing_replication, "answer_remote", lambda *a: False)
+    _app(world, khipu_app)
+    code, out = _answer(capsys, "held:" + ident, "no")
+    assert code == 2 and out["code"] == "not_sent", out
+    assert _request(ident)["state"] == "pending"
+    lines = {a["id"] for a in owner_direction.actions() if a.get("action") == owner_direction.DECLINE_ACTION}
+    assert lines and not _decline_receipts(lines)
+
+
+def test_a_no_to_another_macs_request_that_is_sent_writes_its_receipt_once(world, khipu_app, capsys, monkeypatch):
+    from khipu import routing_replication
+
+    ident = _held_on_another_mac(world)
+    sent = []
+    monkeypatch.setattr(routing_replication, "answer_remote", lambda request, stamp, answer: sent.append(answer) or True)
+    _app(world, khipu_app)
+    code, out = _answer(capsys, "held:" + ident, "no")
+    assert code == 0 and sent == ["decline"] and out["sent"] is True, out
+    lines = {a["id"] for a in owner_direction.actions() if a.get("action") == owner_direction.DECLINE_ACTION}
+    receipts = _decline_receipts(lines)
+    assert len(lines) == 1 and len(receipts) == 1 and receipts[0]["text"].startswith("Declined the request")
+
+
+@pytest.mark.parametrize("broken", ["request_save", "failed_mark"])
+def test_a_failed_no_whose_recovery_also_failed_says_so(world, khipu_app, capsys, monkeypatch, broken):
+    """The no was not recorded to send, and then putting the request back (or
+    marking the no's line failed) could not be written either (fictional disk)."""
+    from khipu import routing_replication
+
+    ident = _held_on_another_mac(world)
+    original_save, original_append = owner_direction._save, owner_direction._append
+
+    def cannot_save(*a, **kw):
+        raise OSError("fictional disk full while putting the request back")
+
+    def cannot_mark(line):
+        if line.get("kind") == "state" and line.get("state") == "failed":
+            raise OSError("fictional disk full while marking the no failed")
+        return original_append(line)
+
+    def fail_delivery(*a):
+        if broken == "request_save":
+            monkeypatch.setattr(owner_direction, "_save", cannot_save)
+        else:
+            monkeypatch.setattr(owner_direction, "_append", cannot_mark)
+        raise OSError("fictional disk full while recording the answer")
+
+    monkeypatch.setattr(routing_replication, "answer_remote", fail_delivery)
+    _app(world, khipu_app)
+    code, out = _answer(capsys, "held:" + ident, "no")
+    monkeypatch.setattr(owner_direction, "_save", original_save)
+    monkeypatch.setattr(owner_direction, "_append", original_append)
+    assert code == 2 and out["ok"] is False and out["code"] == "not_sent" and out["sent"] is False, out
+    assert "not sent" in out["error"]
+    states = [a.get("state") for a in owner_direction.actions() if a.get("target") == ident]
+    if broken == "request_save":
+        assert _request(ident)["state"] == "declined"
+        assert "could not put the request back" in out["error"] and "other Mac" in out["error"]
+        assert "still waits" not in out["error"]
+    else:
+        assert _request(ident)["state"] == "pending"
+        assert "still waits for your answer" in out["error"] and "could not put" not in out["error"]
+        assert states == ["applied"]

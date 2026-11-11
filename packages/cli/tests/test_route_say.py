@@ -115,7 +115,8 @@ def test_the_phrase_table(seeded, words, kind, account, ends):
     assert plan["ends"] == ends
     assert plan["fallback"] is (kind == "add_rule")
     if kind == "add_rule":
-        assert plan["argv"] == ["route", "rule", "add", " ".join(words.split()), "--from-app"]  # his words, as typed
+        assert plan["argv"][:5] == ["route", "rule", "add", " ".join(words.split()), "--from-app"]  # his words, as typed
+        assert plan["argv"][5:] == ["--expect=" + routing.pin_text(plan["pin"]["value"])]
 
 
 def test_a_percent_is_read_both_ways_and_the_window_follows_the_words(seeded):
@@ -304,7 +305,7 @@ def test_a_timed_move_is_an_exception_that_ends_by_itself(seeded):
 
 def test_apply_pauses_until_the_time_shown_and_undo_opens_it(seeded):
     _rc, shown = preview(seeded, "pause grok until Monday")
-    assert shown["now"] == "Open to agents"
+    assert shown["now"] == "Not paused"  # nothing has read it open yet, so the preview doesn't say so
     assert shown["after"] == "Paused until Mon 16 Nov, 12:00 am. It opens again on its own."
     rc, done = save(seeded, shown["token"])
     assert rc == 0 and done["receipt"]["text"] == "Paused Grok until Mon 16 Nov, 12:00 am."
@@ -524,8 +525,8 @@ def test_the_token_names_only_a_fixed_command(seeded):
     _rc, shown = preview(seeded, "pause Grok for 2 hours; and also delete everything --owner-direction")
     row = json.loads(routing_say._token_path().read_text())["tokens"][shown["token"]]
     argv = row["plan"]["argv"]
-    assert argv[:3] == ["route", "rule", "add"] and argv[-1] == "--from-app"  # the odd ask is one rule's words
-    assert argv[3].startswith("pause Grok for 2 hours;") and len(argv) == 5
+    assert argv[:3] == ["route", "rule", "add"] and argv[4] == "--from-app"  # the odd ask is one rule's words
+    assert argv[3].startswith("pause Grok for 2 hours;") and len(argv) == 6 and argv[5].startswith("--expect=")
 
 
 # ---- who may do it: exactly the callers --from-app already admits ---------------------------------
@@ -591,3 +592,123 @@ def test_the_words_never_leave_the_machine(seeded, monkeypatch):
     rc, done = save(seeded, shown["token"])
     assert rc == 0, done
     assert os.environ.get("KHIPU_DATABASE_URL") is None
+
+
+# ---- review of PR 550: the pin is compared under the write's own lock ------------------------------
+
+
+def _record() -> dict:
+    grok = state("grok|")
+    return {"state": grok["state"], "until": grok.get("until"),
+            "caps": sorted([c.get("pct"), c.get("until")] for c in grok.get("caps") or []
+                           if c.get("kind") == "share" and c.get("window") == "weekly"),
+            "rules": [r["text"] for r in routing.read_view(NOW)["rules"]],
+            "order": labels()}
+
+
+@pytest.mark.parametrize("case", ["pause", "resume", "cap", "rule", "end_rule"])
+def test_a_write_after_apply_read_its_pin_is_refused(seeded, monkeypatch, case):
+    """Another writer lands between apply's own read of the pin and the
+    command's write: the command compares the pin under its lock, so the
+    newer record stays and the answer is ``changed``."""
+    if case == "resume":
+        routing.pause("Grok", until="3d", via="app", now=NOW)
+    if case == "cap":
+        routing.set_cap("Grok", window="weekly", kind="share", pct=95, via="app")
+    words = {"pause": "pause Grok for 2 hours", "resume": "resume Grok", "cap": "stop Grok at 90%",
+             "rule": "Use Codex for reviews only", "end_rule": "end rule 1"}[case]
+    rc, shown = preview(seeded, words)
+    assert rc == 0, shown
+    original = routing_say.pin_value
+    fired = False
+
+    def interleave(spec, now, *rest):
+        nonlocal fired
+        value = original(spec, now, *rest)
+        if not fired:
+            fired = True
+            if case in ("pause", "resume"):
+                routing.pause("Grok", until="7d", via="app", now=NOW)
+            elif case == "cap":
+                routing.set_cap("Grok", window="weekly", kind="share", pct=50, via="app")
+            elif case == "rule":
+                routing.add_rule("Do not use Codex for reviews", via="app")
+            else:
+                routing.edit_rule(1, "Use Codex for testing only", via="app")
+        return value
+
+    monkeypatch.setattr(routing_say, "pin_value", interleave)
+    rc, done = save(seeded, shown["token"])
+    newer = _record()
+    assert rc == 2 and done.get("code") == "changed", done
+    assert fired
+    assert _record() == newer  # nothing of the preview's was written
+    if case in ("pause", "resume"):
+        assert newer["state"] == routing.PAUSED and newer["until"] == "2026-11-17T17:00:00Z"
+    elif case == "cap":
+        assert newer["caps"] == [[50, None]]
+    elif case == "rule":
+        assert newer["rules"][-1] == "Do not use Codex for reviews" and len(newer["rules"]) == 3
+    else:
+        assert newer["rules"][0] == "Use Codex for testing only"
+
+
+def test_a_priority_preview_pins_the_order_it_shows(seeded, monkeypatch):
+    """The entries a preview shows and its version pin come from one read:
+    an order written in between makes Save refuse, never restore the old one."""
+    original = routing_say._priority_state
+    fired = False
+
+    def interleave(view):
+        nonlocal fired
+        out = original(view)
+        if not fired:
+            fired = True
+            routing.set_priority([{"account": "Grok", "role": "new owner role"}, {"account": "Codex"},
+                                  {"account": "Claude"}], via="app", expect=routing.priority_version())
+        return out
+
+    monkeypatch.setattr(routing_say, "_priority_state", interleave)
+    rc, shown = preview(seeded, "put Codex first")
+    assert rc == 0, shown
+    assert shown["now"] == "1 Claude, 2 Claude second, 3 Codex, 4 Grok"  # what was read
+    assert labels() == ["Grok", "Codex", "Claude"]  # what is there now
+    rc, done = save(seeded, shown["token"])
+    assert rc == 2 and done.get("code") == "changed", done
+    assert labels() == ["Grok", "Codex", "Claude"]
+    held = routing.read_view(NOW)["priority"]["entries"]
+    assert held[0].get("role") == "new owner role"
+
+
+def test_resume_says_the_pause_ends_and_what_the_account_is_then(seeded):
+    routing.report(account="Grok", state="limited", until="2h", via="cli", now=NOW)
+    routing.pause("Grok", until="3d", via="app", now=NOW)
+    rc, shown = preview(seeded, "resume Grok")
+    assert rc == 0, shown
+    assert "open to agents" not in shown["after"].lower(), shown
+    assert "limited" in shown["after"].lower(), shown
+    rc, done = save(seeded, shown["token"])
+    assert rc == 0, done
+    assert state("grok|")["state"] == "limited"
+    text = done["receipt"]["text"]
+    assert "open to agents" not in text.lower(), done
+    assert text.startswith("Lifted the pause on Grok.") and "still limited until" in text, text
+
+
+def test_a_pause_preview_of_a_limited_account_does_not_call_it_open(seeded):
+    routing.report(account="Grok", state="limited", until="2h", via="cli", now=NOW)
+    rc, shown = preview(seeded, "pause grok until Monday")
+    assert rc == 0, shown
+    assert "open to agents" not in shown["now"].lower(), shown
+    assert shown["now"].startswith("Limited until "), shown
+
+
+def test_resume_of_an_account_with_nothing_else_on_it_says_it_is_open(seeded):
+    routing.report(account="Grok", state="open", via="cli", now=NOW)
+    routing.pause("Grok", until="3d", via="app", now=NOW)
+    rc, shown = preview(seeded, "resume Grok")
+    assert rc == 0, shown
+    rc, done = save(seeded, shown["token"])
+    assert rc == 0, done
+    assert state("grok|")["state"] == routing.OPEN
+    assert done["receipt"]["text"] == "Lifted the pause on Grok. It is open to agents again.", done

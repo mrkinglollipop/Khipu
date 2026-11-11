@@ -212,10 +212,14 @@ class MissingFileLegTest(unittest.TestCase):
                 mock.patch.object(cap, "_capture_v2", return_value=Path("/Volumes/gone/capture_v2.py")), \
                 mock.patch("khipu.t3.thread_for_session", return_value=None), \
                 mock.patch("khipu.embed.embed_on_capture"):
-            rc = cap._capture(dict(self.PAYLOAD), mode="hub", result=outcome)
+            rc = cap._capture(dict(self.PAYLOAD), mode="dual", result=outcome)
+            # Row 11: hub mode never reaches the file leg, so a gone path is
+            # not its failure.
+            hub_rc = cap._capture(dict(self.PAYLOAD), mode="hub", result={})
         self.assertEqual(rc, cap.EX_SOFTWARE)
         self.assertEqual(outcome["reason"], "file_leg_missing")
         self.assertIn("file_leg_missing", cap.REASON_CODES)
+        self.assertEqual(hub_rc, 0)
 
     def test_a_caller_with_no_result_dict_gets_the_same_verdict(self):
         # `khipu capture` and the probe call capture(payload) bare.
@@ -239,7 +243,7 @@ class MissingFileLegTest(unittest.TestCase):
                 mock.patch.object(cap, "run_capture_v2", return_value=cap.EX_SOFTWARE), \
                 mock.patch("khipu.t3.thread_for_session", return_value=None), \
                 mock.patch("khipu.embed.embed_on_capture"):
-            self.assertEqual(cap._capture(dict(self.PAYLOAD), mode="hub", result={}), cap.EX_SOFTWARE)
+            self.assertEqual(cap._capture(dict(self.PAYLOAD), mode="dual", result={}), cap.EX_SOFTWARE)
 
 
 class RetryDoesNotRespendTest(unittest.TestCase):

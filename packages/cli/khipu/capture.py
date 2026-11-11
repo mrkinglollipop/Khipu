@@ -9,15 +9,17 @@ Reads a capture payload (same JSON shape ``capture_v2.py`` accepts) from stdin o
             warning — that is what makes Khipu a second *writer* rather than a mirror),
             then shell out to capture_v2 for the file wiki with KHIPU_MIRROR=0 so it
             does not mirror the same episode a second time.
-  hub     → write PG only. The file wiki is maintained by the reverse-mirror
-            (``khipu regen-memory`` today; full materialize is P3 end-state).
+  hub     → write PG only; capture_v2 never runs. The session files get their
+            lines from the nightly's append-only export
+            (``khipu.capture_export``, ``khipu capture export``), which adds one
+            line per live hub episode that has none and never rewrites a line.
 
 Identity is minted ONCE here (``ts``, seconds precision, ``Z``) and passed to both
 writers, so the PG row and the file line share the (ts, md5(summary)) key the
 reconcile upserts on — the P2b dual-mint bug can't come back through this path.
 
 Exit codes mirror capture_v2: 0 ok · 64 no payload · 65 bad payload · 70 PG write
-failed (dual/hub) · capture_v2's own code if the file leg fails.
+failed (dual/hub) · capture_v2's own code if the file leg fails (legacy/dual).
 """
 from __future__ import annotations
 
@@ -1116,9 +1118,7 @@ def run_fact_steps(cur, payload: dict[str, Any], episode_id: int) -> None:
     :class:`FactStepDeferred` (the whole transaction must roll back and be
     retried); any other error rolls its step back and records a
     ``fact_gaps`` row (invariant I4). ``write_pg`` runs them for a capture,
-    and the file recovery writers (``mirror.sync_recent_episodes``,
-    ``mirror.reconcile_memory_root``) for a file line they import, so the
-    episode commits with its claims (0047's writer gate)."""
+    so the episode commits with its claims (0047's writer gate)."""
     _declare_history_writer(cur, payload)
 
     # O4: files/PR-issue-URLs/release tags from payload['deliverables'].
@@ -2270,12 +2270,21 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
         except Exception as qexc:  # noqa: BLE001 — outbox itself unwritable
             _log(f"outbox enqueue FAILED ({type(qexc).__name__}: {qexc})")
             queued = False
-        # The file leg keeps its own mirror ON here: if PG comes back mid-way it
-        # lands the row now, and if not it re-queues the same identity (no dup).
-        if mode == "hub" and os.environ.get("KHIPU_HUB_FILE_MIRROR", "1").strip().lower() in {"0", "false", "off"}:
+        if mode == "hub":
+            # No file leg in hub (the nightly export writes the line once the
+            # outbox replay lands the row). A queued capture is delivered, as
+            # before, unless the caller asked for a failed hub write to read as
+            # one (KHIPU_HUB_FILE_MIRROR=0: the MCP tool, the probe, the
+            # gateway), which keeps that answer too.
+            if queued and not _hub_pending_fails():
+                _log("hub write queued in the outbox; the hub row lands on replay")
+                return 0
             _log(f"hub delivery pending; durable_outbox={queued}")
             _set_reason(result, "hub_pending")
             return EX_SOFTWARE
+        # dual: the file leg keeps its own mirror ON here: if PG comes back
+        # mid-way it lands the row now, and if not it re-queues the same
+        # identity (no dup).
         rc = _file_leg_rc(run_capture_v2(payload, suppress_mirror=False, outcome=result), result)
         if rc != 0:
             return rc
@@ -2293,11 +2302,9 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
 
         embed_on_capture(payload, episode_id=stats.get("episode_id"))
 
-    # dual: legacy file wiki is a peer; hub: PG is the record and the file is
-    # its reverse mirror (plan: "Hub owns writes ... and can reverse-mirror to
-    # files"). Same call either way — the legacy consumers (nightly consolidate,
-    # topic amend, MEMORY.md) keep working in both modes. KHIPU_HUB_FILE_MIRROR=0
-    # turns the reverse mirror off in hub for a future all-PG world.
+    # dual: the legacy file wiki is a peer and capture_v2 writes its line now.
+    # hub: PG is the record; the file line comes from the nightly's
+    # append-only export (khipu.capture_export), so capture_v2 never runs here.
     if _verbatim_only_empty(payload):
         # The legacy writer refuses an empty summary (exit 65), so the hub row
         # is this capture's only store. Acknowledge only when write_pg read
@@ -2310,21 +2317,30 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
             return EX_DATAERR
         _log("verbatim_only capture confirmed on the hub row; file wiki leg skipped")
         return 0
+    if mode == "hub":
+        # The hub row is the whole capture; the nightly export writes its line.
+        return 0
     if (stats.get("dedup") or {}).get("matched_via") == "same_content":
         # Text this session already holds: no second paraphrase in the file wiki.
         _log("same window text already captured; file wiki leg skipped")
         return 0
-    if mode == "hub" and os.environ.get("KHIPU_HUB_FILE_MIRROR", "1").strip().lower() in {"0", "false", "off"}:
-        return 0
     return _file_leg_rc(run_capture_v2(payload, suppress_mirror=True, outcome=result), result)
 
 
+def _hub_pending_fails() -> bool:
+    """KHIPU_HUB_FILE_MIRROR=0: in hub mode a hub write that only reached the
+    outbox is reported as a failure (hub_pending), not as delivered. The name
+    is kept for the callers that already set it (mcp_server, probe, the
+    gateway); hub mode itself no longer runs a file leg either way."""
+    return os.environ.get("KHIPU_HUB_FILE_MIRROR", "1").strip().lower() in {"0", "false", "off"}
+
+
 def _file_leg_rc(rc: int, result: dict[str, Any] | None) -> int:
-    """A hub-only install has no legacy file writer. Once the hub holds the
-    capture (or the outbox does), a missing writer is a setting, not a failed
-    delivery: reporting it as one kept the job queued and re-ran it on every
-    drain pass, one paraphrased episode per pass. A writer that ran and
-    failed still fails."""
+    """dual mode on an install with no legacy file writer configured. Once the
+    hub holds the capture (or the outbox does), a missing writer is a setting,
+    not a failed delivery: reporting it as one kept the job queued and re-ran
+    it on every drain pass, one paraphrased episode per pass. A writer that
+    ran and failed still fails."""
     if rc != 0 and isinstance(result, dict) and result.get("reason") == "file_leg_not_configured":
         _log("file wiki leg not configured; the hub row is the record")
         result.pop("reason", None)

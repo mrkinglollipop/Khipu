@@ -165,7 +165,8 @@ def test_the_apps_grant_goes_through_the_owner_path_and_ends_by_itself(app, caps
     assert out["ok"] is True and out["until"] == until and out["indefinite"] is False and out["review_at"] is None
     assert out["replaced"] == [] and out["account"].startswith("codex")
     (row,) = overrides.list_overrides()
-    assert row["subject"] == SUBJECT and row["until"] == until and not row.get("indefinite")
+    # A subject with no Mac (this folder had no identity yet) is bound to this Mac's, made then.
+    assert row["subject"] == dict(SUBJECT, mac=routing._local_mac()) and row["until"] == until and not row.get("indefinite")
     # It is on the owner-actions log as the app's, with Undo.
     (line,) = [a for a in owner_direction.actions() if a["action"] == "route.override.grant"]
     assert line["id"] == out["owner_action"] and line["auth"] == "app"
@@ -240,6 +241,86 @@ def test_the_terminal_refuses_without_a_typed_yes(khipu_app, capsys):
     assert overrides.list_overrides() == []
 
 
+# ---- this Mac's identity under a grant -------------------------------------------------------------------------
+
+
+def _mac_file():
+    return routing.routing_dir() / "mac-id"
+
+
+def _folder_bytes() -> dict:
+    folder = routing.routing_dir()
+    return {p.name: p.read_bytes() for p in sorted(folder.iterdir()) if p.is_file()} if folder.is_dir() else {}
+
+
+def test_candidate_grant_still_matches_after_first_routing_write(app):
+    """A fresh data folder: the picker's subject names this Mac, so the first routing write leaves the grant on."""
+    assert not _mac_file().exists()
+    _turn("sess-claude-1")
+    candidate, = overrides.candidates("Claude")
+    mine = routing._local_mac()
+    assert mine and candidate["subject"]["mac"] == mine
+    assert cli.main(_grant(candidate["subject"], _in(2), "Claude")) == 0
+    # A normal later owner action is the first routing write.
+    routing.pause("Codex", until=_in(1), via="app")
+    assert routing._local_mac() == mine
+    advice, reason = overrides.advice("claude|", {"harness": "claude_code", "session": "sess-claude-1"}, environ={})
+    assert advice is not None, reason
+
+
+def test_a_subject_frozen_before_this_mac_had_an_identity_is_granted_for_this_mac(app, capsys):
+    """An ask frozen on a fresh folder carries no Mac; the grant (this Mac's own log) binds it to this Mac."""
+    assert not _mac_file().exists()
+    capsys.readouterr()
+    assert cli.main(_grant(dict(SUBJECT, mac=None), _in(2), "Claude")) == 0
+    mine = routing._local_mac()
+    (row,) = overrides.list_overrides()
+    assert mine and row["subject"] == dict(SUBJECT, mac=mine)
+    routing.pause("Codex", until=_in(1), via="app")
+    advice, reason = overrides.advice("claude|", {"harness": "claude_code", "session": SUBJECT["id"]}, environ={})
+    assert advice is not None, reason
+
+
+def test_an_agents_ask_on_a_fresh_folder_names_this_mac(world):
+    """The conversation's own ask freezes its subject with this Mac's identity, made then if there is none."""
+    from tests.test_owner_direction_e2e import SESSION
+
+    _hook("let this conversation run ahead on Codex for 3 hours")
+    if _mac_file().exists():
+        _mac_file().unlink()  # stand in for a folder whose first routing write is still to come
+    assert not _act("route.override.grant", {"account": "Codex", "until": _in(3), "request": "x"})[0]
+    mine = routing._local_mac()
+    (row,) = overrides.list_overrides()
+    assert mine and row["subject"]["mac"] == mine
+    routing.pause("Claude", until=_in(1), via="app")
+    advice, reason = overrides.advice("codex|", {"harness": "claude_code", "session": SESSION}, environ={})
+    assert advice is not None, reason
+
+
+def test_on_a_mac_with_an_identity_candidates_and_grant_are_as_before(app, capsys):
+    mine = _my_mac()
+    _turn("sess-claude-1")
+    before = _folder_bytes()
+    code, out = _candidates(capsys)
+    assert code == 0
+    (row,) = out["candidates"]
+    assert row["subject"] == {"kind": "session", "id": "sess-claude-1", "harness": "claude_code", "mac": mine}
+    assert _folder_bytes() == before  # the read wrote nothing
+    capsys.readouterr()
+    assert cli.main(_grant(row["subject"], _in(2), "Claude")) == 0
+    (grant,) = overrides.list_overrides()
+    assert json.dumps(grant["subject"], sort_keys=True) == json.dumps(row["subject"], sort_keys=True)
+    assert _mac_file().read_bytes() == before["mac-id"]
+    # A subject naming another Mac is kept as it was asked, not rebound to this one.
+    assert cli.main(_grant(dict(row["subject"], mac=OTHER), _in(2), "Claude")) == 0
+    assert {r["subject"]["mac"] for r in overrides.list_overrides()} == {mine, OTHER}
+
+
+def test_candidates_with_nothing_to_offer_make_no_identity(app, capsys):
+    assert _candidates(capsys)[1] == {"ok": True, "candidates": []}
+    assert not _mac_file().exists()
+
+
 # ---- the Mac on each owner-actions line ------------------------------------------------------------------------
 
 
@@ -292,6 +373,39 @@ def test_each_owner_action_names_its_mac_and_the_other_macs_changes_are_in_the_l
     data["routing_mac_names"] = {}
     cfg.write_text(json.dumps(data))
     assert {r["mac"] for r in owner_direction.listing() if r["id"].startswith("other-mac:")} == {"Your other Mac"}
+
+
+def test_remote_rule_action_names_the_rule_the_hub_numbered(khipu_app):
+    """An older pending row keeps its provisional ``n``; the line carries the rule's entity, which the view names
+    by the number the hub gave it."""
+    from khipu import routing_replication
+
+    _my_mac()
+    event = {
+        "type": "rule_add", "id": "019ac000-0000-7000-8000-000000000001",
+        "entity": "rule-019ac000-0000-7000-8000-000000000001",
+        "mac": OTHER, "written_at": routing._iso(routing._now()),
+        "written_by": {"kind": "owner"}, "via": "app", "auth": "app",
+        "n": 1, "number_pending": True, "text": "Keep the release account held",
+    }
+    routing_replication._store([{"event_id": event["id"], "hub_order": 7, "rule_number": 7, "payload": event}])
+    (row,) = owner_direction._other_mac_lines()
+    (remote,) = routing_replication.remote_events()
+    assert routing._rule_number(remote) == 7
+    rule = next(r for r in routing.read_view()["rules"] if r["entity"] == event["entity"])
+    assert rule["n"] == 7 and rule["text"] == event["text"]  # what the app's ruleWords shows for the entity
+    assert row["target"] == event["entity"], row
+
+
+def test_an_older_rule_line_without_an_entity_carries_the_one_routing_derives(khipu_app):
+    event = _event("rule_add", n=3, text="Keep Grok under 90%")
+    target = owner_direction._other_mac_target(event)
+    assert target == routing.event_identity.entity(event) and target.startswith("rule-")
+    edit = _event("rule_edit", n=3, target="rule-019ac000-0000-7000-8000-000000000002", text="x")
+    assert owner_direction._other_mac_target(edit) == "rule-019ac000-0000-7000-8000-000000000002"
+    # Not a rule: unchanged.
+    assert owner_direction._other_mac_target(_event("cap_set", account="grok|")) == "grok|"
+    assert owner_direction._other_mac_target(_event("priority_confirm")) == "priority"
 
 
 def test_an_unreadable_other_macs_record_leaves_this_macs_list_alone(khipu_app, monkeypatch):

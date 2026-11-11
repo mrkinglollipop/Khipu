@@ -236,6 +236,10 @@ def grant(values: dict, *, now: datetime | None = None) -> dict:
     subj = values.get("subject")
     if not isinstance(subj, dict) or subj.get("kind") not in ("thread", "session", "project") or not isinstance(subj.get("id"), str):
         raise routing.RouteError("an override needs the conversation subject shown in its ask")
+    if not subj.get("mac"):
+        # Frozen before this Mac had an identity.  This log is this Mac's alone (never copied to the hub), so
+        # the conversation is this Mac's: name it now, or the first routing write would leave the grant unmatched.
+        subj = dict(subj, mac=routing._ensure_local_mac())
     if values.get("effect") != "ahead_of_pace":
         raise routing.RouteError("effect must be ahead_of_pace")
     indefinite = values.get("indefinite") is True
@@ -381,6 +385,8 @@ def candidates(account: str, *, now: datetime | None = None) -> list[dict]:
             then = seen.setdefault((harness, session), {"ts": 0.0, "cwd": None})
             if ts >= then["ts"]:
                 then.update(ts=float(ts), cwd=turn.get("cwd") if isinstance(turn.get("cwd"), str) else None)
+    if seen:
+        routing._ensure_local_mac()  # an offered subject names the Mac a grant for it is matched on, before and after
     mac = mac_names.this_mac()
     out: dict[tuple, dict] = {}
     for (harness, session), info in sorted(seen.items(), key=lambda kv: -kv[1]["ts"]):
