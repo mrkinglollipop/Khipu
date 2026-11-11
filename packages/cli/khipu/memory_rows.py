@@ -168,7 +168,7 @@ def mac_resolver():
     """origin -> the name of the Mac that wrote the row, from ``macs`` (the one
     place a Mac gets a name). ``local:<hash>`` equal to this Mac's origin is
     this Mac; any other ``local:`` origin is another Mac (a hardware origin is
-    not a Mac id, so it gets the shared fallback). A gateway origin or none is
+    not a Mac id, so it gets the owner's name for the one other named Mac, else the shared fallback). A gateway origin or none is
     not a Mac: ``None``."""
     from khipu import macs
 
@@ -178,7 +178,7 @@ def mac_resolver():
         mine = local_origin()
     except Exception:  # noqa: BLE001
         mine = None
-    this_name, other_name = macs.mac_label(), macs.name_of(None)
+    this_name, other_name = macs.mac_label(), macs.sole_other_name() or macs.name_of(None)
 
     def resolve(origin: Any) -> str | None:
         origin = str(origin or "")

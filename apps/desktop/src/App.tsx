@@ -807,7 +807,8 @@ export default function App() {
   const workingLabel = (() => {
     if (feedbackSending) return "Sending feedback…";
     if (advertiseBusy) return "Advertising a join PIN…";
-    if (loading.doctor) return "Reading the health check…";
+    // The health check reads for a long time on Settings; the rail item shows
+    // it busy and the page's own rows say "Checking…", so no pill sits over text.
     return null;
   })();
   const tabBusy = (id: Tab): boolean => id === "settings" && Boolean(loading.doctor);
@@ -1080,7 +1081,7 @@ export default function App() {
         macName={thisMac}
       />
 
-      <main className="main" aria-busy={workingLabel != null}>
+      <main className="main" aria-busy={workingLabel != null || Boolean(loading.doctor)}>
         {tab === "routing" ? (
           <Toolbar title="Accounts">
             <ViewSwitch
@@ -1096,6 +1097,8 @@ export default function App() {
           </Toolbar>
         ) : toolbarTitle && tab !== "memory" && tab !== "guides" ? <Toolbar title={toolbarTitle} heading={false} /> : null}
         <WorkingBanner label={workingLabel} />
+        {/* The visible pill is gone, but the health-check read is still announced. */}
+        <span className="sr-only" role="status">{loading.doctor ? "Reading the health check…" : ""}</span>
         <div className="main-content">
         <section className={panelClass("first-run")}>
           <PaneBoundary key={paneRetryKeys["first-run"]} title={PANE_TITLES["first-run"]} onRetry={retryActivePane}>

@@ -68,6 +68,33 @@ def test_search_activity_health_and_macs_name_an_unnamed_mac_the_same(monkeypatc
     assert macs.name_of(OTHER, None) == macs.name_of(None) == macs.OTHER_MAC == resolve("local:someone-else")
 
 
+def _known(monkeypatch, *macs_known):
+    rows = [{"mac": m, "name": "row", "version": None, "seen_at": None, "age_s": 1, "saving": None, "health": None,
+             "running": None, "signins": None} for m in macs_known]
+    monkeypatch.setattr(macs, "read_rows", lambda: (rows, "ok"))
+
+
+def test_a_row_from_the_other_mac_carries_its_name_only_when_it_is_the_one_known_other_mac(monkeypatch):
+    _routing(monkeypatch, {THIS: "M5", OTHER: "M1 Max"})
+    _known(monkeypatch, THIS, OTHER)
+    assert memory_rows.mac_resolver()("local:someone-else") == "M1 Max"
+    # a third Mac is known (never named): a foreign row may be from it
+    _known(monkeypatch, THIS, OTHER, "f" * 32)
+    assert memory_rows.mac_resolver()("local:someone-else") == macs.OTHER_MAC
+    # one other Mac, but the owner never named it
+    _routing(monkeypatch, {THIS: "M5"})
+    _known(monkeypatch, THIS, OTHER)
+    assert memory_rows.mac_resolver()("local:someone-else") == macs.OTHER_MAC
+
+
+def test_no_sole_name_when_this_macs_id_is_unknown(monkeypatch):
+    _routing(monkeypatch, {THIS: "M5"})
+    monkeypatch.setattr(routing, "_local_mac", lambda: None)
+    _known(monkeypatch, THIS)
+    assert macs.sole_other_name() is None
+    assert memory_rows.mac_resolver()("local:someone-else") == macs.OTHER_MAC
+
+
 def test_a_failing_settings_read_never_fails_a_name(monkeypatch):
     def broken(config=None):
         raise OSError("no config")

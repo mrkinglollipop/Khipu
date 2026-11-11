@@ -14,6 +14,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
+import { parseCommandJson } from "./shared/parseOutput";
 
 type Listed = {
   ok?: boolean;
@@ -26,12 +27,8 @@ type Listed = {
 type Done = { ok?: boolean; pending?: number; error?: string; hub_unreachable?: boolean };
 
 function parse<T>(raw: string): T | null {
-  try {
-    const value = JSON.parse(raw.trim().split("\n").pop() ?? "");
-    return value && typeof value === "object" ? (value as T) : null;
-  } catch {
-    return null;
-  }
+  const value = parseCommandJson(raw);
+  return value && typeof value === "object" ? (value as T) : null;
 }
 
 function forgets(n: number): string {

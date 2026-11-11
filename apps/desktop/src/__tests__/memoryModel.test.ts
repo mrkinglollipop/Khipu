@@ -69,6 +69,25 @@ describe("search and conversation reads", () => {
     expect(out).toMatchObject({ kind: "error", needsHub: true });
   });
 
+  it("reads the command's real output: indented JSON over many lines, rows inside", () => {
+    const results = Array.from({ length: 80 }, (_, i) => ({ kind: "episode", id: i + 1, title: `t${i}`, quote: `q${i}`, tool: "Codex" }));
+    const raw = JSON.stringify({ ok: true, query: "x", mode: "hybrid", results }, null, 2) + "\n";
+    expect(raw.split("\n").length).toBeGreaterThan(300);
+    const out = readSearch(raw);
+    expect(out.kind === "rows" && out.rows).toHaveLength(80);
+  });
+
+  it("reads one JSON line, and log lines before one JSON line", () => {
+    const doc = JSON.stringify({ ok: true, results: [{ kind: "episode", id: 7, title: "a" }] });
+    expect(readSearch(doc)).toMatchObject({ kind: "rows" });
+    const out = readSearch(`[khipu] using snapshot\nwarming up\n${doc}\n`);
+    expect(out.kind === "rows" && out.rows.map((r) => r.id)).toEqual([7]);
+  });
+
+  it("says unreadable text is unreadable", () => {
+    expect(readSearch("log line\nstill not json {")).toMatchObject({ kind: "error", message: "Search gave an answer the app could not read." });
+  });
+
   it("reads any other failure as a failure", () => {
     expect(readSearch("not json")).toMatchObject({ kind: "error", needsHub: false });
     expect(readSearch(JSON.stringify({ ok: true }))).toMatchObject({ kind: "error" });
