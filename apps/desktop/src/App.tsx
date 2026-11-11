@@ -1081,7 +1081,7 @@ export default function App() {
         macName={thisMac}
       />
 
-      <main className="main" aria-busy={workingLabel != null}>
+      <main className="main" aria-busy={workingLabel != null || Boolean(loading.doctor)}>
         {tab === "routing" ? (
           <Toolbar title="Accounts">
             <ViewSwitch
@@ -1097,6 +1097,8 @@ export default function App() {
           </Toolbar>
         ) : toolbarTitle && tab !== "memory" && tab !== "guides" ? <Toolbar title={toolbarTitle} heading={false} /> : null}
         <WorkingBanner label={workingLabel} />
+        {/* The visible pill is gone, but the health-check read is still announced. */}
+        <span className="sr-only" role="status">{loading.doctor ? "Reading the health check…" : ""}</span>
         <div className="main-content">
         <section className={panelClass("first-run")}>
           <PaneBoundary key={paneRetryKeys["first-run"]} title={PANE_TITLES["first-run"]} onRetry={retryActivePane}>

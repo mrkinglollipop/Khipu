@@ -164,7 +164,10 @@ it("does not float a pill over Settings while the health check reads", async () 
   // The wait shows on the rail item and in the page's own rows, never as a pill over the text.
   await new Promise((r) => setTimeout(r, 300));
   expect(main.querySelector(".working-banner")).toBeNull();
-  expect(document.body.textContent).not.toContain("Reading the health check");
+  // Not a pill, but still announced: main is busy and a visually hidden status names the read.
+  expect(main.getAttribute("aria-busy")).toBe("true");
+  const status = main.querySelector('.sr-only[role="status"]');
+  expect(status?.textContent).toBe("Reading the health check…");
   // jsdom does not expand the overflow shorthand, so read the shipped rules themselves.
   const rule = (selector: string) =>
     appCss.match(new RegExp(`^\\${selector}\\s*\\{[^}]*\\}`, "m"))?.[0].replace(/\/\*[\s\S]*?\*\//g, "") ?? "";

@@ -127,11 +127,12 @@ describe("the notice list", () => {
   });
 });
 
-describe("notices that pointed at the removed Home screen", () => {
-  it("offer no Show me button and do not say 'on Home'", () => {
+describe("notices that pointed at the old Home screen", () => {
+  it("keep Show me on Today, point Accounts items at Accounts, and do not say 'on Home'", () => {
     for (const v of POST_UPDATE_NOTICES) {
       for (const item of v.items) {
-        if (item.target.kind === "home") expect(itemAction(item, false, ALL_CAPABILITIES)).toBeNull();
+        expect(itemAction(item, false, ALL_CAPABILITIES)).not.toBeNull();
+        if (["Plans in Accounts", "Routing card in Accounts", "Plans", "Plan rows"].includes(item.title)) expect(item.target).toEqual({ kind: "settings", section: "routing" });
         expect(`${item.title} ${item.text} ${item.short ?? ""}`).not.toMatch(/\b(on|Routing card on|Plans on) Home\b/);
       }
     }
