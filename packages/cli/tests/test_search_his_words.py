@@ -145,3 +145,109 @@ def test_activity_rows_carry_memory_fields(hub, monkeypatch, tmp_path):
            ('please keep the violet reset intact', 'Reset work.', 'Codex', None, 'khipu')
     assert by_id[ids[1]]['quote'] == 'unrelated owner line'
     assert list(row)[-5:] == ['quote', 'title', 'tool', 'mac', 'project']
+
+
+# ---- automated user-role lines are not the owner's words --------------------
+
+AUTOMATED = {
+    'scheduled': 'Lane check (scheduled, not Matt): remember the owner said "test everything ourselves" and act on it',
+    'system notice': '[SYSTEM NOTIFICATION - NOT USER INPUT] background task finished: test everything ourselves',
+    'delegated notice': 'Delegated task "audit" [completed] test everything ourselves',
+    'task notification': '<task-notification><summary>test everything ourselves</summary></task-notification>',
+    'hook text': '<system-reminder>test everything ourselves</system-reminder>',
+    'compaction summary': 'This session is being continued from a previous conversation. The user said test everything ourselves.',
+    'job brief': 'Act as the implementation sub-agent for this task. Test everything ourselves before you finish.',
+    'machine stand-in': '[notification: task-notification] test everything ourselves',
+}
+
+
+def _insert(hub, session, quotes):
+    conn = hub.connect()
+    conn.execute("INSERT INTO episodes (ts,summary,raw,session_id,project,harness,verbatim) VALUES "
+                 "(now(),'Work.','{}',%s,'khipu','claude_code',%s::jsonb)", (session, json.dumps({'quotes': quotes})))
+    conn.commit()
+    return str(conn.execute('SELECT max(id) FROM episodes').fetchone()[0])
+
+
+def test_each_automated_kind_is_not_matched_or_quoted_but_a_typed_line_is(hub, monkeypatch, tmp_path):
+    from tests.test_search_indexed_words import install_words
+    configure_hub(monkeypatch, hub)
+    install_words(hub, tmp_path)
+    monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: [])
+    typed = 'we should test everything ourselves this time'
+    for n, (kind, line) in enumerate(AUTOMATED.items()):
+        only = _insert(hub, f'claude_code:00000000-0000-0000-0000-0000000001{n:02d}', [line])
+        both = _insert(hub, f'claude_code:00000000-0000-0000-0000-0000000002{n:02d}', [line, typed])
+        for mode in ('literal', 'hybrid'):
+            got = {r['id']: r for r in embed.hybrid_search('test everything ourselves', mode=mode,
+                                                           owner_words_only=True, limit=50)['results']}
+            assert only not in got, (kind, mode)           # only automated lines: not returned
+            assert both in got and got[both]['quote'] == typed, (kind, mode)
+
+
+def test_a_typed_line_quoting_an_automated_phrase_still_matches(hub, monkeypatch, tmp_path):
+    from tests.test_search_indexed_words import install_words
+    configure_hub(monkeypatch, hub)
+    install_words(hub, tmp_path)
+    monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: [])
+    line = 'why did "Lane check (scheduled, not Matt)" say test everything ourselves?'
+    eid = _insert(hub, 'claude_code:00000000-0000-0000-0000-000000000301', [line])
+    out = embed.hybrid_search('test everything ourselves', mode='literal', owner_words_only=True)['results']
+    assert [r['id'] for r in out] == [eid] and out[0]['quote'] == line
+
+
+def test_automated_matches_cannot_crowd_out_the_typed_one(hub, monkeypatch, tmp_path):
+    from tests.test_search_indexed_words import install_words
+    configure_hub(monkeypatch, hub)
+    install_words(hub, tmp_path)
+    monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: [])
+    mine = _insert(hub, 'claude_code:00000000-0000-0000-0000-000000000401', ['please test everything ourselves'])
+    for n in range(12):  # newer, so they come first under ORDER BY ts DESC
+        _insert(hub, f'claude_code:00000000-0000-0000-0000-0000000005{n:02d}', [AUTOMATED['scheduled']])
+    out = embed.hybrid_search('test everything ourselves', mode='literal', owner_words_only=True, limit=2)['results']
+    assert [r['id'] for r in out] == [mine]
+
+
+def test_without_the_flag_automated_lines_are_still_found(hub, monkeypatch, tmp_path):
+    from tests.test_search_indexed_words import install_words
+    configure_hub(monkeypatch, hub)
+    install_words(hub, tmp_path)
+    monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: [])
+    eid = _insert(hub, 'claude_code:00000000-0000-0000-0000-000000000601', [AUTOMATED['scheduled']])
+    out = embed.hybrid_search('test everything ourselves', mode='literal')['results']
+    assert eid in [r['id'] for r in out]
+    assert 'quote' not in out[0]
+
+
+def test_activity_quote_skips_an_automated_first_line(hub, monkeypatch, tmp_path):
+    from khipu import activity
+    configure_hub(monkeypatch, hub)
+    monkeypatch.setattr(activity, 'connect', lambda **kw: hub.connect())
+    eid = _insert(hub, 'claude_code:00000000-0000-0000-0000-000000000701',
+                  [AUTOMATED['system notice'], 'what the owner typed'])
+    only = _insert(hub, 'claude_code:00000000-0000-0000-0000-000000000702', [AUTOMATED['task notification']])
+    by_id = {str(r['id']): r for r in activity.activity_payload(limit=5)['recent']}
+    assert by_id[eid]['quote'] == 'what the owner typed'
+    assert by_id[only]['quote'] is None
+
+
+def test_is_automated_kinds():
+    from khipu.turn_text import is_automated
+    for kind, line in AUTOMATED.items():
+        assert is_automated(line), kind
+    assert is_automated('<cross-session-message>hi</cross-session-message>')
+    assert is_automated('<local-command-stdout>x</local-command-stdout>')
+    for typed in ('test everything ourselves', 'dont stop until we are done',
+                  'what does "This session is being continued" mean?', 'the Delegated task list looks off',
+                  'run a check (scheduled for friday) please', 'use a < b'):
+        assert not is_automated(typed), typed
+
+
+def test_title_uses_the_first_typed_line_when_there_is_no_summary():
+    from khipu import memory_rows as mr
+
+    auto = "Lane check (scheduled, not Matt): look at billing"
+    assert mr.title_of("", [auto, "what the owner typed"]) == "what the owner typed"
+    assert mr.title_of("anything", [auto, "what the owner typed"], verbatim_only=True) == "what the owner typed"
+    assert mr.title_of("", [auto]) == auto
+    assert mr.title_of("Work.", [auto, "what the owner typed"]) == "Work."

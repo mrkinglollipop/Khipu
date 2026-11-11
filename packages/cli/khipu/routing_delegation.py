@@ -51,6 +51,14 @@ from khipu import hook_shape, wire
 # Claude Code's subagent tool (``Task`` in older versions) and Codex's native
 # one (``spawn_agent``).
 AGENT_TOOLS = frozenset({"Agent", "Task", "spawn_agent"})
+# The Claude desktop app's tools that start another conversation from this
+# one (``start_session``) or hand this one's work over to a new one
+# (``hand_off_to_session``): the new conversation's first turn is this call's
+# brief, delivered with no wrapper, so every text field of the call
+# (``prompt``, ``background``, ``remaining_plan``, ``title``) is noted
+# (``note_brief``); no routing push goes with it. Claude Code only
+# (``integrations.CLAUDE_DELEGATION_MATCHER``).
+START_SESSION_TOOLS = frozenset({"mcp__ccd_session__start_session", "mcp__ccd_session__hand_off_to_session"})
 
 
 def _aegis(environ) -> bool:
@@ -73,7 +81,7 @@ def might_delegate(payload: dict) -> bool:
     """Whether this call's tool can hand work on at all, from its name
     alone: no file, setting or module is read."""
     name = _tool_name(payload)
-    return name is not None and (name in AGENT_TOOLS or _is_delegate_task(name))
+    return name is not None and (name in AGENT_TOOLS or name in START_SESSION_TOOLS or _is_delegate_task(name))
 
 
 def delegation_kind(payload: dict) -> str | None:
@@ -494,6 +502,11 @@ def hook_main(raw: str, environ=None) -> tuple[dict, dict | None, str | None]:
 # fixture yet, so every text value in its input long enough to be a brief is
 # noted: a field under any name still marks the job's first turn.
 _BRIEF_FIELDS = {"Agent": ("prompt",), "Task": ("prompt",), "spawn_agent": ("message",)}
+# The field each desktop session tool hands its brief in: noted whatever its
+# length, and kept eight days (``owner_turns.note_brief``'s ``start``). Its other text values keep
+# the four-word floor, so a title or a name never becomes a brief.
+_START_BRIEF_FIELDS = {"mcp__ccd_session__start_session": "prompt",
+                       "mcp__ccd_session__hand_off_to_session": "remaining_plan"}
 
 
 def _texts(value: Any, depth: int = 0) -> list[str]:
@@ -510,13 +523,26 @@ def briefs_of(payload: dict) -> list[str]:
     tool_input = payload.get("tool_input") or payload.get("toolInput")
     if name is None or not isinstance(tool_input, dict):
         return []
-    if _is_delegate_task(name):
+    if name in _START_BRIEF_FIELDS:
+        field = _START_BRIEF_FIELDS[name]
+        brief = start_brief(payload)
+        return ([brief] if brief else []) + _texts({k: v for k, v in tool_input.items() if k != field})
+    if _is_delegate_task(name) or name in START_SESSION_TOOLS:
         return _texts(tool_input)
     if name in _BRIEF_FIELDS:
         for field in _BRIEF_FIELDS[name]:
             if isinstance(tool_input.get(field), str):
                 return [tool_input[field]]
     return []
+
+
+def start_brief(payload: dict) -> str | None:
+    """A desktop session tool's own brief field (``_START_BRIEF_FIELDS``),
+    when it holds text."""
+    tool_input = payload.get("tool_input") or payload.get("toolInput")
+    field = _START_BRIEF_FIELDS.get(_tool_name(payload) or "")
+    value = tool_input.get(field) if field and isinstance(tool_input, dict) else None
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def note_brief(payload: dict, env) -> None:
@@ -530,8 +556,9 @@ def note_brief(payload: dict, env) -> None:
 
         parent = str(hook_shape.session_id(payload))
         harness = owner_turns.harness_of(env, payload)
+        own = start_brief(payload)
         for brief in briefs_of(payload):
-            owner_turns.note_brief(brief, parent=parent, harness=harness)
+            owner_turns.note_brief(brief, parent=parent, harness=harness, start=brief == own)
     except Exception:  # noqa: BLE001 - noting a brief never fails the call
         pass
 

@@ -683,15 +683,8 @@ async fn khipu_t3_antigravity(action: String, project: Option<String>) -> Result
 // read it as a flag). The gateway token travels on stdin. None of these verbs
 // join `ALLOWED_SUBCOMMANDS`.
 
-/// The eight switches in `khipu.features.FEATURES`.
-const FEATURE_NAMES: &[&str] = &[
-    "validity_ranking",
-    "time_interpretation",
-    "relevance_floor",
-    "rerank",
-    "graph_candidates",
-    "routing_push",
-];
+/// The switches in `khipu.features.FEATURES`.
+const FEATURE_NAMES: &[&str] = &["routing_push"];
 
 /// The scheduled jobs `khipu jobs install|uninstall` accepts (`_JOBS_CHOICES`).
 const JOB_NAMES: &[&str] = &[
@@ -5585,7 +5578,7 @@ mod settings_command_tests {
 
     #[test]
     fn every_switch_builds_an_on_and_an_off_argv() {
-        assert_eq!(FEATURE_NAMES.len(), 6);
+        assert_eq!(FEATURE_NAMES.len(), 1);
         for n in FEATURE_NAMES {
             assert_eq!(feature_set_argv(n, true).unwrap(), v(&["features", "--set", n, "on"]));
             assert_eq!(feature_set_argv(n, false).unwrap(), v(&["features", "--set", n, "off"]));

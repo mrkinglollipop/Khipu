@@ -3,7 +3,7 @@
 The replica keeps a forgotten episode's row and text with deleted_at set (the
 hub does the same). Every reader must skip it: keyword and semantic search,
 the stale-replica search payload, get, the graph walk, status counts, the
-session-start slice, the per-prompt recall lane and the graph-candidates leg.
+session-start slice and the per-prompt recall lane.
 
 Each reader runs against a real sqlite replica holding a live control episode
 (which must come back, so no check is vacuous) and the forgotten one, after
@@ -25,7 +25,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from khipu import graph_candidates as gc
 from khipu import hub_snapshot as hs
 from khipu import recall_prompt, recall_rule
 
@@ -72,7 +71,6 @@ class ForgottenEpisodeStaysForgottenInTheReplicaTest(unittest.TestCase):
             mock.patch.object(hs, "meta_path", return_value=self.data / "meta.json"),
             mock.patch("khipu.paths.ensure_data_dir", return_value=self.data),
             mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(self.data / "outbox")}),
-            mock.patch("khipu.features.enabled", side_effect=lambda name: name == "graph_candidates"),
         ):
             stack.enter_context(patch)
         self.reset_caches()
@@ -80,15 +78,10 @@ class ForgottenEpisodeStaysForgottenInTheReplicaTest(unittest.TestCase):
 
     @staticmethod
     def reset_caches():
-        with gc._SLUG_LOCK:
-            gc._SLUG_CACHE.clear()
-            gc._SLUG_RELOADING = False
         hs._MATRIX_CACHE.clear()
 
     def warm_caches(self):
-        """Load the slug map and the vector matrix while episode 2 is live."""
-        gc._rebuild_slug_map(gc._slug_map_key())
-        self.assertIn("billing-service", gc._SLUG_CACHE["map"])
+        """Load the vector matrix while episode 2 is live."""
         self.assertEqual({r["id"] for r in hs.cosine_candidates_snapshot([1.0, 0.0], "p", limit=5)},
                          {"1", "2"})
 
@@ -189,17 +182,6 @@ class ForgottenEpisodeStaysForgottenInTheReplicaTest(unittest.TestCase):
         pushed = recall_rule._stale_project_slice("acme", None)
         self.assertIn("still remembered", pushed)
         self.assertNotIn("deliberately forgotten", pushed)
-
-        con = hs.open_snapshot()
-        try:
-            cands, missed = gc.replica_candidates(
-                con, [{"kind": "topic", "id": "billing-service"}], deadline=time.monotonic() + 5)
-        finally:
-            con.close()
-        self.assertFalse(missed)
-        self.assert_only_the_live_episode(
-            "graph_candidates replica leg", {r["id"] for r in cands if r["kind"] == "episode"},
-            json.dumps(cands, default=str))
 
         with mock.patch.object(hs, "snapshot_is_fresh", return_value=(True, {"exists": True})), \
                 mock.patch.object(hs, "active_snapshot_profile", return_value="p"), \

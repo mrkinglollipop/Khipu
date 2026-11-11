@@ -1447,3 +1447,54 @@ class ReclaimDeadClaimTest(unittest.TestCase):
             mine.write_text("{}")
             self.assertEqual(sc._reclaim_stale(), 0)
             self.assertTrue(mine.is_file())
+
+
+# ---- the Claude desktop app's own host id (2026-11-10) ------------------------------------------
+
+import pytest as _pytest  # noqa: E402
+
+_DESKTOP = {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop", "CLAUDE_CODE_CHILD_SESSION": "1",
+            "CLAUDE_CODE_HOST_SESSION_ID": "local_852a9695-8a4e-43bc-abbd-14284cf79d21"}
+
+
+@_pytest.mark.parametrize("env,launched,origin,parent", [
+    (_DESKTOP, True, "conversation", ""),                                      # the app's own conversation
+    (_DESKTOP, False, "job", "claude_code:local_852a9695-8a4e-43bc-abbd-14284cf79d21"),  # claude -p from its shell
+    ({**_DESKTOP, "KHIPU_JOB": "1"}, True, "job", ""),                         # a runner's job
+    ({**_DESKTOP, "CLAUDE_CODE_ENTRYPOINT": "cli"}, True, "job",
+     "claude_code:local_852a9695-8a4e-43bc-abbd-14284cf79d21"),               # not the desktop app
+    ({**_DESKTOP, "CLAUDE_CODE_HOST_SESSION_ID": "host-parent-1"}, True, "job", "claude_code:host-parent-1"),
+])
+def test_capture_origin_of_a_desktop_conversation(monkeypatch, env, launched, origin, parent):
+    from khipu import owner_turns
+
+    monkeypatch.setattr(owner_turns, "desktop_launched", lambda pid=None: launched)
+    assert sc.capture_origin({}, env, harness="claude_code", sid="f805b2f5-cli") == origin
+    assert sc.parent_session_id({}, env, harness="claude_code", sid="f805b2f5-cli") == parent
+
+
+# ---- a session another session started (review of #568, 2026-11-10) ------------------------------
+
+_NOTES = ("\n\nShared notes folder for this group of sessions (outside the repo; read siblings' notes there, leave "
+          "hand-over notes or large findings there instead of pasting them into messages): /Users/x/notes/abc")
+_STARTS = [
+    "Task (from the session that started this one):\nContinue the task you were in the middle of in this "
+    "conversation - it was handed to you so the user could keep talking in the original session. Pick up exactly "
+    "where the work stopped and finish it. Remaining plan:\n\nFix the recorder tests",
+    "Background (from the session that started this one):\nThe owner asked for the recorder; this session builds "
+    "it.\n\nTask:\nFix the recorder tests" + _NOTES,
+    "Fix the recorder tests" + _NOTES,
+]
+
+
+@_pytest.mark.parametrize("first", _STARTS)
+def test_a_started_sessions_first_turn_is_a_machine_message_that_keeps_its_brief(first):
+    rows = [{"type": "user", "message": {"role": "user", "content": first}},
+            {"type": "assistant", "message": {"role": "assistant", "content": "On it."}}]
+    with tempfile.TemporaryDirectory() as td:
+        msgs, _, users = sc.read_window(_write(Path(td) / "started.jsonl", rows), 0)
+    assert users == 0
+    user = [text for role, text in msgs if role == "user"]
+    assert len(user) == 1 and user[0].startswith("[notification: session-start]")
+    assert "Fix the recorder tests" in user[0]
+    assert sc._machine_user_message("Fix the recorder tests, then pause Codex") is None

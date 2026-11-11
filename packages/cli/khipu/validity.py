@@ -170,25 +170,15 @@ def is_historical(query: str | None, since: Any = None, until: Any = None) -> bo
 
 
 def apply_ranking(rows: list[dict[str, Any]], historical: bool = False) -> list[dict[str, Any]]:
-    """When the ``validity_ranking`` switch is on and ``historical`` is
-    False, multiply the score of episode rows whose state is superseded or
+    """When ``historical`` is False, multiply the score of episode rows whose state is superseded or
     retracted by ``recency.STATUS_DERANK`` and re-sort stably. Mixed episodes
     are never de-ranked (a mixed episode is still current work, just not
     exclusively). Topic rows are left to ``recency.apply_project_and_status``,
     which already de-ranks them — never applied twice.
 
-    With the switch off (its default) or a historical query, ``rows`` comes
-    back exactly as given — this is the one place the switch itself is
-    checked, so no caller has to duplicate that check.
+    For a historical query, ``rows`` comes back exactly as given.
     """
     if not rows:
-        return rows
-    try:
-        from khipu import features
-
-        if not features.enabled("validity_ranking"):
-            return rows
-    except Exception:  # noqa: BLE001 — a switch-lookup failure must never rank differently
         return rows
     if historical:
         return rows
