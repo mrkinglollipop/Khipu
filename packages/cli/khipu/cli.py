@@ -2500,6 +2500,10 @@ def cmd_needs_you(args: argparse.Namespace) -> int:
     """The local owner list in the same words the app and MCP use."""
     from khipu import needs_you, owner_act, routing
 
+    if getattr(args, "from_app", False) or getattr(args, "answer", None):
+        from khipu import needs_you_app
+
+        return needs_you_app.run_cli(args)
     selector = args.item or args.yes or args.no
     if selector:
         found = _needs_item(selector)
@@ -5185,6 +5189,9 @@ def build_parser() -> argparse.ArgumentParser:
     choose.add_argument("--item", metavar="KEY_OR_NUMBER", help="Show one item whole by stable key or list number")
     choose.add_argument("--yes", metavar="KEY_OR_NUMBER", help="Keep the displayed item after a terminal yes")
     choose.add_argument("--no", metavar="KEY_OR_NUMBER", help="Decline or undo the displayed item after a terminal yes")
+    choose.add_argument("--answer", nargs=2, metavar=("KEY", "YES_OR_NO"), help=argparse.SUPPRESS)
+    ny.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    ny.add_argument("--expect", metavar="PIN", help=argparse.SUPPRESS)
     ny.set_defaults(func=cmd_needs_you)
 
     storage_p = sub.add_parser("storage", help="Free disk space and what Khipu holds, as JSON (read-only)")
