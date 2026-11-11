@@ -3080,11 +3080,16 @@ def cmd_project_alias(args: argparse.Namespace) -> int:
 
 def cmd_hygiene(args: argparse.Namespace) -> int:
     """W5.2: `khipu hygiene paths [--dry-run|--apply]`, plus
-    `historical commitment cleanup` (Owed quality, 2026-09-04)."""
+    `historical commitment cleanup` (Owed quality, 2026-09-04), and
+    `khipu hygiene blank-field` (khipu/blank_field.py)."""
+    if getattr(args, "hygiene_cmd", None) == "blank-field":
+        from khipu import blank_field
+
+        return blank_field.main(args)
     if getattr(args, "hygiene_cmd", None) != "paths":
         print(json.dumps({
             "ok": False,
-            "error": "usage: khipu hygiene paths [--dry-run|--apply]",
+            "error": "usage: khipu hygiene paths [--dry-run|--apply] | blank-field ...",
         }))
         return 2
     from khipu.db import connect
@@ -6085,6 +6090,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply", dest="apply", action="store_true",
         help="Actually delete the failing path: nodes (destructive; needs an explicit go)",
     )
+    hy_blank = hy_sub.add_parser(
+        "blank-field",
+        help="Empty one stored field (preferences or owner_lines) on the episode ids listed in a file, "
+             "with a backup first; --restore puts a backup back. Dry run without --apply",
+    )
+    hy_blank.add_argument("--field", choices=("preferences", "owner_lines"))
+    hy_blank.add_argument("--ids-file", dest="ids_file", help="One episode id per line")
+    hy_blank.add_argument("--backup", help="Backup file to create before any row changes (never overwritten)")
+    hy_blank.add_argument("--restore", metavar="BACKUP", help="Put back what this backup file holds")
+    hy_blank.add_argument("--apply", action="store_true", default=False,
+                          help="Change rows (without it: counts only, nothing changes)")
     hy.set_defaults(func=cmd_hygiene)
 
     nt = sub.add_parser("notes", help="Index harness-native per-project notes as topics (memory reliability W4)")
