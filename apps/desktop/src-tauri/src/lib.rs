@@ -2883,6 +2883,93 @@ fn route_override_argv(verb: &str, id: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+/// The conversation a run-ahead is for, as the picker handed it back (`route override candidates`): only the
+/// fields a subject has, each checked, rebuilt into a fresh object so nothing else can ride along. Only a
+/// conversation (a T3 thread or a session) can be let run ahead from the app, never a whole folder.
+fn checked_override_subject(subject: &Value) -> Result<String, String> {
+    let bad = || "that is not a conversation Khipu offered".to_string();
+    let object = subject.as_object().ok_or_else(bad)?;
+    if object.keys().any(|k| !matches!(k.as_str(), "kind" | "id" | "harness" | "mac")) {
+        return Err(bad());
+    }
+    let kind = object.get("kind").and_then(Value::as_str).ok_or_else(bad)?;
+    if kind != "thread" && kind != "session" {
+        return Err(bad());
+    }
+    let id = object.get("id").and_then(Value::as_str).ok_or_else(bad)?;
+    let id_ok = !id.is_empty()
+        && id.len() <= 128
+        && id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'));
+    if !id_ok {
+        return Err(bad());
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("kind".to_string(), Value::String(kind.to_string()));
+    out.insert("id".to_string(), Value::String(id.to_string()));
+    if let Some(harness) = object.get("harness").filter(|v| !v.is_null()) {
+        let h = harness.as_str().ok_or_else(bad)?;
+        if h.is_empty() || h.len() > 30 || !h.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+            return Err(bad());
+        }
+        out.insert("harness".to_string(), Value::String(h.to_string()));
+    }
+    if let Some(mac) = object.get("mac").filter(|v| !v.is_null()) {
+        let m = mac.as_str().ok_or_else(bad)?;
+        if m.len() != 32 || !m.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+            return Err(bad());
+        }
+        out.insert("mac".to_string(), Value::String(m.to_string()));
+    }
+    serde_json::to_string(&Value::Object(out)).map_err(|_| bad())
+}
+
+/// Let one conversation run ahead of pace on an account until a time: `route override --from-app grant ACCOUNT
+/// --subject=JSON --until=T`. The end is required: the app offers no grant without one, and the CLI refuses a
+/// grant that has neither an end nor `--indefinite` (which the app never sends), so every grant lapses by itself.
+fn route_override_grant_argv(account: &str, subject: &Value, until: &str) -> Result<Vec<String>, String> {
+    let mut argv = route_base("override");
+    argv.extend([
+        "grant".to_string(),
+        checked_route_account(account)?,
+        format!("--subject={}", checked_override_subject(subject)?),
+        format!("--until={}", checked_route_until(until)?),
+    ]);
+    Ok(argv)
+}
+
+/// What the picker lists for one account: `route override --from-app candidates --account=KEY`.
+fn route_override_candidates_argv(account: &str) -> Result<Vec<String>, String> {
+    let mut argv = route_base("override");
+    argv.extend(["candidates".to_string(), format!("--account={}", checked_route_account(account)?)]);
+    Ok(argv)
+}
+
+/// One change to an override from the app: `end` and `keep` name an override's id; `grant` names the account,
+/// the conversation the picker offered and an end time, and no id.
+fn route_override_act_argv(
+    verb: &str,
+    id: Option<&str>,
+    account: Option<&str>,
+    subject: Option<&Value>,
+    until: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let id = id.map(str::trim).filter(|v| !v.is_empty());
+    if verb == "grant" {
+        if id.is_some() {
+            return Err("a new run-ahead has no id yet".to_string());
+        }
+        let account = account.ok_or_else(|| "name the account".to_string())?;
+        let subject = subject.ok_or_else(|| "name the conversation".to_string())?;
+        let until = until.ok_or_else(|| "a run-ahead needs an end time".to_string())?;
+        return route_override_grant_argv(account, subject, until);
+    }
+    if account.is_some() || subject.is_some() || until.is_some() {
+        return Err(format!("not a change to an override: {verb:?}"));
+    }
+    route_override_argv(verb, id.ok_or_else(|| "name the override".to_string())?)
+}
+
 fn route_cleanup_walk_argv(leave: Option<&str>, keep: Option<&str>, restart: bool) -> Result<Vec<String>, String> {
     let mut argv = route_base("override");
     argv.push("walk".to_string());
@@ -2915,9 +3002,21 @@ async fn khipu_route_override_view() -> Result<String, String> {
     run_khipu_cli_async(argv).await
 }
 
+/// `end` or `keep` (with `id`), or `grant` (with `account`, `subject`, `until`; no `id`).
 #[tauri::command]
-async fn khipu_route_override_act(verb: String, id: String) -> Result<String, String> {
-    run_khipu_cli_async(route_override_argv(&verb, &id)?).await
+async fn khipu_route_override_act(
+    verb: String,
+    id: Option<String>,
+    account: Option<String>,
+    subject: Option<Value>,
+    until: Option<String>,
+) -> Result<String, String> {
+    run_khipu_cli_async(route_override_act_argv(&verb, id.as_deref(), account.as_deref(), subject.as_ref(), until.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_route_override_candidates(account: String) -> Result<String, String> {
+    run_khipu_cli_async(route_override_candidates_argv(&account)?).await
 }
 
 #[tauri::command]
@@ -5492,6 +5591,7 @@ pub fn run() {
             khipu_route_hold_end,
             khipu_route_override_view,
             khipu_route_override_act,
+            khipu_route_override_candidates,
             khipu_route_cleanup_walk,
             khipu_route_exception_end,
             khipu_route_cap,
@@ -6349,6 +6449,39 @@ mod settings_command_tests {
         assert_eq!(route_override_argv("end", "abc-123").unwrap(), v(&["route", "override", "--from-app", "end", "abc-123"]));
         assert!(route_override_argv("grant", "abc-123").is_err());
         assert!(route_override_argv("end", "--all").is_err());
+        let who = serde_json::json!({"kind": "thread", "id": "t-123abc", "mac": "0123456789abcdef0123456789abcdef"});
+        let end = "2026-11-10T21:00:00Z";
+        let grant = route_override_act_argv("grant", None, Some("Codex"), Some(&who), Some(end)).unwrap();
+        assert_eq!(&grant[..5], &v(&["route", "override", "--from-app", "grant", "Codex"])[..]);
+        assert_eq!(grant[5], format!("--subject={}", serde_json::to_string(&who).unwrap()));
+        assert_eq!(grant[6], format!("--until={end}"));
+        assert_eq!(grant.len(), 7);
+        assert_eq!(
+            route_override_act_argv("end", Some("abc-123"), None, None, None).unwrap(),
+            v(&["route", "override", "--from-app", "end", "abc-123"])
+        );
+        // A grant with no end, an id, a folder, an extra key or a flag-shaped value is refused; so is an end or a
+        // subject on an end.
+        assert!(route_override_act_argv("grant", None, Some("Codex"), Some(&who), None).is_err());
+        assert!(route_override_act_argv("grant", Some("abc-123"), Some("Codex"), Some(&who), Some(end)).is_err());
+        assert!(route_override_act_argv("grant", None, Some("--all"), Some(&who), Some(end)).is_err());
+        assert!(route_override_act_argv("grant", None, Some("Codex"), Some(&who), Some("1h")).is_err());
+        assert!(route_override_act_argv("grant", None, Some("Codex"), Some(&who), Some("2026-11-10T21:00:00Z\n--x")).is_err());
+        assert!(route_override_act_argv("grant", None, Some("Codex"), None, Some(end)).is_err());
+        let folder = serde_json::json!({"kind": "project", "id": "khipu"});
+        assert!(route_override_act_argv("grant", None, Some("Codex"), Some(&folder), Some(end)).is_err());
+        let extra = serde_json::json!({"kind": "session", "id": "abc12345", "children": false});
+        assert!(route_override_act_argv("grant", None, Some("Codex"), Some(&extra), Some(end)).is_err());
+        let flag = serde_json::json!({"kind": "session", "id": "--owner"});
+        assert!(route_override_act_argv("grant", None, Some("Codex"), Some(&flag), Some(end)).is_err());
+        assert!(route_override_act_argv("end", Some("abc-123"), None, None, Some(end)).is_err());
+        assert!(route_override_act_argv("end", None, None, None, None).is_err());
+        assert!(route_override_act_argv("walk", Some("abc-123"), None, None, None).is_err());
+        assert_eq!(
+            route_override_candidates_argv("Codex").unwrap(),
+            v(&["route", "override", "--from-app", "candidates", "--account=Codex"])
+        );
+        assert!(route_override_candidates_argv("--all").is_err());
         assert_eq!(
             route_cleanup_walk_argv(Some("dup:codex|:xaa111"), None, false).unwrap(),
             v(&["route", "override", "--from-app", "walk", "--leave=dup:codex|:xaa111"])
