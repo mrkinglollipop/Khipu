@@ -19,6 +19,17 @@ import {
 } from "../accounts/accountsModel";
 import type { Pace, RouteAccount, RouteView } from "../routing";
 
+it("shows a successful usage row's same-account note in the existing warning line", () => {
+  const a = account();
+  const note = "Reads the same account as Claude second: both folders are signed in to one account. Sign one of them in to the other account.";
+  expect(rowModel(a, { accounts: [a] }, { accounts: [
+    { key: a.key, ok: true, same_account_as: "Claude second", note },
+  ] }, 0, NOW)).toMatchObject({ line: note, word: "Same account", tone: "warn", left: null });
+  expect(rowModel(a, { accounts: [a] }, { accounts: [
+    { key: a.key, ok: true },
+  ] }, 0, NOW).word).not.toBe("Same account");
+});
+
 const NOW = new Date("2026-11-10T19:00:00Z"); // 2:00 PM in New York
 const at = (min: number) => new Date(NOW.getTime() + min * 60_000).toISOString();
 

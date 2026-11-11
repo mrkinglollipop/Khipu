@@ -210,6 +210,10 @@ export function rowModel(
   const stop = stopAt(a);
   const base = { key: a.key, label: a.label, sub: stopAtLine(stop), left: null, stopAtPct: null, ahead };
   const state = accountState(a, now);
+  const usage = plans?.accounts?.find((row) => row.key === a.key);
+  if (usage?.same_account_as && usage.note) {
+    return { ...base, kind: "unknown", line: usage.note, word: "Same account", tone: "warn" };
+  }
   switch (a.state) {
     case "paused":
       return { ...base, kind: "paused", line: state.text, word: "Paused", tone: "none" };

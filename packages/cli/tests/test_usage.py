@@ -35,6 +35,9 @@ FAKE_CLI = textwrap.dedent("""
     import json, os, subprocess, sys, time
     SENTINEL = "SENTINEL-c0ffee-do-not-leak"
     fixture, mode, out = sys.argv[1], sys.argv[2], sys.argv[3]
+    if sys.argv[4:6] == ["auth", "status"]:
+        print(json.dumps({"loggedIn": False}))
+        sys.exit(1)
     turn = "--max-turns" in sys.argv  # Claude's one-turn fallback: its own fixture and record
     muse_turn = "--disable-shell" in sys.argv  # Muse's one-turn host: the same, answered over stdin
     if turn or muse_turn:

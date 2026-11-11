@@ -185,6 +185,8 @@ def _hold_words(hold: dict, width: int, now: datetime, r) -> str:
 
 def _status(entry: dict, provider: dict, windows: list[dict], holds: list[dict], last: bool, widths,
             now: datetime, r) -> str:
+    if entry.get("_same_account_later"):
+        return "SAME ACCOUNT"
     state = entry.get("state")
     until = r._parse(entry.get("until"))
     window = windows[0] if windows else None
@@ -229,6 +231,10 @@ def _account_text(label: str, entry: dict, item: dict | None, *, number, holds: 
     provider = providers.get(entry.get("harness")) or providers.get(entry["key"].partition(":")[0]) or {}
     status = _status(entry, provider, windows, holds, last, widths, now, r)
     parts = []
+    if entry.get("_same_account_as"):
+        from khipu.usage import same_account_note
+
+        parts.append(same_account_note(entry["_same_account_as"]))
     if window is not None:
         text = f"{_pct(window['left'])}% {_WINDOW_WORDS.get(window['name'], '')} left".replace("%  left", "% left")
         text += f", resets {r._clock(window['resets'], now)}"
@@ -336,8 +342,16 @@ def _render(view: dict, now: datetime, conversation: dict, readings: dict, rules
              "know better, and say why.", ""]
     lines.append("ACCOUNTS, in the owner's order. Take the first with room that fits the work.")
     overridden = []
+    same = ((view.get("sources") or {}).get("usage") or {}).get("same_accounts") or {}
+    labels = {e["key"]: e["label"] for e, _item in (*ordered, *extra)}
+    seen_accounts = set()
 
     def line(entry, item, number, last):
+        peers = [key for key in same.get(entry["key"], []) if key in labels]
+        if peers:
+            entry = dict(entry, _same_account_as=", ".join(labels[key] for key in peers),
+                         _same_account_later=any(key in seen_accounts for key in peers))
+        seen_accounts.add(entry["key"])
         label = r._account_label(entry["label"], entry.get("key"), view=view)
         mine = [h for h in holds if (h.get("scope") or {}).get("kind") == "account"
                 and (h.get("scope") or {}).get("account") == entry["key"]]

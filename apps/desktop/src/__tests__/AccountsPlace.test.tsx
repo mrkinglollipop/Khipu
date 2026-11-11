@@ -89,6 +89,23 @@ beforeEach(() => {
 });
 afterEach(() => cleanup());
 
+it("renders the same-account warning for both successful usage rows", async () => {
+  accounts = [claude(), claude({ key: "claude|/synthetic/second", label: "Claude second" })];
+  const notes = accounts.map((a, i) => ({ key: a.key, ok: true,
+    same_account_as: accounts[1 - i].label,
+    note: `Reads the same account as ${accounts[1 - i].label}: both folders are signed in to one account. Sign one of them in to the other account.`,
+  }));
+  function SameAccounts() {
+    const routing = useRouting(true);
+    return <Accounts routing={routing} plans={{ accounts: notes }} thisMac="M5" now={NOW} />;
+  }
+  const { container } = render(<SameAccounts />);
+  await waitFor(() => expect(screen.getAllByText("Same account").length).toBeGreaterThanOrEqual(2));
+  for (const row of notes) expect(screen.getAllByText(row.note).length).toBeGreaterThanOrEqual(1);
+  expect(container.querySelectorAll(".ac-pace.warn")).toHaveLength(2);
+  expect(writes()).toEqual([]);
+});
+
 function Place() {
   const routing = useRouting(true);
   return <Accounts routing={routing} plans={null} thisMac="M5" now={NOW} />;

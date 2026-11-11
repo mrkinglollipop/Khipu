@@ -1806,7 +1806,12 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
                 out.append(dict(base, id="p" + _sid(key, scope, "open", _iso(at)), state="open", until=None,
                                 basis="checked", window=None, used_pct=top,
                                 evidence=f"usage probe: highest window at {top}%"))
-    return out, {"accounts": accounts_read, "newest": _iso(newest)}
+    status = {"accounts": accounts_read, "newest": _iso(newest)}
+    same = usage.same_account_groups({key: row for key, row in rows.items()
+                                     if configured is None or key in configured})
+    if same:
+        status["same_accounts"] = same
+    return out, status
 
 
 # ---- the routing table (a pointer, never account state) ------------------------------

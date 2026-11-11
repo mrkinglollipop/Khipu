@@ -761,15 +761,43 @@ def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S, t
     frames = _converse([binary, *_CLAUDE_ARGS], messages, _claude_is_answer, env=env, deadline=deadline,
                        close_stdin=True)
     try:
-        return parse_claude(frames)
+        data = parse_claude(frames)
     except ProbeError as exc:
         if exc.code != E_NO_FIGURES or not turn or not _turn_due(config_dir):
             raise
-    # probe_all stops every probe OVERALL_GRACE_S after its timeout; the turn
-    # ends just before that, so a slow turn reads as missing figures.
-    turn = _claude_turn(binary, env, deadline + OVERALL_GRACE_S - 0.25)
-    plan = _text(_dict(_dict(frames[-1], "response"), "response").get("subscription_type"))
-    return dict(turn, plan=plan) if turn else {"ok": False, "error": E_NO_FIGURES}
+        # Keep the existing turn budget; identity is optional and uses only
+        # whatever time remains after the figures have been read.
+        observed = _claude_turn(binary, env, deadline + OVERALL_GRACE_S - 0.25)
+        plan = _text(_dict(_dict(frames[-1], "response"), "response").get("subscription_type"))
+        data = dict(observed, plan=plan) if observed else {"ok": False, "error": E_NO_FIGURES}
+    digest = _claude_identity(binary, config_dir, min(time.monotonic() + 1.5, deadline + OVERALL_GRACE_S - 0.25))
+    if digest:
+        data["account_digest"] = digest
+    return data
+
+
+def _claude_identity(binary: str, home: str | None, deadline: float) -> str | None:
+    """Reuse discovery's bounded auth-status runner; hash (email, orgId),
+    so one person's separate organizations are not called the same plan.
+    No CLI text, including stderr, escapes this optional bounded read."""
+    if deadline <= time.monotonic():
+        return None
+    from khipu import discover
+
+    try:
+        result = discover.run_once("claude", (binary, *discover.STATUS_ARGV["claude"]), home=home,
+                                   timeout=max(0.001, deadline - time.monotonic()), run=getattr(_local, "run", None))
+        if result["outcome"] != "exited" or result["code"] != 0:
+            return None
+        status = json.loads(result["out"])
+        if not isinstance(status, dict) or status.get("loggedIn") is not True:
+            return None
+        email, org = status.get("email"), status.get("orgId")
+        if not all(isinstance(v, str) and v.strip() for v in (email, org)):
+            return None
+        return _account_digest("claude", json.dumps([email.strip().casefold(), org.strip()]))
+    except Exception:  # noqa: BLE001 — optional identity never makes the usage row fail
+        return None
 
 
 # Claude Code answers get_usage from its own usage endpoint. When that endpoint
@@ -3208,6 +3236,8 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
             data["account_digest"] = digest
         else:
             data.pop("account_digest", None)
+        if harness in ("claude", "grok"):
+            data["account_identity_ok"] = bool(digest)
         row = _blank_row(account)
         row.update(data)
         row.update({"probed_at": _iso(_now().timestamp()), "ms": int((time.monotonic() - started) * 1000)})
@@ -3392,6 +3422,18 @@ def _prev_after_roll(previous: dict | None, row: dict) -> dict:
 
 
 def _merge(previous: dict | None, row: dict) -> dict:
+    out = _merge_figures(previous, row)
+    # Identity follows this attempt, independently of which figures were
+    # kept. A missing identity preserves the hash but is not a fresh match.
+    if row.get("harness") in ("claude", "grok"):
+        digest = row.get("account_digest") or (previous or {}).get("account_digest")
+        if digest:
+            out["account_digest"] = digest
+        out["account_identity_ok"] = row.get("account_identity_ok") is True
+    return out
+
+
+def _merge_figures(previous: dict | None, row: dict) -> dict:
     """A good probe replaces figures only when they are at least as recent.
     A failed live read keeps newer good figures even if a fallback succeeds.
     A failed probe keeps the last good figures
@@ -3778,8 +3820,35 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
                 pace = None if window.get("expired") else even_pace(window, now)
                 if pace:
                     window["pace"] = pace
+    mark_same_accounts(rows)
     return {"generated_at": _iso(now.timestamp()), "max_age_s": max_age, "refreshing": refreshing,
             "accounts": rows, "summary_text": [summary_line(r) for r in rows]}
+
+
+def same_account_groups(rows: dict[str, dict]) -> dict[str, list[str]]:
+    """Only current, successful CLI identity readings can establish a match."""
+    groups: dict[tuple, list[str]] = {}
+    for key, row in rows.items():
+        digest = row.get("account_digest")
+        if (row.get("harness") in ("claude", "grok") and row.get("account_identity_ok") is True
+                and isinstance(digest, str) and re.fullmatch(r"sub:[0-9a-f]{24}", digest)):
+            groups.setdefault((row["harness"], digest), []).append(key)
+    return {key: [other for other in group if other != key]
+            for group in groups.values() if len(group) > 1 for key in group}
+
+
+def same_account_note(label: str) -> str:
+    return (f"Reads the same account as {label}: both folders are signed in to one account. "
+            "Sign one of them in to the other account.")
+
+
+def mark_same_accounts(rows: list[dict]) -> None:
+    by_key = {row["key"]: row for row in rows}
+    for key, others in same_account_groups(by_key).items():
+        row = by_key[key]
+        row["same_account_as"] = ", ".join(by_key[other]["account"] for other in others)
+        warning = same_account_note(row["same_account_as"])
+        row["note"] = f"{warning} {row['note']}" if row.get("note") else warning
 
 
 # What a conversation sees of a row (``khipu_usage``): an allowlist, so a field
@@ -3787,7 +3856,7 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
 # or any path: conversations reach other model providers (slice 9A).
 _PUBLIC_ROW_FIELDS = ("harness", "account", "plan", "ok", "error", "live_error", "last_error", "version",
                       "source", "via", "source_note", "observed_at", "probed_at", "last_attempt_at",
-                      "last_good_at", "ms", "cached", "stale", "refreshing")
+                      "last_good_at", "ms", "cached", "stale", "refreshing", "same_account_as")
 _PUBLIC_WINDOW_FIELDS = ("name", "used_pct", "resets_at", "window_mins", "model", "expired", "pace")
 INVALID_PUBLIC_NOTE = "This account entry is not valid; the owner can fix it in Khipu's Settings"
 
@@ -3829,6 +3898,9 @@ def public_row(row: dict) -> dict:
         if note is not None and note not in own:
             note = _note(error, harness, home)
     out["note"] = note
+    if out.get("same_account_as"):
+        warning = same_account_note(out["same_account_as"])
+        out["note"] = f"{warning} {note}" if note else warning
     return out
 
 
@@ -4022,6 +4094,8 @@ def summary_line(row: dict) -> str:
         text += f" [probe failed: {row.get('error')}]"
     if row.get("stale"):
         text += " [stale]"
+    if row.get("same_account_as") and windows:
+        text += "; " + same_account_note(row["same_account_as"])
     return text
 
 

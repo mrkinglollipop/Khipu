@@ -52,6 +52,7 @@ export type UsageAccount = {
   ok?: boolean;
   error?: string | null;
   note?: string | null;
+  same_account_as?: string | null;
   probed_at?: string | null;
   ms?: number | null;
   last_attempt_at?: string | null;

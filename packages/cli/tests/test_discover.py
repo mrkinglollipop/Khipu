@@ -977,7 +977,8 @@ def test_try_reads_an_unsaved_account_once_and_never_writes_the_cache(mac):
     folder = mac.folder(".claude-client")
     out = discover.try_account("claude", "~/.claude-client")
     assert out["ok"] is True and out["row"]["plan"] == "max" and out["row"]["home"] == str(folder)
-    assert mac.calls("claude") == [(str(folder), " ".join(usage._CLAUDE_ARGS))]
+    assert mac.calls("claude") == [(str(folder), " ".join(usage._CLAUDE_ARGS)),
+                                   (str(folder), " ".join(discover.STATUS_ARGV["claude"]))]
     assert discover.try_account("codex", "~/.codex-missing") == {"ok": False, "error": "folder_not_found"}
     assert len(mac.calls("codex")) == 0
     assert discover.try_account("muse", "~/.claude-client") == {"ok": False, "error": "muse_folder"}
