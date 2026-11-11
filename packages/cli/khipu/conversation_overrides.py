@@ -236,6 +236,10 @@ def grant(values: dict, *, now: datetime | None = None) -> dict:
     subj = values.get("subject")
     if not isinstance(subj, dict) or subj.get("kind") not in ("thread", "session", "project") or not isinstance(subj.get("id"), str):
         raise routing.RouteError("an override needs the conversation subject shown in its ask")
+    if not subj.get("mac"):
+        # Frozen before this Mac had an identity.  This log is this Mac's alone (never copied to the hub), so
+        # the conversation is this Mac's: name it now, or the first routing write would leave the grant unmatched.
+        subj = dict(subj, mac=routing._ensure_local_mac())
     if values.get("effect") != "ahead_of_pace":
         raise routing.RouteError("effect must be ahead_of_pace")
     indefinite = values.get("indefinite") is True
@@ -314,6 +318,113 @@ def restore(*, ended: str | None = None, review: dict | None = None, now: dateti
         return [row], row
 
     return _append(make, now)
+
+
+# ---- the run-ahead picker's candidates --------------------------------------------------------
+
+CANDIDATE_HOURS = 24
+CANDIDATES_MOST = 50
+# A conversation's harness -> the account provider it spends from (``routing._provider_id`` folds Cursor into Grok).
+_HARNESS_PROVIDER = {"claude_code": "claude", "codex": "codex", "cursor": "grok", "aegis": "grok"}
+
+
+def _on_account(harness: str, key: str, known: list[dict], lane_map: dict) -> bool:
+    """Whether a conversation of this harness may be on the account ``key``: the lane map when it names one for
+    the harness, else the provider's accounts (every one of them when the provider has more than one)."""
+    provider = _HARNESS_PROVIDER.get(harness)
+    if provider is None:
+        return False
+    try:
+        found = routing.resolve_lane(harness, provider, lane_map, known, {"kind": provider})
+    except Exception:  # noqa: BLE001 - fall back to the provider alone
+        found = {"key": None, "candidates": [a["key"] for a in known if routing._provider_id(a["harness"]) == provider]}
+    return found.get("key") == key or (found.get("key") is None and key in (found.get("candidates") or []))
+
+
+def _title(subj: dict, harness: str, project: str | None) -> str:
+    """The name the owner knows the conversation by: its T3 title, else its tool and folder name."""
+    if subj.get("kind") == "thread":
+        try:
+            from khipu import t3
+            title = t3.thread_title(subj["id"])
+        except Exception:  # noqa: BLE001
+            title = None
+        if title:
+            return title
+    words = f"{routing.HARNESS_WORDS.get(harness, 'A')} conversation"
+    return f"{words} in {project}" if project else words
+
+
+def candidates(account: str, *, now: datetime | None = None) -> list[dict]:
+    """The conversations that could be let run ahead on ``account``: ones the owner typed in during the last day
+    on this Mac whose tool spends from it.  Each is ``{subject, title, mac, last_active}`` and nothing else: no
+    prompt, path or transcript text.  Read from the owner-turn record (facts about each turn, never its words),
+    so a helper, a dispatched job or a machine message is never offered.  An account with none gives ``[]``."""
+    from khipu import mac_names, owner_turns
+
+    now = _now(now)
+    key = routing._resolve_account_key(_clean(account, "account", 128))
+    known = routing.accounts()
+    lane_map = routing.settings().get("routing_lane_map") or {}
+    oldest = now.timestamp() - CANDIDATE_HOURS * 3600
+    seen: dict[tuple, dict] = {}
+    try:
+        files = sorted(owner_turns.folder().glob("*.jsonl"))
+    except OSError:
+        return []
+    for path in files:
+        if path.name == "briefs.jsonl":
+            continue
+        for turn in owner_turns._read_lines(path):
+            ts, session, harness = turn.get("ts"), turn.get("session"), turn.get("harness")
+            if (isinstance(ts, bool) or not isinstance(ts, (int, float)) or ts < oldest or ts > now.timestamp() + 60
+                    or not isinstance(session, str) or not session or not isinstance(harness, str)
+                    or not turn.get("typed") or any(turn.get(f) for f in ("machine", "wrapped", "helper", "dispatched",
+                                                                        "delegated", "duplicate_of"))):
+                continue
+            then = seen.setdefault((harness, session), {"ts": 0.0, "cwd": None})
+            if ts >= then["ts"]:
+                then.update(ts=float(ts), cwd=turn.get("cwd") if isinstance(turn.get("cwd"), str) else None)
+    if seen:
+        routing._ensure_local_mac()  # an offered subject names the Mac a grant for it is matched on, before and after
+    mac = mac_names.this_mac()
+    out: dict[tuple, dict] = {}
+    for (harness, session), info in sorted(seen.items(), key=lambda kv: -kv[1]["ts"]):
+        if not _on_account(harness, key, known, lane_map):
+            continue
+        project = routing._project_name(info["cwd"])
+        subj, _why = subject({"harness": harness, "session": session, "project": project})
+        if subj is None:
+            continue  # Khipu can't prove who this is, so a grant could never match it
+        subj = {k: subj[k] for k in ("kind", "id", "harness", "mac") if subj.get(k) is not None}
+        row = out.setdefault((subj["kind"], subj["id"]), {"subject": subj, "title": _title(subj, harness, project),
+                                                           "mac": mac, "last_active": _iso(datetime.fromtimestamp(info["ts"], timezone.utc))})
+        if info["ts"] > (_parse(row["last_active"]) or now).timestamp():
+            row["last_active"] = _iso(datetime.fromtimestamp(info["ts"], timezone.utc))
+        if len(out) >= CANDIDATES_MOST:
+            break
+    return sorted(out.values(), key=lambda r: r["last_active"], reverse=True)
+
+
+def candidates_cli(args) -> int:
+    """``khipu route override candidates --account KEY --from-app``: the picker's read.  For the app only, like
+    ``list``: conversation titles are the owner's to see.  ``{"ok": true, "candidates": [...]}``."""
+    from khipu import routing as r
+
+    def say(data: dict, code: int) -> int:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return code
+
+    if not getattr(args, "from_app", False) or not r._caller()["app"]:
+        return say({"ok": False, "error": "Only the Khipu app lists the conversations that could run ahead."}, 2)
+    try:
+        account = getattr(args, "account", None)
+        if not account:
+            raise routing.RouteError("candidates needs --account")
+        found = candidates(account)
+    except routing.RouteError as err:
+        return say({"ok": False, "error": str(err)}, 2)
+    return say({"ok": True, "candidates": found}, 0)
 
 
 # ---- advice ----------------------------------------------------------------------------------
