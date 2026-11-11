@@ -2450,6 +2450,14 @@ def cmd_route(args: argparse.Namespace) -> int:
     return routing.run_cli(args)
 
 
+def cmd_route_say(args: argparse.Namespace) -> int:
+    """`khipu route say --from-app --preview WORDS | --apply TOKEN`: say a
+    change to the order or the rules, see it, save it (the app's entry)."""
+    from khipu import routing_say
+
+    return routing_say.run_cli(args)
+
+
 def _needs_item(selector: str) -> tuple[dict, dict, int] | None:
     """One whole needs-you item by stable key or 1-based list number.
 
@@ -5805,10 +5813,14 @@ def build_parser() -> argparse.ArgumentParser:
                                parents=[rt_json])
     rpause.add_argument("account")
     rpause.add_argument("--until", default=None, metavar="T")
+    rpause.add_argument("--expect", default=None, metavar="PIN",
+                        help="The account's pause as read; refused if it changed since")
     rpause.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rpause)
     rlift = rt_sub.add_parser("lift", help="Owner: lift a pause (asks for a typed confirmation)", parents=[rt_json])
     rlift.add_argument("account")
+    rlift.add_argument("--expect", default=None, metavar="PIN",
+                       help="The account's pause as read; refused if it changed since")
     rlift.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rlift)
     rclear = rt_sub.add_parser("clear", help="Owner: clear an account, or dismiss one report (--report ID)",
@@ -5881,7 +5893,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="A conversation: the owner's request, in one line (rule add or edit; stays unconfirmed)")
     rrule.add_argument("--base", default=None, help="Owner revision read when preparing a rule edit request")
     rrule.add_argument("--expect", default=None, metavar="REVISION",
-                       help="Rule revision shown when confirming; refused if it changed since")
+                       help="Rule revision shown when confirming (add: the rules as read); refused if it changed since")
     rrule.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rrule)
 
@@ -5922,8 +5934,15 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Check allowance: only caller-declared sensitive code")
     rcap.add_argument("--until", default=None, metavar="T",
                       help="set: when the cap stops applying (a time, or 2d, 30h); the cap it replaced applies again")
+    rcap.add_argument("--expect", default=None, metavar="PIN",
+                      help="set: the window's share caps as read; refused if they changed since")
     rcap.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rcap)
+    rsay = rt_sub.add_parser("say", parents=[rt_json], help=argparse.SUPPRESS)
+    rsay.add_argument("--preview", default=None, metavar="WORDS", help="The change, in the owner's words")
+    rsay.add_argument("--apply", default=None, metavar="TOKEN", help="Save the change a preview showed")
+    rsay.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    rsay.set_defaults(func=cmd_route_say)
     radv = rt_sub.add_parser("advise", parents=[rt_json],
                              help="Launch advice per account (advisory only; it never blocks anything)")
     radv.add_argument("account", nargs="?", default=None, help="One account (its label or its id)")
