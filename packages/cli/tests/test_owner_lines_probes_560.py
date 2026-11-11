@@ -197,3 +197,112 @@ def test_an_ordinary_conversation_keeps_its_typed_lines(tmp_path, monkeypatch):
     payload, _ = _drain_job(job_path)
     assert payload['verbatim']['owner_lines'] == want
     assert extract.owner_lines(want) == want
+
+
+# ---- a T3 thread launched as another thread's child ------------------------------
+
+from tests.test_t3_owner_confirm import T3  # noqa: E402
+
+T3_SID = '11111111-2222-3333-4444-555555555555'
+
+
+def _t3_thread(tmp_path, monkeypatch, *, parent=None):
+    """A synthetic T3 record: an ordinary thread id for the session, with
+    ``lineage.parentThreadId`` set when ``parent`` is given."""
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setattr(session_capture, 'ancestor_pids', lambda: [])
+    path = tmp_path / 'synthetic-t3.sqlite'
+    T3(path).thread('ordinary-thread-560', T3_SID, parent=parent)
+    monkeypatch.setenv('KHIPU_T3_DB', str(path))
+    assert _t3.thread_for_session(T3_SID) == 'ordinary-thread-560'
+    assert _t3.delegated_thread_result('ordinary-thread-560') == (bool(parent), True)
+    return 'ordinary-thread-560'
+
+
+def test_launched_t3_child_does_not_keep_its_brief(tmp_path, monkeypatch):
+    _t3_thread(tmp_path, monkeypatch, parent='parent-thread-560')
+    brief = 'Read the scope and repair the cerulean windmill before reporting back.'
+    job_path = _queue(tmp_path, [_user_row(brief), _assistant_row('Working. ' + 'x' * 350)])
+    job = json.loads(job_path.read_text())
+    assert job.get('origin') == 'job' and not job.get('parent_session_id'), job
+    assert 'owner_lines' not in job, job.get('owner_lines')
+    payload, _ = _drain_job(job_path)
+    assert not payload['verbatim'].get('owner_lines'), payload['verbatim'].get('owner_lines')
+
+
+def test_a_top_level_t3_thread_keeps_its_typed_lines(tmp_path, monkeypatch):
+    thread = _t3_thread(tmp_path, monkeypatch)
+    typed = 'Please keep the saffron lighthouse sentence I typed in my own T3 chat.'
+    job = json.loads(_queue(tmp_path, [_user_row(typed), _assistant_row('Checking. ' + 'x' * 350)]).read_text())
+    assert job.get('t3_thread_id') == thread and 'origin' not in job
+    assert job.get('owner_lines') == [typed]
+
+
+def test_an_unreadable_t3_record_keeps_the_typed_lines(tmp_path, monkeypatch):
+    """T3's record cannot be read (no database file, or the read fails): not
+    definitive, so the session stays a conversation and keeps its lines."""
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'no-such-t3.sqlite'))
+    typed = 'Keep the indigo harbour line even when T3 cannot be read.'
+    rows = [_user_row(typed), _assistant_row('Checking. ' + 'x' * 350)]
+    assert _t3.delegated_thread_result('ordinary-thread-560') == (False, False)
+    with mock.patch('khipu.t3.thread_for_session', return_value='ordinary-thread-560'):
+        job = json.loads(_queue(tmp_path, rows).read_text())
+    assert job.get('t3_thread_id') == 'ordinary-thread-560' and 'origin' not in job
+    assert job.get('owner_lines') == [typed]
+    for p in session_capture.queued_jobs():
+        p.unlink()
+    with mock.patch('khipu.t3.thread_for_session', return_value='ordinary-thread-561'), \
+            mock.patch('khipu.t3.delegated_thread_result', side_effect=RuntimeError('boom')):
+        job = json.loads(_queue(tmp_path, rows, sid='22222222-2222-3333-4444-555555555555').read_text())
+    assert 'origin' not in job and job.get('owner_lines') == [typed]
+
+
+# ---- the 14,000-character split -------------------------------------------------
+
+def _split_jobs(tmp_path, rows, sid='split-560'):
+    path = tmp_path / f'{sid}.jsonl'
+    path.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    out = session_capture.hook_main(json.dumps({'hook_event_name': 'SessionEnd', 'session_id': sid,
+                                                'cwd': str(tmp_path), 'transcript_path': str(path)}),
+                                    'claude_code')
+    assert out.get('due'), out
+    return [json.loads(p.read_text()) for p in session_capture.queued_jobs()]
+
+
+def test_split_between_adjacent_user_turns_does_not_drop_short_typed_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setattr(session_capture, 'ancestor_pids', lambda: [])
+    first = 'first typed message ' + 'a' * (13890 - len('first typed message '))
+    second = 'Please keep the entire copper meadow sentence. ' + 'b' * 250
+    jobs = _split_jobs(tmp_path, [_user_row(first), _user_row(second), _assistant_row('Checked. ' + 'x' * 350)])
+    assert len(jobs) == 2
+    assert second in [line for job in jobs for line in job.get('owner_lines', [])], \
+        [job.get('owner_lines') for job in jobs]
+
+
+def test_a_message_cut_at_the_split_appears_once_in_the_part_where_it_starts(tmp_path, monkeypatch):
+    """The cut falls inside the message's first 200 characters: it is kept
+    once, in the first part (where its opening is), and in no other."""
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    first = 'opening typed message ' + 'a' * (13900 - len('opening typed message '))
+    second = 'Keep the whole amber orchard sentence exactly once. ' + 'c' * 180
+    jobs = _split_jobs(tmp_path, [_user_row(first), _user_row(second), _assistant_row('Checked. ' + 'x' * 350)])
+    assert len(jobs) == 2
+    head = second.strip()[:200]
+    assert head not in jobs[0]['transcript'] and head not in jobs[1]['transcript']  # the cut is in the probe
+    per_part = [job.get('owner_lines', []) for job in jobs]
+    assert sum(lines.count(second) for lines in per_part) == 1, per_part
+    assert second in per_part[0], per_part
+    assert extract.owner_lines([first])[0] in per_part[0], per_part  # clipped by the line cap
+
+
+def test_a_message_that_fits_whole_in_a_later_part_is_found_there(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    first = 'early typed message ' + 'a' * (13000 - len('early typed message '))
+    later = 'Then check the pewter compass in the second part.'
+    jobs = _split_jobs(tmp_path, [_user_row(first), _assistant_row('Reading. ' + 'r' * 3000),
+                                  _user_row(later), _assistant_row('Checked. ' + 'x' * 350)])
+    assert len(jobs) == 2
+    assert later in jobs[1]['transcript']
+    assert [job.get('owner_lines', []) for job in jobs] == [extract.owner_lines([first]), [later]]

@@ -2850,10 +2850,37 @@ def _redact_messages(msgs: list[tuple[str, str]], harness: str, sid: str) -> lis
     return redacted_msgs
 
 
+def _t3_child_thread(thread: str | None) -> bool:
+    """T3's record definitively names a parent for this thread: one started
+    as another thread's child (``t3_thread_launch``), so a job. One read under
+    the hook's T3 budget. An unreadable record is not definitive and reads as
+    a conversation, lines kept. Never raises."""
+    if not thread:
+        return False
+    try:
+        delegated, definitive = _t3.delegated_thread_result(thread)
+    except Exception:  # noqa: BLE001 — a lookup must never fail a capture
+        return False
+    return bool(delegated and definitive)
+
+
+def _starts_at_cut(text: str, next_text: str, probe: str) -> bool:
+    """A typed message's opening ``probe`` was cut by the splitter: ``text``
+    ends with its head and ``next_text`` opens with the rest, as the next
+    fragment of the same user block (``_split_messages``)."""
+    prefix = "USER: "
+    if not next_text.startswith(prefix):
+        return False
+    rest = next_text[len(prefix):]
+    return any(text.endswith(probe[:n]) and rest.startswith(probe[n:])
+               for n in range(len(probe) - 1, 0, -1))
+
+
 def _owner_lines_by_part(parts: list[dict[str, Any]], typed: list[str] | None) -> list[list[str]]:
     """Each part's ``owner_lines``: the typed messages (in order) found in that
     part's text, through ``extract.owner_lines``. A typed message is looked for
-    from the part the previous one was in, by its opening. Never raises: a
+    from the part the previous one was in, by its opening; one whose opening
+    the split cut is kept once, in the part where it starts. Never raises: a
     failure gives no owner lines, never a failed capture."""
     out: list[list[str]] = [[] for _ in parts]
     try:
@@ -2866,6 +2893,12 @@ def _owner_lines_by_part(parts: list[dict[str, Any]], typed: list[str] | None) -
             if not probe:
                 continue
             k = next((j for j in range(at, len(parts)) if probe in parts[j]["text"]), None)
+            if k is None:
+                # The split cut through its opening: it starts in the part
+                # whose end holds the probe's head and whose next part opens
+                # with the rest. Kept there, once.
+                k = next((j for j in range(at, len(parts) - 1)
+                          if _starts_at_cut(parts[j]["text"], parts[j + 1]["text"], probe)), None)
             if k is not None:
                 found[k].append(t)
                 at = k
@@ -2930,7 +2963,9 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     thread = cache_thread(st, sid)
     # A T3 delegated child thread is a job: T3 names it by this prefix, so no
     # read of T3's database is needed (owner_turns treats it the same way).
-    delegated = str(thread or "").startswith(_t3.DELEGATED_THREAD_PREFIX)
+    # A launched child has an ordinary id; T3's record names its parent.
+    delegated = (str(thread or "").startswith(_t3.DELEGATED_THREAD_PREFIX)
+                 or (not (job_parent or st.get("origin") == "job") and _t3_child_thread(thread)))
     # Decided once, here: the job label below and the owner-lines skip use it.
     # Nobody types into a job, so its user turns are briefs and relays.
     is_job = bool(job_parent or st.get("origin") == "job" or delegated)
