@@ -223,7 +223,9 @@ def _note_topic_dict(path: Path, *, project: str | None) -> dict[str, Any] | Non
         return None
     from khipu.redact import redact_secrets
 
-    text, _ = redact_secrets(text)
+    # PostgreSQL text/jsonb cannot hold NULs. Parse and hash the same clean
+    # source so every derived field (including frontmatter) agrees.
+    text, _ = redact_secrets(text.replace("\x00", ""))
     flat, body = _parse_note_frontmatter(text)
     name, _ = redact_secrets(flat.get("name") or path.stem)
     # `name` is free text ("Aggressive automatic memory capture", em-dashes
@@ -240,7 +242,7 @@ def _note_topic_dict(path: Path, *, project: str | None) -> dict[str, Any] | Non
         "status": status,
         "status_raw": type_raw or None,
         "links": links,
-        "project": project,
+        "project": project.replace("\x00", "") if project is not None else None,
         "note_source": str(path),
         # P5 G5: Claude Code's own note kind (feedback/user/project/reference)
         # — a DIFFERENT axis from `status` above (which `type_raw` also feeds,

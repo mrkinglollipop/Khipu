@@ -7,6 +7,7 @@ touches the real ~/.claude, ~/.codex, or Postgres.
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import shutil
@@ -444,6 +445,81 @@ class ChangedOnlyReconcileTest(unittest.TestCase):
             _sample_note_text().replace("khipu-state-of-play", "three"),
         )
         return claude_root
+
+    def test_nuls_removed_from_all_stored_text_and_second_pass_is_noop(self):
+        clean = (
+            "---\nname: Café note\ndescription: Keep  spacing — exactly\n"
+            "metadata:\n  type: project\n  modified: 2026-08-17T17:13:10.321Z\n"
+            "parent: note:parent\n---\n"
+            "Body\twith  spaces, café — and [[other-note]].\n\nLast line.\n"
+        )
+        dirty = (clean.replace("Café note", "Café\x00 note")
+                 .replace("Keep  spacing", "Keep\x00  spacing")
+                 .replace("type: project", "type: pro\x00ject")
+                 .replace("2026-08-17", "2026-08-\x0017")
+                 .replace("note:parent", "note:par\x00ent")
+                 .replace("Body\t", "\x00Body\t\x00")
+                 .replace("other-note", "other-\x00note")
+                 + "\x00")
+
+        def reject_nul(value):
+            if isinstance(value, str):
+                if "\x00" in value:
+                    raise ValueError("PostgreSQL text fields cannot contain NUL (0x00) bytes")
+            elif isinstance(value, dict):
+                reject_nul(list(value.keys()))
+                reject_nul(list(value.values()))
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    reject_nul(child)
+
+        class NulRejectingCursor(_FakeTopicsCursor):
+            def execute(self, sql, params=None):
+                reject_nul(params)
+                if " ".join(sql.split()).startswith("INSERT INTO topics"):
+                    # NUL is escaped in JSON parameters but still rejected by jsonb.
+                    reject_nul(json.loads(params[5]))
+                    reject_nul(json.loads(params[6]))
+                return super().execute(sql, params)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            claude_root = root / "projects"
+            path = _write(claude_root / "-repo-a" / "memory" / "note.md", clean)
+            expected = notes._note_topic_dict(path, project="acme/repo")
+            path.write_bytes(dirty.encode("utf-8"))
+            cur = NulRejectingCursor()
+            with mock.patch.object(notes, "claude_projects_root", return_value=claude_root), \
+                    mock.patch.object(notes, "codex_memories_root", return_value=root / "absent"), \
+                    mock.patch.object(notes, "cursor_memory_roots", return_value=[]), \
+                    mock.patch.object(notes, "aegis_memory_roots", return_value=[]), \
+                    mock.patch.object(notes, "_project_for_slug", return_value="acme/re\x00po"), \
+                    mock.patch("khipu.paths.ensure_data_dir", return_value=root / "data"), \
+                    mock.patch("khipu.db.connect", return_value=_FakeConn(cur)) as connect, \
+                    mock.patch("khipu.mirror.persist_topic_graph"), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                first = notes.reconcile(changed_only=True)
+                self.assertTrue(first["ok"])
+                self.assertEqual(first["errors"], [])
+                self.assertEqual(first["written"], 1)
+                row = cur.topics[expected["slug"]]
+                self.assertEqual(row["body"].encode("utf-8"), expected["body"].encode("utf-8"))
+                self.assertEqual(row["title"].encode("utf-8"), expected["title"].encode("utf-8"))
+                self.assertEqual(row["frontmatter"], {
+                    **expected["frontmatter"], "_page_chars": len(expected["body"]),
+                })
+                self.assertEqual(row["links"], expected["links"])
+                self.assertEqual(row["content_hash"], expected["digest"])
+                with mock.patch.object(notes, "_note_topic_dict") as parse:
+                    second = notes.reconcile(changed_only=True)
+                parse.assert_not_called()
+                connect.assert_called_once()
+                self.assertEqual(second["candidates"], 0)
+                self.assertEqual(second["written"], 0)
+                self.assertEqual(second["errors"], [])
+                self.assertEqual(len(cur.revisions), 1)
+                self.assertNotIn("upsert failed", stderr.getvalue())
+                self.assertEqual(path.read_bytes(), dirty.encode("utf-8"))
 
     def test_first_run_touches_every_file_second_run_touches_none(self):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as data_td:
