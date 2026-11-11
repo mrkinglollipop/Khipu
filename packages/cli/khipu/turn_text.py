@@ -62,6 +62,35 @@ APP_AUTO_CONTINUE = (
 )
 _APP_AUTO_CONTINUE = frozenset(" ".join(t.split()) for t in APP_AUTO_CONTINUE)
 
+# The first turn of a session another session started (``start_session``,
+# ``hand_off_to_session``): the desktop app wraps the brief in one of these
+# fixed openings, so the turn is the app's whatever the brief's length and
+# however long ago it was written. A fork start, a hand-off (a fork whose
+# prompt is the hand-off paragraph, then the plan) and an offer's brief sent
+# after its session opened open with the "Task" line; a fresh start with a
+# background opens with the "Background" line; the hand-off paragraph's own
+# opening is kept too. Copied from the app's bundle (Claude 4.23118.1,
+# app.asar, 2026-11-10). Matched at the start of the turn only.
+APP_SESSION_START = (
+    "Task (from the session that started this one):\n",
+    "Background (from the session that started this one):\n",
+    "Continue the task you were in the middle of in this conversation - it was handed to you so the user could "
+    "keep talking in the original session.",
+)
+# What the app adds after a fresh start's text when the group has a notes
+# folder: the turn's last paragraph, one line ending in the folder's path. It
+# also marks a fresh proposal started with no background, whose turn is the
+# bare brief and then this paragraph.
+APP_SHARED_NOTES = ("Shared notes folder for this group of sessions (outside the repo; read siblings' notes there, "
+                    "leave hand-over notes or large findings there instead of pasting them into messages): ")
+_SHARED_NOTES_TAIL = re.compile(r"(?:\A|\n\n)" + re.escape(APP_SHARED_NOTES) + r"[^\n]*\s*\Z")
+
+
+def started_session(text: str) -> bool:
+    """True when a cleaned user turn is the desktop app's delivery of another
+    session's brief (``APP_SESSION_START``, ``APP_SHARED_NOTES``)."""
+    return text.lstrip().startswith(APP_SESSION_START) or _SHARED_NOTES_TAIL.search(text) is not None
+
 
 def _blocks(tags: tuple[str, ...]) -> re.Pattern:
     return re.compile(r"<(" + "|".join(re.escape(t) for t in tags) + r")(?:\s[^>]*)?>.*?</\1>", re.S)
@@ -151,11 +180,13 @@ def owner_text(text: str) -> str | None:
 
 def is_machine(text: str, *, anywhere: bool = False) -> bool:
     """True when a cleaned user turn is a message the harness wrote: it opens
-    with one of ``MACHINE_USER_TAGS``, or its whole text is one of the desktop
-    app's ``APP_AUTO_CONTINUE`` turns. ``anywhere`` (the owner-turn recorder):
-    a tag anywhere in the turn, since text inside a wrapper is never the
-    owner's and a turn that mixes the two can't say which words are."""
-    if " ".join(text.split()) in _APP_AUTO_CONTINUE:
+    with one of ``MACHINE_USER_TAGS``, its whole text is one of the desktop
+    app's ``APP_AUTO_CONTINUE`` turns, or it is the app's delivery of a
+    started session's brief (``started_session``). ``anywhere`` (the
+    owner-turn recorder): a tag anywhere in the turn, since text inside a
+    wrapper is never the owner's and a turn that mixes the two can't say
+    which words are."""
+    if " ".join(text.split()) in _APP_AUTO_CONTINUE or started_session(text):
         return True
     if anywhere:
         return any(tag in text for tag in MACHINE_USER_TAGS)

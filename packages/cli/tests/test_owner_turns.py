@@ -1126,3 +1126,318 @@ def test_desktop_launched_reads_the_app_as_the_parent(monkeypatch):
     tree[31] = (11, agent, 1.0)
     args[31] = [agent]
     assert owner_turns.desktop_launched(29) is False
+
+
+# ---- a session another session started (review of #568, 2026-11-10) ------------------------------
+
+# What the desktop app (Claude 4.23118.1, app.asar) sends as a started
+# session's first turn: a fork start, a hand-off (a fork whose prompt is the
+# hand-off paragraph plus the plan) and an offer's brief sent after it opened
+# open with the "Task" line; a fresh start with a background opens with the
+# "Background" line; a fresh proposal started with no background is the bare
+# brief, then the shared-notes paragraph.
+TASK_LINE = "Task (from the session that started this one):\n"
+HANDOFF_PREFIX = ("Continue the task you were in the middle of in this conversation - it was handed to you so the user "
+                  "could keep talking in the original session. Pick up exactly where the work stopped and finish it. If "
+                  "this session runs in its own fresh worktree it was normally cut from the original session's branch "
+                  "tip (check `git log -1` if unsure); anything the original session left uncommitted is not there "
+                  "— re-create it from the remaining plan. Remaining plan:\n\n")
+NOTES = ("\n\nShared notes folder for this group of sessions (outside the repo; read siblings' notes there, leave "
+         "hand-over notes or large findings there instead of pasting them into messages): "
+         "/Users/x/Library/Application Support/Claude/side-notes/abc")
+BACKGROUND = "The owner asked for the recorder; this session builds it and reports back when the suite is green."
+
+
+def _started(prompt: str, session: str) -> dict:
+    _desktop_record(prompt, session=session, env={"CLAUDE_CODE_SESSION_ID": session})
+    return _last(session)
+
+
+def _owner_types_next(session: str) -> None:
+    turn = _started("pause Codex until 5pm", session)
+    assert turn["eligible"] is True and not turn.get("machine")
+
+
+def test_a_short_fork_brief_is_never_the_owners_first_turn(home, launched, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    brief = "Resume Codex now"
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fork", "title": "Resume Codex", "prompt": brief})
+    bare = _started(brief, "started-short")
+    assert (bare["delegated"] or bare["machine"]) and bare["eligible"] is False
+    assert bare.get("parent") == "parent-1"
+    wrapped = _started(TASK_LINE + brief, "started-short-2")
+    assert wrapped["machine"] is True and wrapped["eligible"] is False
+    _owner_types_next("started-short")
+    _owner_types_next("started-short-2")
+
+
+@pytest.mark.parametrize("plan", ["Resume Codex now",
+                                  "Fix the two failing recorder tests, run the whole suite, then report back here."])
+@pytest.mark.parametrize("opening", ["", TASK_LINE])
+def test_a_handed_off_session_never_opens_with_an_owner_turn(home, launched, monkeypatch, plan, opening):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__hand_off_to_session", {"title": "Resume it", "remaining_plan": plan})
+    turn = _started(opening + HANDOFF_PREFIX + plan, "handed-real")
+    assert turn["eligible"] is False and (turn["machine"] or turn["delegated"])
+    _owner_types_next("handed-real")
+
+
+def test_a_fresh_start_is_never_the_owners_even_with_no_brief_on_record(home, launched):
+    """A proposal the owner starts after its brief's record expired: the app's
+    own opening alone marks the turn."""
+    assert not (owner_turns.folder() / "briefs.jsonl").exists()
+    turn = _started(f"Background (from the session that started this one):\n{BACKGROUND}\n\nTask:\nResume Codex now"
+                    + NOTES, "fresh-1")
+    assert turn["machine"] is True and turn["eligible"] is False
+    _owner_types_next("fresh-1")
+
+
+@pytest.mark.parametrize("brief", ["Resume Codex now", BRIEF])
+def test_a_fresh_proposal_with_no_background_is_never_the_owners(home, launched, brief):
+    """A fresh proposal made with no background and started from its card
+    arrives as the bare brief with the shared-notes paragraph after it."""
+    turn = _started(brief + NOTES, "fresh-bare")
+    assert turn["machine"] is True and turn["eligible"] is False
+    _owner_types_next("fresh-bare")
+
+
+def test_a_short_title_or_name_is_never_noted_as_a_brief(home, launched, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fork", "title": "Pause Codex tonight",
+               "name": "lift Grok now", "prompt": BRIEF})
+    assert owner_turns.brief_for("Pause Codex tonight") is None
+    assert owner_turns.brief_for("lift Grok now") is None
+    for text in ("Pause Codex tonight", "lift Grok now"):
+        assert _started(text, "owner-elsewhere")["eligible"] is True
+
+
+def test_a_short_brief_never_makes_other_short_turns_suspect(home, launched, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fork", "title": "Resume", "prompt": "Resume Codex now"})
+    for text in ("lift Grok", "Resume Codex now please, and pause Grok", "yes"):
+        turn = _started(text, "owner-short")
+        assert turn["eligible"] is True and turn["delegated"] is False, text
+    # Other callers keep the 20-character floor.
+    owner_turns.note_brief("lift Grok", parent="p", harness="claude_code")
+    assert owner_turns.brief_for("lift Grok") is None
+
+
+def test_the_start_openings_count_only_at_the_start_of_a_turn(home, launched):
+    turn = _started("What does 'Task (from the session that started this one):' mean? Then pause Codex.", "owner-q")
+    assert turn["machine"] is False and turn["eligible"] is True
+
+
+def _deleted_agent_tree(monkeypatch, agent_args):
+    """The desktop app's agent after an update deleted its file: the kernel
+    gives no path, but a hook pinned it (``_pin_issuer``) with the name the
+    kernel still has."""
+    app = "/Applications/Claude.app/Contents/Helpers/disclaimer"
+    agent = "/Users/x/Library/Application Support/Claude/claude-code/2.1/abc/claude.app/Contents/MacOS/claude"
+    tree = {9: (10, "/usr/bin/python3", 1.0), 10: (11, "/bin/sh", 1.0), 12: (13, app, 1.0)}
+    bare = {11: (12, 1.0, "claude")}
+    known = {11: {"start": 1.0, "name": "claude", "path": agent}}
+    monkeypatch.setattr(owner_turns, "_proc_info", tree.get)
+    monkeypatch.setattr(owner_turns, "_proc_bare", bare.get)
+    monkeypatch.setattr(owner_turns, "_read_known", known.get)
+    monkeypatch.setattr(owner_turns, "_proc_args", lambda pid: agent_args(agent) if pid == 11 else None)
+    monkeypatch.setattr(owner_turns, "_in_trusted_place", lambda p: str(p) == "/Applications")
+    return known
+
+
+def test_desktop_launched_knows_the_agent_after_an_update_deleted_its_file(monkeypatch):
+    _deleted_agent_tree(monkeypatch, lambda agent: [agent, "--output-format", "stream-json"])
+    assert owner_turns.desktop_launched(9) is True
+
+
+def test_desktop_launched_without_a_pin_for_the_deleted_agent_is_not_the_apps(monkeypatch):
+    known = _deleted_agent_tree(monkeypatch, lambda agent: [agent])
+    known.clear()
+    assert owner_turns.desktop_launched(9) is False
+
+
+def test_desktop_launched_refuses_a_recovered_print_mode_agent(monkeypatch):
+    _deleted_agent_tree(monkeypatch, lambda agent: [agent, "-p", "do the build"])
+    assert owner_turns.desktop_launched(9) is False
+
+
+def test_desktop_launched_refuses_a_pin_whose_name_the_kernel_does_not_have(monkeypatch):
+    known = _deleted_agent_tree(monkeypatch, lambda agent: [agent])
+    known[11] = {**known[11], "name": "bash", "path": "/bin/bash"}
+    assert owner_turns.desktop_launched(9) is False
+
+
+# ---- fix round 2: short start briefs match whole turns only; start briefs keep 8 days ----
+
+DAY = 24 * 3600
+
+
+def _age_briefs(seconds: float) -> None:
+    """Every noted brief line, as if noted ``seconds`` before T0."""
+    path = owner_turns.folder() / "briefs.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    path.write_text("".join(json.dumps({**r, "ts": T0 - seconds}) + "\n" for r in rows), encoding="utf-8")
+
+
+def test_a_short_start_brief_over_20_characters_matches_only_the_whole_turn(home, launched, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fork", "title": "Resume", "prompt": "Resume Codex immediately"})
+    typed = _started("please Resume Codex immediately, then pause Grok until 5pm", "owner-typed")
+    assert typed["delegated"] is False and typed["eligible"] is True
+    whole = _started("Resume Codex immediately", "started-whole")
+    assert whole["eligible"] is False
+
+
+def test_a_four_word_start_brief_still_matches_inside_a_longer_turn(home, launched, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    brief = "Resume Codex lanes immediately"
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fork", "title": "Resume", "prompt": brief})
+    turn = _started("some wrapper words " + brief, "wrapped-four")
+    assert turn["delegated"] is True and turn["eligible"] is False
+
+
+def test_a_start_brief_is_kept_eight_days(home, launched, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fresh", "title": "Build", "prompt": BRIEF})
+    _age_briefs(25 * 3600)
+    late = _started(BRIEF, "fresh-late")
+    assert late["eligible"] is False
+    _age_briefs(9 * DAY)
+    assert owner_turns.brief_for(BRIEF, now=T0) is None
+
+
+def test_an_ordinary_brief_is_still_kept_one_day(home, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("Agent", {"prompt": BRIEF, "description": "build"})
+    _age_briefs(25 * 3600)
+    assert owner_turns.brief_for(BRIEF, now=T0) is None
+
+
+def test_noting_an_ordinary_brief_keeps_a_three_day_old_start_brief(home, monkeypatch):
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    _delegate("mcp__ccd_session__start_session",
+              {"initiation": "user_asked", "context": "fresh", "title": "Build", "prompt": BRIEF})
+    _age_briefs(3 * DAY)
+    other = "Run the capture suite and report the failures back here."
+    owner_turns.note_brief(other, parent="p", harness="claude_code", now=T0)
+    assert owner_turns.brief_for(BRIEF, now=T0) is not None
+    assert owner_turns.brief_for(other, now=T0) is not None
+    # The timer's sweep keeps it too, and drops it once eight days have passed.
+    owner_turns.sweep(now=T0)
+    assert owner_turns.brief_for(BRIEF, now=T0) is not None
+    owner_turns.sweep(now=T0 + 6 * DAY)
+    assert owner_turns.brief_for(BRIEF, now=T0 + 6 * DAY) is None
+
+
+# ---- a T3 lookup the hook could not finish (the 2026-11-10 cold read) ----------------------------
+# With T3 closed and the Mac busy, T3's 14 GB record is not in the page cache
+# and the hook's 50 ms read never finishes, so every typed turn is
+# "t3-unverified". The line keeps the entrypoint a settled "none" would have
+# given ("native"); only an owner check that reads T3's record definitively
+# and finds no thread for the session judges the turn by it.
+
+_UNREAD_WHY = "Khipu could not read T3's record"
+
+
+@pytest.fixture
+def cold_t3(home, monkeypatch):
+    """A T3 database whose lookup never finishes in the hook; the calls made."""
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], "some-other-session")))
+    calls: list[str] = []
+
+    def unread(sid, **kw):
+        calls.append(sid)
+        return None, False
+
+    monkeypatch.setattr(owner_turns.t3, "session_thread_ids_result", unread)
+    monkeypatch.setattr(owner_turns, "desktop_launched", lambda pid=None: True)
+    return calls
+
+
+def test_an_unread_t3_lookup_keeps_the_native_entrypoint_beside_it(cold_t3):
+    _desktop_record("pause Codex until tonight")
+    turn = _last()
+    assert (turn["entrypoint"], turn["native"]) == ("t3-unverified", "claude-desktop")
+    assert turn["eligible"] is False and turn["why"].startswith(_UNREAD_WHY)
+    ok, why = owner_turns.eligible(turn)
+    assert not ok and why.startswith(_UNREAD_WHY)
+    # Judged again once T3's record settles that no thread runs the session.
+    assert owner_turns.eligible(turn, t3_settled_none=True) == (True, "")
+
+
+def test_the_hook_reads_t3s_record_no_more_than_before(cold_t3, monkeypatch):
+    _desktop_record("pause Codex until tonight")
+    assert len(cold_t3) == 2  # the hook's two attempts, nothing more
+    calls: list[str] = []
+    monkeypatch.setattr(owner_turns.t3, "session_thread_ids_result",
+                        lambda sid, **kw: calls.append(sid) or ([], True))
+    _desktop_record("pause Codex until tonight")
+    assert len(calls) == 1
+    turn = _last()
+    assert turn["entrypoint"] == "claude-desktop" and "native" not in turn and turn["eligible"] is True
+
+
+def test_a_settled_none_never_lifts_a_machine_native(cold_t3):
+    owner_turns.record(_payload("pause Codex until tonight"), env={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts"},
+                       now=T0, issuer=DESKTOP_ISSUER)
+    turn = _last()
+    assert (turn["entrypoint"], turn["native"]) == ("t3-unverified", "sdk-ts")
+    ok, why = owner_turns.eligible(turn, t3_settled_none=True)
+    assert not ok and "machine entrypoint" in why
+    line = {"entrypoint": "t3-unverified", "native": "sdk-cli", "harness": "claude_code", "typed": True}
+    ok, why = owner_turns.eligible(line, t3_settled_none=True)
+    assert not ok and "machine entrypoint" in why
+
+
+def test_a_settled_none_never_lifts_an_untrusted_native(cold_t3):
+    owner_turns.write_settings({"trusted": ["claude_code:cli"]})
+    _desktop_record("pause Codex until tonight")
+    turn = _last()
+    ok, why = owner_turns.eligible(turn, t3_settled_none=True)
+    assert not ok and why == owner_turns.untrusted_why("claude_code:claude-desktop")
+    assert owner_turns.untrusted_front_end([turn]) is None
+    assert owner_turns.untrusted_front_end([turn], t3_settled_none=True) == "claude_code:claude-desktop"
+
+
+@pytest.mark.parametrize("flag", ["dispatched", "delegated", "machine", "wrapped", "helper"])
+def test_a_settled_none_never_lifts_a_refused_turn(home, flag):
+    line = {"entrypoint": "t3-unverified", "native": "claude-desktop", "harness": "claude_code", "typed": True,
+            flag: True}
+    assert owner_turns.eligible({**line, flag: False}, t3_settled_none=True)[0]
+    assert owner_turns.eligible(line, t3_settled_none=True)[0] is False
+
+
+def test_a_settled_none_never_lifts_a_job_the_recorder_marked(cold_t3):
+    _desktop_record("pause Codex until tonight", env={"KHIPU_JOB": "1"})
+    turn = _last()
+    assert turn["entrypoint"] == "t3-unverified" and turn["dispatched"] is True
+    assert owner_turns.eligible(turn, t3_settled_none=True)[0] is False
+    _desktop_record("pause Codex until tonight", env={"CLAUDE_DISPATCHED_LANE": "claude_secondary"})
+    assert owner_turns.eligible(_last(), t3_settled_none=True)[0] is False
+
+
+def test_an_untyped_unverified_turn_stays_refused(home):
+    line = {"entrypoint": "t3-unverified", "native": "claude-desktop", "harness": "claude_code", "typed": False}
+    ok, why = owner_turns.eligible(line, t3_settled_none=True)
+    assert not ok and why == "no typed text"
+
+
+@pytest.mark.parametrize("native", [None, "", "t3", "t3-unverified", 7, ["claude-desktop"]])
+def test_an_unverified_line_without_a_usable_native_stays_refused(home, native):
+    line = {"entrypoint": "t3-unverified", "harness": "claude_code", "typed": True}
+    if native is not None:
+        line["native"] = native
+    ok, why = owner_turns.eligible(line, t3_settled_none=True)
+    assert not ok and (why.startswith(_UNREAD_WHY) or "T3 conversation" in why)
+
+
+def test_a_native_is_never_read_from_a_turn_that_is_not_unverified(home):
+    # Only "t3-unverified" lines are judged again: a T3 turn stays on the T3 path.
+    line = {"entrypoint": "t3", "native": "claude-desktop", "harness": "claude_code", "typed": True}
+    ok, why = owner_turns.eligible(line, t3_settled_none=True)
+    assert not ok and "T3 conversation" in why
