@@ -6101,6 +6101,8 @@ def build_parser() -> argparse.ArgumentParser:
     hy_blank.add_argument("--restore", metavar="BACKUP", help="Put back what this backup file holds")
     hy_blank.add_argument("--apply", action="store_true", default=False,
                           help="Change rows (without it: counts only, nothing changes)")
+    hy_blank.add_argument("--no-reembed", action="store_true",
+                          help="Skip the memory search refresh after a changed apply or restore")
     hy.set_defaults(func=cmd_hygiene)
 
     nt = sub.add_parser("notes", help="Index harness-native per-project notes as topics (memory reliability W4)")

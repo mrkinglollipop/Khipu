@@ -34,10 +34,10 @@ old value back only where the column still holds exactly what the run wrote.
 How the change spreads: the hub's 0032 trigger moves ``changed_at`` on the
 UPDATE, and every Mac's replica pull reads rows by ``changed_at``, so each
 replica takes the new row on its next pull (its FTS follows by trigger).
-Vectors built from the old preferences text keep it in ``chunk_text`` until
-``khipu embed backfill`` (the nightly runs it) re-embeds the changed chunks;
-the output counts those rows as ``vectors_to_refresh``. Owner lines are never
-embedded. Nothing here prints a stored string.
+After a changed apply or restore commits, a memory-only backfill refreshes
+changed chunks unless ``--no-reembed`` is set. Failures leave the cleanup
+committed; the nightly can retry. ``vectors_to_refresh`` counts existing
+episode vectors before the cleanup. Owner lines are never embedded. Nothing here prints a stored string.
 """
 from __future__ import annotations
 
@@ -482,6 +482,32 @@ def _restore_locked(conn, backup: dict[str, Any], *, apply: bool) -> dict[str, A
     return out
 
 
+def _reembed(out: dict[str, Any]) -> None:
+    """Post-commit, memory only: counts and named failures, never provider text."""
+    import contextlib
+    import io
+
+    try:
+        from khipu import embed
+
+        # Provider progress/errors may contain stored text. Keep the CLI's
+        # single JSON line and never forward those diagnostics.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            stats = embed.backfill()
+        out["reembedded"] = int(stats.get("embedded") or 0)
+        failed = int(stats.get("failed_chunks") or stats.get("failed") or 0)
+        out["reembed_failed"] = failed
+        stopped = [k for k in ("cancelled", "budget_exhausted", "time_budget_exhausted") if stats.get(k)]
+        if stats.get("outcome") in ("partial", "failed"):
+            stopped.append(stats["outcome"])
+        elif stats.get("ok") is False and not stopped:
+            stopped.append("failed")
+        if stopped:
+            out["reembed_error"] = ", ".join(stopped)
+    except BaseException as exc:  # cleanup is already committed, including on a stopped sweep
+        out["reembed_error"] = type(exc).__name__
+
+
 def main(args) -> int:
     """The CLI entry: prints one JSON line. 0 on success, 2 on a refusal,
     1 on an error (rolled back)."""
@@ -507,5 +533,7 @@ def main(args) -> int:
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}; rolled back, nothing changed",
                           "changed": 0}))
         return 1
+    if apply and (out.get("changed", 0) or out.get("restored", 0)) and not getattr(args, "no_reembed", False):
+        _reembed(out)
     print(json.dumps(out))
     return 0
