@@ -513,8 +513,7 @@ def _line_origin(row: dict, text: str = "") -> str | None:
 
 def _prompt_line(raw: bytes) -> tuple[dict, str] | None:
     """A Claude Code user line that holds a prompt (not a tool's result or a
-    normal compaction summary), with its text; None for any other line.
-    Machine-marked summaries remain readable so their origin cannot be human.
+    compaction summary), with its text; None for any other line.
     """
     if b'"user"' not in raw:
         return None
@@ -533,7 +532,7 @@ def _prompt_line(raw: bytes) -> tuple[dict, str] | None:
                             if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
     if not isinstance(content, str):
         return None
-    if row.get("isCompactSummary") and machine_user_origin(row, content) is None:
+    if row.get("isCompactSummary"):
         return None
     return row, content
 

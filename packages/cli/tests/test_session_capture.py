@@ -83,7 +83,8 @@ class PersistentCaptureRetryTest(unittest.TestCase):
 
         preference = "The brief's synthetic preference must never be stored."
         for marks in ({"origin": "job"}, {"parent_session_id": "claude_code:parent"},
-                      {"origin": "job", "subagent": True}):
+                      {"origin": "job", "subagent": True},
+                      {"origin": "job", "subagent": True, "has_owner_turn": True}):
             for cached in (False, True):
                 with self.subTest(marks=marks, cached=cached):
                     extracted = {"summary": "Synthetic task finished.", "topics": [],
@@ -1624,6 +1625,20 @@ def test_desktop_task_notifications_never_supply_owner_lines(tmp_path, text, mar
     assert extract.owner_lines(stats["typed"]) == [typed]
     if "<summary>" in text and not text.startswith("<system-reminder><task-notification>"):
         assert "[notification: task-notification] Synthetic check finished." in sc.render(msgs)
+
+
+def test_human_marked_compact_summary_never_supplies_owner_lines_or_owner_turn(tmp_path):
+    from khipu import extract, memory_rows
+
+    path = _write(tmp_path / "summary.jsonl", [
+        {"type": "user", "isCompactSummary": True, "turnOrigin": "human",
+         "message": {"role": "user", "content": "Keep synthetic summary rules forever."}},
+    ])
+    stats = {}
+    sc.read_window(path, 0, stats=stats)
+    assert stats["typed"] == [] and not stats["has_owner_turn"]
+    lines = extract.owner_lines(stats["typed"])
+    assert lines == [] and memory_rows.owner_lines_of({"owner_lines": lines}) == []
 
 
 @_pytest.mark.parametrize("typed_kind", ["none", "human", "queued-human", "paste-only"])

@@ -1276,6 +1276,10 @@ def test_task_completion_is_never_human_or_picked_before_the_next_typed_turn(no_
         marks = {}
     notice = _desk_prompt(no_t3, text, now - 2, prompt_id="synthetic-notice")
     _cc_line(no_t3.transcript, text, now - 2, {**marks, "promptId": "synthetic-notice"})
+    if shape == "compact":
+        # The summary can share an id, but only the actual prompt matches the hook.
+        _cc_line(no_t3.transcript, text, now - 1,
+                 {**{k: v for k, v in marks.items() if k != "isCompactSummary"}, "promptId": "synthetic-notice"})
     judged = owner_turns.with_origins(owner_turns.turns("s-desk"))[-1]
     assert judged["machine"] and not judged["typed"] and judged.get("origin") != "human"
     assert not owner_turns.eligible(judged)[0]
@@ -1290,6 +1294,21 @@ def test_task_completion_is_never_human_or_picked_before_the_next_typed_turn(no_
     assert _check()["turn"] == typed["turn"] != notice["turn"]
     judged = owner_turns.with_origins(owner_turns.turns("s-desk"))[-1]
     assert judged["origin"] == "human" and judged["typed"] and not judged["machine"]
+
+
+@pytest.mark.parametrize("summary_marks", [{"promptSource": "system"}, {"turnOrigin": "task_notification"}],
+                         ids=["system", "task-notification"])
+def test_compact_summary_with_same_prompt_id_cannot_shadow_typed_prompt(tmp_path, summary_marks):
+    text = "Keep the synthetic report concise."
+    rows = [
+        {"type": "user", "isCompactSummary": True, "promptId": "P1", **summary_marks,
+         "message": {"role": "user", "content": "Synthetic compact summary."}},
+        {"type": "user", "promptId": "P1", "promptSource": "sdk", "turnOrigin": "human",
+         "message": {"role": "user", "content": text}},
+    ]
+    path = tmp_path / "summary-before-owner.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    assert owner_turns.transcript_origin(str(path), sha=owner_turns.prompt_sha256(text), prompt_id="P1") == "human"
 
 
 @pytest.mark.parametrize("case", ["no fields", "sdk", "unknown", "missing", "unreadable"])

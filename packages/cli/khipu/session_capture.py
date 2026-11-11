@@ -993,8 +993,9 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
         if real and stats is not None and not d.get("isCompactSummary"):
             stats["typed"].append(text)
             stats["typed_sdk"].append(_sdk_line(d))
-            # A job's unmarked brief can look typed. Only an explicit human
-            # mark proves an owner correction arrived directly in the job.
+            # Only Claude Code marks typed turns: turnOrigin/origin.kind human;
+            # claude -p briefs are sdk. Unmarked harnesses drop job preferences
+            # even for owner corrections: storing brief rules as preferences is worse.
             source = d.get("attachment") if d.get("type") == "attachment" else d
             origin = source.get("origin") if isinstance(source, dict) else None
             if ((d.get("turnOrigin") == "human" or (isinstance(origin, dict) and origin.get("kind") == "human"))
@@ -3787,7 +3788,7 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
             continue
         # Enforce JOB_SECTION before any checkpoint or delivery can store the
         # model's preferences. Old queued jobs have no positive owner evidence.
-        if (_job_origin(job) == "job" or job.get("subagent")) and not job.get("has_owner_turn"):
+        if job.get("subagent") or (_job_origin(job) == "job" and not job.get("has_owner_turn")):
             payload["preferences"] = []
         if not isinstance(cached, dict) or cached != payload:
             # A copy: the delivery fields added below must not ride into a

@@ -123,9 +123,9 @@ def clean_user_text(text: str, *, owner: bool = False) -> str:
 def machine_user_origin(row: dict, text: str = "") -> str | None:
     """Positive evidence that a user-role record came from the harness.
 
-    Desktop task completions use top-level ``origin.kind``; queued commands
-    use the same field on their attachment. These marks override a human
-    turnOrigin, and apply even to compact summaries and non-desktop fronts.
+    Reads record fields only at the top level, plus the text; attachment
+    fields are not inspected here. These marks override a human turnOrigin,
+    and apply even to compact summaries and non-desktop fronts.
     """
     origin = row.get("origin")
     if ((isinstance(origin, dict) and origin.get("kind") == "task-notification")
