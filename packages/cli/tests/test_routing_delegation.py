@@ -395,10 +395,10 @@ def _ours(entries: list[dict]) -> list[dict]:
     return [e for e in entries if any(integ._is_our_delegation(h.get("command")) for h in e.get("hooks", []))]
 
 
-def _check_hooks(hooks: dict) -> None:
+def _check_hooks(hooks: dict, matcher: str = integ.DELEGATION_MATCHER) -> None:
     pre, start = _ours(hooks["PreToolUse"]), _ours(hooks["SubagentStart"])
     assert len(pre) == 1 and len(start) == 1
-    assert pre[0]["matcher"] == integ.DELEGATION_MATCHER
+    assert pre[0]["matcher"] == matcher
     assert pre[0]["hooks"] == [{"type": "command", "command": integ.delegation_hook(),
                                 "timeout": integ.DELEGATION_TIMEOUT}]
     assert "matcher" not in start[0]
@@ -415,7 +415,7 @@ def test_the_claude_code_installer_adds_both_hooks_once(fake_home):
     assert any(c.endswith("hooks.PreToolUse += khipu-delegation-hook") for c in out["changes"])
     assert any(c.endswith("hooks.SubagentStart += khipu-delegation-hook") for c in out["changes"])
     hooks = json.loads((fake_home / ".claude" / "settings.json").read_text())["hooks"]
-    _check_hooks(hooks)
+    _check_hooks(hooks, integ.CLAUDE_DELEGATION_MATCHER)
     assert other in hooks["PreToolUse"]  # someone else's PreToolUse hook is kept as it was
     assert not any("delegation" in c for c in integ.install("claude_code")["changes"])
     assert integ.status("claude_code")["delegation_push"] == "installed"
@@ -473,10 +473,10 @@ def test_a_claude_code_repair_stops_the_hook_running_before_every_shell_command(
     # Until the repair runs, status says the function needs it, so the app offers Reinstall.
     assert integ.status("claude_code")["delegation_push"] == "missing"
     out = integ.install("claude_code")
-    assert any(c.endswith(f"hooks.PreToolUse khipu-delegation-hook matcher -> {integ.DELEGATION_MATCHER}")
+    assert any(c.endswith(f"hooks.PreToolUse khipu-delegation-hook matcher -> {integ.CLAUDE_DELEGATION_MATCHER}")
                for c in out["changes"])
     hooks = json.loads(settings.read_text())["hooks"]
-    _check_hooks(hooks)
+    _check_hooks(hooks, integ.CLAUDE_DELEGATION_MATCHER)
     assert other in hooks["PreToolUse"]  # the owner's own Bash hook is untouched
     assert not any(re.fullmatch(e["matcher"], "Bash") for e in _ours(hooks["PreToolUse"]))
     assert integ.status("claude_code")["delegation_push"] == "installed"
@@ -497,6 +497,51 @@ def test_a_codex_repair_stops_the_hook_running_before_every_shell_command(fake_h
     for tool in ("shell", "shell_command", "exec_command", "local_shell"):
         assert not any(re.fullmatch(e["matcher"], tool) for e in _ours(hooks["PreToolUse"])), tool
     assert integ.status("codex")["delegation_push"] == "installed"
+
+
+# Every install wrote this matcher from 2026-11-07 until the desktop app's
+# session tools were added for Claude Code only (2026-11-10).
+TODAYS_MATCHER = "Agent|Task|spawn_agent|delegate_task"
+
+
+def _todays_install(path: Path) -> None:
+    path.write_text(json.dumps({"hooks": {
+        "PreToolUse": [{"matcher": TODAYS_MATCHER, "hooks": [
+            {"type": "command", "command": integ.delegation_hook(), "timeout": integ.DELEGATION_TIMEOUT}]}],
+        "SubagentStart": [{"hooks": [{"type": "command", "command": integ.delegation_hook(),
+                                      "timeout": integ.SUBAGENT_START_TIMEOUT}]}]}}))
+
+
+def test_the_desktop_session_tools_reach_claude_code_and_leave_codex_byte_identical(fake_home):
+    """Claude Code's matcher gains the desktop app's two session tools; Codex's
+    stays today's, so its hooks.json comes out as it was and Codex asks the
+    owner for no new hook review."""
+    (fake_home / ".codex").mkdir()
+    integ.CODEX_TOML.write_text("")
+    integ.CODEX_HOOKS.write_text("{}")
+    integ.install("codex")
+    codex = json.loads(integ.CODEX_HOOKS.read_text())["hooks"]
+    _check_hooks(codex, TODAYS_MATCHER)
+    codex_before = integ.CODEX_HOOKS.read_bytes()
+    (fake_home / ".claude").mkdir()
+    (fake_home / ".claude.json").write_text("{}")
+    settings = fake_home / ".claude" / "settings.json"
+    _todays_install(settings)
+    assert integ.status("claude_code")["delegation_push"] == "missing"
+    out = integ.install("claude_code")
+    assert any(c.endswith(f"matcher -> {integ.CLAUDE_DELEGATION_MATCHER}") for c in out["changes"])
+    _check_hooks(json.loads(settings.read_text())["hooks"], integ.CLAUDE_DELEGATION_MATCHER)
+    assert integ.status("claude_code")["delegation_push"] == "installed"
+    for tool in ("mcp__ccd_session__start_session", "mcp__ccd_session__hand_off_to_session", "Agent", "Task"):
+        assert re.fullmatch(integ.CLAUDE_DELEGATION_MATCHER, tool), tool
+        assert routing_delegation.might_delegate(_call(tool)), tool
+    for tool in ("Bash", "mcp__ccd_session__list_sessions", "mcp__ccd_session__send_message"):
+        assert not re.fullmatch(integ.CLAUDE_DELEGATION_MATCHER, tool), tool
+    again = integ.install("codex")
+    assert again["changes"] == [] and "next_step" not in again
+    assert integ.CODEX_HOOKS.read_bytes() == codex_before
+    assert integ.status("codex")["delegation_push"] == "installed"
+    assert integ.DELEGATION_MATCHER == TODAYS_MATCHER
 
 
 def test_a_dry_run_reports_both_hooks_and_writes_nothing(fake_home):

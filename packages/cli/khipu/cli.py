@@ -4347,7 +4347,11 @@ def cmd_jobs(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "error": f"unknown job(s): {bad}; choose from {list(_JOBS_CHOICES)}"}))
         return 2
     if args.jobs_cmd == "install":
-        out = launchd_gen.install_scheduled_jobs(names)
+        keep = bool(getattr(args, "keep_program", False))
+        if keep and not names:
+            print(json.dumps({"ok": False, "error": "--keep-program needs job names"}))
+            return 2
+        out = launchd_gen.install_scheduled_jobs(names, keep_program=keep)
     elif args.jobs_cmd == "refresh":
         out = launchd_gen.refresh_scheduled_jobs(names)
     elif args.jobs_cmd == "uninstall":
@@ -6541,6 +6545,9 @@ def build_parser() -> argparse.ArgumentParser:
     jb_sub.add_parser("status", help="Print khipu.jobs.job_status() as JSON")
     jbi = jb_sub.add_parser("install", help="Render and load the named jobs; with no names, install the six default jobs, excluding opt-in recall_daemon")
     jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,notes_watch,queue_drain,recall_daemon,replica_refresh}")
+    jbi.add_argument("--keep-program", action="store_true",
+                     help="Keep the installed plist's interpreter and program; re-render only the rest "
+                          "(the notes watcher's own watch-list refresh uses this)")
     jbr = jb_sub.add_parser(
         "refresh",
         help="Re-render + reload installed jobs whose plist is stale (default: all installed)",

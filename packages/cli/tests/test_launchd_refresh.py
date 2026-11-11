@@ -26,6 +26,7 @@ def _patched(tmpdir: str):
             side_effect=fake_load,
         ),
         mock.patch.object(launchd_gen, "_plist_loaded", side_effect=lambda label: label in loaded),
+        mock.patch.object(launchd_gen, "cannot_spawn", return_value=False),
         mock.patch.object(launchd_gen, "read_versions", return_value={}),
         mock.patch.object(launchd_gen, "write_versions", return_value=None),
     ]

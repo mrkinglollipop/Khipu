@@ -1569,7 +1569,17 @@ def test_both_installers_match_main_byte_for_byte_without_a_live_link(home, monk
     for job in launchd_gen._JOB_TEMPLATE:
         if job not in main_ld._JOB_TEMPLATE:
             continue  # a job this branch adds has nothing on main to match yet
-        assert launchd_gen.render_plist(job) == main_ld.render_plist(job), job
+        mine, theirs = launchd_gen.render_plist(job), main_ld.render_plist(job)
+        if job == "notes_watch" and not hasattr(main_ld, "_exec_arguments"):
+            # main predates notes-watch starting through /bin/sh: everything
+            # else still matches, and the interpreter and arguments are main's.
+            import plistlib
+
+            a, b = plistlib.loads(mine), plistlib.loads(theirs)
+            a_args, b_args = a.pop("ProgramArguments"), b.pop("ProgramArguments")
+            assert a == b and a_args[:2] == ["/bin/sh", "-c"] and a_args[4:] == b_args, job
+            continue
+        assert mine == theirs, job
     monkeypatch.setattr(main_in, "HOME", home)
     for mod in (integrations, main_in):
         monkeypatch.setattr(mod, "_root", lambda: checkout)

@@ -92,7 +92,8 @@ def test_loaded_matching_plist_stays_current_without_replacement(installed, monk
     state = fake_launchctl(monkeypatch, dest, previous=previous)
     out = ld.refresh_scheduled_jobs(["recall_daemon"])
     assert out["ok"] and out["current"] == ["recall_daemon"]
-    assert state["calls"] == ["print"]
+    # read-only: whether it is loaded, then whether launchd can start it
+    assert state["calls"] == ["print", "print"]
 
 
 @pytest.mark.parametrize("job", ["nightly", "monthly"])

@@ -65,9 +65,21 @@ def _capture(d: dict) -> str:
     return "no recent capture from " + ", ".join(red) if red else "a harness is not being recorded"
 
 
+_NOTES_WATCH_WORDS = {
+    "cannot_start": "launchd cannot start it",
+    "last_run_failed": "last run failed",
+    "unwatched": "not watching every notes folder",
+    "check_failed": "could not be checked",
+}
+
+
+def _notes_watch_label(row: dict) -> str:
+    return f"notes_watch ({_NOTES_WATCH_WORDS.get(str(row.get('state')), 'not installed')})"
+
+
 def _jobs(d: dict) -> str:
     bad = list(d.get("job_failures") or []) + [
-        "notes_watch (not installed)" if k == "notes_reconcile_ok" else k.removesuffix("_ok")
+        _notes_watch_label(v) if k == "notes_reconcile_ok" else k.removesuffix("_ok")
         for k, v in (d.get("nightly_steps") or {}).items() if isinstance(v, dict) and not v.get("ok")]
     return "failing: " + ", ".join(bad) if bad else "a background job is failing"
 
