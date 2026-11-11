@@ -28,8 +28,8 @@ describe("PendingForgets", () => {
       "episode forget-pending --send --from-app": [{ ok: true, pending: 0 }],
     });
     const { container } = render(<PendingForgets run={run} />);
-    const button = await screen.findByRole("button", { name: "Send 2 forgets to the hub" });
-    expect(screen.getByText("2 forgets haven't reached the hub")).toBeInTheDocument();
+    const button = await screen.findByRole("button", { name: "Send 2 forgets now" });
+    expect(screen.getByText("2 forgets haven't reached your saved memory")).toBeInTheDocument();
     fireEvent.click(button);
     await waitFor(() => expect(container).toBeEmptyDOMElement());
     expect(calls).toContainEqual(["episode", "forget-pending", "--send", "--from-app"]);
@@ -41,9 +41,9 @@ describe("PendingForgets", () => {
       "episode forget-pending --send --from-app": [{ ok: false, pending: 1, error: "not sent: the hub refused" }],
     });
     render(<PendingForgets run={run} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Send 1 forget to the hub" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Send 1 forget now" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("not sent: the hub refused.");
-    expect(screen.getByText("1 forget hasn't reached the hub")).toBeInTheDocument();
+    expect(screen.getByText("1 forget hasn't reached your saved memory")).toBeInTheDocument();
   });
 
   it("offers both answers for a forgotten episode number the hub still holds", async () => {
@@ -55,10 +55,10 @@ describe("PendingForgets", () => {
     });
     const { container } = render(<PendingForgets run={run} />);
     expect(await screen.findByText(/An unrelated hub episode/)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /to the hub/ })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Forget episode 42 here" }));
+    expect(screen.queryByRole("button", { name: /^Send / })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Forget conversation 42 there too" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("forget not done.");
-    fireEvent.click(screen.getByRole("button", { name: "Not the same episode" }));
+    fireEvent.click(screen.getByRole("button", { name: "Not the same conversation" }));
     await waitFor(() => expect(container).toBeEmptyDOMElement());
     expect(calls).toContainEqual(["episode", "forget-pending", "--forget-here", "42", "--from-app"]);
     expect(calls).toContainEqual(["episode", "forget-pending", "--not-same", "42", "--from-app"]);

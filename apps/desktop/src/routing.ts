@@ -9,7 +9,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { callCli } from "./settingsCli";
 import { fmtAgoSince } from "./time";
-import { almostPrefix } from "./humanWords";
 
 export type RouteAuthor = { kind?: string; harness?: string; project?: string; session?: string; name?: string };
 
@@ -570,6 +569,8 @@ export type RouteView = {
   definitions?: { providers?: Record<string, RouteProvider>; accounts?: Record<string, unknown> };
   record?: boolean;
   version?: number;
+  /** The name the owner gave this Mac ("M5"), else its short name; null when unreadable. */
+  this_mac?: string | null;
   /** The priority's version, also when none is set (`version_moved` guard). */
   priority_version?: string | null;
   checked_at?: string;
@@ -953,8 +954,7 @@ const HOLD_REASON_WORDS: Record<string, string> = {
   machine_busy: "The Mac is busy",
   disk_low: "The disk is low",
   keep: "Kept for one purpose",
-  outage: "An outage",
-};
+  outage: "An outage" };
 
 export function holdWords(h: RouteHold): string {
   return h.text || HOLD_REASON_WORDS[h.reason] || "A hold";
@@ -980,152 +980,6 @@ export function longDisagreements(view: RouteView, now: Date): { label: string; 
 
 export function brokenChecks(view: RouteView): RuleCheck[] {
   return (view.rule_checks ?? []).filter((c) => c.status === "broken");
-}
-
-/** The broken checks grouped by rule, in the order each rule first appears:
- *  one rule broken on two lanes is one broken rule, not two. */
-export function brokenRules(view: RouteView): { rule: number; checks: RuleCheck[] }[] {
-  const out: { rule: number; checks: RuleCheck[] }[] = [];
-  for (const c of brokenChecks(view)) {
-    const g = out.find((x) => x.rule === c.rule);
-    if (g) g.checks.push(c);
-    else out.push({ rule: c.rule, checks: [c] });
-  }
-  return out;
-}
-
-const BROKEN_LEAD = "A standing rule may be broken: ";
-
-// Why a check could not judge any lane, by check (`routing_sources.rule_checks`).
-const CANNOT_SEE: Record<string, string> = {
-  fast_tier: "the model is set inside the launch script, which Khipu doesn't read.",
-  paid_xai: "the launch environment is set inside the launch script, which Khipu doesn't read.",
-  grok_confirm: "the confirming job slot's kind isn't set in your job runner's settings.",
-  grok_private: "Khipu hasn't read your job runner's list of added work yet.",
-};
-
-// What each check is about, for a rule with several checks.
-const CHECK_FOR: Record<string, string> = {
-  fast_tier: "for models ending in -fast",
-  paid_xai: "for the paid xAI API",
-  grok_private: "for Grok on private work",
-  grok_confirm: "for re-checks of Grok work",
-};
-
-const FILE_WORDS: Record<string, string> = { settings: "settings", events: "list of added work" };
-const NOT_NOW = new Set(["not_read", "failed", "stale"]);
-
-const count = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
-
-// What caps left out, runner by runner, so a part-read check is never a pass.
-function leftOutLine(cells: RuleCell[]): string {
-  const parts = cells
-    .filter((c) => c.outcome === "incomplete" && c.skipped)
-    .map((c) => {
-      const k = c.skipped ?? {};
-      const items = [
-        k.lanes ? count(k.lanes, "job slot", "job slots") : "",
-        k.kinds ? count(k.kinds, "job slot whose kind it can't name", "job slots whose kind it can't name") : "",
-        k.fix_lanes ? count(k.fix_lanes, "default fix job slot", "default fix job slots") : "",
-        k.added ? count(k.added, "line of added work", "lines of added work") : "",
-        k.unfinished_line ? "an unfinished last line of added work" : "",
-      ].filter(Boolean);
-      const list = items.length > 1 ? `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}` : items[0] ?? "some input";
-      return `${list} in ${c.runner}`;
-    });
-  return `Khipu left out ${parts.join("; and ") || "part of what it reads"}.`;
-}
-
-// Why a check has not run now: each runner it could not use, and each of
-// that runner's files it never read, couldn't read, or read too long ago.
-function notNowLine(cells: RuleCell[], nowMs: number): string {
-  const parts = cells
-    .filter((c) => NOT_NOW.has(c.outcome))
-    .flatMap((c) =>
-      Object.entries(c.reads ?? {}).flatMap(([key, r]) => {
-        const file = `${c.runner}'s ${FILE_WORDS[key] ?? key}`;
-        const ago = fmtAgoSince(r?.good_at, nowMs);
-        if (!r || r.read === false) return [`Khipu has never read ${file}`];
-        if (r.failed) return [`Khipu couldn't read ${file}${ago ? `; it last read them ${ago}` : ""}`];
-        if (r.stale) return [`Khipu last read ${file} ${ago ?? "a long time ago"}`];
-        return [];
-      }),
-    );
-  return `${parts.join(" and ") || "Khipu can't tell how recent its read was"}.`;
-}
-
-type Line = { text: string; tone: "ok" | "warn" | "" };
-
-// One result's line. `f` names the check ("" for a rule with one check);
-// `top` says "nothing wrong found" (every check passed), else an ok check
-// says "passed".
-function resultLine(result: RuleResult | RuleCheckResult, f: string, nowMs: number, top: boolean): Line {
-  const by = `Checked by Khipu${f}`;
-  const cells = "cells" in result && result.cells ? result.cells : "checks" in result && result.checks ? result.checks.flatMap((c) => c.cells ?? []) : [];
-  switch (result.result) {
-    case "broken": {
-      const words = (result.text ?? "").replace(BROKEN_LEAD, "");
-      const more = result.more ? ` ${result.more === 1 ? "1 more job slot" : `${result.more} more job slots`} too.` : "";
-      return { text: `${by}: may be broken.${words ? ` ${words.charAt(0).toUpperCase()}${words.slice(1)}` : ""}${more}`, tone: "warn" };
-    }
-    case "ok": {
-      const ago = fmtAgoSince(result.at, nowMs);
-      const n = result.unchecked ?? 0;
-      const rest = n ? ` ${n === 1 ? "1 job slot" : `${n} job slots`} couldn't be checked: ${CANNOT_SEE[result.check ?? ""] ?? CANNOT_SEE.fast_tier}` : "";
-      const head = top ? `${by} in your job runners' settings: nothing wrong found` : `${by}: passed`;
-      const scanned = cells.filter((c) => c.scan?.done);
-      const lines = scanned.reduce((sum, c) => sum + (c.scan?.lines ?? 0), 0);
-      const covered = scanned.length ? ` It read all ${lines.toLocaleString("en-US")} ${lines === 1 ? "line" : "lines"} of added work.` : "";
-      return { text: `${head}${ago ? `, ${ago}` : ""}.${rest}${covered}`, tone: "ok" };
-    }
-    case "not_read":
-    case "failed":
-    case "stale":
-      return { text: `${by}, but not now: ${notNowLine(cells, nowMs)}`, tone: "" };
-    case "checking": {
-      const parts = cells
-        .filter((c) => c.outcome === "checking")
-        .map((c) => {
-          const pct = c.scan?.size ? Math.floor(((c.scan.read ?? 0) / c.scan.size) * 100) : 0;
-          return `${pct}% of ${c.runner}'s list of added work`;
-        });
-      return { text: `${by}, but still checking: Khipu has read ${parts.join(" and ") || "part of your job runners' added work"} so far.`, tone: "" };
-    }
-    case "incomplete":
-      return { text: `${by}, but not fully: ${leftOutLine(cells)}`, tone: "" };
-    case "cannot_check":
-      return { text: `${by}, but not here: ${CANNOT_SEE[result.check ?? ""] ?? CANNOT_SEE.fast_tier}`, tone: "" };
-    case "no_lane":
-      return { text: `${by}, but not yet: none of your job runners has a job slot this rule is about.`, tone: "" };
-    case "no_runner":
-      return { text: `${by}, but not yet: add a job runner folder so it has something to read.`, tone: "" };
-    case "unreadable": // an older Khipu's word for not_read, with no cells to name
-      return { text: `${by}, but not now: Khipu can't read your job runners' settings.`, tone: "" };
-    default:
-      return { text: `${by}. Reading what the last check found…`, tone: "" };
-  }
-}
-
-const NOT_CHECKED: Line = { text: "Passed to every conversation as written. Khipu has no way to check this one.", tone: "" };
-
-/** The line under a standing rule: what Khipu's check found, or that Khipu
- *  has no check for it. `tone` is "ok", "warn" or "" (grey). A rule Khipu
- *  checks says "nothing wrong found" only from a result of "ok", which the
- *  CLI gives only after every check ran and read fresh files. */
-export function ruleResultLine(watched: boolean, result: RuleResult | undefined, nowMs: number = Date.now()): Line {
-  if (!watched) return NOT_CHECKED;
-  return result ? resultLine(result, "", nowMs, true) : resultLine({ rule: 0, result: "" }, "", nowMs, true);
-}
-
-/** Every line under a standing rule: one per check, each from its own
- *  cells, naming its check when the rule has several. "Nothing wrong found"
- *  only when every check passed; else a passing check says "passed". */
-export function ruleResultLines(watched: boolean, result: RuleResult | undefined, nowMs: number = Date.now()): Line[] {
-  const checks = result?.checks ?? [];
-  if (!watched || !result || !checks.length) return [ruleResultLine(watched, result, nowMs)];
-  const allOk = checks.every((c) => c.result === "ok");
-  if (checks.length === 1) return [resultLine(checks[0], "", nowMs, allOk)];
-  return checks.map((c) => resultLine(c, ` ${CHECK_FOR[c.check] ?? ""}`.trimEnd(), nowMs, allOk));
 }
 
 // Words a rule commonly opens with that are not names, so "Never a -fast
@@ -1170,50 +1024,6 @@ export function runnerWords(r: RouteRunner, now: Date): string {
   return r.unreadable_since
     ? `Khipu can't read ${r.name}'s files since ${whenLocal(r.unreadable_since, now)}.`
     : `Khipu can't read ${r.name}'s files.`;
-}
-
-/** What one changed entity now says: "Grok Build limit reached (a guess)". */
-function entityWords(entity: string, view: RouteView): string {
-  const [kind, ...rest] = entity.split(":");
-  const ident = rest.join(":");
-  if (kind === "account") {
-    const a = (view.accounts ?? []).find((x) => x.key === ident);
-    if (!a) return "an account is no longer tracked";
-    const word: Record<string, string> = {
-      limited: a.basis === "estimated" ? "limit reached (a guess)" : "limit reached",
-      open: "open",
-      paused: "paused by you",
-      down: "down",
-      probably_open: "probably open",
-    };
-    return `${a.label} ${word[a.state] ?? "unknown"}`;
-  }
-  if (kind === "hold") {
-    const h = (view.holds ?? []).find((x) => x.id === ident);
-    return h ? `hold on ${h.scope_label} set` : "a hold ended";
-  }
-  if (kind === "rule") return `standing rule ${ident} changed`;
-  if (entity === "note") return view.note ? "your note changed" : "your note ended";
-  if (kind === "runner") {
-    const r = (view.sources?.runners ?? []).find((x) => x.name === ident);
-    return r?.silent ? `${ident} job runner stopped reporting` : `${ident} job runner reporting`;
-  }
-  if (kind === "lane") {
-    const [runner, lane] = ident.split("/");
-    return `${runner}'s ${lane} job slot changed`;
-  }
-  if (entity === "table") return "the routing table's current-state section changed";
-  return entity;
-}
-
-/** "Last change 3:00 PM: Grok Build limit reached (a guess)." or null. */
-export function lastChangeWords(view: RouteView, now: Date): string | null {
-  const changes = view.changes ?? [];
-  const last = changes[changes.length - 1];
-  if (!last || !last.entities?.length) return null;
-  const first = capitalise(entityWords(last.entities[0], view));
-  const more = last.entities.length - 1;
-  return `Last change ${whenLocal(last.at, now)}: ${first}${more > 0 ? ` and ${more} more` : ""}.`;
 }
 
 export const ROUTE_READ_FAILED = "Khipu could not read the routing record. It tries again every minute.";
@@ -1281,27 +1091,6 @@ export function useRouting(active: boolean) {
 
 export type RoutingState = ReturnType<typeof useRouting>;
 
-/** "Khipu's record has not been refreshed since 2:58 PM" when a read failed
- *  and the last good one is older than the record's own bound (5 minutes by
- *  default), or when the record's own `checked_at` is past that bound. Never
- *  while the first read after Home turns active again is under way: the view
- *  is old then only because nobody was looking. */
-export function notRefreshedWords(
-  state: { data: RouteView | null; lastOkAt: string | null; error?: string | null; firstRead?: boolean },
-  now: Date,
-): string | null {
-  const { data, lastOkAt, error, firstRead } = state;
-  if (!data || !lastOkAt || !data.record || firstRead) return null;
-  const bound = data.warn_after?.not_refreshed ?? 5 * 60;
-  if (!bound) return null;
-  const past = (iso: string | null | undefined) => {
-    const at = parse(iso);
-    return !!at && now.getTime() - at.getTime() > bound * 1000;
-  };
-  if (!(error && past(lastOkAt)) && !past(data.checked_at)) return null;
-  return `Khipu's record has not been refreshed since ${whenLocal(data.checked_at ?? lastOkAt, now)}`;
-}
-
 // ---------------------------------------------------------------------------
 // The owner's priority and the spend pace (phase 4b). The priority is the
 // owner's own order, shown as he gave it; the pace is arithmetic on figures
@@ -1315,12 +1104,6 @@ export function priorityOrder(p: RoutePriority, now: Date): string {
     .join(", then ");
 }
 
-/** "Priority: Claude second until Sat 3:00 PM, then Codex". */
-export function priorityHeadline(p: RoutePriority, now: Date): string {
-  const whole = p.until ? ` (all of it until ${whenLocal(p.until, now)})` : "";
-  return `Priority: ${priorityOrder(p, now)}${whole}`;
-}
-
 /** "when read 1 h ago" for figures that may be out of date. */
 export function readWhen(fact: PlanFact, now: Date): string {
   const ago = fmtAgoSince(fact.figures_at, now.getTime());
@@ -1332,43 +1115,6 @@ export function rateWords(pace: number): string {
   if (pace >= 10) return pace.toFixed(0);
   if (pace >= 0.1) return String(Math.round(pace * 10) / 10);
   return pace >= 0.01 ? String(Math.round(pace * 100) / 100) : "less than 0.01";
-}
-
-/** "88% of its week left, resets Sat 3:00 PM: about 1.7% an hour to use it
- *  all (a lot left, little time)", or why there is no pace. */
-export function paceWords(fact: PlanFact | null | undefined, now: Date): string | null {
-  if (!fact) return null;
-  if (!fact.readable) return capitalise(fact.why || "plan figures can't be read");
-  if (fact.stale) {
-    return `${fact.left_pct}% of its ${fact.window} left ${readWhen(fact, now)}, resets ${whenLocal(fact.resets_at, now)}: ` +
-      "these figures may be out of date, so no pace is given";
-  }
-  const head = `${almostPrefix(fact.left_pct)}${fact.left_pct}% of its ${fact.window} left, resets ${whenLocal(fact.resets_at, now)}`;
-  if (!fact.left_pct || fact.left_pct <= 0) return `${head}: nothing left to use until then`;
-  // `fact.words` ("a lot left, little time") describes the pace needed, not
-  // how much is left, so it contradicted the figure; the figure speaks alone.
-  return `${head}: using it all would take about ${rateWords(fact.pace_pct_per_hour ?? 0)}% an hour`;
-}
-
-export function deliveryReason(reason: string): string {
-  const words: Record<string, string> = {
-    "ack-unshown": "a change was acknowledged before it was shown",
-    "budget-stall":
-      "a conversation or its helper agent is behind on routing changes: it has run more steps than the changes owed to it allow. " +
-      "One that started before the last update, or that has ended, keeps what it last had; the next prompt or a new conversation catches up",
-    "lease-expired-twice":
-      "a change was offered to a conversation twice and not confirmed (usually one that went quiet partway). " +
-      "It is offered again on that conversation's next prompt",
-    "prompt-delay": "routing lines were skipped on three or more prompts in a row in one conversation; they arrive with a later prompt",
-    "prompt-skips": "too many prompts skipped routing",
-    "cross-mac-stale": "the cross-Mac copy is behind",
-    "gateway-stale": "the cloud copy is behind",
-    "gateway-cleanup-stopped": "removing the cloud copy stopped after 6 failed tries",
-    "gateway-cleanup-interrupted": "removing the cloud copy was interrupted",
-    "gateway-cleanup-full": "too many unresolved cloud copy cleanups",
-    "unmatched-limit": "an unmatched job slot has a limit for over an hour",
-  };
-  return words[reason] ?? reason.replace(/-/g, " ");
 }
 
 const DELIVERY_HARNESS_WORDS: ReadonlyArray<readonly [string, string]> = [
@@ -1428,7 +1174,6 @@ export function deliveryConversationLabels(
             ? "MCP helper"
             : component === "agent" || component.startsWith("agent:")
               ? "a helper agent"
-              : "another component",
-    };
+              : "another component" };
   });
 }

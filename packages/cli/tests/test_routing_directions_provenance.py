@@ -87,3 +87,57 @@ def test_one_text_typed_by_him_and_sent_by_a_machine_opens_one_item(world):
 def test_a_text_the_recorder_never_saw_still_waits_unjoined(world):
     (row,) = scan("use GLM only one job at a time, please")
     assert row["join"] == "unjoined"  # a missed hook: kept as before, joined once a record arrives
+
+
+# ---- a turn recorded t3-unverified (review of #568 and #570, 2026-11-11) ----
+
+_UNVERIFIED = {"session": SESSION, "entrypoint": "t3-unverified", "native": "claude-desktop",
+               "harness": "claude_code", "typed": True}
+
+
+def test_his_judges_an_unverified_turn_by_its_native_front_end_once_t3_settles_none(world):
+    assert routing_directions._his(_UNVERIFIED, owner_turns.settings(), t3="none")
+
+
+def test_his_keeps_the_t3_rule_for_an_unverified_turn_t3_runs(world):
+    conf = owner_turns.settings()
+    assert routing_directions._his(_UNVERIFIED, conf, t3="t3")
+    assert not routing_directions._his(dict(_UNVERIFIED, machine=True), conf, t3="t3")
+
+
+def test_his_refuses_an_unverified_turn_while_t3_stays_unreadable(world):
+    conf = owner_turns.settings()
+    assert not routing_directions._his(_UNVERIFIED, conf, t3="unverified")
+    assert not routing_directions._his(_UNVERIFIED, conf)
+
+
+def test_a_scan_opens_an_unverified_turn_once_t3_settles_none(world, monkeypatch):
+    import sqlite3
+
+    real = owner_turns._t3_membership
+    monkeypatch.setattr(owner_turns, "_t3_membership", lambda session: "unverified")
+    say(GLM)
+    assert owner_turns.turns(SESSION)[-1]["entrypoint"] == "t3-unverified"
+    db = world / "t3.sqlite"
+    with sqlite3.connect(db) as con:
+        con.execute("CREATE TABLE orchestration_v2_projection_provider_threads (thread_id TEXT, payload_json TEXT)")
+    monkeypatch.setenv("KHIPU_T3_DB", str(db))
+    monkeypatch.setattr(owner_turns, "_t3_membership", real)
+    (row,) = scan()
+    assert row["typed"] is True and row["status"] == "open"
+
+
+def test_a_scheduled_prompt_opens_no_item(world, monkeypatch):
+    import json
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    transcript = Path(world) / "t.jsonl"
+    now = time.time()
+    stamp = datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    owner_turns.record({"session_id": SESSION, "prompt": GLM, "cwd": "/work", "transcript_path": str(transcript)},
+                       CLAUDE_ENV, now=now)
+    transcript.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": GLM},
+                                      "timestamp": stamp, "isMeta": True, "promptSource": "system",
+                                      "wakeupSource": "schedule_wakeup", "turnOrigin": "scheduled"}) + "\n")
+    assert scan() == []

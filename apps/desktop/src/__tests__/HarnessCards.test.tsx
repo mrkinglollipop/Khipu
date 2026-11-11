@@ -67,7 +67,7 @@ describe("T3 provider rows", () => {
   it("counts features and calls anything short of complete Partial, in amber", () => {
     const [cursor, antigravity] = T3_PROVIDERS.providers!.map(providerSummary);
     expect(cursor).toMatchObject({ line: "Cursor · 4 of 5 features, Reinstall adds the rest", tag: { tone: "warn", label: "Partial" } });
-    expect(antigravity.line).toBe("Antigravity · 2 of 5 features, capture and tools in 1 project; recall not possible in T3");
+    expect(antigravity.line).toBe("Antigravity · 2 of 5 features, saving and tools in 1 project; recall not possible in T3");
     expect(antigravity.tag).toEqual({ tone: "warn", label: "Partial" });
   });
 
@@ -95,7 +95,7 @@ describe("T3 provider rows", () => {
     expect(text).toContain("T3's Antigravity runtime");
   });
 
-  it("reads recall as a harness limit, not a gap", () => {
+  it("reads recall as a app limit, not a gap", () => {
     const rows = antigravityT3Rows(T3_PROVIDERS.providers![1].functions, [KHIPU_PROJECT]);
     expect(rows.map((r) => r.mark)).toEqual(["ok", "ok", "na"]);
     expect(antigravityT3Rows(undefined, []).map((r) => r.mark)).toEqual(["off", "off", "na"]);
@@ -171,7 +171,7 @@ describe("the Cursor card", () => {
   it("shows one row per function with proof, its files and Reinstall, Verify, Remove", async () => {
     renderCards();
     const card = (await screen.findByText("Cursor", { selector: ".name" })).closest(".hcard") as HTMLElement;
-    expect(within(card).getByText(/Capture hook · last capture 29 s ago|Capture hook · last capture 29s ago/)).toBeInTheDocument();
+    expect(within(card).getByText(/Saving hook · last save 29 s ago|Saving hook · last save 29s ago/)).toBeInTheDocument();
     expect(within(card).getByText("proven Oct 27")).toBeInTheDocument();
     expect(within(card).getByText("not seen")).toBeInTheDocument();
     expect(within(card).getByText(/Routing after a delegation · installed, waiting for proof/)).toBeInTheDocument();

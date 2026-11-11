@@ -88,8 +88,9 @@ describe("Tauri invoke contracts", () => {
         }
       }
     }
-    expect(commands.size).toBeGreaterThan(100);
-    expect(checked).toBeGreaterThan(100);
+    expect(commands.size).toBe(92);
+    // Exact, not a floor: A12 removed 50 commands nothing called and lost no call site (98 before and after).
+    expect(checked).toBe(98);
     expect(violations).toEqual([]);
   });
 });

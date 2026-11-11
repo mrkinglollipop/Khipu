@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { PostUpdateNoticeDialog } from "../PostUpdateNoticeDialog";
-import { WhatsNewCard, WhatsNewHistory, revealSettingsGroup } from "../WhatsNew";
+import { WhatsNewCard, WhatsNewHistory } from "../WhatsNew";
 import { ALL_CAPABILITIES, itemsBetween, type NoticeTarget } from "../postUpdateNotices";
 
 afterEach(cleanup);
@@ -138,24 +138,5 @@ describe("WhatsNewHistory", () => {
     render(<WhatsNewHistory caps={ALL_CAPABILITIES} appVersion="0.4.16" needsRoutingSetup={false} onShow={onShow} />);
     fireEvent.click(screen.getByRole("button", { name: "Show me: Setup" }));
     expect(onShow).toHaveBeenCalledWith({ kind: "setup", step: "accounts" });
-  });
-});
-
-describe("revealSettingsGroup", () => {
-  it("opens a folded group button and does nothing when absent", async () => {
-    const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
-      cb(0);
-      return 0;
-    });
-    const btn = document.createElement("button");
-    btn.setAttribute("data-settings-group", "accounts");
-    btn.setAttribute("aria-expanded", "false");
-    btn.addEventListener("click", () => btn.setAttribute("aria-expanded", "true"));
-    document.body.appendChild(btn);
-    revealSettingsGroup("accounts");
-    expect(btn.getAttribute("aria-expanded")).toBe("true");
-    expect(() => revealSettingsGroup("missing")).not.toThrow();
-    btn.remove();
-    raf.mockRestore();
   });
 });

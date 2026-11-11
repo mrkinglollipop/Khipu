@@ -124,16 +124,19 @@ class MergedEpisodeScratchTest(unittest.TestCase):
 
     # 1. merge-then-reconcile does not resurrect
 
-    def test_reconcile_and_tail_sync_do_not_resurrect_a_merged_line(self):
-        from khipu import mirror
+    def test_reconcile_and_the_export_do_not_resurrect_a_merged_line(self):
+        # Row 11: the reconcile no longer imports episode lines at all, and the
+        # hub → files export matches both merged lines through episode_sources.
+        from khipu import capture_export, mirror
 
         self._write_file(_line(self.a), _line(self.b))
         before = self._count()
         self.assertEqual(before, 1)
         self.assertEqual(self._missing(self.a, self.b), [])
-        self.assertEqual(mirror.reconcile_memory_root(self.root)["episodes_new"], 0)
+        mirror.reconcile_memory_root(self.root)
         self.assertEqual(self._count(), before)
-        self.assertEqual(mirror.sync_recent_episodes(self.root)["inserted"], 0)
+        out = capture_export.export_new_lines(self.root, dry_run=True)
+        self.assertEqual(out["would_add"], 0, out)
         self.assertEqual(self._count(), before)
 
     def test_merged_line_is_reported_missing_when_the_probe_is_false(self):

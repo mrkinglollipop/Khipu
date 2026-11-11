@@ -9,8 +9,6 @@
    loaded every name and line does, with problems.privacy set. The app shows
    WITHHELD's words in its place and offers no action that needs it. */
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { callCli } from "./settingsCli";
 import { whenLocal } from "./routing";
 
 export type Vocab = { state: Array<[string, string]>; kind: string[] };
@@ -145,31 +143,6 @@ export type WaitItem = {
   masked?: boolean;
   actions: WaitAction[];
 };
-// The keys each kind of item needs before the app offers any action on it.
-// An item missing one (a withheld id, a routing item with no key) is shown
-// with no buttons at all, whatever its actions list says.
-const NEEDS: Record<WaitItem["source"], Array<"key" | "project" | "id">> = {
-  ledger: ["key", "project", "id"],
-  commitment: ["key", "id"],
-  routing: ["key"],
-};
-
-const has = (v: string | null | undefined) => v != null && v !== "";
-
-/** Whether the app may offer ``action`` on ``item`` (no action: any at all).
- *  Beyond the item's own keys, "These are the same" and "Not the same" name
- *  the project's ledger row, so they need the project and that row's id;
- *  Done and Drop on a ledger row need ``vocab`` to define that state. */
-export function canAct(item: WaitItem, action?: WaitAction, vocab?: Vocab | null): boolean {
-  const needs = NEEDS[item.source];
-  if (needs === undefined || !needs.every((k) => has(item[k]))) return false;
-  if (action === "same" || action === "not_same") return has(item.project) && usableRowId(item.looks_like?.id);
-  if (item.source === "ledger" && (action === "done" || action === "drop")) {
-    return wordFor(vocab, action === "done" ? "done" : "dropped") != null;
-  }
-  return true;
-}
-
 // A row id as the ledger accepts one (ledger.py's _ID_RE). An id the
 // projection changed ("(a path)", "[redacted]") is not one, and the app
 // never looks it up or acts on it.
@@ -269,7 +242,7 @@ export function appliedFinished(reply: LedgerSetReply | null | undefined, vocab:
 /** Words for a set reply that did not apply now, or null. */
 export function unappliedWords(reply: LedgerSetReply | null | undefined, owed: boolean): string | null {
   if (!reply) return null;
-  const tail = owed ? " The Owed item stays open until the ledger takes it." : "";
+  const tail = owed ? " The work list item stays open until the project list takes it." : "";
   if (reply.queued) return `Saved on this Mac; the change is waiting to be sent to the database.${tail}`;
   if (reply.late) {
     const where = reply.state ? ` to ${stateWords(reply.state)}` : "";
@@ -299,8 +272,7 @@ export const WITHHELD = {
   name: "Name withheld",
   title: "Title withheld",
   summary: "Summary withheld",
-  line: "Line withheld",
-} as const;
+  line: "Line withheld" } as const;
 
 /** One rule for a project's words, in Owed and in Work: `commitments.project`
  *  is an owner/repo slug (its repo half), or the raw `harness:uuid` session id
@@ -333,8 +305,7 @@ const STATE_APP_WORDS: Record<string, string> = {
   "NEEDS OWNER": "Needs you",
   "NEEDS MATT": "Needs you",
   DROPPED: "Dropped",
-  DONE: "Done",
-};
+  DONE: "Done" };
 
 /** A ledger state in the app's words; a project's own word shows as written. */
 export function stateWords(word: string): string {
@@ -351,8 +322,7 @@ const KIND_WORDS: Record<string, [string, string]> = {
   "audit-item": ["Audit item", "Audit items"],
   drive: ["Drive", "Drives"],
   wave: ["Wave", "Waves"],
-  train: ["Train", "Trains"],
-};
+  train: ["Train", "Trains"] };
 
 export function kindWords(kind: string, many = false): string {
   const w = KIND_WORDS[kind];
@@ -363,18 +333,6 @@ export function kindWords(kind: string, many = false): string {
 export function meaningOf(vocab: Vocab | undefined | null, state: string): Meaning {
   const hit = vocab?.state.find(([w]) => w === state);
   return (hit ? hit[1] : null) as Meaning;
-}
-
-/** The project's word for this meaning (Done on a Needs you row is this
- *  project's done word, not always DONE): DONE or DROPPED when the project
- *  has it, else its first word with that meaning. */
-export function wordFor(vocab: Vocab | undefined | null, meaning: "done" | "dropped"): string | null {
-  const words = (vocab?.state ?? []).filter(([, m]) => m === meaning).map(([w]) => w);
-  // The default ledger lists VERIFIED before DONE, both meaning done; an
-  // answered Needs you row is DONE there, as the scope says.
-  const plain = meaning === "done" ? "DONE" : "DROPPED";
-  if (words.includes(plain)) return plain;
-  return words[0] ?? null;
 }
 
 /** A ledger state's dot. The words always sit beside it. */
@@ -481,8 +439,7 @@ const RUN_WORDS: Record<string, string> = {
   running: "running",
   failed: "failed",
   skipped: "skipped",
-  queued: "waiting",
-};
+  queued: "waiting" };
 
 /** "Unit tests passed", "Screenshots waiting". */
 export function runWords(run: WorkRun): string {
@@ -500,91 +457,6 @@ export function runTone(run: WorkRun): string {
 }
 
 export type LineTone = "" | "warn" | "err" | "ok";
-
-const CAP_WORDS: Record<string, string> = {
-  jobs: "jobs",
-  prs: "pull requests",
-  trains: "release trains",
-  runs: "test runs",
-};
-
-/** "2 items couldn't be read and are left out. Showing the newest 20 of 31
- *  test runs." for a board showing a summary, this read or the last good
- *  one (both held to the caps set now; the run cap counts the project). */
-function shownNotes(s: WorkBoard["source"]): string[] {
-  const out: string[] = [];
-  const dropped = (s.dropped ?? 0) + (s.other_project ?? 0);
-  if (dropped) {
-    out.push(`${plural(dropped, "item")} couldn't be read and ${dropped === 1 ? "is" : "are"} left out.`);
-  }
-  for (const [what, cap] of Object.entries(s.capped ?? {})) {
-    // A last good read kept by an older Khipu may count runs per train.
-    const words = CAP_WORDS[what] ?? (what.startsWith("runs") ? CAP_WORDS.runs : what);
-    out.push(`Showing the newest ${cap.shown.toLocaleString()} of ${cap.of.toLocaleString()} ${words}.`);
-  }
-  return out;
-}
-
-/** The newest summary is older than the last one read (work.py's words). */
-const OLDER_PROBLEM = "The newest summary is older than the last one read";
-
-/** The line under a board's head: where its job runner's word stands (the
- *  scope's source-state table). */
-export function sourceLine(board: WorkBoard, now: Date): { text: string; tone: LineTone } {
-  const s = board.source;
-  const asOf = timeOnly(s.as_of);
-  switch (s.state) {
-    case "ok":
-      return { text: [`Updated ${updatedWords(s.as_of, now)}.`, ...shownNotes(s)].join(" "), tone: "ok" };
-    case "stale":
-      return {
-        text: [`No update for ${ageWords(s.as_of, now)}; showing what it said at ${asOf}.`, ...shownNotes(s)].join(" "),
-        tone: "warn",
-      };
-    case "gone":
-      return { text: `Not reporting since ${whenLocal(s.as_of, now)}.`, tone: "warn" };
-    case "too_big": {
-      const head = s.problem ?? "The summary file is over its size limit.";
-      const notes = asOf ? shownNotes(s) : [];
-      return { text: [`${head}${asOf ? ` Showing what it said at ${asOf}.` : ""}`, ...notes].join(" "), tone: "warn" };
-    }
-    case "unreadable": {
-      if (!asOf) return { text: "Couldn't read the summary file.", tone: "err" };
-      const head = s.problem?.startsWith(OLDER_PROBLEM)
-        ? `The newest summary is older than the last one read; showing what it said at ${asOf}.`
-        : `Couldn't read the newest summary; showing what it said at ${asOf}.`;
-      return { text: [head, ...shownNotes(s)].join(" "), tone: "err" };
-    }
-    case "newer_format":
-      return {
-        text: s.problem ?? "Written in a newer format than this Khipu reads. Update Khipu to see it.",
-        tone: "warn",
-      };
-    case "wrong_project":
-      return { text: `${s.problem ?? "This file says it is for another project."} Nothing from it is shown.`, tone: "err" };
-    case "refused":
-      return {
-        text: "Not read: the file is inside a private or login folder, is reached through a link, or has more than one name.",
-        tone: "err",
-      };
-    case "missing":
-      return { text: "No summary file yet at the place you set.", tone: "" };
-    case "off":
-      return { text: "Its summary file is turned off.", tone: "" };
-    default:
-      return { text: "No job runner reports for this project. The ledger is below.", tone: "" };
-  }
-}
-
-const LIVE_STATES = ["running", "queued", "waiting"];
-
-/** A board with nothing running, nothing flagged and nothing waiting folds
- *  to one line; so does a project that stopped reporting. */
-export function boardFolds(board: WorkBoard, waiting: number): boolean {
-  if (board.source.state === "gone") return true;
-  const running = board.jobs.some((j) => LIVE_STATES.includes(j.state ?? ""));
-  return !running && board.flagged === 0 && waiting === 0;
-}
 
 /** "2 running · 1 flagged · 9 waiting on you". */
 export function boardMeta(board: WorkBoard, waiting: number, now: Date): string {
@@ -605,111 +477,6 @@ export function foldedMeta(board: WorkBoard, waiting: number, now: Date): string
   return bits.join(" · ");
 }
 
-const BAR_ORDER: Array<[string, string, string]> = [
-  ["VERIFIED", "b-ver", "verified"],
-  ["MERGED-UNVERIFIED", "b-mer", "merged"],
-  ["BUILT-UNMERGED", "b-bui", "built"],
-  ["IN FLIGHT", "b-fly", "in progress"],
-];
-
-/** A goal's bar: segments per child state, each named in the bar's label,
- *  plus "4 of 7 verified · 1 needs you". */
-export function goalBar(
-  goal: LedgerGoal,
-  vocab?: Vocab | null,
-): { parts: Array<{ cls: string; pct: number }>; label: string; words: string } {
-  const total = goal.children;
-  const by = goal.by_state ?? {};
-  const isNeeds = (w: string) => meaningOf(vocab, w) === "needs" || w.startsWith("NEEDS ");
-  const pct = (n: number) => (total ? (100 * n) / total : 0);
-  const parts: Array<{ cls: string; pct: number }> = [];
-  const label: string[] = [];
-  let needs = 0;
-  for (const [w, n] of Object.entries(by)) {
-    if (isNeeds(w)) needs += n;
-  }
-  for (const [w, cls, words] of BAR_ORDER) {
-    const n = by[w] ?? 0;
-    if (!n) continue;
-    parts.push({ cls, pct: pct(n) });
-    label.push(`${n.toLocaleString()} ${words}`);
-  }
-  if (needs) {
-    parts.push({ cls: "b-need", pct: pct(needs) });
-    label.push(`${needs.toLocaleString()} needs you`);
-  }
-  const counted = new Set(BAR_ORDER.map(([w]) => w));
-  for (const [w, n] of Object.entries(by)) {
-    if (!counted.has(w) && !isNeeds(w)) label.push(`${n.toLocaleString()} ${stateWords(w).toLowerCase()}`);
-  }
-  const words = total
-    ? `${goal.verified.toLocaleString()} of ${total.toLocaleString()} verified${needs ? ` · ${needs.toLocaleString()} needs you` : ""}`
-    : "No slices yet";
-  return { parts, label: label.join(", ") || "No slices yet", words };
-}
-
 export const WORK_READ_FAILED = "Khipu couldn't read the work view. It tries again shortly.";
 export const WORK_READ_UNREADABLE = "The work view gave an answer Khipu could not read.";
 
-/** Polls `khipu_work_view` refresh_s after the previous read ends while the
- *  tab is open, a minute after otherwise (the rail badge): a slow read never
- *  has another start behind it. `load(true)` after a write waits for a read
- *  already under way, then reads again, so the badge moves at once. */
-export function useWork(active: boolean, enabled = true) {
-  const [data, setData] = useState<WorkView | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [readAt, setReadAt] = useState<number | null>(null);
-  const inflight = useRef<Promise<void> | null>(null);
-
-  const load = useCallback((fresh = false): Promise<void> => {
-    if (inflight.current) return fresh ? inflight.current.then(() => load(false)) : inflight.current;
-    setLoading(true);
-    const p = (async () => {
-      try {
-        const res = await callCli<WorkView>("khipu_work_view");
-        if (!res.ok) {
-          setError(WORK_READ_FAILED);
-          return;
-        }
-        if (res.data && Array.isArray(res.data.projects) && Array.isArray(res.data.waiting)) {
-          setData(res.data);
-          setError(null);
-          setReadAt(Date.now());
-        } else {
-          setError(WORK_READ_UNREADABLE);
-        }
-      } finally {
-        inflight.current = null;
-        setLoading(false);
-      }
-    })();
-    inflight.current = p;
-    return p;
-  }, []);
-
-  const every = active ? Math.max(1, data?.refresh_s ?? 5) * 1000 : 60_000;
-  useEffect(() => {
-    if (!enabled) return;
-    let stopped = false;
-    let timer: number | undefined;
-    const next = () => {
-      if (!stopped) timer = window.setTimeout(() => void load().then(next), every);
-    };
-    void load().then(next);
-    return () => {
-      stopped = true;
-      window.clearTimeout(timer);
-    };
-  }, [enabled, every, load]);
-
-  return { data, error, loading, readAt, load };
-}
-
-export type WorkState = ReturnType<typeof useWork>;
-
-/** The rail badge's name for a screen reader: a bare number says nothing. */
-export function badgeLabel(waiting: number, blocking: number, quiet = 0): string {
-  const head = `${waiting.toLocaleString()} waiting on you`;
-  return `${head}${blocking ? `, ${blocking.toLocaleString()} blocking` : ""}${quiet ? `, ${quiet.toLocaleString()} quiet` : ""}`;
-}

@@ -101,7 +101,7 @@ describe("cardStatus — Claude homes", () => {
     expect(cardStatus(row, RECORDING, undefined)).toEqual({ tone: "ok", label: "Recording" });
   });
 
-  it("reads Idle, not green Recording, when the last capture is over a week old", () => {
+  it("reads Idle, not green Recording, when the last save is over a week old", () => {
     const row = claudeRow([home(), t3Home()]);
     const old: HarnessLiveness = { ok: true, seen: true, captures: 4, last_captured_age_s: 7 * 86400 + 3600 };
     expect(cardStatus(row, old, undefined)).toEqual({ tone: "neutral", label: "Idle" });
@@ -140,7 +140,7 @@ describe("cardStatus — Claude homes", () => {
     expect(cardStatus(row, RECORDING, undefined)).toEqual({ tone: "ok", label: "Recording" });
   });
 
-  it("is unchanged for a row with no homes (every other harness)", () => {
+  it("is unchanged for a row with no homes (every other app)", () => {
     const row: StatusRow = {
       harness: "cursor",
       detected: true,
@@ -361,12 +361,12 @@ describe("IntegrationsPanel — T3 health card", () => {
     expect(card).toHaveClass("t3-card");
     expect(within(card).getByText("Linking threads")).toBeInTheDocument();
     expect(within(card).getByText(/Thread lookup · reads T3's thread records, read-only/)).toBeInTheDocument();
-    expect(within(card).getByText(/Last capture linked to a thread 12 min ago · Codex/)).toBeInTheDocument();
+    expect(within(card).getByText(/Last save linked to a thread 12 min ago · Codex/)).toBeInTheDocument();
     // Recheck stays disabled until the panel's first read finishes.
     const recheck = within(card).getByRole("button", { name: "Recheck" });
     await waitFor(() => expect(recheck).toBeEnabled());
     fireEvent.click(recheck);
-    fireEvent.click(within(card).getByRole("button", { name: "Search T3 captures" }));
+    fireEvent.click(within(card).getByRole("button", { name: "Search T3 saves" }));
     expect(refresh).toHaveBeenCalledOnce();
     expect(search).toHaveBeenCalledOnce();
   });
@@ -393,7 +393,7 @@ describe("IntegrationsPanel — Claude homes", () => {
     const card = await claudeCard();
 
     expect(within(card).getByText("Recording")).toBeInTheDocument();
-    expect(within(card).getByText(/Capture hook · last capture 4 min ago/)).toBeInTheDocument();
+    expect(within(card).getByText(/Saving hook · last save 4 min ago/)).toBeInTheDocument();
     const list = within(card).getByRole("list", { name: "Claude homes" });
     // The header is the list's label, not one of its items.
     expect(within(list).queryByText("Claude homes")).not.toBeInTheDocument();
@@ -437,7 +437,7 @@ describe("IntegrationsPanel — Claude homes", () => {
     expect(within(card).getByText("1 home not installed")).toBeInTheDocument();
     expect(within(card).queryByText("Recording")).not.toBeInTheDocument();
     // The shared evidence stays about the harness, not the missing home.
-    expect(within(card).getByText(/Capture hook · last capture 4 min ago/)).toBeInTheDocument();
+    expect(within(card).getByText(/Saving hook · last save 4 min ago/)).toBeInTheDocument();
     expect(within(card).getByText("Recall at session start")).toBeInTheDocument();
 
     const rows = within(within(card).getByRole("list", { name: "Claude homes" })).getAllByRole("listitem");
@@ -471,7 +471,7 @@ describe("IntegrationsPanel — Claude homes", () => {
     fireEvent.click(within(rows[0]).getByRole("button", { name: "Remove Khipu from Default" }));
     expect(runKhipu).not.toHaveBeenCalledWith(["integrations", "uninstall", "claude_code", "--home", DEFAULT_PATH]);
     const dialog = await screen.findByRole("dialog", { name: "Remove Khipu from Default?" });
-    expect(within(dialog).getByText(/future capture and recall/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/future saving and recall/)).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: "Remove Khipu" }));
     await waitFor(() =>
       expect(runKhipu).toHaveBeenCalledWith(["integrations", "uninstall", "claude_code", "--home", DEFAULT_PATH]),
@@ -518,7 +518,7 @@ describe("IntegrationsPanel — Claude homes", () => {
     );
   });
 
-  it("stays off green after a capture lands while a home is still not installed", async () => {
+  it("stays off green after a save lands while a home is still not installed", async () => {
     // Same shape as the auto-verify flip, but one home is still missing: the
     // newer beat must not turn the tag to Verified.
     let installedAtIso = "";
@@ -535,7 +535,7 @@ describe("IntegrationsPanel — Claude homes", () => {
     const card = await claudeCard();
 
     fireEvent.click(within(card).getByRole("button", { name: "Reinstall" }));
-    await waitFor(() => expect(within(card).getByText(/select Verify to check capture and recall/)).toBeInTheDocument());
+    await waitFor(() => expect(within(card).getByText(/select Verify to check saving and recall/)).toBeInTheDocument());
     window.dispatchEvent(new Event("focus"));
     await waitFor(() => expect(runKhipu.mock.calls.filter((c) => c[0][1] === "status").length).toBeGreaterThan(2));
 
@@ -760,7 +760,7 @@ describe("IntegrationsPanel — per-home actions", () => {
     await waitFor(() => expect(toasts).toEqual(["Removed Khipu entries. Backups kept next to each file."]));
   });
 
-  it("does not let one home's install arm auto-verify from another home's capture", async () => {
+  it("does not let one home's install arm auto-verify from another home's save", async () => {
     let installedAtIso = "";
     const runKhipu = renderPanel(
       () => [
@@ -811,7 +811,7 @@ const CURSOR_MISSING: StatusRow = {
   hook_precompact: false,
   recall_rule: "missing",
 };
-const INSTALL_OK_COPY = "Installed. Restart each harness, then select Verify to check capture and recall.";
+const INSTALL_OK_COPY = "Installed. Restart each app, then select Verify to check saving and recall.";
 
 type EntryPoint = {
   name: string;
@@ -924,7 +924,7 @@ describe("runInstall result evidence", () => {
   it.each([
     ["[]", "action result was missing or unreadable"],
     ["not json", "action result was missing or unreadable"],
-    ['[{"harness":"claude_code","ok":true}]', "action result did not cover the requested harness"],
+    ['[{"harness":"claude_code","ok":true}]', "action result did not cover the requested app"],
   ])("rejects %s for cursor", async (raw, error) => {
     const runKhipu = vi.fn(async () => raw);
     const run = await runInstall(runKhipu, "cursor");
@@ -1004,7 +1004,7 @@ describe("Grok Bot card and the guides", () => {
     expect(within(card).queryByRole("button", { name: "Install" })).not.toBeInTheDocument();
     fireEvent.click(within(card).getByRole("button", { name: "Set up…" }));
     expect(onOpenGuide).toHaveBeenCalledWith("grok_bot");
-    expect(within(card).getByRole("button", { name: "Check the gateway" })).toBeInTheDocument();
+    expect(within(card).getByRole("button", { name: "Check the cloud server" })).toBeInTheDocument();
   });
 
   it("puts a How this works link on the card and opens the guide from it", async () => {
@@ -1018,7 +1018,7 @@ describe("Grok Bot card and the guides", () => {
   });
 });
 
-describe("IntegrationsPanel — unknown harness rows", () => {
+describe("IntegrationsPanel — unknown app rows", () => {
   it("still renders its cards when the CLI status lists grok_build", async () => {
     const rows = [
       { harness: "claude_code", detected: true, mcp: true, hook_stop: true, hook_precompact: true, recall_rule: "installed", homes: [] },
@@ -1038,6 +1038,6 @@ describe("IntegrationsPanel — unknown harness rows", () => {
     );
     await waitFor(() => expect(runKhipu).toHaveBeenCalled());
     await waitFor(() => expect(screen.getByText("Claude Code")).toBeInTheDocument());
-    expect(screen.queryAllByText(/Couldn't read the harness configs/)).toHaveLength(0);
+    expect(screen.queryAllByText(/Couldn't read the app configs/)).toHaveLength(0);
   });
 });

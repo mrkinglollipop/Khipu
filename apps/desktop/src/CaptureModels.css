@@ -1,10 +1,5 @@
-/* Settings > Capture & models (docs/plans/2026-10-15-settings-clarity.md, phase 6).
-   Tokens and base components come from App.css. */
-/* After: section intro and pointer. */
-.cm-intro{font-size:var(--t-md);color:var(--text-2);line-height:1.5}
+
 .cm-readonly{margin:0;font-size:var(--t-md);color:var(--text);line-height:1.5}
-.cm-pointer{margin:0;font-size:var(--t-sm);color:var(--text-2);line-height:1.5;display:flex;flex-wrap:wrap;gap:var(--s1) var(--s2);align-items:baseline}
-.cm-pointer button.link{height:auto;padding:0}
 
 /* Session summaries: one choice per row, the chosen one open. */
 .choices{display:flex;flex-direction:column;border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden;background:var(--surface)}
@@ -66,8 +61,6 @@ fieldset.set-field legend{padding:0;margin-bottom:var(--s1)}
 .choice-head input[type="radio"],.radio-stack input[type="radio"]{height:auto;width:auto;padding:0;border:0;flex:none}
 .radio-stack .radio-choice{align-items:center}
 .radio-stack .radio-choice input{margin:0}
-.cm-pointer{display:block}
-.cm-pointer button.link{display:inline;vertical-align:baseline;font-size:inherit}
 
 /* Add or replace a key: one inline row under the key's line. */
 .key-edit{grid-column:1 / -1;display:flex;flex-wrap:wrap;gap:var(--s2);align-items:center;margin-top:var(--s2)}

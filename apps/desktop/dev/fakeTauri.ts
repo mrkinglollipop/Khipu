@@ -4,9 +4,10 @@
 import { CLIENT, TRACKED, discovery, liveRow, status9B } from "../src/__tests__/accountsFixtures";
 import type { DiscoverResult } from "../src/accountsApi";
 import { DELIVERY_VIEW } from "./deliveryFake";
+import { fakeAnswer, isRaw, RAW } from "./fakes";
 import { config as fixtureRoutingConfig } from "../src/__tests__/routingSettingsFixtures";
 
-export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; worst?: boolean; routeReplication?: boolean; routeMacs?: "first" | "settled" | "off"; overrides?: boolean };
+export type Fake = { projects?: unknown; noProjects?: boolean; settings?: "stale" | "samename" | "one" | "problem"; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; worst?: boolean; routeReplication?: boolean; routeMacs?: "first" | "settled" | "off"; overrides?: boolean; welcome?: boolean; quiet?: boolean; accounts?: boolean; accountsProblem?: boolean; accountsAhead?: boolean; accountsRefuse?: boolean; healthProblem?: boolean; healthUnknown?: boolean; healthNone?: boolean; running?: boolean; runningSilent?: boolean; runningNone?: boolean; runningStale?: boolean; runningFail?: boolean; needsMore?: boolean; needsChanged?: boolean; needsSlow?: boolean; memOffline?: boolean; memPending?: boolean; orderRules?: boolean; sayRefusal?: string; sayOwnerOnly?: boolean };
 
 /** Values used by every routing-settings preview. They match the CLI's named
  * settings so every Change control is enabled with a real-looking value. */
@@ -313,6 +314,8 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
   const f = fake();
   await new Promise((r) => setTimeout(r, 200));
   const answer = (() => {
+    const shared = fakeAnswer(cmd, args, f as Record<string, unknown>);
+    if (shared !== undefined) return shared;
     if (f.overrides) {
       const mine = overridesCommand(cmd, args);
       if (mine !== undefined) return mine;
@@ -351,20 +354,21 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
         return f.usage ?? { accounts: [{ harness: "claude", account: "Claude Code", home: null, ok: true, plan: "max", windows: [] }] };
       case "khipu_features_show":
         return { features: { routing_push: { enabled: true, source: "default" } } };
-      case "khipu_projects_list":
-        return { ok: true, ...(f.projects as object) };
       case "khipu_route_view":
         if (f.routeNeeds) return (f.worst ? routeNeedsWorst() : routeNeeds()).view;
         if (f.routeMacs) return routeMacs(f.routeMacs).view;
         if (f.routeReplication) return routeReplication().view;
         if (f.route15a) return route15a().view;
         if (f.route15b) return route15b().view;
-        return { accounts: [], priority: null };
+        return { accounts: [], priority: null, this_mac: "M5" };
       case "khipu_account_sign_in":
         return { ok: true, row: liveRow({ account: CLIENT.name ?? "Claude client" }) };
       default:
         return { ok: true };
     }
   })();
-  return JSON.stringify(answer) as unknown as T;
+  // A fake may answer later (slice A3's slow answer): wait for it.
+  const settled = answer instanceof Promise ? await answer : answer;
+  if (isRaw(settled)) return settled[RAW] as T;
+  return JSON.stringify(settled) as unknown as T;
 }

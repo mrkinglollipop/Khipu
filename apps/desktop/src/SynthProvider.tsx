@@ -41,7 +41,7 @@ export type SynthProviderInfo = {
 
 export const SYNTH_PROVIDERS: readonly SynthProviderInfo[] = [
   { id: "gemini", label: "Gemini Flash (API key)", name: "Gemini Flash", kind: "API key", line: "Fastest, about 3 s, least accurate", route: "key", account: "gemini_api_key", secretPrefix: "gemini", defaultModel: "gemini-2.5-flash" },
-  { id: "anthropic", label: "Claude Haiku (API key)", name: "Claude Haiku", kind: "API key", line: "Best memory, about 11 s a capture", route: "key", account: "anthropic_api_key", secretPrefix: "anthropic", defaultModel: "claude-haiku-5-5" },
+  { id: "anthropic", label: "Claude Haiku (API key)", name: "Claude Haiku", kind: "API key", line: "Best memory, about 11 s a save", route: "key", account: "anthropic_api_key", secretPrefix: "anthropic", defaultModel: "claude-haiku-5-5" },
   { id: "openai", label: "OpenAI (API key)", name: "OpenAI", kind: "API key", line: "Accurate, thinner on open loops, about 8 s", route: "key", account: "openai_api_key", secretPrefix: "openai", exampleModel: "gpt-6-luna" },
   { id: "openrouter", label: "OpenRouter (one key, any model)", name: "OpenRouter", kind: "API key", line: "One key, any model", route: "key", account: "openrouter_api_key", secretPrefix: "openrouter", exampleModel: "openai/gpt-6-luna" },
   { id: "claude-cli", label: "Claude on my own login (claude -p)", name: "Claude", kind: "your login", line: "Uses the login you already have; counts against that plan", route: "login", defaultModel: "haiku", binary: "claude" },
@@ -654,16 +654,16 @@ export function SynthFallbackField({
       {isGemini ? (
         <p className="set-help">Gemini is the provider; there is nothing to fall back to.</p>
       ) : value == null ? (
-        <p className="set-help">Nothing is dropped either way: a failed capture waits and is retried. Saved when you choose.</p>
+        <p className="set-help">Nothing is dropped either way: a failed save waits and is retried. Saved when you choose.</p>
       ) : value === "gemini" ? (
         <p className="set-help">
           Fallback uses the Gemini key, about $0.002 a conversation. Nothing is dropped either way. Saved when you
           choose.
-          {refused ? " While that key is refused, a failed capture waits and is retried; nothing is dropped." : ""}
+          {refused ? " While that key is refused, a failed save waits and is retried; nothing is dropped." : ""}
         </p>
       ) : (
         <p className="set-help">
-          Nothing is dropped: a failed capture waits and is retried. Saved when you choose.
+          Nothing is dropped: a failed save waits and is retried. Saved when you choose.
         </p>
       )}
       {noKey ? (
@@ -782,7 +782,7 @@ export function SummariserCalls({ active }: { active: boolean }) {
   let sub: string | null = null;
   if (b) {
     if (exhausted) {
-      main = `Calls today: ${fmtCount(b.calls)} of ${fmtCount(b.cap)}. Captures wait until midnight UTC; nothing is dropped.`;
+      main = `Calls today: ${fmtCount(b.calls)} of ${fmtCount(b.cap)}. Saves wait until midnight UTC; nothing is dropped.`;
       sub = `Midnight UTC is ${midnight} here.${cost ? ` About ${cost} today.` : ""}`;
     } else {
       main = unlimited
@@ -847,7 +847,7 @@ export function SummariserCalls({ active }: { active: boolean }) {
             narrow
             inputMode="decimal"
             value={b && typeof b.cap === "number" ? String(b.cap) : ""}
-            help="0 means no limit. When the limit is reached, captures wait until midnight UTC; nothing is dropped."
+            help="0 means no limit. When the limit is reached, saves wait until midnight UTC; nothing is dropped."
             onSave={async (v) => {
               if (!/^\s*\d+\s*$/.test(v)) return "Enter a whole number, 0 or more.";
               const res = await callCli("khipu_config_set", { key: "synth_daily_calls", value: v.trim() });

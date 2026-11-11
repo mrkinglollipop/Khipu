@@ -1980,6 +1980,22 @@ def _local_mac() -> str | None:
     return value if re.fullmatch(r"[0-9a-f]{32}", value) else None
 
 
+def _ensure_local_mac() -> str:
+    """This Mac's routing identity.  None yet: made now, under the routing lock, exactly as the first routing
+    write would make it, so a subject frozen before that write names the same Mac after it.  A Mac that has
+    one reads it and writes nothing."""
+    mac = _local_mac()
+    if mac is not None:
+        return mac
+    try:
+        with _lock():
+            return _mac_locked()
+    except LockBusy as exc:
+        raise RouteError(str(exc)) from exc
+    except UnicodeError as exc:
+        raise RouteError("the routing Mac identity is unreadable; restore its mac-id file") from exc
+
+
 def _hub_configured() -> bool:
     # Detection only: never connect, migrate credentials or start a probe.
     from khipu import db, keychain
@@ -7352,21 +7368,75 @@ def account_txn_end(txn: str, state: str) -> dict:
     return out
 
 
-def pause(account: str, *, until: str | None = None, via: str, now: datetime | None = None) -> dict:
+class RecordMoved(RouteError):
+    """An owner write that carried what it was shown (``expect``, one of the
+    pins below), after that changed: nothing is written (``code`` for the
+    app, the same as a moved priority)."""
+
+    code = "version_moved"
+
+
+def pin_text(value) -> str:
+    """A pin as ``--expect`` carries it."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _account_entry(view: dict, key: str) -> dict | None:
+    return next((a for a in view.get("accounts") or [] if a.get("key") == key), None)
+
+
+def pause_pin(view: dict, key: str) -> list | None:
+    """An account's pause as read: paused or not, and the pause's end."""
+    entry = _account_entry(view, key)
+    if entry is None:
+        return None
+    paused = entry.get("state") == PAUSED
+    return [paused, entry.get("until") if paused else None]
+
+
+def cap_pin(view: dict, key: str, window) -> list | None:
+    """An account's share caps on one window as read: each level and end."""
+    entry = _account_entry(view, key)
+    if entry is None:
+        return None
+    return sorted([c.get("pct"), c.get("until")] for c in entry.get("caps") or []
+                  if c.get("kind") == "share" and c.get("window") == window and c.get("purpose", "job") == "job")
+
+
+def rules_pin(view: dict) -> list:
+    """The rules as read: each one's id and revision."""
+    return sorted([r.get("entity"), r.get("revision")] for r in view.get("rules") or [])
+
+
+def _as_shown(actual, expect, what: str) -> None:
+    """Refuse when ``expect`` is given and the pin moved; the caller holds
+    the routing lock until its write is down (as ``_check_priority``)."""
+    if expect is not None and str(expect) != pin_text(actual):
+        raise RecordMoved(f"{what} changed after it was read; read it again")
+
+
+def pause(account: str, *, until: str | None = None, via: str, now: datetime | None = None, expect=None) -> dict:
     now = now or _now()
     key = _resolve_account_key(account)
     stop = parse_until(until, now) if until else None
     if stop is not None and stop <= now:
         raise RouteError("--until must be in the future")
-    return dict(_owner_write({"type": "pause", "account": key, "until": _iso(stop)}, via), account=key)
+    with _lock():
+        if expect is not None:
+            _as_shown(pause_pin(read_view(now), key), expect, "the pause")
+        return dict(_owner_write({"type": "pause", "account": key, "until": _iso(stop)}, via), account=key)
 
 
-def lift(account: str, *, via: str, now: datetime | None = None) -> dict:
+def lift(account: str, *, via: str, now: datetime | None = None, expect=None) -> dict:
     key = _resolve_account_key(account)
-    entry = next((a for a in read_view(now)["accounts"] if a["key"] == key), None)
-    if entry is None or entry["state"] != PAUSED:
-        raise RouteError("that account isn't paused")
-    return dict(_owner_write({"type": "lift", "account": key}, via), account=key)
+    with _lock():
+        view = read_view(now)
+        if expect is not None:
+            _as_shown(pause_pin(view, key), expect, "the pause")
+        entry = _account_entry(view, key)
+        if entry is None or entry["state"] != PAUSED:
+            raise RouteError("that account isn't paused")
+        return dict(_owner_write({"type": "lift", "account": key}, via), account=key)
 
 
 def clear(account: str, *, report_id: str | None = None, via: str, now: datetime | None = None) -> dict:
@@ -7522,14 +7592,17 @@ def _rule_target(rule: dict) -> dict:
 
 
 def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | None = None,
-             event_id: str | None = None, holds: dict | None = None) -> dict:
+             event_id: str | None = None, holds: dict | None = None, expect=None) -> dict:
     """``event_id``: the id an owner action chose for this line before it
-    was written, so its Undo finds this rule and no other."""
+    was written, so its Undo finds this rule and no other. ``expect``: the
+    rules as read (``rules_pin``); refused once any of them changed."""
     now = now or _now()
     if not isinstance(text, str) or not text.strip():
         raise RouteError("a rule needs its words")
     check_rule_words(text, via)
     with _lock():
+        if expect is not None:
+            _as_shown(rules_pin(read_view(now)), expect, "the rules")
         check_rule_count(now, via)
         events, _bad = read_events()
         n = _next_rules(events, 1)
@@ -7846,16 +7919,21 @@ def _cap_end(until, now: datetime | None) -> str | None:
 
 def set_cap(account: str, *, window: str | None = None, kind: str, pct=None, slack=None, usd=None,
             days=None, n=None, revision: str | None = None, via: str,
-            purpose: str = "job", tier=None, sensitive_only=None, until=None, now: datetime | None = None) -> dict:
+            purpose: str = "job", tier=None, sensitive_only=None, until=None, now: datetime | None = None,
+            expect=None) -> dict:
     """Owner-only: confirm a cap as a structured fact, never from prose.
     A runner's numbers are never read here; they only judge the cap later.
     With ``until`` the cap stops applying then, and the cap it replaced
-    applies again."""
+    applies again. ``expect``: the window's share caps as read
+    (``cap_pin``); refused once they changed."""
     key = _resolve_account_key(account)
     event = _cap_set_event(key, window=window, kind=kind, pct=pct, slack=slack, usd=usd, days=days, n=n,
                            revision=revision, purpose=purpose, tier=tier, sensitive_only=sensitive_only,
                            until=until, now=now)
-    return dict(_owner_write(event, via), account=key)
+    with _lock():
+        if expect is not None:
+            _as_shown(cap_pin(read_view(now), key, window), expect, "the stop level")
+        return dict(_owner_write(event, via), account=key)
 
 
 def _cap_set_event(key: str, *, window, kind, pct=None, slack=None, usd=None, days=None, n=None, revision=None,
@@ -13051,6 +13129,10 @@ def run_cli(args) -> int:
                     out = project_route_view(out, mode)
                 elif narrowed:
                     out = only_account_part(out, account)
+                if args.json and not mode:
+                    from khipu import mac_names
+
+                    out["this_mac"] = mac_names.this_mac()  # the app's "On M5"; null when unreadable
                 _print_json(out)
             else:
                 _print_view(view, now, account)
@@ -13160,7 +13242,8 @@ def run_cli(args) -> int:
                               slack=getattr(args, "slack", None), usd=getattr(args, "usd", None),
                               days=getattr(args, "days", None), n=getattr(args, "n", None),
                               revision=args.revision, purpose=args.purpose, tier=args.tier,
-                              sensitive_only=args.sensitive_only, until=getattr(args, "until", None), via=via)
+                              sensitive_only=args.sensitive_only, until=getattr(args, "until", None), via=via,
+                              expect=getattr(args, "expect", None))
             else:
                 if getattr(args, "until", None):
                     raise RouteError("a cap's end is set with the cap; removing a cap takes none")
@@ -13168,9 +13251,9 @@ def run_cli(args) -> int:
         elif cmd == "definition":
             out = set_definition(args.definition, want["facts"]["value"], via=via)
         elif cmd == "pause":
-            out = pause(args.account, until=args.until, via=via, now=now)
+            out = pause(args.account, until=args.until, via=via, now=now, expect=getattr(args, "expect", None))
         elif cmd == "lift":
-            out = lift(args.account, via=via, now=now)
+            out = lift(args.account, via=via, now=now, expect=getattr(args, "expect", None))
         elif cmd == "clear":
             out = clear(args.account, report_id=args.report, via=via, now=now)
         elif cmd == "note":
@@ -13182,7 +13265,8 @@ def run_cli(args) -> int:
             params = list(args.params)
             if args.action == "add":
                 out = add_rule(" ".join(params), source=args.source, via=via, now=now,
-                               event_id=_planned_id("route.rule.add"), holds=_holds_arg(args))
+                               event_id=_planned_id("route.rule.add"), holds=_holds_arg(args),
+                               expect=getattr(args, "expect", None))
             elif args.action == "edit":
                 if len(params) < 2:
                     raise RouteError('rule edit takes the rule number and its new words: rule edit 3 "<words>"')

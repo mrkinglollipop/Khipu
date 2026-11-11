@@ -184,12 +184,21 @@ class CaptureTest(unittest.TestCase):
             self.assertEqual({json.loads(p.read_text())["payload"]["decisions"][0]
                               for p in outbox.jobs()}, {"first", "second"})
 
-    def test_hub_failed_mirror_keeps_source_when_only_outbox_succeeds(self):
+    def test_dual_failed_mirror_keeps_source_when_only_outbox_succeeds(self):
         with mock.patch.object(cap, "write_pg", side_effect=RuntimeError("offline")), \
                 mock.patch("khipu.outbox.enqueue"), \
                 mock.patch.object(cap, "run_capture_v2", return_value=70), \
                 mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "1"}):
-            self.assertEqual(cap.capture(episode(), mode="hub"), 70)
+            self.assertEqual(cap.capture(episode(), mode="dual"), 70)
+
+    def test_hub_with_only_the_outbox_holding_it_runs_no_file_leg(self):
+        # Row 11: hub mode has no file leg; the queued capture is delivered.
+        with mock.patch.object(cap, "write_pg", side_effect=RuntimeError("offline")), \
+                mock.patch("khipu.outbox.enqueue"), \
+                mock.patch.object(cap, "run_capture_v2", return_value=70) as file_leg, \
+                mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "1"}):
+            self.assertEqual(cap.capture(episode(), mode="hub"), 0)
+        file_leg.assert_not_called()
 
     def test_merge_replay_appends_source_evidence_only_once(self):
         cur = Cursor({1: episode()})
@@ -210,10 +219,16 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual(result["action"], "skip")
         self.assertEqual(result["matched_episode"], 1)
 
-    def test_hub_enabled_mirror_failure_requires_retry(self):
+    def test_dual_mirror_failure_requires_retry(self):
         with mock.patch.object(cap, "write_pg", return_value={"episode_inserted": False, "topics_written": 0}), \
                 mock.patch.object(cap, "run_capture_v2", return_value=70):
-            self.assertEqual(cap.capture(episode(), mode="hub"), 70)
+            self.assertEqual(cap.capture(episode(), mode="dual"), 70)
+
+    def test_hub_capture_does_not_wait_on_a_file_leg(self):
+        with mock.patch.object(cap, "write_pg", return_value={"episode_inserted": False, "topics_written": 0}), \
+                mock.patch.object(cap, "run_capture_v2", return_value=70) as file_leg:
+            self.assertEqual(cap.capture(episode(), mode="hub"), 0)
+        file_leg.assert_not_called()
 
     def test_alias_is_canonicalized_before_episode_insert(self):
         cur = Cursor({})

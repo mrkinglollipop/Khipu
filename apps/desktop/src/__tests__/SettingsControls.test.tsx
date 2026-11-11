@@ -87,9 +87,9 @@ afterEach(() => {
 });
 
 describe("CaptureTuningCard", () => {
-  it("changes capture mode through khipu_config_set with the fixed key", async () => {
+  it("changes save mode through khipu_config_set with the fixed key", async () => {
     render(<CaptureTuningCard active />);
-    const select = (await screen.findByLabelText("Where captures are written")) as HTMLSelectElement;
+    const select = (await screen.findByLabelText("Where saved conversations are written")) as HTMLSelectElement;
     await waitFor(() => expect(select).not.toBeDisabled());
     fireEvent.change(select, { target: { value: "hub" } });
     await waitFor(() => expect(calls).toContainEqual(["khipu_config_set", { key: "capture_mode", value: "hub" }]));
@@ -98,25 +98,25 @@ describe("CaptureTuningCard", () => {
   it("locks a threshold the environment decides and names the variable", async () => {
     config.float_settings = { dedup_similarity: { value: 0.9, source: "env", default: 0.92 } };
     render(<CaptureTuningCard active />);
-    const close = (await screen.findByLabelText("Merge near-duplicate captures at")) as HTMLInputElement;
+    const close = (await screen.findByLabelText("Merge near-duplicate saved conversations at")) as HTMLInputElement;
     await waitFor(() => expect(close.value).toBe("0.9"));
     expect(close).toBeDisabled();
     expect(screen.getAllByText("Locked").length).toBeGreaterThan(0);
     expect(screen.getByText("KHIPU_DEDUP_SIMILARITY")).toBeInTheDocument();
   });
 
-  it("describes capture matching and has no automatic commitment threshold", async () => {
+  it("describes save matching and has no automatic commitment threshold", async () => {
     render(<CaptureTuningCard active />);
-    await screen.findByLabelText("Merge near-duplicate captures at");
+    await screen.findByLabelText("Merge near-duplicate saved conversations at");
     expect(
-      screen.getByText("From 0 to 1; higher merges only closer matches. A word matching rule can also merge close captures. Default 0.92."),
+      screen.getByText("From 0 to 1; higher merges only closer matches. A word matching rule can also merge close saved conversations. Default 0.92."),
     ).toBeInTheDocument();
     expect(
-      screen.queryByLabelText("Close a commitment when a later capture matches it at"),
+      screen.queryByLabelText("Close a commitment when a later save matches it at"),
     ).not.toBeInTheDocument();
   });
 
-  it("keeps the newest capture settings when reversed reloads finish", async () => {
+  it("keeps the newest save settings when reversed reloads finish", async () => {
     config = {
       ...config,
       float_settings: {
@@ -134,7 +134,7 @@ describe("CaptureTuningCard", () => {
     });
 
     render(<CaptureTuningCard active />);
-    const dedup = (await screen.findByLabelText("Merge near-duplicate captures at")) as HTMLInputElement;
+    const dedup = (await screen.findByLabelText("Merge near-duplicate saved conversations at")) as HTMLInputElement;
     const close = screen.getByLabelText("Your names") as HTMLInputElement;
     await waitFor(() => expect(close.value).toBe(""));
 
@@ -172,16 +172,16 @@ describe("CaptureTuningCard", () => {
     expect(heads).toEqual(["When Khipu saves a conversation", "Commitments"]);
     expect(
       screen.getByText(
-        "After 5 turns or 20 minutes, before a conversation is compacted, and when it ends. The same on every harness.",
+        "After 5 turns or 20 minutes, before a conversation is compacted, and when it ends. The same on every app.",
       ),
     ).toBeInTheDocument();
     expect(screen.getByText("Keys, tokens and passwords are masked before anything is summarised or stored.")).toBeInTheDocument();
     const [first, second] = Array.from(container.querySelectorAll(".section-card"));
     expect(first.querySelector("select")).not.toBeNull();
-    expect(first.textContent).toContain("Merge near-duplicate captures at");
-    expect(second.textContent).toContain("Owed keeps explicitly filed asks and archived commitments");
+    expect(first.textContent).toContain("Merge near-duplicate saved conversations at");
+    expect(second.textContent).toContain("The work list keeps explicitly filed asks and archived commitments");
     expect(second.textContent).toContain("Your names");
-    expect(second.textContent).not.toContain("Close a commitment when a later capture matches it at");
+    expect(second.textContent).not.toContain("Close a commitment when a later save matches it at");
     expect(second.textContent).toContain("Default: none.");
   });
 
@@ -192,11 +192,11 @@ describe("CaptureTuningCard", () => {
     };
     render(<CaptureTuningCard active />);
     const labels = [
-      "Most items on one page of Owed",
+      "Most items on one page of the work list",
       "Most items changed at once",
     ];
     for (const label of labels) expect(await screen.findByLabelText(label)).toBeInTheDocument();
-    const page = screen.getByLabelText("Most items on one page of Owed") as HTMLInputElement;
+    const page = screen.getByLabelText("Most items on one page of the work list") as HTMLInputElement;
     await waitFor(() => expect(page.value).toBe("200"));
     fireEvent.change(page, { target: { value: "0" } });
     fireEvent.submit(page.closest("form") as HTMLFormElement);
@@ -219,7 +219,7 @@ describe("CaptureTuningCard", () => {
       return new Promise<string>((resolve) => (release = resolve));
     });
     render(<CaptureTuningCard active />);
-    const select = screen.getByLabelText("Where captures are written") as HTMLSelectElement;
+    const select = screen.getByLabelText("Where saved conversations are written") as HTMLSelectElement;
     expect(select.selectedOptions[0].textContent).toBe("Reading…");
     expect(select).toBeDisabled();
     expect(screen.queryByText("Files and Khipu")).toBeNull();
@@ -236,10 +236,10 @@ describe("CaptureTuningCard", () => {
     expect(screen.queryByText("Files and Khipu")).toBeNull();
   });
 
-  it("names the variable that locks where captures are written", async () => {
+  it("names the variable that locks where saves are written", async () => {
     config = { ...config, capture_mode: "hub", capture_mode_source: "env" };
     render(<CaptureTuningCard active />);
-    const select = (await screen.findByLabelText("Where captures are written")) as HTMLSelectElement;
+    const select = (await screen.findByLabelText("Where saved conversations are written")) as HTMLSelectElement;
     await waitFor(() => expect(select.value).toBe("hub"));
     expect(select).toBeDisabled();
     expect(screen.getByText("KHIPU_CAPTURE_MODE")).toBeInTheDocument();
@@ -247,7 +247,7 @@ describe("CaptureTuningCard", () => {
 
   it("saves the dedup threshold and your names, and shows the CLI's refusal", async () => {
     render(<CaptureTuningCard active />);
-    const dedup = (await screen.findByLabelText("Merge near-duplicate captures at")) as HTMLInputElement;
+    const dedup = (await screen.findByLabelText("Merge near-duplicate saved conversations at")) as HTMLInputElement;
     await waitFor(() => expect(dedup.value).toBe("0.92"));
     fireEvent.change(dedup, { target: { value: "0.8" } });
     fireEvent.click(dedup.closest("form")!.querySelector("button")!);
@@ -281,8 +281,8 @@ describe("Save button", () => {
 describe("JobsCard descriptions", () => {
   it("says in plain words what each job does", async () => {
     render(<JobsCard active />);
-    expect(await screen.findByText(/Consolidates the day's captures/)).toBeInTheDocument();
-    expect(screen.getByText(/saves captures that another harness queued/)).toBeInTheDocument();
+    expect(await screen.findByText(/Consolidates the day's saved conversations/)).toBeInTheDocument();
+    expect(screen.getByText(/saves conversations that another app queued/)).toBeInTheDocument();
     expect(screen.getByText(/Keeps a small process running/)).toBeInTheDocument();
     expect(screen.queryByText("Queue drain")).not.toBeInTheDocument();
   });
@@ -312,7 +312,7 @@ describe("PathOverridesCard", () => {
     render(<PathOverridesCard active />);
     const root = (await screen.findByLabelText("Session file folder")) as HTMLInputElement;
     await waitFor(() => expect(root.value).toBe("/Volumes/M/conversations"));
-    expect(screen.getByLabelText("Capture script")).toBeDisabled();
+    expect(screen.getByLabelText("Saving script")).toBeDisabled();
     expect(screen.getByText("KHIPU_CAPTURE_V2")).toBeInTheDocument();
     expect(screen.getByText("Not found on this Mac")).toBeInTheDocument();
     // Reset only where the file holds a value.
@@ -346,7 +346,7 @@ describe("JobsCard", () => {
   it("shows the CLI's error beside the job that failed", async () => {
     render(<JobsCard active />);
     refuse = "launchctl refused";
-    fireEvent.click(await screen.findByRole("button", { name: "Install queued captures" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Install queued saves" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("launchctl refused");
   });
 });
@@ -472,12 +472,12 @@ describe("HubAwayCard", () => {
       },
     };
     render(<HubAwayCard active />);
-    const card = screen.getByRole("region", { name: "When the hub is away" });
-    expect(screen.getAllByText("When the hub is away")).toHaveLength(1);
+    const card = screen.getByRole("region", { name: "When your saved memory is away" });
+    expect(screen.getAllByText("When your saved memory is away")).toHaveLength(1);
     const fields: Array<[string, string, string]> = [
       ["Bring the copy up to date after (minutes)", "20", "1200"],
       ["Skip the database after a failed connection for (seconds)", "45", "45"],
-      ["Wait on the hub for a read or write (seconds)", "10", "10"],
+      ["Wait on your saved memory for a read or write (seconds)", "10", "10"],
       ["Wait for an answer in this app (seconds)", "90", "90"],
     ];
     const keys = ["replica_refresh_after", "hub_down_memo_for", "hub_statement_timeout", "app_cli_timeout"];
