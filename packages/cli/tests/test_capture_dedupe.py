@@ -118,7 +118,8 @@ class ReadWindowDedupeTest(unittest.TestCase):
                                                 _assistant("ok " + "o" * 80, "m1")])
             msgs, off, users, stats = _window(tp, 0, ())
             self.assertEqual(users, 1)
-            self.assertIn("[notification: task-notification] build finished green", msgs[0][1])
+            # A stand-in never shares the typed message's block (PR #566).
+            self.assertIn("[notification: task-notification] build finished green", msgs[1][1])
             _append(tp, [_user(note), _user(NEW_TURN)])
             msgs2, _, users2, stats2 = _window(tp, off, stats["fresh"])
             self.assertEqual(stats2["deduped_msgs"], 1)
