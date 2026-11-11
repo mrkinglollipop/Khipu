@@ -68,7 +68,7 @@ ROUTING_WORDS_KEPT_WHY = (
         "they are the owner's rules, notes, holds and conversations' proposals, with no episode "
         "provenance, so forgetting an episode does not remove them; remove them with the routing "
         "commands that manage them (khipu route rule retire, khipu route note end, "
-        "khipu route hold end, khipu route priority clear) or in Settings → Routing")
+        "khipu route hold end, khipu route priority clear) or in the Khipu app (usually Accounts, Order and rules)")
 NO_ROOT_WHY = "no memory root is configured, so legacy logs could not be checked"
 GATEWAY_NO_ROOT_WHY = ("this server is the HTTPS gateway, a hub-only server that keeps no "
                        "legacy logs, so there are none to check")

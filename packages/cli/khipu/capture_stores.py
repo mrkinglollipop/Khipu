@@ -169,7 +169,7 @@ STORES: tuple[Store, ...] = (
           "kept: routing words have no episode provenance; they are the owner's rules, notes, holds "
           "and conversations' proposals, removed through the routing commands that manage them "
           "(khipu route rule retire, khipu route note end, khipu route hold end, "
-          "khipu route priority clear) or in Settings → Routing, not by forgetting an episode; "
+          "khipu route priority clear) or in the Khipu app (usually Accounts, Order and rules), not by forgetting an episode; "
           "forget lists each copy as kept and an unreadable routing folder keeps the forget open",
           _w("routing_delivery._transaction", "routing_ledger_prune._remove")),
     Store("routing delivery titles", "capture home state/title-pending--*.json and "
@@ -179,7 +179,7 @@ STORES: tuple[Store, ...] = (
           "kept: routing words have no episode provenance; they are the owner's rules, notes, holds "
           "and conversations' proposals, removed through the routing commands that manage them "
           "(khipu route rule retire, khipu route note end, khipu route hold end, "
-          "khipu route priority clear) or in Settings → Routing, not by forgetting an episode; "
+          "khipu route priority clear) or in the Khipu app (usually Accounts, Order and rules), not by forgetting an episode; "
           "forget lists each copy as kept and an unreadable routing folder keeps the forget open",
           _w("routing_delivery_rows._write_private_file")),
     Store("routing replication words", "data folder state/routing/remote.jsonl and .replication-* rewrites",
@@ -188,7 +188,7 @@ STORES: tuple[Store, ...] = (
           "kept: routing words have no episode provenance; they are the owner's rules, notes, holds "
           "and conversations' proposals, removed through the routing commands that manage them "
           "(khipu route rule retire, khipu route note end, khipu route hold end, "
-          "khipu route priority clear) or in Settings → Routing, not by forgetting an episode; "
+          "khipu route priority clear) or in the Khipu app (usually Accounts, Order and rules), not by forgetting an episode; "
           "forget lists each copy as kept and an unreadable routing folder keeps the forget open",
           _w("routing_replication._atomic")),
     Store("routing gateway publisher state", "data folder state/routing/gateway-copy.json, gateway-publishers.json and .gateway-copy-* rewrites",

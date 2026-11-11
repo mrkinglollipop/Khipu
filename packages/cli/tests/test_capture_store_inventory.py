@@ -350,7 +350,7 @@ def test_routing_words_without_source_provenance_are_kept_not_incomplete(isolate
     kept = [loc for loc in result["locations"] if loc["path"] == str(path)]
     assert kept and kept[0]["state"] == "kept", result["locations"]
     assert "no episode provenance" in kept[0]["why"]
-    assert "Settings → Routing" in kept[0]["why"]
+    assert "in the Khipu app (usually Accounts, Order and rules)" in kept[0]["why"]
     assert "khipu route" in kept[0]["why"]
     assert path.read_text() == text
     assert "not completely forgotten yet" not in result["message"]
@@ -363,7 +363,7 @@ def test_routing_word_stores_are_classified_kept():
         store = capture_stores.store(name)
         assert store.forget.startswith("kept: "), store
         assert "no episode provenance" in store.forget
-        assert "Settings → Routing" in store.forget
+        assert "in the Khipu app (usually Accounts, Order and rules)" in store.forget
 
 
 def test_unreadable_routing_folder_is_not_a_clean_scan(isolated, monkeypatch):

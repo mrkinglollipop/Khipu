@@ -110,7 +110,7 @@ def test_a_runner_silent_past_a_week_is_one_quiet_note_with_the_exact_way_out(ho
     assert len(block["notes"]) == 1
     note = block["notes"][0]
     assert "project A job runner has not reported since 2026-10-14T14:59:50Z" in note
-    assert "Settings → Routing → Job runner folders → Remove project A" in note
+    assert "If it is gone for good, stop reading it: run `khipu config --unset routing_sources`" in note
     assert "khipu config --unset routing_sources" in note  # the only source: nothing is left to keep
 
 
@@ -121,7 +121,7 @@ def test_the_note_keeps_the_other_sources_in_its_command(home):
     home["clock"].now = T0 + timedelta(days=8)
     note = routing.doctor_block()["notes"][0]
     assert "khipu config --set routing_sources " in note and "project B" in note
-    assert "--unset" not in note and "\"project A\"" not in note.split("or run")[1]
+    assert "--unset" not in note and "\"project A\"" not in note.split("run `", 1)[1]
 
 
 def test_a_runner_that_is_reporting_has_neither(home):
