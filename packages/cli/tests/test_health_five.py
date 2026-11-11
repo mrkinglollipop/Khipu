@@ -148,6 +148,12 @@ def test_doctor_summary_is_unchanged_by_the_keyed_view():
 
 
 def test_health_parses_and_prints_json(monkeypatch, capsys):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW
+
+    monkeypatch.setattr(health_five, "datetime", Clock)
     monkeypatch.setattr(health_five, "run_doctor", lambda: (report(), ""))
     monkeypatch.setattr(health_five, "mac_label", lambda: "M1")
     assert cli.main(["health", "--json"]) == 0
