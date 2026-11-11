@@ -244,7 +244,7 @@ export function rowModel(
   const extra = a.models?.length && state.text !== "Open" ? ` · ${state.text}` : "";
   const line =
     `${w.left}% left ${windowOf(w.key)}${w.resets ? ` · resets ${w.resets}` : ""}` + extra;
-  return { ...base, kind: "room", line, word: w.word, tone: warning ? "warn" : w.tone, left: w.left, stopAtPct: level };
+  return { ...base, kind: "room", line, word: w.word, tone: warning && w.tone !== "err" ? "warn" : w.tone, left: w.left, stopAtPct: level };
 }
 
 /** "Read 3 minutes ago." from the record's own check time. */

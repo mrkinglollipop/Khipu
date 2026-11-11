@@ -105,6 +105,24 @@ it("renders the same-account warning for both successful usage rows", async () =
   expect(container.querySelectorAll(".ac-pace.warn")).toHaveLength(2);
   expect(container.querySelectorAll(".ac-meter")).toHaveLength(2);
   expect(screen.getByRole("article", { name: "Claude" }).textContent).toContain("62% left");
+  expect(within(screen.getByRole("article", { name: "Claude" })).getByText(notes[0].note)).toBeTruthy();
+  expect(writes()).toEqual([]);
+});
+
+it.each([false, true])("omits the warning from the list and page when a nonempty note is not paired with a mark (%s)", async (marked) => {
+  const note = "Reads the same account as Claude second: both folders are signed in to one account.";
+  const usage = marked ? { same_account_as: "Claude second", note: "" } : { note };
+  function NoWarning() {
+    const routing = useRouting(true);
+    return <Accounts routing={routing} plans={{ accounts: [{ key: "claude|", ok: true, ...usage }] }} thisMac="M5" now={NOW} />;
+  }
+  render(<NoWarning />);
+  const button = await screen.findByRole("button", { name: /^Claude/ });
+  expect(within(button).queryByText(note)).toBeNull();
+  fireEvent.click(button);
+  const page = await screen.findByRole("article", { name: "Claude" });
+  expect(within(page).queryByText(note)).toBeNull();
+  expect(screen.queryByText(note)).toBeNull();
   expect(writes()).toEqual([]);
 });
 

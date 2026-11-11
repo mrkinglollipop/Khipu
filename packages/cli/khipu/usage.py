@@ -54,6 +54,7 @@ from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
 from pathlib import Path
+from typing import Literal
 
 HARNESSES = ("claude", "codex", "grok", "muse", "glm")
 LABELS = {"claude": "Claude", "codex": "Codex", "grok": "Grok", "muse": "Muse", "glm": "GLM",
@@ -779,13 +780,16 @@ def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S, t
     digest = _claude_identity(binary, config_dir, min(time.monotonic() + 1.5, deadline)) if identity else None
     if digest:
         data["account_digest"] = digest
+    elif digest is False:
+        data["_account_identity_clear"] = True
     return data
 
 
-def _claude_identity(binary: str, home: str | None, deadline: float) -> str | None:
+def _claude_identity(binary: str, home: str | None, deadline: float) -> str | Literal[False] | None:
     """Reuse discovery's bounded auth-status runner; hash (email, orgId),
     so one person's separate organizations are not called the same plan.
-    No CLI text, including stderr, escapes this optional bounded read."""
+    False means definitely no account; None means the read failed or was
+    skipped. No CLI text, including stderr, escapes this bounded read."""
     if deadline <= time.monotonic():
         return None
     from khipu import discover
@@ -796,11 +800,13 @@ def _claude_identity(binary: str, home: str | None, deadline: float) -> str | No
         if result["outcome"] != "exited" or result["code"] != 0:
             return None
         status = json.loads(result["out"])
-        if not isinstance(status, dict) or status.get("loggedIn") is not True:
+        if not isinstance(status, dict):
             return None
+        if status.get("loggedIn") is not True:
+            return False
         email, org = status.get("email"), status.get("orgId")
         if not all(isinstance(v, str) and v.strip() for v in (email, org)):
-            return None
+            return False
         return _account_digest("claude", json.dumps([email.strip().casefold(), org.strip()]))
     except Exception:  # noqa: BLE001 — optional identity never makes the usage row fail
         return None
@@ -3429,9 +3435,15 @@ def _prev_after_roll(previous: dict | None, row: dict) -> dict:
 
 def _merge(previous: dict | None, row: dict) -> dict:
     out = _merge_figures(previous, row)
+    out.pop("_account_identity_clear", None)  # probe-only; never cached or published
     # Identity has its own confirmation clock, independent of kept figures.
     # Repeated failures must never move that clock forward.
     if row.get("harness") in ("claude", "grok"):
+        if row.get("harness") == "claude" and row.get("_account_identity_clear") is True:
+            out.pop("account_digest", None)
+            out.pop("account_identity_at", None)
+            out["account_identity_ok"] = False
+            return out
         digest = row.get("account_digest") or (previous or {}).get("account_digest")
         if digest:
             out["account_digest"] = digest

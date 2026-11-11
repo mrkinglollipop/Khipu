@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from khipu import config, routing, routing_page, routing_sources, usage
+from khipu import config, routing, routing_advice, routing_page, routing_sources, usage
 
 
 @pytest.fixture
@@ -48,6 +48,9 @@ if sys.argv[3:5] == ["auth", "status"]:
         sys.exit(7)
     if data.get("mode") == "malformed":
         print("not JSON")
+        sys.exit(0)
+    if data.get("mode") == "nonobject":
+        print("[]")
         sys.exit(0)
     time.sleep(data.get("delay", 0))
     print(json.dumps(data, indent=2))
@@ -119,7 +122,7 @@ def test_different_accounts_or_organizations_are_not_duplicates(logins, change):
     assert all("same_account_as" not in row for row in read(accounts[:2])["accounts"])
 
 
-@pytest.mark.parametrize("failure", [{"mode": "fail"}, {"mode": "malformed"}, {"loggedIn": False}, {"orgId": None}])
+@pytest.mark.parametrize("failure", [{"mode": "fail"}, {"mode": "malformed"}, {"mode": "nonobject"}])
 def test_identity_failure_keeps_hash_and_match_for_only_thirty_minutes(logins, failure, caplog, capsys, monkeypatch):
     accounts, _, identity, _, _ = logins
     now = usage._now()
@@ -143,6 +146,53 @@ def test_identity_failure_keeps_hash_and_match_for_only_thirty_minutes(logins, f
     assert not failed["account_identity_ok"]
     assert "same_accounts" not in routing_sources.usage_evidence({usage._key(a) for a in accounts[:2]})[1]
     assert_private(report, caplog, capsys)
+
+
+@pytest.mark.parametrize("signed_out", [{"loggedIn": False}, {"loggedIn": 1}, {"orgId": None}, {"email": " "}])
+@pytest.mark.parametrize("figures_fail", [False, True])
+def test_definite_no_account_clears_identity_and_restores_peer_immediately(
+        logins, signed_out, figures_fail, caplog, capsys, monkeypatch):
+    accounts, _, identity, _, _ = logins
+    assert all(row.get("same_account_as") for row in read(accounts[:2])["accounts"])
+    identity(0, **signed_out)
+    if figures_fail:
+        converse = usage._converse
+
+        def figures(argv, *args, **kwargs):
+            if "CLAUDE_CONFIG_DIR" not in kwargs["env"]:
+                raise usage.ProbeError(usage.E_SIGNIN)
+            return converse(argv, *args, **kwargs)
+
+        monkeypatch.setattr(usage, "_converse", figures)
+    report = read(accounts[:2])
+    assert all("same_account_as" not in row for row in report["accounts"])
+    cleared = report["accounts"][0]
+    assert cleared["account_identity_ok"] is False
+    assert "account_digest" not in cleared and "account_identity_at" not in cleared
+    assert not usage.same_account_groups({row["key"]: row for row in report["accounts"]})
+    cached = usage._load_cache()
+    assert "account_digest" not in cached[usage._key(accounts[0])]
+    assert "account_identity_at" not in cached[usage._key(accounts[0])]
+    assert all("_account_identity_clear" not in row for row in [*report["accounts"], *cached.values()])
+    _, status = routing_sources.usage_evidence({usage._key(a) for a in accounts[:2]})
+    assert "same_accounts" not in status
+    entries = [{"key": usage._key(a), "label": a["label"], "harness": "claude", "state": "open"}
+               for a in accounts[:2]]
+    view = {"record": True, "accounts": entries, "sources": {"usage": status},
+            "priority": {"entries": [{"account": e["key"]} for e in entries]}}
+    if figures_fail:
+        view["accounts"][0]["state"] = "down"
+    normal = {**view, "sources": {"usage": {}}}
+    peer = next(row for row in routing_advice.rank(view, usage._now()) if row["label"] == accounts[1]["label"])
+    normal_peer = next(row for row in routing_advice.rank(normal, usage._now()) if row["label"] == accounts[1]["label"])
+    assert peer["verdict"] == "go" and "same_account_as" not in peer
+    assert peer["rank"] == normal_peer["rank"]
+    assert peer["why_ranked"] == normal_peer["why_ranked"] == "priority 2"
+    assert "SAME ACCOUNT" not in routing.page(view, usage._now())
+    assert_private(report, caplog, capsys)
+    # A fresh sign-in restores the match on the very next read.
+    identity(0)
+    assert all(row.get("same_account_as") for row in read(accounts[:2])["accounts"])
 
 
 def test_mark_clears_after_a_folder_changes_account(logins):
@@ -264,10 +314,42 @@ def test_identity_deadline_never_extends_the_callers_timeout(logins, monkeypatch
 
 
 def test_identity_can_be_disabled_by_plan_only_callers(logins, monkeypatch):
-    accounts, _, _, calls, _ = logins
+    accounts, _, identity, calls, _ = logins
+    before = read(accounts[:2])["accounts"][0]
+    identity(0, loggedIn=False)
+    calls.write_text("")
     row = usage.probe_account(accounts[0], turn=False, identity=False)
     assert row["ok"]
     assert ["auth", "status", "--json"] not in [json.loads(line) for line in calls.read_text().splitlines()]
+    merged = usage._merge(before, row)
+    assert merged["account_digest"] == before["account_digest"]
+    assert merged["account_identity_at"] == before["account_identity_at"]
+    assert merged["account_identity_ok"] is True
+
+
+@pytest.mark.parametrize("failure", ["deadline", "timeout", "exception"])
+def test_identity_skipped_or_failed_read_never_clears_confirmation(logins, monkeypatch, failure):
+    from khipu import discover
+
+    accounts, _, _, _, _ = logins
+    before = read(accounts[:2])["accounts"][0]
+
+    def run_once(*_args, **_kwargs):
+        if failure == "deadline":
+            pytest.fail("an expired deadline must not run auth status")
+        if failure == "exception":
+            raise OSError("synthetic read failure")
+        return {"outcome": "timeout", "code": None, "out": b""}
+
+    monkeypatch.setattr(discover, "run_once", run_once)
+    if failure == "deadline":
+        monkeypatch.setattr(usage, "_converse", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(usage, "parse_claude", lambda _: {"ok": True})
+    row = usage.probe_account(accounts[0], turn=False, timeout=0 if failure == "deadline" else 2)
+    merged = usage._merge(before, row)
+    assert merged["account_identity_ok"] is True
+    assert merged["account_digest"] == before["account_digest"]
+    assert merged["account_identity_at"] == before["account_identity_at"]
 
 
 def paired_view(*, reverse=False, state="open"):

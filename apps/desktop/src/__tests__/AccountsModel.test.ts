@@ -25,10 +25,26 @@ it("shows a successful usage row's same-account note in the existing warning lin
   expect(rowModel(a, { accounts: [a] }, { accounts: [
     { key: a.key, ok: true, same_account_as: "Claude second", note },
   ] }, 0, NOW)).toMatchObject({ kind: "room", warning: note, word: "On pace", tone: "warn", left: 62 });
-  expect(rowModel(a, { accounts: [a] }, { accounts: [
-    { key: a.key, ok: true },
-  ] }, 0, NOW).word).not.toBe("Same account");
 });
+
+it.each([
+  { note: "Reads the same account as Claude second: both folders are signed in to one account." },
+  { same_account_as: "Claude second", note: "" },
+])("shows no warning without both a same-account mark and a note: %j", (usage) => {
+  const a = account();
+  expect(rowModel(a, view([a]), { accounts: [{ key: a.key, ok: true, ...usage }] }, 0, NOW))
+    .toMatchObject({ kind: "room", warning: null, tone: "ok" });
+});
+
+it.each([["cap_reached", "At your stop level"], ["limit_reached", "Out of room"]])(
+  "keeps an open duplicate row red at %s", (verdict, word) => {
+    const a = account({ pace: [win("weekly", 100, 3000, verdict)] });
+    const note = "Reads the same account as Claude second: both folders are signed in to one account.";
+    expect(rowModel(a, view([a]), { accounts: [{ key: a.key, ok: true,
+      same_account_as: "Claude second", note }] }, 0, NOW))
+      .toMatchObject({ kind: "room", warning: note, word, tone: "err" });
+  },
+);
 
 it.each([
   ["limited", "Out of room", "err"], ["paused", "Paused", "none"], ["down", "Down", "err"],
