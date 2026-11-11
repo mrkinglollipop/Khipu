@@ -22,12 +22,10 @@ import subprocess
 import sys
 import time
 import tracemalloc
-from unittest import mock
 
-import psycopg
 import pytest
 
-from khipu import capture, hub_snapshot as hs, mirror, outbox, provenance, request_context, tombstones
+from khipu import capture, hub_snapshot as hs, outbox, provenance, tombstones
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.test_provenance_forget import ALT, CANON, env, pg, _capture, _payload  # noqa: F401
 from tests.test_provenance_replica import hub_forget, replica, _replica, _replica_readers  # noqa: F401
@@ -79,56 +77,7 @@ def test_nonanchor_claimant_source_is_fenced(pg, replica, method):
 # ---- 2. P2 recovery at an existing legacy key -----------------------------------
 
 
-@pytest.mark.parametrize("method", ["sync_recent_episodes", "reconcile_memory_root"])
-def test_recovery_same_legacy_key_keeps_each_fact(pg, method):
-    pg.memory.mkdir()
-    a = _payload(loop=None, decision="Use weekly release trains")
-    b = {**a, "decisions": ["Keep staging deployments isolated"]}
-    (pg.memory / "episodes.jsonl").write_text(json.dumps(a) + "\n" + json.dumps(b) + "\n")
-    getattr(mirror, method)(pg.memory)
-    getattr(mirror, method)(pg.memory)
-    with pg.connect() as c:
-        rows = c.execute("SELECT text FROM decisions ORDER BY id").fetchall()
-        gaps = c.execute("SELECT episode_id, step FROM fact_gaps").fetchall()
-    jobs = [json.loads(p.read_text()) for p in outbox.jobs()]
-    assert any("staging" in r[0] for r in rows) or gaps or jobs, \
-        "second line evidence has no fact, gap, or queued deferral"
-    # An equal replay of the first line is never queued.
-    assert [j["payload"]["decisions"] for j in jobs] == [["Keep staging deployments isolated"]], jobs
-    assert jobs[0].get("origin", "absent") is None
-
-
 # ---- 3. P2 a deferred recovery line keeps unknown ownership ---------------------
-
-
-@pytest.mark.parametrize("method", ["sync_recent_episodes", "reconcile_memory_root"])
-def test_recovery_deferral_preserves_unknown_origin(pg, monkeypatch, method):
-    pg.memory.mkdir()
-    a = _payload(loop=None, decision="Use recovery line alpha", title="Alpha proof", path="docs/alpha.md")
-    b = _payload(loop=None, decision="Use recovery line beta", title="Beta proof", path="docs/beta.md")
-    (pg.memory / "episodes.jsonl").write_text(json.dumps(a) + "\n" + json.dumps(b) + "\n")
-    real = provenance.record_claim
-    fired = []
-
-    def once(cur, kind, *args, **kw):
-        if kind == "deliverable" and not fired:
-            fired.append(True)
-            raise psycopg.errors.QueryCanceled("synthetic per-line timeout")
-        return real(cur, kind, *args, **kw)
-
-    from khipu.request_context import request_origin
-
-    # Normal request-origin stamping, not the shared fixture's anonymous stub.
-    monkeypatch.setattr(outbox, "_queued_origin", lambda: {"origin": request_origin()})
-    with request_context.replaying("local:recovery-review"):
-        with mock.patch.object(provenance, "record_claim", once):
-            getattr(mirror, method)(pg.memory)
-        outbox.drain()
-    with pg.connect() as c:
-        rows = c.execute("SELECT summary, origin FROM episodes ORDER BY summary").fetchall()
-        facts = c.execute("SELECT title FROM deliverables").fetchall()
-    assert fired and len(rows) == 2 and len(facts) == 2 and not outbox.jobs()
-    assert all(r[1] is None for r in rows), "retry attributed a historical line to the recovery caller"
 
 
 # ---- 4. P2 gap replay runs the dependent reversal detection ---------------------

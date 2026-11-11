@@ -207,7 +207,7 @@ Topics and episodes are never silently dropped. Both carry a `deleted_at` column
 
 Hooks put prior work in front of the agent before it acts.
 
-- **Session start** (Claude Code, Codex, Cursor): the recall rule plus a slice scoped to the current project (recent episodes and linked topics), plus, when the `routing_push` switch is on (it is off by default), the routing page. See [routing.md](routing.md). 
+- **Session start** (Claude Code, Codex, Cursor): the recall rule plus a slice scoped to the current project (recent episodes and linked topics; a project with nothing summarised yet gets one line saying so and none of another project's rows), plus, when the `routing_push` switch is on (it is off by default), the routing page. See [routing.md](routing.md). 
 - **Every prompt** (Claude Code and Codex): a bounded search on the prompt itself. It pushes at most three hits under a "Prior work on this topic" heading, capped at 600 characters. It has a 1.2 second budget, skips trivial prompts, and skips hits already shown in the last three prompts. It calls no summariser or chat model. When an embedding profile is active and the prompt's vector is not already cached, it makes one embedding call (secrets masked first), so the prompt text goes to that profile's embedding provider. It reads the local replica first and does not search libraries. If anything fails it returns nothing.
 - **Aegis** gets no push. Its hooks run as observers and their output is discarded. Aegis agents pull with `khipu_status` and `khipu_owed`.
 - **Cursor** gets the session-start push and a project rule file, but no per-prompt hook.
@@ -373,7 +373,9 @@ stateDiagram-v2
 |---|---|---|
 | `legacy` | Files only | Existing capture scripts only. Full rollback. |
 | `dual` | Files and Khipu | Legacy capture continues and mirrors into PostgreSQL. The default. |
-| `hub` | Khipu only | Khipu owns writes, with the outbox behind it. |
+| `hub` | Khipu only | Khipu owns writes, with the outbox behind it. The old capture script does not run. |
+
+In `hub` mode the session files (`episodes.jsonl`) get their lines from the hub, once a night. The nightly adds one line for each live episode that has none yet (`khipu capture export`, `--dry-run` to count first). It never changes, reorders or deletes a line that is already there, and never writes a forgotten episode. The old script's extra preference pass no longer runs, so new lines carry only the preferences the hub holds. Lines written before this change keep theirs. Episodes no longer flow from the files back into the hub; `khipu reconcile` now syncs topic pages only.
 
 Change it in Settings, Capture & models, or with `khipu config --set-capture-mode`. The app control is locked when `KHIPU_CAPTURE_MODE` is set in the environment.
 

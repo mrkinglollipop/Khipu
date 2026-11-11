@@ -14,9 +14,8 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-import pytest
 
-from khipu import capture, embed, forget, mirror, offline_reads, outbox, paths, tombstones
+from khipu import capture, embed, forget, offline_reads, paths, tombstones
 from khipu import hub_snapshot as hs
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401 - fixtures
 from tests.test_provenance_forget import ALT, CANON, _capture, _payload, env, pg  # noqa: F401
@@ -135,31 +134,6 @@ def test_an_older_copy_cannot_overwrite_a_newer_pull(pg, replica):
     assert older["ok"], older
     assert results["pull"]["ok"] and results["pull"]["facts"].get("copied"), results
     assert "new decision" in _replica_readers()
-
-
-@pytest.mark.parametrize("method", ["sync_recent_episodes", "reconcile_memory_root"])
-@pytest.mark.parametrize("held", [False, True])
-def test_closed_only_recovery(pg, method, held):
-    """Legacy closure wording is preserved without automatically closing work."""
-    pg.memory.mkdir()
-    _capture(loop=CANON)
-    payload = _payload(loop=None, closed_loops=[{"text": "done: " + CANON}])
-    if held:
-        first = dict(payload)
-        first.pop("closed_loops")
-        capture.write_pg(first)
-    (pg.memory / "episodes.jsonl").write_text(json.dumps(payload) + "\n")
-    for _ in range(2):
-        getattr(mirror, method)(pg.memory)
-    with pg.connect() as c:
-        work = c.execute("SELECT text, status FROM commitments").fetchall()
-        raws = [r[0] for r in c.execute("SELECT raw FROM episodes").fetchall()]
-        gaps = c.execute("SELECT step FROM fact_gaps WHERE resolved_at IS NULL").fetchall()
-    jobs = [json.loads(p.read_text()) for p in outbox.jobs()]
-    assert work == [(CANON, "open")]
-    assert not gaps
-    evidence = [*raws, *(job.get("payload", {}) for job in jobs)]
-    assert any(row.get("closed_loops") == payload["closed_loops"] for row in evidence), evidence
 
 
 def test_actual_embed_catchup_stale_hub_vector(pg, replica):

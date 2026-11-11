@@ -163,7 +163,6 @@ def test_run_never_raises_and_names_every_skipped_step(monkeypatch, capsys):
 
     monkeypatch.setattr(hb, "_drain", boom)
     monkeypatch.setattr(khipu.config, "path_setting", boom)
-    monkeypatch.setattr(khipu.mirror, "sync_recent_episodes", boom)
     monkeypatch.setattr(khipu.outbox, "jobs", boom)
     monkeypatch.setattr(khipu.notes, "reconcile", boom)
     monkeypatch.setattr(khipu.embed, "embed_recent_missing", boom)
@@ -171,9 +170,11 @@ def test_run_never_raises_and_names_every_skipped_step(monkeypatch, capsys):
     hb.run("", "claude_code", "sid-9")
 
     err = capsys.readouterr().err
-    for step in ("drain skipped", "mirror skipped", "outbox drain skipped",
+    for step in ("drain skipped", "outbox drain skipped",
                  "embed catch-up skipped"):
         assert step in err, (step, err)
+    # Row 11: the episodes.jsonl tail copy into the hub is gone.
+    assert "mirror" not in err and not hasattr(khipu.mirror, "sync_recent_episodes")
     assert "session=sid-9" in err
 
 
@@ -186,7 +187,6 @@ def test_run_does_not_scan_notes_at_the_end_of_a_turn(monkeypatch, capsys, tmp_p
         raise AssertionError("the stop hook must not touch notes")
 
     monkeypatch.setattr(hb, "_drain", lambda *a, **k: None)
-    monkeypatch.setattr(khipu.mirror, "sync_recent_episodes", lambda *_a, **_k: {})
     monkeypatch.setattr(khipu.embed, "embed_recent_missing", lambda **_k: {"embedded": 0})
     monkeypatch.setattr(khipu.notes, "reconcile", boom)
 

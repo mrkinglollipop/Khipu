@@ -96,7 +96,7 @@ STORES: tuple[Store, ...] = (
     Store("legacy log", "memory root: episodes*.jsonl, their .bak copies, .khipu-forget-backups/, "
           "and .tmp files beside them",
           "one capture per line, summary text", "legacy logs",
-          _w("forget._rewrite_log", "forget._scrub_copy")),
+          _w("forget._rewrite_log", "forget._scrub_copy", "capture_export._append")),
     Store("replica", "data folder hub_snapshot.sqlite",
           "episode rows, vectors, decisions, deliverables, topics and commitments", "replica",
           _w("hub_snapshot._refresh_locked", "hub_snapshot._replica_write_gate",
