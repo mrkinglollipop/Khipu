@@ -754,6 +754,8 @@ export type AccountRefs = {
   priority: { place: number; next: string | null } | null;
   pausedUntil: string | null | undefined;
   last: boolean;
+  /** The lane map could not be read, so the dialog cannot say which job slots use it. */
+  lanesUnknown?: boolean;
 };
 
 export function accountRefs(
@@ -786,6 +788,7 @@ export function accountRefs(
     priority: at >= 0 ? { place: at + 1, next: entries[at + 1]?.label ?? null } : null,
     pausedUntil: ra?.state === "paused" ? (ra.until ?? null) : undefined,
     last: trackedCount <= 1,
+    lanesUnknown: !laneMap,
   };
 }
 
@@ -975,7 +978,8 @@ export function StopTrackingDialog({
         expect,
         keepPriority: !prio,
         keepPause: !pause,
-        keepLanes: !lanes,
+        // A job-slot map that could not be read is never silently emptied.
+        keepLanes: !lanes || refs.lanesUnknown === true,
         endHolds: holds,
         confirmLast: refs.last,
       });

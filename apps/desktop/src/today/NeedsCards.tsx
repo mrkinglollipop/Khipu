@@ -18,7 +18,9 @@ import {
   type NeedsHook, type NeedsItem, type Receipt as ReceiptData,
 } from "./needs";
 
-type Answered = { receipt: ReceiptData; undone: boolean };
+/** A receipt belongs to one answered proposal: its item key plus the `expect`
+ *  pin the answer carried. A newer proposal with the same key has another pin. */
+type Answered = { receipt: ReceiptData; undone: boolean; expect: string | null };
 
 /** A held key never answers twice: only the first press of Enter clicks. */
 const noRepeat = (e: KeyboardEvent) => {
@@ -166,7 +168,12 @@ export function NeedsCards({ needs, onAllChanges }: { needs: NeedsHook; onAllCha
   const listedKeys = listed.map((it) => it.key);
   // A receipt stays where its card was; an undone one gives the card back if
   // the item is waiting again.
-  const shownReceipts = Object.keys(answered).filter((k) => !(answered[k].undone && listedKeys.includes(k)));
+  // A newer proposal under the same key (another pin) is its own card, not hidden behind the old receipt.
+  const shownReceipts = Object.keys(answered).filter((k) => {
+    const now = listed.find((it) => it.key === k);
+    if (!now) return true;
+    return !answered[k].undone && (now.expect ?? null) === answered[k].expect;
+  });
   // Cards keep their places between reads; a new item goes after them.
   const order = useRef<string[]>([]);
   order.current = mergeOrder(order.current, [...new Set([...listedKeys, ...shownReceipts])]);
@@ -220,7 +227,7 @@ export function NeedsCards({ needs, onAllChanges }: { needs: NeedsHook; onAllCha
       const out = await sendAnswer(item, said);
       if (out.kind === "done") {
         dropWhole(item.key);
-        setAnswered((prev) => ({ ...prev, [item.key]: { receipt: out.receipt, undone: false } }));
+        setAnswered((prev) => ({ ...prev, [item.key]: { receipt: out.receipt, undone: false, expect: item.expect ?? null } }));
         await needs.reload();
         return;
       }
@@ -238,7 +245,7 @@ export function NeedsCards({ needs, onAllChanges }: { needs: NeedsHook; onAllCha
           if (res.ok && res.data.ok) {
             setAnswered((prev) => ({
               ...prev,
-              [item.key]: { receipt: { text: outcome, action_id: null, undoable: false, saved_on: [], not_reached: [] }, undone: false },
+              [item.key]: { receipt: { text: outcome, action_id: null, undoable: false, saved_on: [], not_reached: [] }, undone: false, expect: item.expect ?? null },
             }));
           } else {
             setNote(item.key, outcome);

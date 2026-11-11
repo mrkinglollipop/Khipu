@@ -6,7 +6,7 @@
 import { useEffect, useState } from "react";
 import { Body } from "../shell";
 import {
-  agoWords, clockWords, headline, isLive, jobWords,
+  agoWords, clockWords, currentView, headline, isLive, jobWords,
   type RunJob, type RunMac, type RunRunner, type RunningHook,
 } from "./running";
 import "./running.css";
@@ -41,7 +41,9 @@ function JobRow({ job, runner, now }: { job: RunJob; runner: RunRunner; now: Dat
 }
 
 function RunnerGroup({ runner, mac, now }: { runner: RunRunner; mac: RunMac; now: Date }) {
-  const beat = runner.silent
+  const beat = mac.old
+    ? `Not known now; last read ${clockWords(runner.silent_since ?? runner.heartbeat_at, now)}`
+    : runner.silent
     ? `Stopped reporting at ${clockWords(runner.silent_since ?? runner.heartbeat_at, now)}`
     : runner.heartbeat_at ? `Reporting, last heard ${agoWords(runner.heartbeat_at, now)}` : "Reporting";
   return (
@@ -60,7 +62,8 @@ function RunnerGroup({ runner, mac, now }: { runner: RunRunner; mac: RunMac; now
         <tr className="rn-note">
           <td colSpan={5}>
             <p className="rn-runner-note">
-              <b>Khipu can’t tell if these are still running.</b> If this runner should be on, start it again on {mac.name}.
+              <b>Khipu can’t tell if these are still running.</b>{" "}
+              {mac.old ? "This is the last answer it could read." : `If this runner should be on, start it again on ${mac.name}.`}
             </p>
           </td>
         </tr>
@@ -118,12 +121,18 @@ export function RunningNow({ hook, now: nowProp }: { hook: RunningHook; now?: Da
     );
   }
   const updated = agoWords(data.updated_at, now);
+  const shown = currentView(hook) ?? data;
   return (
     <Body>
       <div className="rn-page">
-        <p className="rn-sub">{headline(data)}</p>
+        {hook.readFailed ? (
+          <p className="rn-stale" role="alert">
+            Khipu couldn’t read what is running just now. This is from {clockWords(data.updated_at, now)}, so what is running now is not known.
+          </p>
+        ) : null}
+        <p className="rn-sub">{headline(shown)}</p>
         {data.note ? <p className="rn-note-line">{data.note}</p> : null}
-        {data.macs.map((m) => <MacSection key={m.mac || m.name} mac={m} now={now} />)}
+        {shown.macs.map((m) => <MacSection key={m.mac || m.name} mac={m} now={now} />)}
         <p className="rn-foot">
           {updated ? `Updated ${updated}. ` : ""}Only jobs a job runner reports to Khipu show here.
         </p>
@@ -137,7 +146,7 @@ export function RunningHere({ accountKey, accountLabel, hook, now: nowProp }: {
   accountKey: string; accountLabel: string; hook: RunningHook; now?: Date;
 }) {
   const now = useClock(nowProp);
-  const data = hook.data;
+  const data = currentView(hook);
   let body: React.ReactNode;
   if (!data) {
     body = <div className="ac-v ac-muted">{hook.unread ? "Khipu couldn’t read what is running yet." : "Reading what is running…"}</div>;

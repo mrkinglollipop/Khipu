@@ -114,6 +114,30 @@ describe("Your Macs: what the Macs disagree on (moved from the older routing scr
     expect(writes()[0]).toEqual({ cmd: "khipu_config_set", args: { key: "routing_busy_load", value: "90" } });
   });
 
+  it("sends on and off, the words the bridge accepts, for a switch: Keep, Use and Use the other Mac's for all", async () => {
+    config = {
+      routing: { routing_pace_order: { value: true, kind: "switch" }, routing_push_prompt: { value: false, kind: "switch" } },
+      settings_sync: { enabled: true, differences: [
+        { key: "routing_pace_order", name: "Order by pace", local: true, remote: false },
+        { key: "routing_push_prompt", name: "Tell conversations", local: false, remote: true },
+      ] },
+    };
+    render(<YourMacsPage macs={loaded([mac(M5, "M5", true), mac(M1, "M1", false)])} />);
+    const first = await screen.findByRole("group", { name: "Order by pace" });
+    fireEvent.click(within(first).getByRole("button", { name: "Keep on" }));
+    await waitFor(() => expect(writes()).toHaveLength(1));
+    expect(writes()[0]).toEqual({ cmd: "khipu_config_set", args: { key: "routing_pace_order", value: "on" } });
+    fireEvent.click(within(first).getByRole("button", { name: "Use off" }));
+    await waitFor(() => expect(writes()).toHaveLength(2));
+    expect(writes()[1]).toEqual({ cmd: "khipu_config_set", args: { key: "routing_pace_order", value: "off" } });
+    fireEvent.click(screen.getByRole("button", { name: "Use the other Mac’s for all" }));
+    await waitFor(() => expect(writes()).toHaveLength(4));
+    expect(writes().slice(2)).toEqual([
+      { cmd: "khipu_config_set", args: { key: "routing_pace_order", value: "off" } },
+      { cmd: "khipu_config_set", args: { key: "routing_push_prompt", value: "on" } },
+    ]);
+  });
+
   it("answers a change another Mac holds with the old owner answer", async () => {
     config = { settings_sync: { enabled: true, waiting: [{ id: "r1", request: "r1", mac: "M1", ask: "Pause Claude?", answerable: true }] } };
     render(<YourMacsPage macs={loaded([mac(M5, "M5", true), mac(M1, "M1", false)])} />);

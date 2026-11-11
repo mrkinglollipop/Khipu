@@ -5,7 +5,10 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Memory } from "../memory/Memory";
 
-const ago = (h: number) => new Date(Date.now() - h * 3600_000).toISOString();
+// A fixed local clock (2:00 pm), so "Today" and "Yesterday" never depend on the
+// hour the suite runs: an hour or two ago is today, thirty hours ago is yesterday.
+const NOW = new Date(2026, 10, 11, 14, 0, 0);
+const ago = (h: number) => new Date(NOW.getTime() - h * 3600_000).toISOString();
 
 const RECENT = [
   { id: 11, ts: ago(1), summary: "About one.", title: "Making the app simpler", tool: "Claude Code", mac: "M5", project: "Khipu", quote: "first line" },
@@ -43,12 +46,17 @@ async function searchFor(text: string) {
 }
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(NOW);
   HTMLElement.prototype.scrollIntoView = vi.fn();
   // jsdom has no <dialog>.showModal
   HTMLDialogElement.prototype.showModal = function () { this.setAttribute("open", ""); };
   HTMLDialogElement.prototype.close = function () { this.removeAttribute("open"); };
 });
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe("Memory: recent conversations", () => {
   it("lists them by day when the box is empty, and opens one", async () => {

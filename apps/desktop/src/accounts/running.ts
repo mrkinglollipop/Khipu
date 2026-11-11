@@ -39,6 +39,8 @@ export type RunMac = {
   this_mac: boolean;
   as_of: string | null;
   stale: boolean;
+  /** Set by `currentView`: this Mac's rows are from an earlier read, and the latest read failed. */
+  old?: boolean;
   runners: RunRunner[];
 };
 
@@ -172,6 +174,12 @@ export function countLive(macs: RunMac[]): number {
 /** The sentence above the tables. It never says "nothing" about a Mac it
  *  can't see, and the empty case says what is true: no runner is reporting. */
 export function headline(data: Running): string {
+  const old = data.macs.filter((m) => m.old);
+  if (old.length) {
+    const others = data.macs.filter((m) => m.stale && !m.old);
+    const otherLine = others.length ? ` ${joinNames(others.map((m) => m.name))} ${others.length === 1 ? "hasn’t" : "haven’t"} reported recently either.` : "";
+    return `Activity on ${joinNames(old.map((m) => m.name))} is unknown: Khipu couldn’t read what is running just now.${otherLine}`;
+  }
   const fresh = data.macs.filter((m) => !m.stale);
   const stale = data.macs.filter((m) => m.stale);
   if (!data.macs.length) return "No Mac has reported yet, so Khipu can’t tell what is running.";
@@ -183,8 +191,34 @@ export function headline(data: Running): string {
   const reporting = fresh.some((m) => m.runners.length > 0);
   if (!reporting) return `No job runner is reporting on ${names}.${staleLine}`;
   const n = countLive(data.macs);
-  if (n === 0) return `Nothing is running right now on ${names}.${staleLine}`;
-  return `${n === 1 ? "1 job" : `${n} jobs`} running or waiting on ${names}.${staleLine}`;
+  // A runner that stopped reporting counts for nothing, so its Mac is never "quiet":
+  // Khipu can't tell, and the headline keeps saying so, as the table does.
+  const silent = fresh.filter((m) => m.runners.some((r) => r.silent));
+  const clear = fresh.filter((m) => !silent.includes(m));
+  const silentLine = silent.length
+    ? ` Activity on ${joinNames(silent.map((m) => m.name))} is unknown: a job runner there stopped reporting.`
+    : "";
+  if (n === 0) {
+    if (!clear.length) return `${silentLine.trim()}${staleLine}`;
+    return `Nothing is running right now on ${joinNames(clear.map((m) => m.name))}.${silentLine}${staleLine}`;
+  }
+  return `${n === 1 ? "1 job" : `${n} jobs`} running or waiting on ${names}.${silentLine}${staleLine}`;
+}
+
+/** The answer as it can be trusted now. When the latest read failed and an
+ *  earlier answer is still on screen, the rows stay, but nothing in them is
+ *  current: every runner reads as not reporting, so a job is "Not known",
+ *  never "Running", and no runner is "Reporting". */
+export function currentView(hook: Pick<RunningHook, "data" | "readFailed">): Running | null {
+  const data = hook.data;
+  if (!data || !hook.readFailed) return data;
+  return {
+    ...data,
+    macs: data.macs.map((m) => (m.stale ? m : {
+      ...m, old: true,
+      runners: m.runners.map((r) => ({ ...r, silent: true, silent_since: r.silent_since ?? data.updated_at ?? m.as_of })),
+    })),
+  };
 }
 
 // ---------- the last answer, kept on this device ----------
@@ -209,6 +243,8 @@ export type RunningHook = {
   data: Running | null;
   /** The last try failed and there is no earlier answer to show. */
   unread: boolean;
+  /** The last try failed while an earlier answer is on screen: that answer is old. */
+  readFailed?: boolean;
   /** When the answer on screen was made, in ms. */
   answeredAt: number | null;
 };
@@ -259,5 +295,5 @@ export function useRunning(active: boolean): RunningHook {
   }, [active, refresh]);
 
   const t = data?.updated_at ? Date.parse(data.updated_at) : NaN;
-  return { data, unread: failed && !data, answeredAt: Number.isNaN(t) ? null : t };
+  return { data, unread: failed && !data, readFailed: failed && !!data, answeredAt: Number.isNaN(t) ? null : t };
 }

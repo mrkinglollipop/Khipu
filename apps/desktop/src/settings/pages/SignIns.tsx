@@ -8,7 +8,7 @@ import { fmtAge } from "../../time";
 /** Per Mac: each account and whether it is signed in. This Mac's accounts that
  *  need it get the same sign-in button the account cards use. The other Mac's
  *  list is read-only, and says how old it is. */
-export function SignInsPage({ macs, active }: { macs: Loaded<MacsDoc>; active: boolean }) {
+export function SignInsPage({ macs, active, onSignedIn }: { macs: Loaded<MacsDoc>; active: boolean; onSignedIn?: () => void | Promise<unknown> }) {
   const { support, reload } = useAccountsSupport(active);
   if (macs.loading && !macs.data) return <p className="st-muted" role="status">Reading sign-ins…</p>;
   if (!macs.data) return <p className="st-muted" role="status">Khipu could not read the sign-ins just now{macs.error ? `: ${macs.error}` : "."}</p>;
@@ -43,7 +43,7 @@ export function SignInsPage({ macs, active }: { macs: Loaded<MacsDoc>; active: b
                     <span className="st-inline">
                       <SignInControl
                         row={{ harness: s.harness, account: s.label, home: homes.get(key) ?? null, ok: false, error: "not_signed_in" }}
-                        onSignedIn={reload}
+                        onSignedIn={async () => { await Promise.all([reload(), onSignedIn?.()]); }}
                       />
                     </span>
                   ) : null}

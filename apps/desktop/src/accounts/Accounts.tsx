@@ -95,10 +95,21 @@ export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp,
   const writes = useAccountWrites(reread);
   // Adding, finding, renaming and no longer tracking accounts: the older
   // Accounts screen's finder, unchanged (its own commands and dialogs).
+  // The job-slot map, read the way the older Accounts screen read it (`khipu config`),
+  // so Stop tracking can say which slots use the account. Unread stays null.
+  const [laneMap, setLaneMap] = useState<Record<string, Record<string, string>> | null>(null);
+  const loadLaneMap = useCallback(async () => {
+    const res = await callCli<{ routing?: { routing_lane_map?: { value?: unknown } } }>("khipu_config_show");
+    const raw = res.ok ? res.data?.routing?.routing_lane_map?.value : undefined;
+    setLaneMap(raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, Record<string, string>>) : null);
+  }, []);
+  useEffect(() => { void loadLaneMap(); }, [loadLaneMap]);
   const finder = useAccountsFinder(true, {
     view: routing.data,
+    laneMap,
     onChanged: () => {
       void routing.load(true);
+      void loadLaneMap();
       void onReloadPlans?.();
     },
   });

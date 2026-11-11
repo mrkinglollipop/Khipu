@@ -38,6 +38,13 @@ function valueWords(value: unknown, kind?: string): string {
   return typeof value === "object" ? JSON.stringify(value) : String(value);
 }
 
+/** A value as `khipu_config_set` takes it: a switch is the word on or off (the
+ *  bridge refuses "true" and "false"); anything else is its JSON. */
+function settingText(value: unknown): string {
+  if (typeof value === "boolean") return value ? "on" : "off";
+  return JSON.stringify(value);
+}
+
 function givenNames(cfg: MacConfig | null): Record<string, string> {
   const v = cfg?.routing?.[NAMES_KEY]?.value;
   if (!v || typeof v !== "object" || Array.isArray(v)) return {};
@@ -158,11 +165,11 @@ export function MacSettings({ macs, active, onNamed }: { macs: MacRow[]; active:
                   <div className="st-v">This Mac: <b>{valueWords(d.local, kind)}</b> · Other Mac: <b>{valueWords(d.remote, kind)}</b></div>
                   <div className="st-actions">
                     <button type="button" className="sm" disabled={w.busy != null}
-                      onClick={() => void w.run(`sync-local-${d.key}`, "khipu_config_set", { key: d.key, value: JSON.stringify(d.local) })}>
+                      onClick={() => void w.run(`sync-local-${d.key}`, "khipu_config_set", { key: d.key, value: settingText(d.local) })}>
                       Keep {valueWords(d.local, kind)}
                     </button>
                     <button type="button" className="sm" disabled={w.busy != null}
-                      onClick={() => void w.run(`sync-remote-${d.key}`, "khipu_config_set", { key: d.key, value: JSON.stringify(d.remote) })}>
+                      onClick={() => void w.run(`sync-remote-${d.key}`, "khipu_config_set", { key: d.key, value: settingText(d.remote) })}>
                       Use {valueWords(d.remote, kind)}
                     </button>
                   </div>
@@ -175,7 +182,7 @@ export function MacSettings({ macs, active, onNamed }: { macs: MacRow[]; active:
           </div>
           <div className="st-actions">
             <button type="button" disabled={w.busy != null} onClick={() => void (async () => {
-              for (const d of differences) await w.run(`sync-all-${d.key}`, "khipu_config_set", { key: d.key, value: JSON.stringify(d.remote) });
+              for (const d of differences) await w.run(`sync-all-${d.key}`, "khipu_config_set", { key: d.key, value: settingText(d.remote) });
             })()}>Use the other Mac’s for all</button>
           </div>
         </section>

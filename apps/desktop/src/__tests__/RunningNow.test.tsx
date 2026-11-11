@@ -65,8 +65,14 @@ describe("the sentence above the tables", () => {
   it("counts live jobs on fresh Macs and names them", () => {
     expect(headline(data([mac(), mac({ mac: "m1", name: "M1", runners: [runner({ jobs: [job({ state: "waiting" })] })] })]))).toBe("2 jobs running or waiting on M5 and M1.");
   });
-  it("does not count a silent runner's jobs as running", () => {
-    expect(headline(data([mac({ runners: [runner({ silent: true })] })]))).toBe("Nothing is running right now on M5.");
+  it("does not count a silent runner's jobs as running, and does not say nothing is running", () => {
+    const h = headline(data([mac({ runners: [runner({ silent: true })] })]));
+    expect(h).toBe("Activity on M5 is unknown: a job runner there stopped reporting.");
+    expect(h).not.toMatch(/nothing is running/i);
+  });
+  it("still says nothing is running on a Mac whose runners all report, beside one that went quiet", () => {
+    expect(headline(data([mac({ runners: [runner({ jobs: [] })] }), mac({ mac: "m1", name: "M1", runners: [runner({ silent: true })] })])))
+      .toBe("Nothing is running right now on M5. Activity on M1 is unknown: a job runner there stopped reporting.");
   });
   it("says what is true when no runner reports: not that nothing is being worked on", () => {
     const h = headline(data([mac({ runners: [] })]));
@@ -180,9 +186,35 @@ describe("the last answer and the refresh", () => {
     render(<Probe />);
     expect(screen.getByText("Job one")).toBeVisible();
     await act(async () => { release(); });
+    // The earlier answer stays, marked as earlier, with what is running now unknown.
     expect(screen.getByText("Job one")).toBeVisible();
-    expect(screen.queryByRole("alert")).toBeNull();
-    expect(screen.queryByText(/couldn’t read|try again/i)).toBeNull();
+    expect(screen.getByRole("alert")).toHaveTextContent(/Khipu couldn’t read what is running just now\. This is from .*, so what is running now is not known\./);
+    expect(screen.getByText("Not known")).toBeVisible();
+    expect(screen.getByText(/Activity on M5 is unknown/)).toBeVisible();
+    expect(screen.queryByText("Running")).toBeNull();
+    expect(screen.queryByText(/^Reporting/)).toBeNull();
+  });
+
+  it("does not show the earlier answer's running job or reporting runner as live when reads fail", async () => {
+    store.set("khipu.accounts.running.v1", answer({ updated_at: new Date(NOW.getTime() - 24 * 3600_000).toISOString() }));
+    invokeMock.mockRejectedValue(new Error("down"));
+    render(<Probe />);
+    await waitFor(() => expect(screen.getByRole("alert")).toBeVisible());
+    expect(screen.queryByText("Running")).toBeNull();
+    expect(screen.queryByText(/^Reporting/)).toBeNull();
+    expect(screen.getByText("Not known")).toBeVisible();
+  });
+
+  it("the account page lists the earlier answer's job as not known, not running", async () => {
+    store.set("khipu.accounts.running.v1", answer({ macs: [{ mac: "m5", name: "M5", this_mac: true, as_of: new Date().toISOString(), stale: false, runners: [{ name: "lanes", heartbeat_at: null, silent: false, jobs: [{ summary: "Job one", state: "running", account_key: "claude|", account_label: "Claude" }] }] }] as unknown as RunMac[] }));
+    invokeMock.mockRejectedValue(new Error("down"));
+    function Here() {
+      const h = useRunning(true);
+      return <RunningHere accountKey="claude|" accountLabel="Claude" hook={h} />;
+    }
+    render(<Here />);
+    await waitFor(() => expect(screen.getByText(/Not known/)).toBeVisible());
+    expect(screen.queryByText(/Running,/)).toBeNull();
   });
 
   it("replaces the answer with a newer one without clearing the screen in between", async () => {

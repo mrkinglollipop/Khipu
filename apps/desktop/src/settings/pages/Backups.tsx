@@ -11,6 +11,11 @@ type BackupState =
   | { kind: "done"; archive: string | null; files: number | null }
   | { kind: "error"; message: string };
 
+/** The archive path with the home folder shortened: `/Users/<name>/Downloads/x.zip` shows as `~/Downloads/x.zip`. */
+export function homeShortened(path: string): string {
+  return path.replace(/^\/(?:Users|home)\/[^/]+(?=\/)/, "~");
+}
+
 /** The newest successful backup and the free space, from the status commands,
  *  plus Back up now: the same `backup-local --out=~/Downloads` the older Data
  *  screen ran. Nothing here says how often backups run; Khipu does not report it. */
@@ -54,7 +59,7 @@ export function BackupsPage({ macs, health, run, onBackedUp }: {
         {state.kind === "busy" ? <p className="st-muted" role="status">Writing a zip of this Mac's Khipu files to Downloads…</p> : null}
         {state.kind === "done" ? (
           <p role="status">
-            Backed up{state.files != null ? ` ${state.files} files` : ""}{state.archive ? ` to ${state.archive}` : ""}.
+            Backed up{state.files != null ? ` ${state.files} files` : ""}{state.archive ? ` to ${homeShortened(state.archive)}` : ""}.
           </p>
         ) : null}
         {state.kind === "error" ? <p role="alert">The backup did not finish: {state.message}</p> : null}

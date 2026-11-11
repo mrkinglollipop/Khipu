@@ -94,7 +94,7 @@ export function Settings({ ctx, active }: { ctx: SettingsCtx; active: boolean })
     switch (cur.id) {
       case "macs": return <YourMacsPage macs={macs} active={pageActive} onNamed={reloadMacs} anotherMac={ctx.anotherMac} />;
       case "updates": return <UpdatesPage appVersion={ctx.appVersion} thisMac={ctx.thisMac} whatsNew={ctx.whatsNew} />;
-      case "signins": return <SignInsPage macs={macs} active={pageActive} />;
+      case "signins": return <SignInsPage macs={macs} active={pageActive} onSignedIn={reloadMacs} />;
       case "apps": return <AppsPage ctx={ctx} active={pageActive} onAnotherMac={() => { setSel("macs"); setOpen(true); }} />;
       case "summaries": return <SummariesPage ctx={ctx} active={pageActive} />;
       case "meaning": return <SearchByMeaningPage active={pageActive} />;

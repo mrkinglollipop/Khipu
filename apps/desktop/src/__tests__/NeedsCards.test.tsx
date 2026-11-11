@@ -191,6 +191,33 @@ describe("a refused or failed answer", () => {
   });
 });
 
+describe("a receipt belongs to one answered proposal", () => {
+  it("shows a newer proposal with the same key as its own card, counted, beside the old receipt's answer", async () => {
+    const first = item("priority", { words: "First priority proposal.", expect: "pin-1" });
+    const second = item("priority", { words: "Second priority proposal.", expect: "pin-2" });
+    route([listOf([first]), listOf([second])], [done({ text: "You said yes to the first." }), done({ text: "You said yes to the second." })]);
+    render(<Host />);
+    await screen.findByText("First priority proposal.");
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Yes" })); });
+    // The read after the answer carries a newer proposal under the same key.
+    await screen.findByText("Second priority proposal.");
+    expect(screen.queryByText("You said yes to the first.")).toBeNull();
+    expect(screen.getByText("1 question")).toBeTruthy();
+    // Its own buttons answer it with its own pin.
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Yes" })); });
+    expect(calls("khipu_needs_you_answer")[1]).toEqual(["khipu_needs_you_answer", { key: "priority", answer: "yes", expect: "pin-2" }]);
+  });
+  it("keeps the receipt while the same proposal (same pin) is still listed", async () => {
+    const first = item("priority", { words: "First priority proposal.", expect: "pin-1" });
+    route([listOf([first]), listOf([first])], [done({ text: "You said yes to the first." })]);
+    render(<Host />);
+    await screen.findByText("First priority proposal.");
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Yes" })); });
+    await screen.findByText("You said yes to the first.");
+    expect(screen.queryByText("First priority proposal.")).toBeNull();
+  });
+});
+
 describe("receipts and Undo", () => {
   it("Undo runs the existing undo on the receipt's action once, then is gone", async () => {
     let release: (v: string) => void = () => {};

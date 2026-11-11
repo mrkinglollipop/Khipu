@@ -21,7 +21,8 @@ describe("Back up now", () => {
     expect(screen.getByText(/Writing a zip/)).toBeTruthy();
     expect(done).not.toHaveBeenCalled();
     finish(JSON.stringify({ ok: true, archive: "/Users/x/Downloads/khipu-local-1.zip", files: 12 }));
-    await waitFor(() => expect(screen.getByText(/Backed up 12 files to \/Users\/x\/Downloads\/khipu-local-1\.zip/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Backed up 12 files to ~/Downloads/khipu-local-1.zip.")).toBeTruthy());
+    expect(document.body.textContent).not.toContain("/Users/x");
     expect(done).toHaveBeenCalledTimes(1);
   });
 
