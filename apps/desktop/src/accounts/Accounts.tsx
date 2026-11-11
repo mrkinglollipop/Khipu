@@ -53,6 +53,7 @@ function AccountRow({ row, selected, onSelect }: { row: RowModel; selected: bool
           {row.line}
           {row.ahead ? ` · ${row.ahead === 1 ? "1 conversation" : `${row.ahead} conversations`} running ahead` : ""}
         </span>
+        {row.warning ? <span className="ac-line" style={{ color: "var(--warn)" }}>{row.warning}</span> : null}
       </span>
     </button>
   );

@@ -406,6 +406,18 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
             "caps": [{**s, "applies": _applies(s, purpose, statuses, tier=check_tier, sensitive=sensitive)}
                      for s in statuses],
             "eligible": eligible, "why_eligible": why_eligible, "advisory": True}
+    # The later login folder is never separate room, even when its peer is
+    # paused or closed. Keep any existing closure reason alongside the mark.
+    from khipu import routing_page
+
+    ordered, extra = routing_page._same_account_rows(view, now)
+    marked = next((e for e, _ in (*ordered, *extra) if e["key"] == entry["key"]), {})
+    if marked.get("_same_account_later"):
+        out["same_account_as"] = marked["_same_account_as"]
+        reason_same = f"same account as {out['same_account_as']}; not separate room"
+        out["reason"] = reason_same if verdict == "go" else f"{reason}; {reason_same}"
+        if verdict == "go":
+            out["verdict"] = verdict = "closed"
     left = nearly_out(entry)
     if left is not None and verdict == "go":
         out["nearly_out"] = left
@@ -476,7 +488,11 @@ def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
                                 privacy=privacy, sensitive=sensitive, explicit=target_key is not None,
                                 declared_tier=declared_tier, second_opinion=second_opinion,
                                 override=overrides.get(routing.account_id(entry["key"])) if overrides else None)
-        if not advice["eligible"]:
+        if advice.get("same_account_as"):
+            # Always after its peer, whatever the peer's own verdict.
+            group = 4
+            why = f"same account as {advice['same_account_as']}; not separate room"
+        elif not advice["eligible"]:
             group = 3
             why = advice["why_eligible"]
         elif advice["verdict"] == "go":

@@ -394,6 +394,7 @@ export function AccountPage({ a, row, view, plans, now, writes, overrides, thisM
           {row.kind !== "room" ? (
             <div className="ac-kv"><div className="ac-k">Now</div><div className="ac-v">{row.line} · <b>{row.word}</b></div></div>
           ) : null}
+          {row.warning ? <p className="ac-muted" style={{ color: "var(--warn)" }}>{row.warning}</p> : null}
           <SignInSection usage={usage} onSignedIn={onSignedIn} />
           {runningHere}
         </div>

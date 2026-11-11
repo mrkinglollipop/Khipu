@@ -971,6 +971,20 @@ def test_codex_rollout_off_opens_nothing_under_the_folder_and_returns_the_live_c
 # ---- try_account --------------------------------------------------------------------------------
 
 
+def test_discovery_plan_read_does_not_repeat_identity(mac):
+    mac.install("claude")
+    folder = mac.folder(".claude-client")
+    run = usage._Run()
+    try:
+        state, _, plan = discover._check_one({"cli": "claude", "abs": str(folder)},
+                                              run=run, end=time.monotonic() + 7)
+    finally:
+        run.kill_all()
+    assert state == discover.SIGNED_IN and plan == "max"
+    assert mac.calls("claude") == [(str(folder), " ".join(discover.STATUS_ARGV["claude"])),
+                                   (str(folder), " ".join(usage._CLAUDE_ARGS))]
+
+
 def test_try_reads_an_unsaved_account_once_and_never_writes_the_cache(mac):
     mac.install("claude")
     mac.install("codex")

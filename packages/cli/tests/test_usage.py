@@ -35,6 +35,9 @@ FAKE_CLI = textwrap.dedent("""
     import json, os, subprocess, sys, time
     SENTINEL = "SENTINEL-c0ffee-do-not-leak"
     fixture, mode, out = sys.argv[1], sys.argv[2], sys.argv[3]
+    if sys.argv[4:6] == ["auth", "status"]:
+        print(json.dumps({"loggedIn": False}))
+        sys.exit(1)
     turn = "--max-turns" in sys.argv  # Claude's one-turn fallback: its own fixture and record
     muse_turn = "--disable-shell" in sys.argv  # Muse's one-turn host: the same, answered over stdin
     if turn or muse_turn:
@@ -202,7 +205,9 @@ def test_claude_turn_without_a_rate_limit_event_still_reads_no_figures(fake, tmp
     lone = tmp_path / "claude-lone.jsonl"  # no claude-lone-turn.jsonl: the turn prints nothing
     shutil.copy(FIXTURES / "claude-null.jsonl", lone)
     fake("claude", lone)
-    row = usage.probe_claude()
+    # Figures only: the fake's auth status answers "signed out", which is
+    # covered with the identity read in test_usage_same_account.py.
+    row = usage.probe_claude(identity=False)
     assert row == {"ok": False, "error": usage.E_NO_FIGURES}
 
 
@@ -1142,7 +1147,7 @@ def test_every_probe_runs_in_a_fresh_empty_temp_cwd(fake):
 def test_a_grandchild_holding_stdout_is_killed(fake):
     out = fake("claude", "claude.jsonl", mode="grandchild")
     started = time.monotonic()
-    row = usage.probe_claude(timeout=5)
+    row = usage.probe_claude(timeout=5, identity=False)  # figures only
     assert row == {"ok": False, "error": "no_answer"}
     assert time.monotonic() - started < 3, "the CLI's exit is noticed though a grandchild holds stdout"
     assert _gone(_child(out)["grandchild"])
@@ -1340,7 +1345,8 @@ def test_repeated_failures_keep_the_last_good_figures(fake, monkeypatch):
 ])
 def test_malformed_nested_replies_are_bad_reply(fake, tmp_path, harness, frames):
     fake(harness, _jsonl(tmp_path / f"{harness}-bad.jsonl", frames))
-    probe = {"claude": usage.probe_claude, "grok": lambda: usage.probe_grok(None), "muse": usage.probe_muse,
+    probe = {"claude": lambda: usage.probe_claude(identity=False),  # figures only
+             "grok": lambda: usage.probe_grok(None), "muse": usage.probe_muse,
              "codex": lambda: usage.probe_codex(str(tmp_path / "no-sessions"))}[harness]
     assert probe() == {"ok": False, "error": "bad_reply"}
 

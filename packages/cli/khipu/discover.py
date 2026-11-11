@@ -1039,7 +1039,7 @@ def _check_one(rec: dict, *, run: "usage._Run", end: float) -> tuple[str, str | 
         plan = None
         if state == SIGNED_IN and end - time.monotonic() > 0.5:
             row = usage.probe_account({"label": usage.LABELS[cli], "harness": cli, "home": home},
-                                      timeout=left(), rollout=False, turn=False, login=False)
+                                      timeout=left(), rollout=False, turn=False, login=False, identity=False)
             plan = row.get("plan") if row.get("ok") else None
         return state, reason, plan
     if cli in ("grok", "muse"):
@@ -1492,5 +1492,5 @@ def try_account(harness: str, folder: str | None = None, *, timeout: float = usa
             return {"ok": False, "error": "folder_not_found"}
         home = None if identity(path) == identity(default_folder(harness)) else str(path)
     row = usage.probe_account({"label": usage.LABELS[harness], "harness": harness, "home": home},
-                              timeout=timeout, rollout=False, login=False)
+                              timeout=timeout, rollout=False, login=False, identity=False)
     return {"ok": bool(row.get("ok")), "default": home is None, "row": row}

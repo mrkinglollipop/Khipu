@@ -201,6 +201,8 @@ def _status(entry: dict, provider: dict, windows: list[dict], holds: list[dict],
         return "DOWN: " + _one_line(entry.get("reason") or "out of service")
     if state not in (r.OPEN, r.PROBABLY_OPEN):
         return "UNKNOWN"
+    if entry.get("_same_account_later"):
+        return "SAME ACCOUNT"
     if window is not None and window["left"] < NEARLY_OUT_PCT:
         return "NEARLY OUT"
     if provider.get("use") == "second_opinion":  # the provider fact advice reads too
@@ -229,6 +231,16 @@ def _account_text(label: str, entry: dict, item: dict | None, *, number, holds: 
     provider = providers.get(entry.get("harness")) or providers.get(entry["key"].partition(":")[0]) or {}
     status = _status(entry, provider, windows, holds, last, widths, now, r)
     parts = []
+    if entry.get("_same_account_as"):
+        from khipu.usage import same_account_note
+
+        if entry.get("_same_account_later"):
+            parts.append(f"Same account as {entry['_same_account_as']}")
+        else:
+            note = same_account_note(entry["_same_account_as"])
+            if widths[1] == 0:
+                note = note.removesuffix(" Sign one of them in to the other account.")
+            parts.append(note)
     if window is not None:
         text = f"{_pct(window['left'])}% {_WINDOW_WORDS.get(window['name'], '')} left".replace("%  left", "% left")
         text += f", resets {r._clock(window['resets'], now)}"
@@ -322,6 +334,28 @@ def _ordered(view: dict, now: datetime) -> tuple[list, list]:
     return ordered, extra
 
 
+def _same_account_rows(view: dict, now: datetime) -> tuple[list, list]:
+    """The page's order and same-account peers, shared by text and facts.
+    Only peers still shown on the page count; the owner's first row stays
+    primary even when the input accounts list is in a different order."""
+    ordered, extra = _ordered(view, now)
+    same = ((view.get("sources") or {}).get("usage") or {}).get("same_accounts") or {}
+    labels = {e["key"]: e["label"] for e, _item in (*ordered, *extra)}
+    seen = set()
+
+    def mark(pair):
+        entry, item = pair
+        peers = [key for key in same.get(entry["key"], []) if key in labels and key != entry["key"]]
+        if peers:
+            entry = dict(entry, _same_account_peers=peers,
+                         _same_account_as=", ".join(labels[key] for key in peers),
+                         _same_account_later=any(key in seen for key in peers))
+        seen.add(entry["key"])
+        return entry, item
+
+    return [mark(pair) for pair in ordered], [mark(pair) for pair in extra]
+
+
 def _headings(cut: list[tuple[str, str]]) -> str:
     """The headings that lost lines, in the page's order, each once."""
     return ", ".join(dict.fromkeys(name for name, _text in cut))
@@ -330,13 +364,12 @@ def _headings(cut: list[tuple[str, str]]) -> str:
 def _render(view: dict, now: datetime, conversation: dict, readings: dict, rules: list, keep: int, widths,
             account_width: int, r) -> str:
     providers = (view.get("definitions") or {}).get("providers") or {}
-    ordered, extra = _ordered(view, now)
+    ordered, extra = _same_account_rows(view, now)
     holds = [h for h in view.get("holds") or []]
     lines = [f"ROUTING {r._clock(now, now)}. The owner's record. Guidance, not a gate: route differently if you "
              "know better, and say why.", ""]
     lines.append("ACCOUNTS, in the owner's order. Take the first with room that fits the work.")
     overridden = []
-
     def line(entry, item, number, last):
         label = r._account_label(entry["label"], entry.get("key"), view=view)
         mine = [h for h in holds if (h.get("scope") or {}).get("kind") == "account"
@@ -446,7 +479,7 @@ def _fitted(view: dict, now: datetime, conversation: dict, readings: dict, r) ->
 # set). A percentage, a reset time or a measured spend moving on its own
 # changes none of them, so it never resends the page.
 
-WORDS = ("PAUSED", "NO JOBS", "LIMIT REACHED", "DOWN", "UNKNOWN", "NEARLY OUT", "SECOND OPINIONS ONLY",
+WORDS = ("PAUSED", "NO JOBS", "LIMIT REACHED", "DOWN", "UNKNOWN", "SAME ACCOUNT", "NEARLY OUT", "SECOND OPINIONS ONLY",
          "LAST RESORT", "HOLD BACK", "PROBABLY OPEN", "OK")
 
 
@@ -467,7 +500,7 @@ def facts(view: dict, now: datetime) -> dict:
     if not view.get("record"):
         return {"record": False}
     providers = (view.get("definitions") or {}).get("providers") or {}
-    ordered, extra = _ordered(view, now)
+    ordered, extra = _same_account_rows(view, now)
     holds = view.get("holds") or []
     accounts = []
     for n, (entry, item) in enumerate([*ordered, *extra]):
@@ -479,6 +512,7 @@ def facts(view: dict, now: datetime) -> dict:
         exceptions = [{k: x.get(k) for k in ("id", "text", "until")} for x in (item or {}).get("exceptions") or []
                       if (r._parse(x.get("until")) or now) > now]
         accounts.append({"key": entry["key"], "ordered": item is not None, "word": _word(status),
+                         "same_as": sorted(entry.get("_same_account_peers") or []),
                          "role": (item or {}).get("role"), "exceptions": exceptions,
                          "caps": entry.get("caps") or [], "terms": entry.get("terms") or {},
                          "provider": {k: provider.get(k) for k in ("use", "models_allowed")}})

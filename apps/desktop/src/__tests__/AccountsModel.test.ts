@@ -19,6 +19,50 @@ import {
 } from "../accounts/accountsModel";
 import type { Pace, RouteAccount, RouteView } from "../routing";
 
+it("shows a successful usage row's same-account note in the existing warning line", () => {
+  const a = account();
+  const note = "Reads the same account as Claude second: both folders are signed in to one account. Sign one of them in to the other account.";
+  expect(rowModel(a, { accounts: [a] }, { accounts: [
+    { key: a.key, ok: true, same_account_as: "Claude second", note },
+  ] }, 0, NOW)).toMatchObject({ kind: "room", warning: note, word: "On pace", tone: "warn", left: 62 });
+});
+
+it.each([
+  { note: "Reads the same account as Claude second: both folders are signed in to one account." },
+  { same_account_as: "Claude second", note: "" },
+])("shows no warning without both a same-account mark and a note: %j", (usage) => {
+  const a = account();
+  expect(rowModel(a, view([a]), { accounts: [{ key: a.key, ok: true, ...usage }] }, 0, NOW))
+    .toMatchObject({ kind: "room", warning: null, tone: "ok" });
+});
+
+it.each([["cap_reached", "At your stop level"], ["limit_reached", "Out of room"]])(
+  "keeps an open duplicate row red at %s", (verdict, word) => {
+    const a = account({ pace: [win("weekly", 100, 3000, verdict)] });
+    const note = "Reads the same account as Claude second: both folders are signed in to one account.";
+    expect(rowModel(a, view([a]), { accounts: [{ key: a.key, ok: true,
+      same_account_as: "Claude second", note }] }, 0, NOW))
+      .toMatchObject({ kind: "room", warning: note, word, tone: "err" });
+  },
+);
+
+it.each([
+  ["limited", "Out of room", "err"], ["paused", "Paused", "none"], ["down", "Down", "err"],
+])("keeps a duplicate account's %s state and reading", (state, word, tone) => {
+  const a = account({ state, until: at(70) });
+  const note = "Reads the same account as Claude second: both folders are signed in to one account.";
+  const r = rowModel(a, view([a]), { accounts: [{ key: a.key, ok: true, same_account_as: "Claude second", note }] }, 0, NOW);
+  expect(r).toMatchObject({ kind: state, word, tone, warning: note, left: null });
+  expect(accountWindows(a, view([a]), NOW)).toHaveLength(1);
+});
+
+it("keeps the sign-in state beside a same-account warning", () => {
+  const a = account();
+  expect(rowModel(a, view([a]), { accounts: [{ key: a.key, ok: false, error: "not_signed_in",
+    same_account_as: "Claude second", note: "Same account warning" }] }, 0, NOW))
+    .toMatchObject({ kind: "signin", word: "Needs sign-in", warning: "Same account warning", left: null });
+});
+
 const NOW = new Date("2026-11-10T19:00:00Z"); // 2:00 PM in New York
 const at = (min: number) => new Date(NOW.getTime() + min * 60_000).toISOString();
 
