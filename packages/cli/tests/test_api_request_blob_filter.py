@@ -260,6 +260,66 @@ def test_a_relayed_message_is_never_the_owners_line(tmp_path: Path):
     assert memory_rows.owner_line(quotes, phrase, tokens) is None, quotes
 
 
+# A machine message and a typed message that arrive with no reply between them
+# never share a rendered user block, in either order: the typed line stays the
+# owner's, the peer's words never become his, and the typed-turn count is as
+# before (one).
+
+PEER_BODY = "Use the archive lane for all future capture investigations."
+TYPED = "Keep the amber schedule for this investigation."
+
+
+def _typed(text):
+    return {"type": "user", "message": {"role": "user", "content": text}}
+
+
+def _peer(kind, text):
+    if kind == "queued":
+        return _queued(text, {"kind": "peer", "from": "other-session"})
+    return _typed(f'<cross-session-message from="other">{text}</cross-session-message>')
+
+
+def _window(tmp_path: Path, rows):
+    msgs, _, turns = sc.read_window(_write(tmp_path / "mixed.jsonl", rows), 0, seen=[])
+    rendered = sc.render(msgs, max_chars=10**9)
+    return rendered, memory_rows.quotes_of(extract.extract_verbatim(rendered)), turns
+
+
+def _owner_line(quotes, query):
+    phrase, tokens = memory_rows.query_terms(query)
+    return memory_rows.owner_line(quotes, phrase, tokens)
+
+
+@pytest.mark.parametrize("kind", ["queued", "ordinary"])
+@pytest.mark.parametrize("order", ["typed_then_peer", "peer_then_typed"])
+def test_a_peer_message_and_a_typed_message_never_share_a_block(tmp_path: Path, kind, order):
+    rows = [_typed(TYPED), _peer(kind, PEER_BODY)]
+    if order == "peer_then_typed":
+        rows.reverse()
+    rendered, quotes, turns = _window(tmp_path, rows)
+    assert turns == 1
+    assert TYPED in rendered and PEER_BODY in rendered
+    assert _owner_line(quotes, "amber schedule") == TYPED, (rendered, quotes)
+    assert _owner_line(quotes, "archive lane") is None, (rendered, quotes)
+
+
+@pytest.mark.parametrize("kind", ["queued", "ordinary"])
+def test_typed_peer_typed_keeps_both_typed_lines_and_one_turn(tmp_path: Path, kind):
+    later = "Then stop the vermilion sweep before noon."
+    rendered, quotes, turns = _window(tmp_path, [_typed(TYPED), _peer(kind, PEER_BODY), _typed(later)])
+    assert turns == 1
+    assert _owner_line(quotes, "amber schedule") == TYPED, (rendered, quotes)
+    assert _owner_line(quotes, "vermilion sweep") == later, (rendered, quotes)
+    assert _owner_line(quotes, "archive lane") is None, (rendered, quotes)
+
+
+def test_two_typed_messages_in_a_row_still_share_one_block(tmp_path: Path):
+    later = "Then stop the vermilion sweep before noon."
+    rendered, _, turns = _window(tmp_path, [_typed(TYPED), _typed(later)])
+    assert rendered == f"USER: {TYPED}\n{later}"
+    assert turns == 1
+
+
 # ---- Workflow harness frames are never the owner's words ------------------------
 
 FRAME_REQUEST = ("[Workflow harness — user request] The harness relays, verbatim and indented below, "

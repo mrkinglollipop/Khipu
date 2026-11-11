@@ -915,7 +915,8 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
                    and not _db_step(entries[printed[p]][0])):
                 copied.add(printed[p])
                 p += step
-    last_user_counted = False   # the open user block already holds a real turn
+    last_user_counted = False   # the open run of user blocks already holds a real turn
+    open_real = False           # the open user block holds typed messages, not stand-ins
     head_open = True            # every message so far was an already-seen copy
     for i, (d, role, text, line_end, checkpoint, real, streamed, fp) in enumerate(entries):
         if role == "tool":
@@ -951,15 +952,20 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             stats.setdefault("carry", []).append((role, text))
         else:
             head_open = False
-        if msgs and msgs[-1][0] == role:
+        if msgs and msgs[-1][0] == role and (role != "user" or streamed or real == open_real):
             # ACP streams chunks (concatenate); the others emit whole
             # messages (join on a newline).
             sep = "" if streamed else "\n"
             msgs[-1] = (role, msgs[-1][1] + sep + text)
         else:
+            # A machine stand-in and a typed message never share a block: a
+            # block is quoted as the owner's by its opening alone. Back-to-back
+            # user blocks are still one turn.
+            if role == "user" and not (msgs and msgs[-1][0] == "user"):
+                last_user_counted = False
             msgs.append((role, text))
             if role == "user":
-                last_user_counted = False
+                open_real = real
         if real and not last_user_counted:
             users += 1
             last_user_counted = True
