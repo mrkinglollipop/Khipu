@@ -48,12 +48,15 @@ if sys.argv[3:5] == ["auth", "status"]:
         sys.exit(7)
     if data.get("mode") == "malformed":
         print("not JSON")
-        sys.exit(0)
+        sys.exit(data.get("exit_code", 0))
     if data.get("mode") == "nonobject":
         print("[]")
         sys.exit(0)
     time.sleep(data.get("delay", 0))
+    if data.get("mode") == "missing-logged-in":
+        data.pop("loggedIn", None)
     print(json.dumps(data, indent=2))
+    sys.exit(data.get("exit_code", 0 if data.get("loggedIn") is True else 1))
 else:
     for frame in json.loads(Path(sys.argv[1]).read_text()):
         print(json.dumps(frame), flush=True)
@@ -122,7 +125,16 @@ def test_different_accounts_or_organizations_are_not_duplicates(logins, change):
     assert all("same_account_as" not in row for row in read(accounts[:2])["accounts"])
 
 
-@pytest.mark.parametrize("failure", [{"mode": "fail"}, {"mode": "malformed"}, {"mode": "nonobject"}])
+@pytest.mark.parametrize("failure", [
+    pytest.param({"mode": "fail"}, id="exit-7-no-json"),
+    pytest.param({"mode": "malformed"}, id="exit-0-malformed"),
+    pytest.param({"mode": "nonobject"}, id="exit-0-nonobject"),
+    pytest.param({"mode": "malformed", "exit_code": 1}, id="exit-1-malformed"),
+    pytest.param({"loggedIn": "no", "exit_code": 0}, id="exit-0-nonboolean"),
+    pytest.param({"mode": "missing-logged-in", "exit_code": 0}, id="exit-0-missing-logged-in"),
+    pytest.param({"loggedIn": 1}, id="exit-1-numeric-logged-in"),
+    pytest.param({"exit_code": 1}, id="exit-1-logged-in"),
+])
 def test_identity_failure_keeps_hash_and_match_for_only_thirty_minutes(logins, failure, caplog, capsys, monkeypatch):
     accounts, _, identity, _, _ = logins
     now = usage._now()
@@ -148,7 +160,11 @@ def test_identity_failure_keeps_hash_and_match_for_only_thirty_minutes(logins, f
     assert_private(report, caplog, capsys)
 
 
-@pytest.mark.parametrize("signed_out", [{"loggedIn": False}, {"loggedIn": 1}, {"orgId": None}, {"email": " "}])
+@pytest.mark.parametrize("signed_out", [
+    pytest.param({"loggedIn": False}, id="exit-1-signed-out"),
+    pytest.param({"orgId": None}, id="exit-0-no-org"),
+    pytest.param({"email": " "}, id="exit-0-no-email"),
+])
 @pytest.mark.parametrize("figures_fail", [False, True])
 def test_definite_no_account_clears_identity_and_restores_peer_immediately(
         logins, signed_out, figures_fail, caplog, capsys, monkeypatch):

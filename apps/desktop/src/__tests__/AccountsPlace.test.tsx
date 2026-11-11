@@ -118,10 +118,11 @@ it.each([false, true])("omits the warning from the list and page when a nonempty
   }
   render(<NoWarning />);
   const button = await screen.findByRole("button", { name: /^Claude/ });
-  expect(within(button).queryByText(note)).toBeNull();
+  expect(button.querySelector(".ac-pace.warn")).toBeNull();
+  expect(button.textContent).not.toMatch(/same account/i);
   fireEvent.click(button);
   const page = await screen.findByRole("article", { name: "Claude" });
-  expect(within(page).queryByText(note)).toBeNull();
+  expect(page.textContent).not.toMatch(/same account/i);
   expect(screen.queryByText(note)).toBeNull();
   expect(writes()).toEqual([]);
 });

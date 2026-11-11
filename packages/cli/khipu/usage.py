@@ -797,13 +797,15 @@ def _claude_identity(binary: str, home: str | None, deadline: float) -> str | Li
     try:
         result = discover.run_once("claude", (binary, *discover.STATUS_ARGV["claude"]), home=home,
                                    timeout=max(0.001, deadline - time.monotonic()), run=getattr(_local, "run", None))
-        if result["outcome"] != "exited" or result["code"] != 0:
+        if result["outcome"] != "exited":
             return None
         status = json.loads(result["out"])
         if not isinstance(status, dict):
             return None
-        if status.get("loggedIn") is not True:
+        if status.get("loggedIn") is False:
             return False
+        if status.get("loggedIn") is not True or result["code"] != 0:
+            return None
         email, org = status.get("email"), status.get("orgId")
         if not all(isinstance(v, str) and v.strip() for v in (email, org)):
             return False
