@@ -114,6 +114,28 @@ class CaptureCapaTest(unittest.TestCase):
             self.assertEqual(json.loads(sc.queued_jobs()[0].read_text())["parent_session_id"],
                              "claude_code:parent")
 
+    def test_subagent_capture_stores_no_preferences(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(Path(td) / "kh")}):
+            child = _write(Path(td) / "child.jsonl", [
+                {"type": "user", "message": {"role": "user", "content": "Plain wording, never ask"}},
+                {"type": "assistant", "message": {"role": "assistant", "content": "result " + "x" * 220}},
+            ])
+            out = sc.hook_main(json.dumps({"hookEventName": "SubagentStop", "session_id": "parent",
+                                           "agent_id": "helper", "cwd": td,
+                                           "agent_transcript_path": str(child)}), "claude_code")
+            self.assertTrue(out["due"], out)
+            self.assertTrue(json.loads(sc.queued_jobs()[0].read_text())["subagent"])
+            captured, kwargs = [], []
+            reply = {"summary": "Helper read the code", "topics": [], "decisions": ["Kept X"],
+                     "preferences": ["Plain wording, never ask"], "scope": ""}
+            with mock.patch("khipu.extract.extract_memory",
+                            side_effect=lambda t, *, cwd="", **kw: kwargs.append(kw) or dict(reply)), \
+                    mock.patch("khipu.capture.capture", side_effect=lambda p, **kw: captured.append(p) or 0):
+                sc.drain()
+        self.assertEqual(kwargs, [{"job": True}])
+        self.assertEqual(captured[0]["preferences"], [])
+        self.assertEqual(captured[0]["decisions"], ["Kept X"])
+
     def test_short_explicit_request_precedes_minimum_character_gate(self):
         text = "USER: save this"
         due, why = sc.decide("stop", user_turns=1, chars=len(text), elapsed_s=0,

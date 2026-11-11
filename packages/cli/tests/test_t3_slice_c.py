@@ -504,3 +504,23 @@ def test_large_projection_vm_is_bounded(t3_db):
                         [('other',json.dumps({'nativeThreadRef':{'nativeId':'other'}}),'2026-10-07')]*1000)
     with mock.patch.object(t3.time,'monotonic',side_effect=[0, 1]):
         assert t3.thread_for_session('absent') is None
+
+
+def test_delegated_thread_capture_is_a_job_and_reaches_the_extractor_as_one(t3_db, tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'khipu'))
+    calls = []
+    for sid in ('child', 'claude-one'):
+        path = tmp_path / f'{sid}.jsonl'
+        path.write_text(json.dumps({'type':'user','message':{'role':'user','content':'Read the code ' * 15}})+'\n')
+        env = json.dumps({'session_id':sid,'hook_event_name':'SessionEnd','transcript_path':str(path),'cwd':str(tmp_path)})
+        with mock.patch('khipu.identity.resolve_repo_root', return_value={}):
+            assert sc.hook_main(env, harness='claude_code')['due']
+    jobs = {json.loads(p.read_text())['session_id']: json.loads(p.read_text()) for p in sc.queued_jobs()}
+    assert jobs['child']['origin'] == 'job'
+    assert 'origin' not in jobs['claude-one']
+    with mock.patch('khipu.extract.extract_memory',
+                    side_effect=lambda t, *, cwd='', **kw: calls.append(kw) or {'summary': 'Thread capture'}), \
+         mock.patch('khipu.capture.capture', return_value=0), \
+         mock.patch('khipu.hub_snapshot.sync_decision_changes', return_value={'ok': True}):
+        assert sc.drain()['captured'] == 2
+    assert sorted(calls, key=len) == [{}, {'job': True}]
