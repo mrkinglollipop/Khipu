@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from khipu import antigravity_db, hook_shape, t3
-from khipu.turn_text import clean_user_text, is_machine, owner_text
+from khipu.turn_text import clean_user_text, is_machine, machine_user_origin, owner_text
 
 RETENTION_S = 24 * 3600
 # A brief noted from a desktop session tool's own brief field: its proposal
@@ -499,27 +499,30 @@ _ORIGIN_LINE_MOST = 64 << 20  # the longest one line read to its end
 _ORIGIN_CHUNK = 64 << 10
 
 
-def _line_origin(row: dict) -> str | None:
+def _line_origin(row: dict, text: str = "") -> str | None:
+    machine = machine_user_origin(row, text)
+    if machine is not None:
+        return machine
     origin = row.get("turnOrigin")
     if isinstance(origin, str) and origin.strip():
         return None if origin.strip() in _UNSAID_ORIGINS else origin.strip()[:40]
     if isinstance(row.get("wakeupSource"), str) and row["wakeupSource"].strip():
         return "scheduled"
-    if row.get("promptSource") == "system":
-        return "system"
     return None
 
 
 def _prompt_line(raw: bytes) -> tuple[dict, str] | None:
     """A Claude Code user line that holds a prompt (not a tool's result or a
-    compaction summary), with its text; None for any other line."""
+    normal compaction summary), with its text; None for any other line.
+    Machine-marked summaries remain readable so their origin cannot be human.
+    """
     if b'"user"' not in raw:
         return None
     try:
         row = json.loads(raw)
     except (ValueError, RecursionError):
         return None
-    if not isinstance(row, dict) or row.get("type") != "user" or row.get("isCompactSummary"):
+    if not isinstance(row, dict) or row.get("type") != "user":
         return None
     msg = row.get("message")
     content = msg.get("content") if isinstance(msg, dict) else None
@@ -528,7 +531,11 @@ def _prompt_line(raw: bytes) -> tuple[dict, str] | None:
             return None
         content = "\n".join(b["text"] for b in content
                             if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
-    return (row, content) if isinstance(content, str) else None
+    if not isinstance(content, str):
+        return None
+    if row.get("isCompactSummary") and machine_user_origin(row, content) is None:
+        return None
+    return row, content
 
 
 def _same_prompt(found: tuple[dict, str], sha: str, prompt_id) -> bool:
@@ -560,7 +567,7 @@ def transcript_origin(path: str, *, sha: str, prompt_id=None, offset: int = 0) -
                 chunk = fh.read(_ORIGIN_CHUNK)
                 if not chunk:
                     found = _prompt_line(bytes(line)) if line else None
-                    return _line_origin(found[0]) if found is not None and _same_prompt(found, sha, prompt_id) \
+                    return _line_origin(*found) if found is not None and _same_prompt(found, sha, prompt_id) \
                         else None
                 at = 0
                 while (end := chunk.find(b"\n", at)) >= 0:
@@ -568,7 +575,7 @@ def transcript_origin(path: str, *, sha: str, prompt_id=None, offset: int = 0) -
                     at = end + 1
                     found = _prompt_line(bytes(line))
                     if found is not None and _same_prompt(found, sha, prompt_id):
-                        return _line_origin(found[0])
+                        return _line_origin(*found)
                     start += len(line) + 1
                     line.clear()
                     if start >= _ORIGIN_READ_MOST:
@@ -1357,7 +1364,7 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
     # Claude Code's mark on the prompt's transcript line is written after this
     # hook returns, so it is never read here: the owner check reads it from
     # ``transcript_at`` (``with_origins``).
-    origin = "scheduled_run" if scheduled_run(env) else None
+    origin = "scheduled_run" if scheduled_run(env) else machine_user_origin(payload, prompt)
     transcript = hook_shape.transcript_path(payload) if harness == "claude_code" else ""
     transcript_at = None
     if origin is None and transcript and not machine and typed and typed.strip():

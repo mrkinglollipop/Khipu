@@ -120,6 +120,31 @@ def clean_user_text(text: str, *, owner: bool = False) -> str:
     return _CURSOR_WRAP.sub("", text)   # no strip: ACP user text arrives in chunks that must re-join exactly
 
 
+def machine_user_origin(row: dict, text: str = "") -> str | None:
+    """Positive evidence that a user-role record came from the harness.
+
+    Desktop task completions use top-level ``origin.kind``; queued commands
+    use the same field on their attachment. These marks override a human
+    turnOrigin, and apply even to compact summaries and non-desktop fronts.
+    """
+    origin = row.get("origin")
+    if ((isinstance(origin, dict) and origin.get("kind") == "task-notification")
+            or row.get("turnOrigin") == "task_notification"):
+        return "task_notification"
+    if row.get("promptSource") == "system":
+        turn_origin = row.get("turnOrigin")
+        if isinstance(turn_origin, str) and turn_origin.strip() not in ("", "human", "sdk", "unknown"):
+            return turn_origin.strip()[:40]
+        if isinstance(row.get("wakeupSource"), str) and row["wakeupSource"].strip():
+            return "scheduled"
+        return "system"
+    cleaned = clean_user_text(text).strip()
+    if (cleaned.startswith("<task-notification")
+            or (not cleaned and "<task-notification" in text)):
+        return "task_notification"
+    return None
+
+
 # What makes a tag wrapper-like: a name a harness wraps text in, or any
 # name in the snake_case or kebab-case style harnesses use for them. A plain
 # HTML name (<b>, <div>) is something the owner can type.

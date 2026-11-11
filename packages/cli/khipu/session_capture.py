@@ -83,7 +83,7 @@ if not hasattr(_t3, 'cache_thread'):
     importlib.reload(_t3)
 from khipu.t3 import cache_thread, is_helper_session
 from khipu.turn_text import (INJECTED_CONTEXT_TAGS, MACHINE_USER_TAGS, clean_user_text, is_machine,  # noqa: F401
-                             started_session)
+                             machine_user_origin, owner_text, started_session)
 
 HARNESSES = ("claude_code", "cursor", "codex", "aegis", "grok_build", "antigravity")
 
@@ -722,7 +722,8 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     fresh: list[str] = []
     dropped = dropped_chars = 0
     if stats is not None:
-        stats.update(deduped_msgs=0, deduped_chars=0, fresh=fresh, skip_to=offset, typed=[], typed_sdk=[])
+        stats.update(deduped_msgs=0, deduped_chars=0, fresh=fresh, skip_to=offset, typed=[], typed_sdk=[],
+                     has_owner_turn=False)
         stats.pop("first_line_ts", None)
     try:
         size = path.stat().st_size
@@ -851,10 +852,13 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     for (d, role, text, line_end), checkpoint in zip(items, checkpoints):
         real = False
         if role == "user":
+            machine_origin = machine_user_origin(d, text)
             text = _clean_user_text(text)
             if not text.strip():
                 continue
             stand_in = _machine_user_message(text)
+            if stand_in is None and machine_origin is not None:
+                stand_in = f"[notification: {machine_origin}] {text}"
             if (stand_in is None and d.get("type") == "attachment"
                     and any(r == _QUEUED_PEER for r, _ in _queued_command(d))):
                 # Another session's message queued mid-turn: kept as a relayed
@@ -989,6 +993,13 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
         if real and stats is not None and not d.get("isCompactSummary"):
             stats["typed"].append(text)
             stats["typed_sdk"].append(_sdk_line(d))
+            # A job's unmarked brief can look typed. Only an explicit human
+            # mark proves an owner correction arrived directly in the job.
+            source = d.get("attachment") if d.get("type") == "attachment" else d
+            origin = source.get("origin") if isinstance(source, dict) else None
+            if ((d.get("turnOrigin") == "human" or (isinstance(origin, dict) and origin.get("kind") == "human"))
+                    and owner_text(text)):
+                stats["has_owner_turn"] = True
         if msgs and msgs[-1][0] == role and (role != "user" or streamed or real == open_real):
             # ACP streams chunks (concatenate); the others emit whole
             # messages (join on a newline).
@@ -3080,7 +3091,8 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     delegated = (str(thread or "").startswith(_t3.DELEGATED_THREAD_PREFIX)
                  or (not (job_parent or st.get("origin") == "job") and _t3_child_thread(thread)))
     # Decided once, here: the job label below and the owner-lines skip use it.
-    # Nobody types into a job, so its user turns are briefs and relays.
+    # A job's user turns are usually briefs and relays; a positively marked
+    # owner correction is retained as a boolean for preference extraction.
     is_job = bool(job_parent or st.get("origin") == "job" or delegated
                   or (sdk_run and _headless_outside_t3(
                       thread, sid, _session_start_ts(path) or window_ts)))
@@ -3098,8 +3110,10 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
             # KHIPU_JOB=1 or a T3 delegated thread with no lineage; lineage
             # alone already marks a job.
             job["origin"] = "job"
+        if is_job:
+            job["has_owner_turn"] = bool(st.get("has_owner_turn"))
         if st.get("subagent"):
-            # Nobody types into a subagent: its user turns are the parent's.
+            # A subagent is a dispatched job of its parent session.
             job["subagent"] = True
         if checkout:
             job["checkout"] = checkout
@@ -3286,6 +3300,8 @@ def hook_main(raw: str, harness: str | None = None, event: str | None = None) ->
 
             msgs = _redact_messages(msgs, harness, sid)
             typed = _redact_typed(dedupe)
+            if dedupe.get("has_owner_turn"):
+                st["has_owner_turn"] = True
             # K3: the full window, unclipped — decide() and the high-value scan see
             # everything; only the job-splitting step below ever bounds it.
             full_text = render(msgs, max_chars=10**9)
@@ -3520,6 +3536,8 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                         carried = [tuple(m) for m in st.get("carry") or []]
                         msgs = _redact_messages(carried + msgs, harness, sid)
                         typed = _redact_typed(dedupe)
+                        if dedupe.get("has_owner_turn"):
+                            st["has_owner_turn"] = True
                         chars = len(render(msgs, max_chars=10**9))
                         latest = _transcript_stat(path)
                         if (latest.st_mtime_ns, latest.st_size) != (info.st_mtime_ns, info.st_size) \
@@ -3767,7 +3785,11 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                 _record_drain(harness, captured=False, empty=True)
             out["empty"] += 1
             continue
-        if not isinstance(cached, dict):
+        # Enforce JOB_SECTION before any checkpoint or delivery can store the
+        # model's preferences. Old queued jobs have no positive owner evidence.
+        if (_job_origin(job) == "job" or job.get("subagent")) and not job.get("has_owner_turn"):
+            payload["preferences"] = []
+        if not isinstance(cached, dict) or cached != payload:
             # A copy: the delivery fields added below must not ride into a
             # later failure record.
             job["extracted_payload"] = dict(payload)
@@ -3782,10 +3804,6 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                 _record_drain(harness, captured=False, error=f"extract checkpoint: {e}")
                 continue
         payload["session_id"] = f"{harness}:{job.get('session_id')}"
-        if job.get("subagent"):
-            # A subagent's preferences can only be its parent's brief: the
-            # owner's own words are captured in the parent session.
-            payload["preferences"] = []
         payload["scope"] = payload.get("scope") or f"{harness} {job.get('event')}"
         # The trigger itself, not just its trace in `scope`: commitments'
         # session-plan closure retires a session's own in-flight/plan items

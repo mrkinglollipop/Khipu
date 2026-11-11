@@ -1250,6 +1250,48 @@ def test_a_prompt_the_transcript_says_the_owner_typed_counts(no_t3, monkeypatch)
     assert _check()["turn"] == row["turn"]
 
 
+@pytest.mark.parametrize("shape", ["envelope", "reminder", "compact", "origin-only", "system-only",
+                                   "turn-origin-only", "content-only", "origin-over-human", "system-over-human"])
+def test_task_completion_is_never_human_or_picked_before_the_next_typed_turn(no_t3, monkeypatch, shape):
+    now = time.time()
+    envelope = ("<task-notification><task-id>synthetic-task</task-id><tool-use-id>synthetic-tool</tool-use-id>"
+                "<status>completed</status><summary>Synthetic task finished.</summary></task-notification>")
+    origin = {"kind": "task-notification", "producer": "session-task", "runId": "synthetic-run"}
+    marks = {"origin": origin, "promptSource": "system", "turnOrigin": "task_notification",
+             "entrypoint": "claude-desktop", "isSidechain": False, "userType": "external",
+             "turnPosition": {"promptIndex": 3, "turnIndex": 6}}
+    text = envelope
+    if shape == "reminder":
+        text = "<system-reminder>Injected context.</system-reminder>\n" + text
+    elif shape == "compact":
+        text = "Synthetic compaction result."
+        marks["isCompactSummary"] = True
+    elif shape in ("origin-only", "system-only", "turn-origin-only", "origin-over-human", "system-over-human"):
+        text = "Synthetic completion."
+        marks = {"origin-only": {"origin": origin}, "system-only": {"promptSource": "system"},
+                 "turn-origin-only": {"turnOrigin": "task_notification"},
+                 "origin-over-human": {"origin": origin, "turnOrigin": "human"},
+                 "system-over-human": {"promptSource": "system", "turnOrigin": "human"}}[shape]
+    elif shape == "content-only":
+        marks = {}
+    notice = _desk_prompt(no_t3, text, now - 2, prompt_id="synthetic-notice")
+    _cc_line(no_t3.transcript, text, now - 2, {**marks, "promptId": "synthetic-notice"})
+    judged = owner_turns.with_origins(owner_turns.turns("s-desk"))[-1]
+    assert judged["machine"] and not judged["typed"] and judged.get("origin") != "human"
+    assert not owner_turns.eligible(judged)[0]
+    _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+
+    typed = _desk_prompt(no_t3, "Keep the synthetic report concise.", now, prompt_id="synthetic-owner")
+    _cc_line(no_t3.transcript, "Keep the synthetic report concise.", now,
+             {**_HUMAN, "promptId": "synthetic-owner"})
+    assert _check()["turn"] == typed["turn"] != notice["turn"]
+    judged = owner_turns.with_origins(owner_turns.turns("s-desk"))[-1]
+    assert judged["origin"] == "human" and judged["typed"] and not judged["machine"]
+
+
 @pytest.mark.parametrize("case", ["no fields", "sdk", "unknown", "missing", "unreadable"])
 def test_a_transcript_that_says_nothing_leaves_a_typed_turn_as_it_was(no_t3, monkeypatch, case):
     now = time.time()
