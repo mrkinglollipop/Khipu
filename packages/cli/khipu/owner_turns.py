@@ -476,14 +476,17 @@ def prompt_sha256(text: str) -> str:
 # in its transcript (``turnOrigin``, Claude Code 2.1.321 and up): "human" is
 # the person typing. "scheduled" (a scheduled wake-up or cron prompt),
 # "peer" (another session's message), "task_notification",
-# "auto_continuation", "host_synthetic", "system" and "sdk" (the brief an
-# Agent SDK host or another session started it with) are not; "unknown" and
-# no mark say nothing. The hook input does not carry it, and Claude Code
+# "auto_continuation", "host_synthetic" and "system" are not. "sdk" says
+# nothing: an Agent SDK host (T3 Code among them) delivers every prompt with
+# it, the person's typed ones included, so the turn is judged as it was
+# before this mark was read (the brief another session starts a desktop
+# conversation with also carries it, and is refused by its own record and
+# templates). "unknown" and no mark say nothing either. The hook input does not carry it, and Claude Code
 # writes the line after the prompt hooks return, so the recorder also notes
 # where the transcript ended (``transcript_at``) and the owner check reads
 # the line from there (``with_origins``).
 PERSON_ORIGIN = "human"
-_UNSAID_ORIGINS = ("unknown",)
+_UNSAID_ORIGINS = ("unknown", "sdk")
 _ORIGIN_READ_MOST = 4 << 20   # forward from ``transcript_at``
 _ORIGIN_TAIL = 256 << 10      # the recorder's look at the end of the file
 _ORIGIN_CHUNK = 64 << 10

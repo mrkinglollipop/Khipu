@@ -1146,8 +1146,13 @@ _ORIGINS = {
                   "turnOrigin": "scheduled"},
     "peer": {"isMeta": True, "promptSource": "system", "turnOrigin": "peer"},
     "task_notification": {"promptSource": "system", "turnOrigin": "task_notification"},
-    "sdk": {"promptSource": "sdk", "turnOrigin": "sdk"},
+    "auto_continuation": {"promptSource": "system", "turnOrigin": "auto_continuation"},
+    "host_synthetic": {"promptSource": "system", "turnOrigin": "host_synthetic"},
 }
+# An Agent SDK host (T3 Code among them) delivers every prompt with this mark,
+# the person's typed ones included (3,903 of 3,903 prompt lines in 60 real T3
+# transcripts on 2026-11-11), so it says nothing about who typed.
+_SDK = {"promptSource": "sdk", "turnOrigin": "sdk"}
 
 
 @pytest.fixture
@@ -1238,18 +1243,32 @@ def test_a_prompt_the_transcript_says_the_owner_typed_counts(no_t3, monkeypatch)
     assert _check()["turn"] == row["turn"]
 
 
-@pytest.mark.parametrize("case", ["no fields", "missing", "unreadable"])
+@pytest.mark.parametrize("case", ["no fields", "sdk", "unknown", "missing", "unreadable"])
 def test_a_transcript_that_says_nothing_leaves_a_typed_turn_as_it_was(no_t3, monkeypatch, case):
     now = time.time()
     path = no_t3.transcript
     if case == "no fields":
         _cc_line(path, "pause Codex until tonight", now - 1, {})
+    elif case == "sdk":
+        _cc_line(path, "pause Codex until tonight", now - 1, _SDK)
+    elif case == "unknown":
+        _cc_line(path, "pause Codex until tonight", now - 1, {"promptSource": "typed", "turnOrigin": "unknown"})
     elif case == "missing":
         path = no_t3.tmp / "nowhere.jsonl"
     else:
         path.mkdir()  # a folder where the file should be: can't be read
     row = _desk_prompt(no_t3, "pause Codex until tonight", now, transcript=path)
     assert (row["typed"], row["machine"], row["eligible"]) == (True, False, True) and "origin" not in row, row
+    _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
+    assert _check()["turn"] == row["turn"]
+
+
+def test_an_sdk_marked_line_written_after_the_hook_leaves_the_typed_turn_as_it_was(no_t3, monkeypatch):
+    now = time.time()
+    row = _desk_prompt(no_t3, "pause Codex until tonight", now)
+    _cc_line(no_t3.transcript, "pause Codex until tonight", now - 0.5, _SDK)
+    judged = owner_turns.with_origins(owner_turns.turns("s-desk"))[-1]
+    assert (judged["typed"], judged["machine"]) == (True, False) and "origin" not in judged, judged
     _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
     assert _check()["turn"] == row["turn"]
 
