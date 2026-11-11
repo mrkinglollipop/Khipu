@@ -116,6 +116,13 @@ def test_an_item_closed_by_a_forgotten_episode_stays_with_its_reason_forgotten(f
 # ---- khipu activity --------------------------------------------------------
 
 def _activity():
+    """(recent rows, ids the display-field lookup was asked for)."""
+    asked: list = []
+
+    def facts(cur, ids):
+        asked.extend(ids)
+        return {}
+
     cur = _Cursor({"COUNT(*) FROM episodes": [(1,)], "MAX(ts)": [(None, None, None)],
                    "to_regclass": [(False,)]})
     with mock.patch.object(activity, "connect", return_value=_Connection(cur)), \
@@ -123,14 +130,19 @@ def _activity():
          mock.patch.object(activity, "_recent_rows",
                            return_value=[{"id": FORGOT, "summary": "FORGOTTEN-ACTIVITY"},
                                          {"id": LIVE, "summary": "LIVE-ACTIVITY"}]), \
+         mock.patch("khipu.memory_rows.episode_facts", facts), \
          mock.patch("khipu.keychain.secrets_status", return_value={}):
-        return activity.activity_payload()["recent"]
+        return activity.activity_payload()["recent"], asked
 
 
 def test_khipu_activity_hides_a_forgotten_episode(forgotten):
-    assert [r["summary"] for r in _activity()] == ["LIVE-ACTIVITY"]
+    recent, asked = _activity()
+    assert [r["summary"] for r in recent] == ["LIVE-ACTIVITY"]
+    # the new row fields are looked up only for the rows that remain
+    assert [str(i) for i in asked] == [str(LIVE)]
 
 
 def test_khipu_activity_shows_no_episode_when_the_forget_list_is_unreadable():
     _corrupt_list()
-    assert _activity() == []
+    recent, asked = _activity()
+    assert recent == [] and asked == []

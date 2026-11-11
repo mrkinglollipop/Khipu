@@ -857,7 +857,7 @@ const NOT_CONFIGURED_LABEL: Record<string, string> = {
   memory_root: "File ↔ PG drift (legacy wiki)",
   // A step nightly_step_health() has never recorded yet (fresh install, or
   // a Mac that just updated) — skipped, not red; see healthRows.tsx LABELS.
-  notes_reconcile: "Notes reconciled by the nightly",
+  notes_reconcile: "Notes watcher installed",
   embed_provider: "Embedding provider reachable",
 };
 

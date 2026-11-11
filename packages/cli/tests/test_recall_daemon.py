@@ -789,14 +789,12 @@ class HealthFromAnotherCopyTest(unittest.TestCase):
 
 
 class WarmCachesTest(unittest.TestCase):
-    def test_start_loads_the_matrix_and_the_slug_map_off_the_prompt_path(self):
+    def test_start_loads_the_matrix_off_the_prompt_path(self):
         with mock.patch.object(hs, "active_snapshot_profile", return_value="p@1"), \
                 mock.patch.object(hs, "snapshot_path", return_value=Path("/nonexistent/replica.sqlite")), \
-                mock.patch.object(hs, "_matrix_rows", return_value=([], {})) as m_rows, \
-                mock.patch("khipu.graph_candidates._episode_slug_map", return_value=None) as m_map:
+                mock.patch.object(hs, "_matrix_rows", return_value=([], {})) as m_rows:
             recall_daemon._warm_caches()
         m_rows.assert_called_once_with(Path("/nonexistent/replica.sqlite"), "p@1", None)
-        m_map.assert_called_once_with()
 
     def test_a_failed_warm_up_is_logged_and_never_raises(self):
         with mock.patch.object(hs, "active_snapshot_profile", side_effect=RuntimeError("no replica")), \

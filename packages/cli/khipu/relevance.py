@@ -1,4 +1,4 @@
-"""The one absolute relevance gate, behind the ``relevance_floor`` switch.
+"""The one absolute relevance gate (always on).
 
 ``recall_prompt._apply_score_floor`` is relative to the top row, so a prompt
 about something memory has never seen still keeps its three nearest
@@ -39,17 +39,6 @@ from typing import Any, Sequence
 # ranges. Re-measure if the active profile changes; overridable by the
 # ``relevance.cosine_floor`` config key.
 COSINE_FLOOR = 0.65
-
-
-def enabled() -> bool:
-    """The ``relevance_floor`` switch. Fails open to off: a broken config read
-    must never cost a caller its search."""
-    try:
-        from khipu import features
-
-        return features.enabled("relevance_floor")
-    except Exception:  # noqa: BLE001 — a switch lookup must not sink a search
-        return False
 
 
 def cosine_floor() -> float:

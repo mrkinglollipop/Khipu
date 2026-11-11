@@ -190,7 +190,12 @@ class DoctorFoldsBundleSealTest(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertFalse(out["bundle_seal_ok"])
         self.assertIn("file added", out["bundle_seal"]["error"])
-        fake_run.assert_called_once()
+        # The patch covers the shared subprocess module, so the doctor's build
+        # stamp (khipu.build_info runs `git rev-parse` when the code is a
+        # checkout, as on a developer Mac) lands here too. The seal check is
+        # the one codesign call.
+        seal_calls = [c for c in fake_run.call_args_list if c.args[0][0] == "codesign"]
+        self.assertEqual(len(seal_calls), 1)
 
 
 if __name__ == "__main__":

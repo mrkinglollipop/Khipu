@@ -224,8 +224,18 @@ class _Conn:
         return False
 
 
+LOOKED_UP: list[str] = []  # episode ids `khipu search` asked the display-field lookup about
+
+
+def _looked_up(cur, ids):
+    LOOKED_UP.extend(str(i) for i in ids)
+    return {}
+
+
 def _fake_hub():
     from contextlib import ExitStack
+
+    LOOKED_UP.clear()
 
     from khipu import embed
 
@@ -238,7 +248,10 @@ def _fake_hub():
             ("khipu.topic_graph.enrich_search_results", {"side_effect": lambda cur, r: list(r)}),
             ("khipu.decisions.enrich_search_results", {"side_effect": lambda cur, r: list(r)}),
             ("khipu.library_search.enabled_libraries", {"return_value": []}),
-            ("khipu.query_log.log_query", {})):
+            ("khipu.query_log.log_query", {}),
+            # `khipu search` asks for the row fields (quote, title, tool, mac, project) with one lookup; the stand-in
+            # database has no query to answer it, so record which episodes it is asked about.
+            ("khipu.memory_rows.episode_facts", {"side_effect": _looked_up})):
         stack.enter_context(mock.patch(target, **kw))
     stack.enter_context(mock.patch.object(embed, "_apply_search_filters", side_effect=lambda cur, r, **k: r))
     return stack
@@ -266,6 +279,8 @@ def test_every_search_route_drops_a_forgotten_episode(monkeypatch, capsys):
     routes = _routes(capsys)
     assert [r for r, text in routes.items() if "SECRET" in text] == []
     assert [r for r, text in routes.items() if "kept episode" not in text] == []
+    # the new row-field lookup runs only for the rows that remain: a forgotten episode's text is never read for display
+    assert "7" not in LOOKED_UP and "8" in LOOKED_UP
 
 
 def test_every_search_route_drops_hub_episodes_when_the_registry_is_unreadable(monkeypatch, capsys):

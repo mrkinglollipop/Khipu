@@ -65,5 +65,6 @@ def test_notes_watch_plist_watches_every_memory_dir_and_throttles(monkeypatch):
     assert data["Label"] == "com.khipu.notes-watch"
     assert data["WatchPaths"] == ["/tmp/a/memory", "/tmp/b/memory"]
     assert data["ThrottleInterval"] == 30
+    assert data["StartInterval"] == 1800  # a pass every 30 minutes even if no watched folder changed
     assert data["ProgramArguments"][-3:] == ["notes", "reconcile", "--changed-only"]
     assert data["RunAtLoad"] is False
