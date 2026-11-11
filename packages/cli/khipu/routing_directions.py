@@ -688,7 +688,7 @@ def capture_scan(session: str, turns, *, now: float | None = None, actions: list
         return _capture_scan_locked(session, turns, now=now, actions=actions)
 
 
-def _his(turn: dict, conf: dict) -> bool:
+def _his(turn: dict, conf: dict, *, t3: str | None = None) -> bool:
     """Whether a recorded turn is the owner's for opening an owed item.
     ``owner_turns.eligible`` decides, except for the one refusal that is about
     authorizing a change: a T3 conversation can't be told apart from T3's
@@ -696,12 +696,20 @@ def _his(turn: dict, conf: dict) -> bool:
     its word. Opening a direction only creates a reminder and authorizes
     nothing, so a typed turn in T3 opens one; a turn T3's record marks as a
     machine's, a handoff, a helper, a dispatched job's or untyped is still
-    refused by the same checks. (Nothing here changes ``eligible``.)"""
-    if turn.get("entrypoint") == "t3":
+    refused by the same checks. (Nothing here changes ``eligible``.)
+
+    ``t3``: T3's membership for the turn's session, read once per scan
+    (``owner_turns._t3_membership``). A turn whose hook could not read T3's
+    record (``t3-unverified``) is judged as a T3 turn when T3 runs the
+    session ("t3"), by its native entrypoint when T3's record settles that it
+    does not ("none", as ``eligible``'s ``t3_settled_none``), and refused
+    otherwise (still unreadable, or not read)."""
+    entry = turn.get("entrypoint")
+    if entry == "t3" or (entry == "t3-unverified" and t3 == "t3"):
         harness = turn.get("harness")
         return owner_turns.eligible(dict(turn, entrypoint="cli"),
                                     dict(conf, trusted=[f"{harness}:cli"]))[0]
-    return owner_turns.eligible(turn, conf)[0]
+    return owner_turns.eligible(turn, conf, t3_settled_none=entry == "t3-unverified" and t3 == "none")[0]
 
 
 def _capture_scan_locked(session, turns, *, now, actions):
@@ -716,9 +724,14 @@ def _capture_scan_locked(session, turns, *, now, actions):
     # dispatched job's turn can carry the owner's words and still not be his.
     # A text with recorded turns and none of them eligible opens nothing.
     conf = owner_turns.settings()
-    is_his = lambda turn: _his(turn, conf)  # noqa: E731
+    # What each prompt's transcript line says started it (a scheduled prompt
+    # is never his), and T3's membership read once for the scan (``_his``).
+    his_turns = owner_turns.with_origins(owner_turns.turns(session, now))
+    t3 = owner_turns._t3_membership(session) \
+        if any(t.get("entrypoint") == "t3-unverified" for t in his_turns) else None
+    is_his = lambda turn: _his(turn, conf, t3=t3)  # noqa: E731
     counted: set[str] = set()
-    for turn in owner_turns.turns(session, now):
+    for turn in his_turns:
         sha = turn.get("prompt_sha256")
         if not isinstance(sha, str):
             continue
