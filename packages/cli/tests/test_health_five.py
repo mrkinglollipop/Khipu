@@ -153,3 +153,28 @@ def test_health_parses_and_prints_json(monkeypatch, capsys):
     assert cli.main(["health", "--json"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["headline"] == "Everything is working." and len(out["areas"]) == 5
+
+
+@pytest.mark.parametrize("key", ["embed_coverage_ok", "topics_embed_lag_ok", "index_freshness_ok"])
+def test_search_gaps_wait_for_nightly_without_claiming_running_work(key):
+    row = doc(**{key: False, "embed_coverage": {"missing": 2, "stale": 3, "oldest_gap_minutes": 90}})["areas"][1]
+    assert row["state"] == "warn"
+    assert row["khipu_doing"] == "The nightly job refreshes the search index on its next run."
+    assert "background" not in json.dumps(row).lower()
+
+
+def test_aged_probe_needs_agent_action_without_claiming_running_work():
+    d = doc(recall_probe_ok=False, recall_probe={"ok": False, "age_seconds": 8 * 86400,
+                                               "reason": "last probe is stale (8.0 days old)"})
+    row = d["areas"][1]
+    assert row["state"] == "warn" and "7 days" in row["line"]
+    assert "until an agent runs a fresh check" in row["khipu_doing"]
+    assert "agent" in row["you_do"] and "fresh" in row["you_do"]
+    assert "background" not in json.dumps(row).lower()
+    assert "khipu doctor --probe" in d["agent_note"]
+
+
+def test_no_finding_failure_claims_background_work_without_evidence():
+    for key in health_five.every_key():
+        if health_five.area_of(key) == 1:
+            assert "background" not in doc(**{key: False})["areas"][1]["khipu_doing"].lower()

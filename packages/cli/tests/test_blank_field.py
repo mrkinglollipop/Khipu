@@ -30,6 +30,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("KHIPU_TEST", "1")
     monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "state"))
     monkeypatch.delenv("KHIPU_ISOLATED_DIR", raising=False)
+    monkeypatch.setattr(embed, "backfill", lambda **kw: {"embedded": 0, "ok": True})
     db._TABLE_COLUMNS_CACHE.clear()
     yield
     db._TABLE_COLUMNS_CACHE.clear()
@@ -102,12 +103,12 @@ def columns(conn, eid):
     return {"preferences": exact(r[0]), "raw": exact(r[1]), "verbatim": exact(r[2])}
 
 
-def run(tmp_path, capsys, *, field=None, ids=(), backup="b.json", apply=False, restore=None):
+def run(tmp_path, capsys, *, field=None, ids=(), backup="b.json", apply=False, restore=None, no_reembed=False):
     ids_file = tmp_path / "ids.txt"
     ids_file.write_text("".join(f"{i}\n" for i in ids) + "\n")
     args = argparse.Namespace(field=field, ids_file=str(ids_file) if field else None,
                               backup=str(tmp_path / backup) if backup else None,
-                              restore=str(tmp_path / restore) if restore else None, apply=apply)
+                              restore=str(tmp_path / restore) if restore else None, apply=apply, no_reembed=no_reembed)
     capsys.readouterr()
     code = blank_field.main(args)
     printed = capsys.readouterr().out
@@ -432,3 +433,148 @@ def test_output_reports_the_hub_check_and_repeated_ids(pg, tmp_path, capsys, mon
     c = add(pg, "c")
     code, out = run(tmp_path, capsys, field="preferences", ids=(c,), backup="b2.json", apply=True)
     assert code == 0 and out["changed"] == 1 and out["hub_check"] == "skipped", out
+
+
+@pytest.fixture
+def fake_cleanup(tmp_path, monkeypatch):
+    """Exercise real blank/restore transaction code without starting PostgreSQL."""
+    import contextlib
+    from khipu import memory_lock, tombstones
+
+    class Connection:
+        def __init__(self):
+            self.values = {"preferences": '["synthetic rule"]', "raw": '{}'}
+            self.committed = dict(self.values)
+            self.events = []
+            self.rows = []
+            self.rowcount = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def cursor(self):
+            return self
+
+        def execute(self, sql, params=None):
+            if sql.startswith("SELECT id,"):
+                if "::text, (" in sql:
+                    self.rows = [(1, False, self.values["preferences"], '[]', '{}', '{}')]
+                else:
+                    self.rows = [(1, False, self.values["preferences"], self.values["raw"])]
+            elif sql.startswith("SELECT count"):
+                self.rows = [(1,)]
+            elif sql.startswith("UPDATE episodes SET"):
+                cols = [part.strip().split()[0] for part in sql.split("SET ")[1].split(" WHERE")[0].split(",")]
+                self.values.update(zip(cols, params[:-1]))
+                self.rowcount = 1
+
+        def fetchall(self):
+            return self.rows
+
+        def fetchone(self):
+            return self.rows[0]
+
+        def commit(self):
+            self.events.append("commit")
+            self.committed = dict(self.values)
+
+        def rollback(self):
+            self.events.append("rollback")
+            self.values = dict(self.committed)
+
+    conn = Connection()
+    monkeypatch.setattr(db, "connect", lambda: conn)
+    monkeypatch.setattr(db, "has_columns", lambda cur, table, column: column in ("preferences", "raw"))
+    monkeypatch.setattr(blank_field, "_columns", lambda cur, field: ["preferences", "raw"])
+    monkeypatch.setattr(blank_field, "_hub_identity", lambda conn: "synthetic-hub")
+    monkeypatch.setattr(blank_field, "_changed_receipt_identities", lambda *a: [])
+    monkeypatch.setattr(blank_field, "_receipts_forgotten", lambda *a: False)
+    monkeypatch.setattr(blank_field, "_declare_writer", lambda cur: None)
+    monkeypatch.setattr(tombstones, "hub_source_forgotten", lambda *a: False)
+    monkeypatch.setattr(memory_lock, "shared", contextlib.nullcontext)
+    return conn
+
+
+def test_reembed_apply_and_restore_after_commit(fake_cleanup, tmp_path, capsys, monkeypatch):
+    conn = fake_cleanup
+    calls = []
+
+    def backfill(**kwargs):
+        calls.append((dict(conn.values), kwargs))
+        assert conn.events[-1] == "commit"
+        assert conn.values == conn.committed
+        return {"embedded": 3, "failed_chunks": 0, "ok": True}
+
+    monkeypatch.setattr(embed, "backfill", backfill)
+    code, result = run(tmp_path, capsys, field="preferences", ids=[1], apply=True)
+    assert code == 0 and result["changed"] == 1 and result["reembedded"] == 3
+    assert result["reembed_failed"] == 0 and calls == [({"preferences": '[]', "raw": '{}'}, {})]
+    code, result = run(tmp_path, capsys, restore="b.json", apply=True)
+    assert code == 0 and result["restored"] == 1 and result["reembedded"] == 3
+    assert len(calls) == 2 and calls[1] == ({"preferences": '["synthetic rule"]', "raw": '{}'}, {})
+
+
+@pytest.mark.parametrize("mode", ["dry", "skip", "noop", "restore-dry", "restore-skip", "restore-noop"])
+def test_reembed_skips_nonchanges_and_opt_out(fake_cleanup, tmp_path, capsys, monkeypatch, mode):
+    from unittest.mock import Mock
+
+    conn = fake_cleanup
+    if mode.startswith("restore"):
+        assert run(tmp_path, capsys, field="preferences", ids=[1], apply=True, no_reembed=True)[0] == 0
+        if mode == "restore-noop":
+            conn.values["preferences"] = '["changed since"]'
+            conn.commit()
+    elif mode == "noop":
+        conn.values["preferences"] = '[]'
+        conn.commit()
+    backfill = Mock(side_effect=AssertionError("must not embed"))
+    monkeypatch.setattr(embed, "backfill", backfill)
+    code, result = run(tmp_path, capsys, field=None if mode.startswith("restore") else "preferences", ids=[1],
+                       restore="b.json" if mode.startswith("restore") else None,
+                       apply=mode not in ("dry", "restore-dry"), no_reembed=mode in ("skip", "restore-skip"))
+    assert code == 0
+    assert not any(k.startswith("reembed") for k in result)
+    backfill.assert_not_called()
+
+
+@pytest.mark.parametrize("restore", [False, True])
+@pytest.mark.parametrize("failure", ["raise", "budget", "cancelled", "failed", "time-budget", "partial", "system-exit"])
+def test_reembed_failure_keeps_committed_cleanup(fake_cleanup, tmp_path, capsys, monkeypatch, restore, failure):
+    conn = fake_cleanup
+    if restore:
+        assert run(tmp_path, capsys, field="preferences", ids=[1], apply=True, no_reembed=True)[0] == 0
+
+    def backfill(**kwargs):
+        assert conn.events[-1] == "commit"
+        print("provider diagnostic synthetic private text")
+        if failure == "raise":
+            raise RuntimeError("synthetic private text")
+        if failure == "system-exit":
+            raise SystemExit("synthetic private text")
+        return {"embedded": 2, "budget_exhausted": failure == "budget", "cancelled": failure == "cancelled",
+                "failed_chunks": 4 if failure == "failed" else 0, "ok": False,
+                "time_budget_exhausted": failure == "time-budget",
+                "outcome": "partial" if failure == "partial" else None}
+
+    monkeypatch.setattr(embed, "backfill", backfill)
+    code, result = run(tmp_path, capsys, field=None if restore else "preferences", ids=[1],
+                       restore="b.json" if restore else None, apply=True)
+    assert code == 0 and result["ok"] and result["restored" if restore else "changed"] == 1
+    assert conn.events[-1] == "commit" and conn.values == conn.committed
+    assert conn.values["preferences"] == ('["synthetic rule"]' if restore else '[]')
+    assert "synthetic private text" not in json.dumps(result)
+    if failure in ("raise", "system-exit"):
+        assert result["reembed_error"] == ("RuntimeError" if failure == "raise" else "SystemExit")
+    else:
+        assert result["reembedded"] == 2 and result["reembed_failed"] == (4 if failure == "failed" else 0)
+        assert result["reembed_error"] == {"budget": "budget_exhausted", "time-budget": "time_budget_exhausted"}.get(failure, failure)
+
+
+def test_no_reembed_is_a_cli_switch():
+    from khipu import cli
+
+    args = cli.build_parser().parse_args(["hygiene", "blank-field", "--restore", "fake.json", "--apply", "--no-reembed"])
+    assert args.no_reembed

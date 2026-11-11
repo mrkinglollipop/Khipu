@@ -36,7 +36,7 @@ OK_LINES = (
 )
 DOING = (
     "Khipu keeps what it could not save safe on this Mac and keeps trying.",
-    "Khipu is catching the search index up in the background.",
+    "Khipu checks search again on the next health check.",
     "Khipu rebuilds the routing record on its next read.",
     "Khipu keeps trying to reach the database and keeps a copy on this Mac meanwhile.",
     "Khipu runs its jobs again on their next turn.",
@@ -49,6 +49,7 @@ YOU_DO = {
     "hub_ok": "Check this Mac's internet connection. If it is fine, there is nothing more to do.",
     "outbox_ok": LATER, "launchers_ok": LATER, "bundle_seal_ok": LATER, "backup_ok": LATER,
     "routing_delivery_ok": LATER,
+    "recall_probe_ok": "Give the note below to an agent to run a fresh capture-and-search check.",
 }
 UNNAMED_YOU_DO = "Nothing yet. If it is still here tomorrow, give the note below to an agent."
 
@@ -174,8 +175,14 @@ def build(report: dict, *, now: datetime | None = None, mac: str | None = None, 
     if ran:
         for key, area, what, fix in failing_keyed(report):
             delivery = key == "routing_delivery_ok"
+            doing = DELIVERY_DOING if delivery else DOING[area]
+            if key in {"embed_coverage_ok", "topics_embed_lag_ok", "index_freshness_ok"}:
+                doing = "The nightly job refreshes the search index on its next run."
+            elif key == "recall_probe_ok":
+                doing = "Khipu keeps the last check result until an agent runs a fresh check."
+                fix = "run `khipu doctor --probe` to refresh the capture-and-search check"
             problems[area].append(("err" if key in SEVERE else "warn", DELIVERY_LINE if delivery else _cap(what),
-                                   DELIVERY_DOING if delivery else DOING[area],
+                                   doing,
                                    YOU_DO.get(key, NOTHING) if key in WORDS else UNNAMED_YOU_DO))
             notes.append(f"[{AREAS[area]}] {key}: {what}. Fix: {fix}")
             if delivery:
