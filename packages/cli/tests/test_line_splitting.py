@@ -126,18 +126,6 @@ class ReaderTest(unittest.TestCase):
             {"ts": "2026-10-15T02:00:00Z", "query": "s", "top": [{"kind": "topic", "id": "two"}]}])
         self.assertEqual([slug for slug, _ in topic_hits._iter_topic_hits_from_text(text)], ["one", "two"])
 
-    def test_mirror_tail_sync(self):
-        from khipu import mirror
-
-        _jsonl(self.dir / "mem" / "episodes.jsonl", [
-            {"ts": "2026-10-15T01:00:00Z", "summary": f"x{LS}y"},
-            {"ts": "2026-10-15T02:00:00Z", "summary": "z"}])
-        conn = mock.MagicMock()
-        with mock.patch("khipu.db.connect", return_value=conn), \
-                mock.patch("khipu.drift.episodes_missing_in_pg", return_value=[]):
-            stats = mirror.sync_recent_episodes(self.dir / "mem")
-        self.assertEqual(stats["tail"], 2)
-
     def _recall_log(self, *reasons: str) -> Path:
         path = self.dir / "kh" / "logs" / "prompt-recall.log"
         path.parent.mkdir(parents=True, exist_ok=True)

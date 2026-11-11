@@ -222,22 +222,6 @@ def test_poison_gap_prefix_does_not_starve_healthy_new_gap(pg):
 # ---- 5. current JSONL recovery writers --------------------------------------------
 
 
-@pytest.mark.parametrize("method", ["sync_recent_episodes", "reconcile_memory_root"])
-def test_current_file_recovery_can_import_fact_bearing_episode(pg, method):
-    """A current recovery writer imports a missing fact-bearing file row
-    with its claims (the writer gate refused it on bb0be6de)."""
-    pg.memory.mkdir()
-    payload = _payload(loop=None, decision="Keep the release train weekly", title="Release checklist")
-    (pg.memory / "episodes.jsonl").write_text(json.dumps(payload) + "\n")
-    getattr(mirror, method)(pg.memory)
-    with pg.connect() as conn:
-        rows = conn.execute("SELECT summary, decisions FROM episodes").fetchall()
-        assert conn.execute("SELECT count(*) FROM decisions").fetchone() == (0,)
-        claims = conn.execute("SELECT count(*) FROM fact_claims WHERE kind='deliverable'").fetchone()[0]
-    assert rows == [(payload["summary"], payload["decisions"])]
-    assert claims == 1
-
-
 def test_current_legacy_mirror_deferral_has_durable_outbox_recovery(pg):
     """Control: a bare mirror refusal is queued by mirror_after_capture."""
     payload = _payload(loop=None, decision="Keep the release train weekly", title="Release checklist")

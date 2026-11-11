@@ -262,7 +262,7 @@ through the gate and added here.
 | `mirror._upsert_episode` | hub episode row + origin source row | `hub_source_forgotten` before the INSERT; 0030 insert triggers | shared (callers) |
 | `capture.write_pg` | hub (via `_upsert_episode`, `_merge_into_episode`) | `hub_source_forgotten` first thing inside the cursor | shared |
 | `mirror.mirror_episode` | hub (via `_upsert_episode`), capture graph | the callee; a refusal skips the graph mint | shared |
-| `mirror.sync_recent_episodes`, `mirror.reconcile_memory_root` | hub (via `_upsert_episode`) | the callee | shared |
+| `capture_export._append` | legacy `episodes.jsonl` (one append of new lines from the hub, row 11) | `write_gate` held from the hub read through the append; skips tombstoned rows and this Mac's forget list | shared (via `write_gate`) |
 | `capture._merge_into_episode` | hub merge receipt + merged source row | `hub_source_forgotten` under the target row lock; 0030 update trigger | shared (via `write_pg`) |
 | `capture_identity.record_source` / `_insert_source` | hub `episode_sources` | called only from the two gated writers above; 0030 insert trigger | shared (callers) |
 | `capture.run_capture_v2` | legacy `episodes.jsonl` (subprocess) | `write_guard` held through the child, lock FD handed to it | shared (via `capture.capture`) |
