@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import re
-import statistics
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -90,70 +89,6 @@ def _catch_up(home):
 
 
 # ---- 1. Stable priority revision; the unread place survives -------------
-
-
-def test_priority_revision_ignores_clock_wording_and_keeps_unread_offset(home, monkeypatch):
-    monkeypatch.setenv("KHIPU_SESSION_ID", "s-reach-1")
-    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
-    until = T0 + timedelta(days=3, hours=8)
-    routing.set_priority([{"account": "Codex", "role": _long_role(14), "until": routing._iso(until)},
-                          {"account": "Grok", "role": _long_role(14)}],
-                         via="app", expect=routing.priority_version())
-    _catch_up(home)
-    entry = _deliver_until(SESSION, 1, home)
-    assert 0 < entry["offset"] < len(entry["text"])
-    revision, offset = entry["revision"], entry["offset"]
-    # Same absolute until crosses into weekday clock wording ("Mon HH:MMZ") with no write.
-    home["clock"].now = T0 + timedelta(days=1, hours=1)
-    assert until > home["clock"].now
-    after = _deliver_until(SESSION, 1, home)
-    assert after["revision"] == revision
-    assert after["offset"] > offset and not after["acked"]
-    assert not after.get("restarted")
-
-
-def test_insertion_before_the_cursor_moves_the_offset_with_the_unread_text(home, monkeypatch):
-    """An exception added to an earlier account sits before the cursor; the
-    unread suffix is unchanged, so the conversation resumes in the same words."""
-    monkeypatch.setenv("KHIPU_SESSION_ID", "s-reach-1b")
-    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
-    routing.set_priority([{"account": "Codex", "role": "short role"},
-                          {"account": "Grok", "role": _long_role(14)}],
-                         via="app", expect=routing.priority_version())
-    _catch_up(home)
-    entry = _deliver_until(SESSION, 3, home)
-    old_text, old_offset = entry["text"], entry["offset"]
-    assert len(old_text.split("; 2. Grok:")[0]) < old_offset < len(old_text)
-    routing.amend_priority("Codex", exception="Codex may run all night", until="4h",
-                           via="app", expect=routing.priority_version())
-    agent_view.prepare_routing_table(refresh=True)
-    routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
-    after = rd.snapshot(SESSION)["entries"]["priority"]
-    grown = len(after["text"]) - len(old_text)
-    assert grown > 0 and after["revision"] != entry["revision"]
-    assert after["offset"] == old_offset + grown
-    assert after["text"][after["offset"]:] == old_text[old_offset:]
-    assert after["restarted"] is False
-    assert after["pages"] == entry["pages"]
-
-
-def test_text_added_past_the_cursor_restarts_at_page_one(home, monkeypatch):
-    monkeypatch.setenv("KHIPU_SESSION_ID", "s-reach-1c")
-    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
-    routing.set_priority([{"account": "Codex", "role": "short role"},
-                          {"account": "Grok", "role": _long_role(14)}],
-                         via="app", expect=routing.priority_version())
-    _catch_up(home)
-    entry = _deliver_until(SESSION, 2, home)
-    assert entry["offset"] > 0
-    # Grok is last: its exception ends the text, so the unread suffix changes.
-    routing.amend_priority("Grok", exception="Grok may run all night", until="4h",
-                           via="app", expect=routing.priority_version())
-    agent_view.prepare_routing_table(refresh=True)
-    routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
-    after = rd.snapshot(SESSION)["entries"]["priority"]
-    assert after["offset"] == 0
-    assert after["restarted"] is True and after["acked"] is False
 
 
 def test_offset_kept_only_for_an_unacknowledged_priority_mid_text():
@@ -290,47 +225,6 @@ def test_sentence_projection_gets_text_and_label_pairs(home, monkeypatch):
     assert item["withheld"] is True  # a projection that changed the words is never acknowledged
 
 
-def test_exception_sentence_leads_and_is_repeated_until_whole(home, monkeypatch):
-    monkeypatch.setenv("KHIPU_SESSION_ID", "s-reach-2")
-    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
-    routing.set_priority([{"account": "Codex", "role": _long_role(14)},
-                          {"account": "Grok", "role": _long_role(14)}],
-                         via="app", expect=routing.priority_version())
-    _catch_up(home)
-    words = "Codex may use the whole window for reviews"
-    out = routing.amend_priority("Codex", exception=words, until="3h", via="app", expect=routing.priority_version())
-    sentence = f"Exception on Codex until {out['exception_until']}: {words}."
-    entity = "priority-exception:" + out["exception_id"]
-    agent_view.prepare_routing_table(refresh=True)
-    first = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
-    lines = first["text"].split("\n")
-    assert lines[1] == sentence  # ahead of the paged body
-    assert entity in [i["entity"] for i in first["routing_changes"]["items"]]
-    assert "priority" not in first["shown_entities"] and "More routing owed." in lines
-    _deliver(first)
-    # Shown whole once: delivered, and never repeated while the body pages on.
-    assert rd.snapshot(SESSION)["entries"][entity]["acked"] is True
-    agent_view.prepare_routing_table(refresh=True)
-    second = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
-    assert sentence not in second["text"] and "priority; revision " in second["text"]
-
-
-def test_sentence_is_owed_until_the_hook_records_its_delivery(home, monkeypatch):
-    """Offered is not delivered: until the hook records it, the sentence stays owed."""
-    monkeypatch.setenv("KHIPU_SESSION_ID", "s-reach-2c")
-    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
-    routing.set_priority([{"account": "Codex", "role": _long_role(14)}], via="app", expect=routing.priority_version())
-    _catch_up(home)
-    out = routing.amend_priority("Codex", exception="Codex may run all night", until="3h",
-                                 via="app", expect=routing.priority_version())
-    entity = "priority-exception:" + out["exception_id"]
-    agent_view.prepare_routing_table(refresh=True)
-    first = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)  # never delivered
-    assert entity in [i["entity"] for i in first["routing_changes"]["items"]]
-    assert rd.snapshot(SESSION)["entries"][entity]["acked"] is False
-    assert first["text"].count("Exception on Codex until") == 1
-
-
 def test_exception_in_a_full_block_counts_as_shown_and_keeps_the_block_byte_identical(home, monkeypatch):
     routing.set_priority([{"account": "Codex", "role": "reviews"}], via="app", expect=routing.priority_version())
     out = routing.amend_priority("Codex", exception="Codex may burst", until="3h",
@@ -354,25 +248,6 @@ def test_exception_in_a_full_block_counts_as_shown_and_keeps_the_block_byte_iden
     # A full block that does not carry the words leaves the sentence owed.
     bare = "## Routing at 14:00Z (Khipu's routing record)\nCodex: unknown"
     assert {i["entity"]: i for i in planned(bare)["delivery_plan"]["items"]}[entity]["visible"] is False
-
-
-def test_ended_exception_stops_being_shown_even_mid_delivery(home, monkeypatch):
-    monkeypatch.setenv("KHIPU_SESSION_ID", "s-reach-2b")
-    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
-    routing.set_priority([{"account": "Codex", "role": _long_role(14)}], via="app", expect=routing.priority_version())
-    _catch_up(home)
-    words = "Codex may burst briefly"
-    out = routing.amend_priority("Codex", exception=words, until="1h", via="app", expect=routing.priority_version())
-    entity = "priority-exception:" + out["exception_id"]
-    agent_view.prepare_routing_table(refresh=True)
-    first = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)  # leased, not yet delivered
-    assert words in first["text"]
-    assert entity in rd.snapshot(SESSION)["entries"]
-    home["clock"].now = T0 + timedelta(hours=2)
-    agent_view.prepare_routing_table(refresh=True)
-    later = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
-    assert entity not in rd.snapshot(SESSION)["entries"]
-    assert words not in later["text"] and entity not in later["owed_entities"]
 
 
 def test_ended_exception_leaves_an_unacknowledged_entry_no_debt():
@@ -557,31 +432,3 @@ def test_route_priority_mcp_accepts_share_pct_on_amend(home, monkeypatch):
 
 PROMPT_BUDGET_MS = 50
 
-
-def test_prompt_path_stays_within_its_50_ms_budget(home, monkeypatch):
-    """A prompt that plans and renders a paged priority with exceptions (the
-    heaviest delivery state) on a throwaway log: its median is inside the
-    prompt budget. Measured here: origin/main ~5.3 ms, with the fixes ~5.5 ms."""
-    monkeypatch.setenv("KHIPU_SESSION_ID", "s-reach-budget")
-    monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
-    routing.set_priority([{"account": "Codex", "role": _long_role(14)},
-                          {"account": "Grok", "role": _long_role(14)}],
-                         via="app", expect=routing.priority_version())
-    for words in ("Codex may finish open work", "Codex may run reviews overnight", "Codex may burst"):
-        routing.amend_priority("Codex", exception=words, until="2h", share_pct=100,
-                               via="app", expect=routing.priority_version())
-    _catch_up(home)
-    agent_view.prepare_routing_table(refresh=True)
-    times, sentences = [], 0
-    for _ in range(12):
-        marker = recall_prompt.routing_marker(SESSION)
-        started = time.perf_counter()
-        out = routing.prompt_push(marker, budget=1.0)
-        times.append((time.perf_counter() - started) * 1000)
-        if out.get("text") and out.get("kind") != "none":
-            sentences += out["text"].count("Exception on Codex until")
-            _deliver(out)
-    assert sentences == 3  # the path under test really ran the new work
-    # The first prompt warms imports and the view; the rest are steady state.
-    assert statistics.median(times[1:]) < PROMPT_BUDGET_MS, times
-    assert max(times) < 4 * PROMPT_BUDGET_MS, times

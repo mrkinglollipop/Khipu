@@ -575,8 +575,9 @@ def test_a_limits_end_with_no_file_changing_reaches_the_next_prompt_as_a_change(
     # The real helper prepares complete inventory before forking a prompt.
     agent_view.prepare_routing_table(refresh=True)
     push = routing.prompt_push(marker, budget=1.0)
-    assert push["kind"] == "changes", push
-    assert "Codex: probably open: its limit was due to end at 16:00Z" in push["text"]
+    # The page the poll's fold wrote says the limit's end, with no fold on the prompt.
+    assert push["kind"] == "full" and push["text"].startswith("ROUTING "), push
+    assert "Codex: PROBABLY OPEN" in push["text"], push["text"]
 
 
 def test_a_source_change_refolds(home, monkeypatch):
@@ -1056,7 +1057,8 @@ def test_the_budget_rate_counts_only_prompts_with_the_push_on(home):
     _hook_log(["full", "none", "skipped:budget", None, None, "changes:2", "unsent:full"])
     rate = recall_prompt.prompt_routing_budget_rate(warn_pct=1.0)
     assert rate["available"] and rate["count"] == 5 and rate["skipped_budget"] == 1
-    assert rate["rate_pct"] == 20.0 and not rate["warn"]  # too few prompts to judge
+    assert rate["rate_pct"] is None and not rate["warn"]  # too few prompts to judge
+    assert "not enough recent prompts to tell" in rate["message"]
 
 
 def test_the_budget_rate_counts_every_prompt_that_went_without_routing_for_lack_of_time(home):
@@ -1089,6 +1091,22 @@ def test_old_lines_are_left_out_of_the_budget_rate(home):
     _hook_log(["none"] * 25)
     rate = recall_prompt.prompt_routing_budget_rate()
     assert rate["count"] == 25 and rate["skipped_budget"] == 0 and not rate["warn"]
+
+
+def test_lines_older_than_a_day_are_left_out_of_the_budget_rate(home):
+    # Last week's failures on a quiet Mac must not read as current.
+    _hook_log(["skipped:budget"] * 30, when=datetime.now(timezone.utc) - timedelta(days=3))
+    _hook_log(["none"] * 25, when=datetime.now(timezone.utc) - timedelta(hours=2))
+    rate = recall_prompt.prompt_routing_budget_rate()
+    assert rate["count"] == 25 and rate["skipped"] == 0 and rate["rate_pct"] == 0.0 and not rate["warn"]
+
+
+def test_a_quiet_mac_gets_no_budget_rate_from_old_lines(home):
+    _hook_log(["skipped:budget"] * 30, when=datetime.now(timezone.utc) - timedelta(days=3))
+    _hook_log(["none"] * 3)
+    rate = recall_prompt.prompt_routing_budget_rate()
+    assert rate["count"] == 3 and rate["rate_pct"] is None and not rate["warn"]
+    assert rate["message"].startswith("not enough recent prompts to tell")
 
 
 # ---- the stop-condition's replay ------------------------------------------------------------------

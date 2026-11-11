@@ -87,7 +87,7 @@ _SUMMARY_RE = re.compile(
 # The summary line's last field when the routing push is on (phase 3b), and
 # the search's degraded note before it.
 _ROUTING_FIELD_RE = re.compile(r" routing=(?P<status>\S+)\s*$")
-_DEGRADED_RE = re.compile(r" degraded=(?P<degraded>.*?)(?= stage=| offline=| routing=|\s*$)")
+_DEGRADED_RE = re.compile(r" degraded=(?P<degraded>.*?)(?= stage=| offline=| route_session=| routing=|\s*$)")
 _LEGS_RE = re.compile(r" legs=(?P<legs>\[.*?\]) degraded=")
 # Routing statuses a candidate's replay with the push on may log and still
 # pass: it waited for another fold past its budget (``fold-busy``: on a live
@@ -770,6 +770,59 @@ def _gate_passes(out: dict[str, Any], okey: str) -> bool:
     return isinstance(block, dict) and block.get("gate_ok") is True
 
 
+def _pending_migrations(out: dict[str, Any]) -> list[str]:
+    block = out.get("schema_migrations")
+    names = block.get("pending") if isinstance(block, dict) else None
+    return [str(n) for n in names] if isinstance(names, list) else []
+
+
+def _pending_migrations_sentence(names: list[str]) -> str:
+    return (f"the database is behind the new code (pending migrations: {', '.join(names)}); "
+            "run `khipu promote --apply-migrations` to apply them with the new code first")
+
+
+def apply_staged_migrations(slot: Path) -> dict[str, Any]:
+    """List the pending migrations with the staged slot's code and apply them
+    with that code (``khipu migrate`` run from the slot, under the environment
+    a launchd job from it would get). Returns ``{"ok", "pending", "applied",
+    "error"?, "failed"?}``; nothing pending is ok and a no-op. A failed
+    migration leaves earlier ones applied, so the database may be partly ahead."""
+    from khipu import launchd_gen
+
+    ctx = launchd_gen.render_context(root=Path(slot))
+    env, cwd = _launchd_env(ctx), ctx["WORKING_DIRECTORY"]
+
+    def migrate(*flags: str, timeout: float = 900) -> tuple[subprocess.CompletedProcess, dict[str, Any] | None]:
+        r = _run([ctx["KHIPU_PYTHON"], "-m", "khipu", "migrate", *flags], env=env, cwd=cwd, timeout=timeout)
+        try:
+            parsed = json.loads(r.stdout or "")
+        except ValueError:
+            parsed = None
+        return r, parsed if isinstance(parsed, dict) else None
+
+    r, listed = migrate("--dry-run", timeout=120)
+    if r.returncode != 0 or listed is None or not isinstance(listed.get("pending"), list):
+        return {"ok": False, "pending": [], "applied": [],
+                "error": f"could not list pending migrations with the new code: "
+                         f"{_tail(r.stderr or r.stdout) or f'exit {r.returncode}'}; nothing was applied"}
+    pending = [str(v) for v in listed["pending"]]
+    if not pending:
+        return {"ok": True, "pending": [], "applied": []}
+    r, ran = migrate()
+    if r.returncode == 0 and ran is not None and not ran.get("pending"):
+        return {"ok": True, "pending": pending, "applied": pending}
+    # Failed: ask the database what is still pending to name the one that broke.
+    r2, left = migrate("--dry-run", timeout=120)
+    still = [str(v) for v in left["pending"]] if left and isinstance(left.get("pending"), list) else None
+    applied = [v for v in pending if still is not None and v not in still]
+    failed = next((v for v in pending if still is None or v in still), pending[0])
+    why = _tail(r.stderr or r.stdout) or f"exit {r.returncode}"
+    which = f"migration {failed} failed" if still is not None else f"a migration failed (first pending: {failed}; could not check which)"
+    return {"ok": False, "pending": pending, "applied": applied, "failed": failed if still is not None else None,
+            "error": f"{which}: {why}; the database may be partly ahead of live (applied: "
+                     f"{', '.join(applied) or 'none'}); live is unchanged"}
+
+
 @_step
 def gate_doctor(candidate: Path) -> tuple[bool, str] | tuple[bool, str, dict[str, Any]]:
     """1. ``khipu doctor --quick`` from the candidate under the environment a
@@ -821,7 +874,11 @@ def gate_doctor(candidate: Path) -> tuple[bool, str] | tuple[bool, str, dict[str
     other = bool(problems) or hard
     if "jobs" in red:
         problems.append(f"jobs failing: {out['job_failures']}")
-    if red:
+    pending_migrations = _pending_migrations(out)
+    if red == ["schema_migrations"] and not problems and pending_migrations:
+        # The only red is a database that is behind the new code: say so.
+        problems.append(_pending_migrations_sentence(pending_migrations))
+    elif red:
         problems.append("red: " + ", ".join(red))
     if not out:
         problems.append(f"exit {r.returncode}: {_tail(r.stderr or r.stdout)}")
@@ -837,7 +894,9 @@ def gate_doctor(candidate: Path) -> tuple[bool, str] | tuple[bool, str, dict[str
                                    ("owner_only_reds", owner_only)) if v}
         return True, "doctor --quick ok; " + "; ".join(notes), {**extra, **used}
     return False, "; ".join(problems) or f"exit {r.returncode}", {
-        **({"red_checks": red} if red else {}), **({"other_problems": True} if other else {}), **used}
+        **({"red_checks": red} if red else {}), **({"other_problems": True} if other else {}),
+        **({"pending_migrations": pending_migrations} if "schema_migrations" in red and pending_migrations else {}),
+        **used}
 
 
 def _parse_summary(line: str) -> dict[str, Any] | None:
@@ -1834,7 +1893,8 @@ def _post_flip_result(entry: dict[str, Any], t0: float) -> dict[str, Any]:
 # ---- commands ----------------------------------------------------------------
 
 
-def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None) -> dict[str, Any]:
+def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None,
+            apply_migrations: bool = False) -> dict[str, Any]:
     """Fetch, check the inactive slot out at ``ref``, gate it, and on a pass
     flip ``live`` to it. Pre-flip failures leave the link as it was;
     post-flip refresh failures report a partial deployment with the link moved.
@@ -1849,7 +1909,10 @@ def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None)
     write): a run that dies part way leaves it queued for the next retry. The owner's
     one-time override the doctor step read is cleared only after a live flip
     or after it excused doctor reds and the whole gate passed. A failed gate
-    keeps it, as does a queued retry (the retry is the same attempt)."""
+    keeps it, as does a queued retry (the retry is the same attempt).
+
+    ``apply_migrations`` applies the database migrations the staged code ships
+    (with that code) before the gate runs; without it nothing is applied."""
     t0 = time.monotonic()
     with _lock() as held:
         if not held:
@@ -1858,7 +1921,7 @@ def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None)
         if retry_of is not None and not _same_queued_request(previous, retry_of):
             return record({"ok": True, "action": "retry-queued", "cancelled": True,
                            "queued": previous, "reason": "queued request was replaced or cancelled"})
-        out = _promote_locked(ref, t0)
+        out = _promote_locked(ref, t0, **({"apply_migrations": True} if apply_migrations else {}))
         failed = next((step for step in out.get("gate") or [] if not step["ok"]), None)
         doctor = next((step for step in out.get("gate") or [] if step.get("step") == "doctor"), None)
         override = (doctor or {}).get("override")
@@ -1887,7 +1950,7 @@ def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None)
         return record(out)
 
 
-def _promote_locked(ref: str, t0: float) -> dict[str, Any]:
+def _promote_locked(ref: str, t0: float, *, apply_migrations: bool = False) -> dict[str, Any]:
     """The promotion itself, under the lock; the caller records the result."""
     repo = _repo()
     from_slot = active_slot()
@@ -1909,6 +1972,12 @@ def _promote_locked(ref: str, t0: float) -> dict[str, Any]:
                 "ms": round((time.monotonic() - t0) * 1000)}
     # The gate's replay runs the slot's hooks by the slot's own path.
     entry["precompile"] = precompile(slot)
+    if apply_migrations:
+        migrated = apply_staged_migrations(slot)
+        entry["migrations"] = migrated
+        if not migrated["ok"]:
+            return {**entry, "ok": False, "failed_step": "migrations", "error": migrated["error"],
+                    "ms": round((time.monotonic() - t0) * 1000)}
     gate = run_gate(slot)
     entry["gate"] = gate
     entry["gate_ms"] = sum(step["ms"] for step in gate)
@@ -2156,6 +2225,12 @@ def format_result(out: dict[str, Any]) -> str:
     if out.get("slot"):
         head += f" in {Path(out['slot']).name}"
     lines.append(head)
+    migrated = out.get("migrations")
+    if isinstance(migrated, dict):
+        for name in migrated.get("applied") or []:
+            lines.append(f"  migrate  applied {name}")
+        if migrated.get("ok") and not migrated.get("pending"):
+            lines.append("  migrate  nothing pending")
     for step in out.get("gate") or []:
         lines.append(f"  {step['step']:<8} {'ok  ' if step['ok'] else 'FAIL'} {step['ms']:>6} ms  {step['detail']}")
     override = out.get("override")

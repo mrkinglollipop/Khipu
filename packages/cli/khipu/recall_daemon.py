@@ -356,7 +356,7 @@ class RecallService:
 
     def keep_caches_warm(self) -> bool:
         """Between prompts, reload what a replica write made stale (the
-        vector matrix, the topic slug map, the word-rarity counts), so the
+        vector matrix, the word-rarity counts), so the
         next prompt does not. Each of those is keyed by the replica file, and
         nearly every write is followed by a prompt: the first prompt after it
         paid for all three, the reloads holding the interpreter while its own
@@ -644,20 +644,19 @@ def _warm_imports() -> None:
 
 
 def _warm_caches() -> None:
-    """Load the replica's vector matrix, the topic slug map and the word-rarity
+    """Load the replica's vector matrix and the word-rarity
     counts now, on a thread: at start, and after each replica change
     (``RecallService.keep_caches_warm``). The service restarts on every code
     change, and a cold matrix load (about a second, competing with the lexical
     scan for the same process) cost the first prompts after each restart their
-    whole budget (2026-10-12). A changed replica's matrix and slug map reload
-    on threads of their own; the counts are made here."""
+    whole budget (2026-10-12). A changed replica's matrix reloads
+    on a thread of its own; the counts are made here."""
     try:
-        from khipu import graph_candidates, hub_snapshot
+        from khipu import hub_snapshot
 
         profile = hub_snapshot.active_snapshot_profile()
         if profile:
             hub_snapshot._matrix_rows(hub_snapshot.snapshot_path(), profile, None)
-        graph_candidates._episode_slug_map()
         hub_snapshot.term_document_frequency()
     except Exception as exc:  # noqa: BLE001 — the first prompt loads them instead
         _log(f"warm caches skipped: {type(exc).__name__}: {exc}")

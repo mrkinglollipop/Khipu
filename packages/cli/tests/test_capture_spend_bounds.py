@@ -275,17 +275,6 @@ class SynthBudgetTest(_SynthBudget):
                 extract._generate("p")
             self.assertEqual(calls, [], "network must not be touched once the budget is spent")
 
-    def test_rerank_cloud_call_is_gated_too(self):
-        from khipu import rerank
-
-        with mock.patch.object(em, "SYNTH_DAILY_CALL_BUDGET", 1), \
-                mock.patch("khipu.models.synth_settings", return_value={"provider": "cloud"}), \
-                mock.patch.object(extract, "_key", return_value="k"), \
-                mock.patch.object(extract.urllib.request, "urlopen",
-                                  side_effect=AssertionError("network touched")):
-            em._budget_take(scope="synth")
-            with self.assertRaises(em.BudgetExhausted):
-                rerank._call_model("p", timeout=1)
 
 
 class DrainBudgetTest(_SynthBudget):

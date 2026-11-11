@@ -125,7 +125,7 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
             answer = json.loads(wire.split(b"\n")[1])
             assert answer.get("kind") == "full", answer
             assert b"SecretAliasZZZ" not in wire
-            assert "Use " in answer["text"]
+            assert answer["text"].startswith("ROUTING ")
             return
         assert select.select([ready_read], [], [], 5)[0], "helper never became ready"
         assert os.read(ready_read, 100) == b"ready\n"
@@ -174,13 +174,15 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
                 assert b"SecretAliasZZZ" not in wire
                 if word:
                     assert word.encode() not in wire
-                if refresh == "cold-stalled-volume" or ((added or refresh == "cold-recovery") and index < 2):
+                # The prompt serves the page the last fold rendered, scrubbed with
+                # that fold's table; a read that needs the table and cannot have it
+                # still refuses rather than guess.
+                if answer.get("skip"):
                     assert answer == {"skip": "error-InventoryUnavailable", "done": answer["done"]}
                     assert not recall_prompt.routing_marker(f"alias-{index}")
                 else:
                     assert answer.get("kind") == "full", answer
-                    assert "Use " in answer["text"]
-                    assert "Work: open" in answer["text"]
+                    assert answer["text"].startswith("ROUTING ") and "Work:" in answer["text"]
                     assert answer["routing_changes"]["batch"]
                 if refresh in ("stalled-volume", "cold-stalled-volume", "cold-recovery") and not added:
                     assert (replay.data / "volume-stalled").exists()

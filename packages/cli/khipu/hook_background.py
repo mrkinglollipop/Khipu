@@ -99,19 +99,19 @@ def _drain(sid: str, harness: str) -> None:
 
 
 def run(mem_root: str, harness: str, sid: str) -> None:
-    """Drain, mirror, replay the outbox, reconcile notes, catch up embeddings.
+    """Drain, mirror, replay the outbox, catch up embeddings.
     Every step fails open and is logged with the session id.
 
     The promotion gate's own capture (``KHIPU_GATE=1``, khipu.promote) drains
-    its isolated queue and stops there: the mirror, the outbox replay, the
-    notes reconcile and the embed catch-up all act on live state that is not
+    its isolated queue and stops there: the mirror, the outbox replay and the
+    embed catch-up all act on live state that is not
     the gate's."""
     try:
         _drain(sid, harness)
     except Exception as e:  # noqa: BLE001 — fail-open, always
         _say(sid, harness, f"drain skipped: {type(e).__name__}: {e}")
     if os.environ.get("KHIPU_GATE") == "1":
-        _say(sid, harness, "gate run: mirror, outbox drain, notes-reconcile and embed catch-up skipped")
+        _say(sid, harness, "gate run: mirror, outbox drain and embed catch-up skipped")
         return
     try:
         from khipu.config import path_setting
@@ -157,23 +157,6 @@ def run(mem_root: str, harness: str, sid: str) -> None:
             _say(sid, harness, f"ledger offline copy catch-up {catch_up_offline_copy()}")
     except Exception as e:  # noqa: BLE001
         _say(sid, harness, f"ledger outbox drain skipped: {type(e).__name__}: {e}")
-    try:
-        # A note edited this session becomes a topic now, not after the nightly.
-        t0 = time.monotonic()
-        # Throttled and stat-checked (notes.hook_reconcile): a full pass parses
-        # every note on the Mac, and nearly every stop has nothing new.
-        from khipu.notes import hook_reconcile
-
-        r = hook_reconcile()
-        if r.get("skipped"):
-            _say(sid, harness, f"notes-reconcile not needed ({r['skipped']}) "
-                               f"{round((time.monotonic() - t0) * 1000, 1)}ms")
-        else:
-            _say(sid, harness, f"notes-reconcile changed_only candidates={r.get('candidates')} "
-                               f"written={r.get('written')} errors={len(r.get('errors') or [])} "
-                               f"{round((time.monotonic() - t0) * 1000, 1)}ms")
-    except Exception as e:  # noqa: BLE001
-        _say(sid, harness, f"notes-reconcile skipped: {type(e).__name__}: {e}")
     try:
         # Rows the legacy mirror inserted would otherwise wait for the nightly
         # to be embedded. Bounded catch-up.

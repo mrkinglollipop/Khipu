@@ -7,7 +7,7 @@ from datetime import timedelta
 
 import pytest
 
-from khipu import cli, mcp_server, owner_act, routing
+from khipu import cli, mcp_server, owner_act, routing, routing_page
 
 pytest_plugins = ("tests.test_routing_acceptance", "tests.test_owner_direction")
 
@@ -53,8 +53,7 @@ def test_an_exception_is_in_every_reader_before_its_end_and_in_none_after(direct
     before, after = now + timedelta(hours=1), now + timedelta(hours=3)
     lines_before = routing.priority_line(routing.read_view(before)["priority"], before)
     assert WORDS in lines_before and "exception until" in lines_before
-    assert WORDS in routing.summary(now=before)["text"]
-    assert WORDS in routing._priority_push(routing.read_view(before), before)[0][0]
+    assert WORDS in routing_page.page(routing.read_view(before), before)  # the page every reader gets
     public = routing._public_priority(routing.read_view(before), before, {})
     assert [x["text"] for x in public["entries"][0]["exceptions"]] == [WORDS]
     assert WORDS in public["line"]
@@ -62,8 +61,7 @@ def test_an_exception_is_in_every_reader_before_its_end_and_in_none_after(direct
 
     lines_after = routing.priority_line(routing.read_view(after)["priority"], after)
     assert WORDS not in lines_after and "exception" not in lines_after
-    assert WORDS not in routing.summary(now=after)["text"]
-    assert WORDS not in routing._priority_push(routing.read_view(after), after)[0][0]
+    assert WORDS not in routing_page.page(routing.read_view(after), after)
     gone = routing._public_priority(routing.read_view(after), after, {})
     assert "exceptions" not in gone["entries"][0] and WORDS not in gone["line"]
     assert "exceptions" not in _codex(after)
@@ -205,7 +203,6 @@ def test_an_over_budget_legacy_role_still_reads_warns_and_takes_exceptions(direc
     now = routing._now()
     assert any("over the 2,000 budget" in w for w in routing._priority_warnings(view, now, routing.settings()))
     assert "over the 2,000 budget" in routing.priority_line(view["priority"], now)
-    assert "over the 2,000 budget" in routing.summary(now=now)["text"]
     assert any("over the 2,000 budget" in w for w in routing.doctor_block(now)["warnings"])
     _add(direction_world)  # an exception does not grow the role, so it is allowed
     assert len(_codex()["role"]) == size

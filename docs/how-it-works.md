@@ -207,7 +207,7 @@ Topics and episodes are never silently dropped. Both carry a `deleted_at` column
 
 Hooks put prior work in front of the agent before it acts.
 
-- **Session start** (Claude Code, Codex, Cursor): the recall rule plus a slice scoped to the current project (recent episodes and linked topics), plus, when the `routing_push` switch is on (it is off by default), the routing summary. See [routing.md](routing.md). 
+- **Session start** (Claude Code, Codex, Cursor): the recall rule plus a slice scoped to the current project (recent episodes and linked topics), plus, when the `routing_push` switch is on (it is off by default), the routing page. See [routing.md](routing.md). 
 - **Every prompt** (Claude Code and Codex): a bounded search on the prompt itself. It pushes at most three hits under a "Prior work on this topic" heading, capped at 600 characters. It has a 1.2 second budget, skips trivial prompts, and skips hits already shown in the last three prompts. It calls no summariser or chat model. When an embedding profile is active and the prompt's vector is not already cached, it makes one embedding call (secrets masked first), so the prompt text goes to that profile's embedding provider. It reads the local replica first and does not search libraries. If anything fails it returns nothing.
 - **Aegis** gets no push. Its hooks run as observers and their output is discarded. Aegis agents pull with `khipu_status` and `khipu_owed`.
 - **Cursor** gets the session-start push and a project rule file, but no per-prompt hook.
@@ -233,9 +233,9 @@ khipu graph <node-id> --hops 2                           # connections
 
 **Semantic** mode uses cosine plus token overlap only. `--semantic` still works as a deprecated alias.
 
-Two optional stages sit behind feature switches, both off by default: a rerank pass (one model call over 12 candidates) and an absolute relevance floor. See `khipu features`. With rerank on and no synth model that can answer (a CLI provider, a local endpoint with no model, or a cloud provider with no key), search skips the stage without a call: the `rerank` block says `applied: false, skipped: true, reason: "no-provider"`, `degraded_legs` lists `rerank`, and `timing.rerank_skipped` is set. `khipu doctor` shows a `rerank` block (`enabled`, `usable`, `provider`, `reason`) and a warning when it is on with no model.
+Search always applies the absolute relevance floor (an unrelated query returns nothing), validity ranking and time interpretation. There are no switches for them, and there is no rerank stage.
 
-**Filters** work in the CLI and the MCP tool: `--kind`, `--source` (one library), `--project`, `--since`, `--until` (ISO dates or `7d`), `--session-id`, `--harness`, `--via`. Hybrid and literal accept episode, topic, node and library; semantic accepts episode, topic, media and library. The MCP tool also accepts `t3_thread` and `tz`; the CLI has no `--t3-thread` or `--tz` flags. Timezone defaults to UTC, including for an unknown zone. Natural-language time interpretation applies only with its feature switch on and no explicit `since` or `until`.
+**Filters** work in the CLI and the MCP tool: `--kind`, `--source` (one library), `--project`, `--since`, `--until` (ISO dates or `7d`), `--session-id`, `--harness`, `--via`. Hybrid and literal accept episode, topic, node and library; semantic accepts episode, topic, media and library. The MCP tool also accepts `t3_thread` and `tz`; the CLI has no `--t3-thread` or `--tz` flags. Timezone defaults to UTC, including for an unknown zone. Natural-language time interpretation applies only when no explicit `since` or `until` is given.
 
 **Graph** walks expand the neighbourhood of a node. A topic slug works as an id. A digit id is an episode, and its neighbourhood is that capture's topics.
 

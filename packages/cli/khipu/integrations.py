@@ -366,6 +366,11 @@ def codex_sessionend_hook() -> str:
 # PreToolUse holds the call, so its timeout is the per-prompt hook's; the hook
 # never denies, whatever happens.
 DELEGATION_MATCHER = "Agent|Task|spawn_agent|delegate_task"
+# Claude Code's own: the desktop app's tools that start another conversation
+# from this one (``routing_delegation.START_SESSION_TOOLS``), whose first turn
+# is this call's brief. They exist only in Claude Code, so Codex keeps the
+# shared matcher byte for byte and asks the owner for no new hook review.
+CLAUDE_DELEGATION_MATCHER = DELEGATION_MATCHER + "|mcp__ccd_session__start_session|mcp__ccd_session__hand_off_to_session"
 DELEGATION_TIMEOUT = PROMPT_RECALL_TIMEOUT
 SUBAGENT_START_TIMEOUT = 10
 DELEGATION_EVENTS = ("PreToolUse", "SubagentStart")
@@ -381,10 +386,11 @@ def _is_our_delegation(cmd: Any) -> bool:
     return _is_launcher_command(cmd, "khipu-delegation-hook")
 
 
-def _delegation_current(hooks: dict) -> bool:
+def _delegation_current(hooks: dict, matcher: str = DELEGATION_MATCHER) -> bool:
     """Whether a Claude-shaped ``hooks`` block runs Khipu's delegation hook on
     both events, its PreToolUse entry matched to the current tools only (an
-    older install's entry also matched every shell command)."""
+    older install's entry also matched every shell command). ``matcher``:
+    that harness's own (``CLAUDE_DELEGATION_MATCHER`` for Claude Code)."""
     def entries(event: str) -> list[dict]:
         found = hooks.get(event) if isinstance(hooks, dict) else None
         return [e for e in found if isinstance(e, dict)] if isinstance(found, list) else []
@@ -394,18 +400,20 @@ def _delegation_current(hooks: dict) -> bool:
 
     pre = [e for e in entries("PreToolUse") if ours(e)]
     start = [e for e in entries("SubagentStart") if ours(e)]
-    return bool(pre) and bool(start) and all(e.get("matcher") == DELEGATION_MATCHER for e in pre)
+    return bool(pre) and bool(start) and all(e.get("matcher") == matcher for e in pre)
 
 
-def _install_delegation_hooks(hooks: dict, path: Path, changes: list[str]) -> bool:
+def _install_delegation_hooks(hooks: dict, path: Path, changes: list[str],
+                              tools: str = DELEGATION_MATCHER) -> bool:
     """Add or re-point Khipu's PreToolUse and SubagentStart entries in a
-    Claude-shaped ``hooks`` block (Claude Code's settings.json, Codex's
-    hooks.json). True when anything changed."""
+    Claude-shaped ``hooks`` block (Claude Code's settings.json with
+    ``CLAUDE_DELEGATION_MATCHER``, Codex's hooks.json with the shared one).
+    True when anything changed."""
     changed = False
     want = delegation_hook()
     for event in DELEGATION_EVENTS:
         entries = hooks.setdefault(event, [])
-        matcher = DELEGATION_MATCHER if event == "PreToolUse" else None
+        matcher = tools if event == "PreToolUse" else None
         timeout = DELEGATION_TIMEOUT if event == "PreToolUse" else SUBAGENT_START_TIMEOUT
         ours = [e for e in entries if any(_is_our_delegation(h.get("command")) for h in e.get("hooks", []))]
         if not ours:
@@ -773,7 +781,7 @@ def _claude_hooks_install(settings: Path, dry: bool, res: dict) -> None:
         res["changes"].append(
             f"{settings}: hooks.UserPromptSubmit khipu-prompt-recall -> {prompt_recall_hook()}")
         changed = True
-    if _install_delegation_hooks(hooks, settings, res["changes"]):
+    if _install_delegation_hooks(hooks, settings, res["changes"], CLAUDE_DELEGATION_MATCHER):
         changed = True
     if changed and not dry:
         res.setdefault("backups", []).append(_backup(settings))
@@ -939,7 +947,8 @@ def _claude_home_status(h: _homes.ClaudeHome) -> tuple[dict, dict]:
         hook_sessionend=sessionend is not None, hook_subagentstop=subagentstop is not None,
         recall_rule="installed" if rule else "missing",
         prompt_recall="installed" if prompt_recall else "missing",
-        delegation_push="installed" if _delegation_current(s.get("hooks") or {}) else "missing",
+        delegation_push="installed" if _delegation_current(s.get("hooks") or {}, CLAUDE_DELEGATION_MATCHER)
+        else "missing",
         memory_tools_ok=mcp_ok, launcher_ok=launch["launcher_ok"],
     )
     row["hooks_ok"] = all((stop, precompact, sessionend, subagentstop, rule, prompt_recall))
@@ -4283,12 +4292,18 @@ def format_hook_refresh(res: dict[str, Any]) -> list[str]:
     return lines or ["hooks: every wired harness is current"]
 
 
-def hook_wiring_report() -> dict[str, Any]:
+def hook_wiring_report(*, ask_codex: bool = False) -> dict[str, Any]:
     """`khipu doctor`'s hook row: per detected harness, whether the hooks wired
     now are what this version would install, from the same dry run an install
     uses. ``warnings`` is plain text for each one that is not, with the fix. It
     is warning-level by design: the promote gate runs doctor on the candidate,
-    and a stale hook list must not block the promote that refreshes it."""
+    and a stale hook list must not block the promote that refreshes it.
+
+    ``ask_codex`` (the full ``khipu doctor`` only): Codex runs a hook only
+    after its owner reviewed it, so when Khipu's hooks are installed in Codex
+    the row also asks Codex (``codex_hook_trust``, read-only, a few seconds at
+    most) and says "installed and trusted", "installed, waiting for your
+    review in Codex" or "installed; could not ask Codex"."""
     rows, warnings = [], []
     for harness in HOOK_PLAN_HARNESSES:
         label = _HOOK_LABELS[harness]
@@ -4322,6 +4337,23 @@ def hook_wiring_report() -> dict[str, Any]:
                 fix = (f"run `khipu integrations install {harness}` (a promote or an app update "
                        "refreshes it by itself)")
             warnings.append(f"{label}: the wired hooks are behind this version ({shown}); {fix}")
+    if ask_codex:
+        for row in rows:
+            if row["harness"] != "codex" or row.get("state") not in ("current", "stale"):
+                continue
+            try:
+                from khipu import codex_hook_trust
+
+                answer = codex_hook_trust.ask()
+            except Exception as e:  # noqa: BLE001 - a failed question is "could not ask"
+                answer = {"state": "unknown", "words": f"installed; could not ask Codex ({type(e).__name__})"}
+            row["trust"] = answer["state"]
+            row["words"] = answer["words"]
+            if answer["state"] == "waiting":
+                if row["state"] == "current":
+                    row["state"] = "waiting for review"
+                warnings.append("Codex: Khipu's hooks are installed, waiting for your review in Codex; "
+                                "until you approve them there, Codex does not run them.")
     return {"harnesses": rows, "warnings": warnings, "ok": not warnings}
 
 

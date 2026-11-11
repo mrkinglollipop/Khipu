@@ -84,6 +84,8 @@ def test_a_burst_behind_a_held_fold_lock_stays_within_the_child_cap(home, monkey
     home["clock"].now = datetime.now(timezone.utc).replace(microsecond=0)
     push._set(home, routing_prompt_budget_ms=50)
     routing.view_file().unlink()  # every child wants to fold
+    from khipu import routing_page_file
+    routing_page_file.path().unlink(missing_ok=True)  # with no page to read
     push._push_on(monkeypatch)
     svc, thread = push._fresh_daemon(home, "burst")
     lock = open(routing.routing_dir() / routing.PROMPT_FOLD_LOCK, "a")
@@ -262,67 +264,6 @@ def test_three_skips_in_a_row_in_one_conversation_is_a_delay(replay):
 
 
 # ---- review round 1 (Grok leads, 2026-10-27) -------------------------------------------------
-
-
-def _wait_behind(world, holder_work):
-    """A prompt whose view is due waits for another fold's lock; ``holder_work``
-    runs while it waits. Returns the (view, now) the prompt built its lines from."""
-    import os
-
-    seen = {}
-
-    def text(marker, view, now, cfg, *, session_id=None):
-        seen.update(view=view, now=now)
-        return {"kind": "none", "_delivery_view": view}
-
-    held, waiting = threading.Event(), threading.Event()
-
-    def other():
-        with routing._fold_turn():
-            held.set()
-            waiting.wait(5)
-            time.sleep(0.05)  # the prompt is now inside its fold-lock wait
-            holder_work()
-
-    thread = threading.Thread(target=other)
-    thread.start()
-    assert held.wait(5)
-    real_take = routing._take_fold_lock
-
-    def take(fd):
-        waiting.set()
-        return real_take(fd)
-
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(routing, "_prompt_text", text)
-        m.setattr(routing, "_take_fold_lock", take)
-        routing._prompt_push(None, budget=0.05, fold_wait=2.0)
-    thread.join(10)
-    assert os.path.exists(routing.view_file())
-    return seen["view"], seen["now"]
-
-
-def test_a_view_that_falls_due_during_the_fold_wait_is_not_served(world):
-    _pace_world(T0 - timedelta(minutes=19, seconds=50))
-    routing.read_view()  # valid until T0 + 11 s
-    world[0] = T0 + timedelta(seconds=12)  # due: the prompt waits for the other fold
-
-    def holder():
-        routing._start_fold(world[0], save=True)  # saves a view valid until T0 + 42 s
-        world[0] = T0 + timedelta(seconds=50)  # and the clock moves on past it while the prompt waits
-
-    view, now = _wait_behind(world, holder)
-    assert now == T0 + timedelta(seconds=50)
-    assert routing._parse(view["valid_until"]) > now, (view["valid_until"], now)
-
-
-def test_a_waiter_past_its_routing_lock_deadline_still_folds_and_saves(world):
-    _pace_world(T0)
-    routing.read_view()
-    world[0] = T0 + timedelta(seconds=31)  # due
-    view, now = _wait_behind(world, lambda: time.sleep(0.1))  # the other fold saves nothing
-    assert view.get("saved") is not False
-    assert routing._load_view()["folded_at"] == routing._iso(now)
 
 
 def test_one_shot_children_do_not_pile_up_behind_a_held_fold_lock(home, monkeypatch):

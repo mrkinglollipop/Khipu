@@ -13,7 +13,7 @@ python3 -m khipu <command>
 
 Most commands need the Python dependencies on `PYTHONPATH` first; [packages/cli/README.md](../packages/cli/README.md) shows the one-time setup. To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
 
-There are 56 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
+There are 59 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
 
 ## Health and status
 
@@ -23,10 +23,13 @@ There are 56 top-level commands; the reference below includes storage, ledger, w
 | `status` | Row counts in Postgres. `--sample N` (default 0, which skips the file walk), `--drift` adds drift samples. |
 | `doctor` | The single health command. Exits 0 only when `ok` is true, otherwise 2. |
 | `activity` | Recent capture episodes. `--limit`, `--show ID`. |
+| `health` | The five checks the app shows (saving, finding, routing, database, jobs) as plain rows, with a line each for what Khipu is doing and what you do. A view over `doctor`; `--json` is the only form, and it exits 0 whatever the checks say. Also shares this Mac's status row through the hub. |
+| `macs` | One status row per Mac, shared through the hub: this Mac live, every other Mac as last reported (marked stale after 15 minutes). A Mac on an older build, a hub that is down or a missing table gives this Mac only, with a note. `--json` is the only form. |
+| `running` | Which jobs are running, on which Mac, and which have gone quiet. This Mac live, the other as last reported; it also refreshes this Mac's remembered running part. `--json` is the only form. |
 | `revisions` | Topic revisions, including edits that lost a last-write-wins conflict. `--slug`, `--show ID`. |
 | `secrets` | Shows whether the database address and model keys are present (Keychain, environment or file). Never prints values. |
 | `git-sync` | Reports whether the memory-tree git auto-sync is alive. Exits 2 if red. |
-| `features` | Shows feature switches. `--set NAME VALUE` changes one. |
+| `features` | Shows the one feature switch left (`routing_push`). `--set NAME VALUE` changes it. |
 
 `doctor` flags:
 
@@ -69,7 +72,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 - `recall status`: shows whether the service is up.
 - `recall log [--tail N]`: shows the search query log (default 20).
 - `recall zero-results [--days]` (default 7): lists queries that found nothing.
-- `recall eval`: scores a golden set. Flags: `--golden`, `--path explicit|prompt|status|all` (default `explicit`), `--budget-ms`, `--record`, `--compare`, `--allow-changes`, `--replay`, `--rerank on|off`, `--relevance-floor on|off`, `--sample`, `--seed`.
+- `recall eval`: scores a golden set. Flags: `--golden`, `--path explicit|prompt|status|all` (default `explicit`), `--budget-ms`, `--record`, `--compare`, `--allow-changes`, `--replay`, `--sample`, `--seed`.
 
 ## Explicit asks and archived commitments
 
@@ -164,7 +167,7 @@ Usage normally reads the CLI's usage protocol. Claude may use a tiny Haiku turn 
 
 ### route
 
-Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `--brief` (text for a job-runner brief), `--account A`.
+Top-level flags: `--json`, `--since V`, `--page` (the routing page; `--summary` and `--brief` print the same page), `--account A`.
 
 - `check ACCOUNT`: check one account now; Claude may use the bounded tiny-turn fallback if its usage reply omits figures.
 - `report`: record a state. `--state limited|open|down`, `--account` or `--runner` with `--lane`, `--until`, `--window five-hour|weekly`, `--model`, `--message`, `--seen`, `--name`, `--evidence`. A runner lane must resolve through its provider/account declaration and local identity binding, or be named in `routing_lane_map`; unresolved or ambiguous declarations stay unmatched.
@@ -256,6 +259,7 @@ Job names: `nightly`, `monthly`, `notes_watch`, `queue_drain`, `recall_daemon`, 
 - `--rollback`: flip back to the previous slot.
 - `--status`: show the live commit, main, how far behind, and queued promotion.
 - `--retry-queued`: retry the queued attempt once the hub answers. A promotion blocked only by an unreachable hub stays queued and retries when the hub returns.
+- `--apply-migrations`: before the gate runs, list the pending database migrations with the new code, apply them with that code, and print each one applied. Without it nothing is applied, and a gate that is red only for pending migrations names them and says to use this flag. If a migration fails, the promotion stops, live is unchanged, and the output names the failed migration and says the database may be partly ahead.
 - `--gate-only STEP`: run one gate step (`doctor`, `recall`, `capture`, `version`). It never flips the link.
 - `--json`: machine-readable output.
 

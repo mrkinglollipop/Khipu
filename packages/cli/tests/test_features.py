@@ -27,7 +27,7 @@ def _isolated_data_dir():
 
 
 class PrecedenceTest(unittest.TestCase):
-    NAME = "rerank"
+    NAME = "routing_push"
 
     def test_default_is_off(self):
         patch, _ = _isolated_data_dir()
@@ -44,7 +44,7 @@ class PrecedenceTest(unittest.TestCase):
         patch, _ = _isolated_data_dir()
         with patch:
             features.set_enabled(self.NAME, True)
-            with mock.patch.dict(os.environ, {"KHIPU_FEATURE_RERANK": "off"}):
+            with mock.patch.dict(os.environ, {"KHIPU_FEATURE_ROUTING_PUSH": "off"}):
                 self.assertFalse(features.enabled(self.NAME))
 
 
@@ -63,8 +63,8 @@ class BoolParsingTest(unittest.TestCase):
 
     def test_an_unparseable_env_value_falls_through_to_file_then_default(self):
         patch, _ = _isolated_data_dir()
-        with patch, mock.patch.dict(os.environ, {"KHIPU_FEATURE_GRAPH_CANDIDATES": "maybe"}):
-            self.assertFalse(features.enabled("graph_candidates"))
+        with patch, mock.patch.dict(os.environ, {"KHIPU_FEATURE_ROUTING_PUSH": "maybe"}):
+            self.assertFalse(features.enabled("routing_push"))
 
 
 class UnknownNameTest(unittest.TestCase):
@@ -99,24 +99,50 @@ class SetEnabledRoundTripTest(unittest.TestCase):
     def test_round_trip_under_a_temp_data_dir(self):
         patch, tmp = _isolated_data_dir()
         with patch:
-            features.set_enabled("graph_candidates", True)
-            self.assertTrue(features.enabled("graph_candidates"))
+            features.set_enabled("routing_push", True)
+            self.assertTrue(features.enabled("routing_push"))
             on_disk = json.loads((tmp / "config.json").read_text())
-            self.assertEqual(on_disk["features"]["graph_candidates"], True)
-            features.set_enabled("graph_candidates", False)
-            self.assertFalse(features.enabled("graph_candidates"))
+            self.assertEqual(on_disk["features"]["routing_push"], True)
+            features.set_enabled("routing_push", False)
+            self.assertFalse(features.enabled("routing_push"))
 
     def test_states_reports_the_source(self):
         patch, _ = _isolated_data_dir()
         with patch:
             out = features.states()
-            self.assertEqual(out["features"]["graph_candidates"]["source"], "default")
-            features.set_enabled("graph_candidates", True)
+            self.assertEqual(out["features"]["routing_push"]["source"], "default")
+            features.set_enabled("routing_push", True)
             out = features.states()
-            self.assertEqual(out["features"]["graph_candidates"], {"enabled": True, "source": "file"})
-            with mock.patch.dict(os.environ, {"KHIPU_FEATURE_GRAPH_CANDIDATES": "off"}):
+            self.assertEqual(out["features"]["routing_push"], {"enabled": True, "source": "file"})
+            with mock.patch.dict(os.environ, {"KHIPU_FEATURE_ROUTING_PUSH": "off"}):
                 out = features.states()
-                self.assertEqual(out["features"]["graph_candidates"], {"enabled": False, "source": "env"})
+                self.assertEqual(out["features"]["routing_push"], {"enabled": False, "source": "env"})
+
+
+class RetiredSwitchTest(unittest.TestCase):
+    """The deleted search switches may still sit in an old config.json or the
+    environment: they load, are ignored, and are never reported."""
+
+    OLD = ("validity_ranking", "graph_candidates", "time_interpretation", "rerank",
+           "relevance_floor", "briefs", "reflect", "decision_details")
+
+    def test_old_keys_in_config_and_env_load_without_error_or_report(self):
+        patch, tmp = _isolated_data_dir()
+        with patch:
+            (tmp / "config.json").write_text(json.dumps(
+                {"features": {**{k: True for k in self.OLD}, "routing_push": True}}))
+            env = {"KHIPU_FEATURE_RERANK": "1", "KHIPU_FEATURE_GRAPH_CANDIDATES": "0"}
+            with mock.patch.dict(os.environ, env):
+                out = features.states()
+            self.assertEqual(out["unknown"], [])
+            self.assertEqual(list(out["features"]), ["routing_push"])
+            self.assertTrue(out["features"]["routing_push"]["enabled"])
+
+    def test_the_list_is_only_the_routing_switch(self):
+        self.assertEqual(set(features.FEATURES), {"routing_push"})
+        for old in self.OLD:
+            with self.assertRaises(KeyError):
+                features.enabled(old)
 
 
 class ContractShapeTest(unittest.TestCase):
@@ -131,7 +157,7 @@ class ContractShapeTest(unittest.TestCase):
         self.assertEqual(c["capabilities"], sorted(c["capabilities"]))
         self.assertIn("search.hybrid", c["capabilities"])
         self.assertIn("launchers.read_only", c["capabilities"])
-        self.assertEqual(set(c["features"]), set(features.FEATURES))
+        self.assertEqual(set(c["features"]), set(features.FEATURES) | set(features._FIXED_CONTRACT_FEATURES))
         self.assertTrue(all(isinstance(v, bool) for v in c["features"].values()))
 
 
@@ -159,3 +185,16 @@ class VersionSyncTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContractFixedFeaturesTest(unittest.TestCase):
+    def test_contract_keeps_the_retired_switch_keys_with_their_fixed_values(self):
+        patch, _ = _isolated_data_dir()
+        with patch:
+            feats = features.contract()["features"]
+        self.assertIs(feats["validity_ranking"], True)
+        self.assertIs(feats["time_interpretation"], True)
+        self.assertIs(feats["relevance_floor"], True)
+        self.assertIs(feats["graph_candidates"], False)
+        self.assertIs(feats["rerank"], False)
+        self.assertIn("routing_push", feats)

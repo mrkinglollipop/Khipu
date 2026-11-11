@@ -151,30 +151,11 @@ def test_unmatched_limit_age_starts_with_the_current_continuous_run(replay):
     assert lane["limited_since"] == routing._iso(replay.now)
 
 
-def test_actual_clipped_identifying_lines_are_receipts(replay):
-    text = "Synthetic account line with enough words to be clipped in a final delivery."
-    item = dict(entity="account:synthetic", revision="r1", text=text, label="Synthetic account",
-                whole=False, visible=True)
-    plan = dict(epoch="e1", version=1, text=routing._clip(text, 20), delivery_plan=dict(
-        items=[item], current_entities=[item["entity"]], at=routing._iso(replay.now), limit=400,
-        page_limit=400, lease=60, heading="Routing", text=routing._clip(text, 20)))
-
-    main = routing_delivery.offer(plan, session="clip-main")
-    assert routing_delivery.acknowledge("clip-main", main["routing_changes"])
-    assert routing_health.component_health(routing_delivery.snapshot("clip-main"), replay.now)["status"] == "green"
-
-    start = routing_delivery.child_offer(plan, session="clip-child", component="agent:c", now=replay.now,
-                                         cfg={"routing_child_chars": 8, "routing_line_chars": 12})
-    assert not start["shown_entities"]
-    page = routing_delivery.child_page(plan, session="clip-child", component="agent:c", now=replay.now,
-                                       cfg={"routing_child_chars": 8, "routing_line_chars": 12})
-    assert page and routing_delivery.acknowledge("clip-child", page["routing_changes"])
-    assert routing_health.component_health(routing_delivery.snapshot("clip-child", "agent:c"), replay.now)["status"] == "green"
-
-
 def test_completed_child_marker_keeps_pruned_render_proof(replay):
     routing.add_rule("Synthetic completed child rule.", via="app")
     child = routing.start_push(moment="delegation", child_component="agent:c", child_session="s1")
+    # Reserved by the hook once it holds the answer (``recall_rule._RoutingAtStart.text``).
+    child = routing_delivery.offer(child, session="s1", component="agent:c", deferred=True)
     assert child and child["shown_entities"]
     assert routing_delivery.acknowledge("s1", child["routing_changes"])
     assert routing_delivery.snapshot("s1", "agent:c")["done_shown"]

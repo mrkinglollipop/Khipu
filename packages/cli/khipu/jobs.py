@@ -154,6 +154,63 @@ def _plist_loaded(label: str) -> bool:
         return False
 
 
+_LAUNCHD_SPAWN_FAILED = "spawn failed"
+# launchd's own exit code for a job it could not start (missing or
+# unexecutable Program): "last exit code = 78: EX_CONFIG". No Khipu command
+# exits 78.
+_LAUNCHD_EX_CONFIG = 78
+
+
+def parse_launchctl_print(text: str) -> dict[str, Any]:
+    """The run state ``launchctl print gui/<uid>/<label>`` reports: ``job
+    state``, ``last exit code`` (None before the first exit), ``runs`` and
+    ``properties``. ``spawn_failed`` is True when launchd could not start the
+    job at all (2026-11-10 on the M1: the app was replaced while the job was
+    loaded, launchd armed a one-shot "executable is back" event that never
+    fired, and the job stayed in ``spawn failed`` with ``penalty box``; a
+    kickstart did not run it, only a reload does)."""
+    out: dict[str, Any] = {"job_state": None, "last_exit": None, "runs": None, "properties": ""}
+    for raw in text.splitlines():
+        line = raw.strip()
+        key, sep, value = line.partition(" = ")
+        if not sep:
+            continue
+        value = value.strip()
+        if key == "job state" and out["job_state"] is None:
+            out["job_state"] = value
+        elif key == "last exit code" and out["last_exit"] is None:
+            m = re.match(r"-?\d+", value)
+            out["last_exit"] = int(m.group(0)) if m else None
+        elif key == "runs" and out["runs"] is None:
+            m = re.match(r"\d+", value)
+            out["runs"] = int(m.group(0)) if m else None
+        elif key == "properties" and not out["properties"]:
+            out["properties"] = value
+    # "last exit code" is the previous run's: a run in progress after launchd's
+    # own retry still shows 78, and that job has not failed to spawn.
+    out["spawn_failed"] = (out["job_state"] == _LAUNCHD_SPAWN_FAILED
+                           or (out["last_exit"] == _LAUNCHD_EX_CONFIG
+                               and out["job_state"] != "running"))
+    return out
+
+
+def launchd_state(label: str) -> dict[str, Any]:
+    """What launchd says about a loaded agent. ``loaded`` False when launchctl
+    does not know the label (or could not be asked); otherwise the parsed run
+    state (see parse_launchctl_print). "Loaded" alone says nothing about
+    whether the job can start or whether its last run worked."""
+    try:
+        r = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception as exc:  # noqa: BLE001 - an unanswered question is not "loaded"
+        return {"loaded": False, "error": f"{type(exc).__name__}: {exc}"}
+    if r.returncode != 0:
+        return {"loaded": False}
+    return {"loaded": True, **parse_launchctl_print(r.stdout or "")}
+
+
 def _read_job_state(name: str) -> dict[str, Any] | None:
     path = ensure_data_dir() / "state" / f"job-{name}.json"
     if not path.is_file():
@@ -391,7 +448,7 @@ def _record_nightly_step(
     """F3/D1: persist this nightly's step-by-step outcome to
     ``nightly-last.json`` (one entry per step: name/ok/counts/error/ts) —
     the "green because the evidence never arrived" class (audit
-    2026-08-17): notes reconcile, embed backfill, mark-stale and hygiene
+    2026-08-17): embed backfill, mark-stale and hygiene
     outcomes were logged as free text and never read by anything. Phase 6
     reads this file; written here so it exists starting now. Written after
     EVERY step (not once at the end) so a step that hangs or crashes the
@@ -450,7 +507,6 @@ def _run_nightly_locked() -> int:
         driver_error = "driver timed out" if rc == 124 else f"driver failed (exit {rc})"
     _record_nightly_step(steps, "consolidate_nightly", ok=(rc == 0),
                          counts={"rc": rc}, error=driver_error)
-    _record_nightly_step(steps, "notes_reconcile", **_step_result(_reconcile_notes_if_due()))
     _record_nightly_step(steps, "embed_backfill", **_step_result(_embed_backfill()))
     _record_nightly_step(steps, "summary_kind_backfill", **_step_result(_summary_kind_backfill()))
     _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))
@@ -1021,22 +1077,6 @@ def _provenance_nightly() -> dict[str, Any]:
     return out
 
 
-def _reconcile_notes_if_due() -> dict[str, Any]:
-    """W4.3: piggyback `khipu.notes.reconcile` on the nightly cadence, the
-    additive,
-    best-effort, and must never turn a good nightly run into a bad one on
-    doctor/status (the external CONSOLIDATE_NIGHTLY driver's exit code above
-    is the one that actually gates job_status/doctor)."""
-    try:
-        from khipu import notes
-
-        out = notes.reconcile(dry_run=False)
-    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
-        out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
-    _nightly_log(f"notes-reconcile: {json.dumps(out, default=str)[:600]}")
-    return out
-
-
 def nightly_last() -> dict[str, Any] | None:
     """D1: read back the per-step evidence `_record_nightly_step` writes.
     None when the nightly has never recorded a run on this Mac (not a
@@ -1087,10 +1127,6 @@ def nightly_consolidate_ts(log_mtime: float | None, *, slack_s: float) -> float 
 # "green because evidence never arrived" (audit 2026-08-17), the same class
 # `_record_nightly_step`'s own docstring names.
 _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
-    "notes_reconcile_ok": (
-        "notes_reconcile",
-        "run `khipu notes reconcile` and check the error",
-    ),
     "embed_provider_ok": (
         "embed_backfill",
         "check the embedding provider key/credentials, then run `khipu jobs install nightly`"
@@ -1452,7 +1488,83 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
             "source": source,
             **({"carried": True} if step_name in carried_names else {}),
         }
+    # Not a nightly step: an edited note is picked up only by the notes watcher.
+    out["notes_reconcile_ok"] = notes_watch_health()
     return out
+
+
+def _last_line(path: Any) -> str:
+    """The last non-empty line of a small log tail, '' when unreadable."""
+    try:
+        with open(str(path), "rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, size - 4096))
+            tail = fh.read().decode("utf-8", "replace")
+    except (OSError, TypeError, ValueError):
+        return ""
+    lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+    return lines[-1][:300] if lines else ""
+
+
+def notes_watch_health() -> dict[str, Any]:
+    """The notes watcher is the only thing that picks up an edited note by
+    itself, so a Mac without it loaded would never index one. One doctor block,
+    keyed like the nightly steps; the fix is the install command.
+
+    Loaded is not enough (2026-11-10: on one Mac every run failed with exit 1,
+    on the other launchd could not start the job at all, and both read ok):
+    the row is red when launchd cannot start the job or its last run failed.
+    ``state`` names which, for the summary line."""
+    fix = "run `khipu jobs install notes_watch`"
+    try:
+        entry = _job_entry("notes_watch")
+        loaded = bool(entry.get("plist_loaded"))
+    except Exception as exc:  # noqa: BLE001 - a failed check must not look like a pass
+        return {"ok": False, "applicable": True, "state": "check_failed",
+                "error": f"{type(exc).__name__}: {exc}", "fix": fix}
+    if loaded:
+        try:
+            run = launchd_state(PLIST_NOTES_WATCH)
+        except Exception as exc:  # noqa: BLE001 - a failed check must not look like a pass
+            return {"ok": False, "applicable": True, "state": "check_failed",
+                    "error": f"could not read the notes watcher's launchd state: {type(exc).__name__}: {exc}",
+                    "fix": fix}
+        if not run.get("loaded"):
+            return {"ok": False, "applicable": True, "state": "check_failed", "launchd": run,
+                    "error": "could not read the notes watcher's launchd state: "
+                             + (run.get("error") or "launchctl no longer reports it loaded"),
+                    "fix": fix}
+        if run.get("spawn_failed"):
+            return {"ok": False, "applicable": True, "state": "cannot_start", "launchd": run,
+                    "error": "launchd cannot start the notes watcher"
+                             f" (job state {run.get('job_state') or 'unknown'}, last exit code {run.get('last_exit')}),"
+                             " so edited notes are not indexed",
+                    "fix": fix}
+        last_exit = run.get("last_exit")
+        if isinstance(last_exit, int) and last_exit != 0:
+            said = _last_line(entry.get("err_log_path"))
+            return {"ok": False, "applicable": True, "state": "last_run_failed", "launchd": run,
+                    "error": f"the notes watcher's last run failed (exit {last_exit})"
+                             + (f": {said}" if said else "")
+                             + ", so edited notes are not indexed",
+                    "fix": fix}
+        try:
+            from khipu.launchd_gen import watch_list_drift
+
+            drift = watch_list_drift()
+        except Exception as exc:  # noqa: BLE001 - a failed comparison must not look like a pass
+            return {"ok": False, "applicable": True, "state": "check_failed",
+                    "error": f"could not compare the watch list: {type(exc).__name__}: {exc}", "fix": fix}
+        if drift.get("unwatched"):
+            n = len(drift["unwatched"])
+            return {"ok": False, "applicable": True, "state": "unwatched", "unwatched": drift["unwatched"],
+                    "error": f"the notes watcher is not watching {n} notes folder{'s' if n != 1 else ''} that exist"
+                             f" (for example {drift['unwatched'][0]}), so edits there are indexed only on its 30-minute timer",
+                    "fix": fix}
+        return {"ok": True, "applicable": True}
+    return {"ok": False, "applicable": True, "state": "not_installed",
+            "error": "the notes watcher is not installed, so edited notes are not indexed",
+            "fix": fix}
 
 
 def skipped_step_names(health: dict[str, dict[str, Any]]) -> list[str]:

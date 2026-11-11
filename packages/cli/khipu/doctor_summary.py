@@ -65,10 +65,28 @@ def _capture(d: dict) -> str:
     return "no recent capture from " + ", ".join(red) if red else "a harness is not being recorded"
 
 
+_NOTES_WATCH_WORDS = {
+    "cannot_start": "launchd cannot start it",
+    "last_run_failed": "last run failed",
+    "unwatched": "not watching every notes folder",
+    "check_failed": "could not be checked",
+}
+
+
+def _notes_watch_label(row: dict) -> str:
+    return f"notes_watch ({_NOTES_WATCH_WORDS.get(str(row.get('state')), 'not installed')})"
+
+
 def _jobs(d: dict) -> str:
-    bad = list(d.get("job_failures") or []) + [k.removesuffix("_ok") for k, v in (d.get("nightly_steps") or {}).items()
-                                               if isinstance(v, dict) and not v.get("ok")]
+    bad = list(d.get("job_failures") or []) + [
+        _notes_watch_label(v) if k == "notes_reconcile_ok" else k.removesuffix("_ok")
+        for k, v in (d.get("nightly_steps") or {}).items() if isinstance(v, dict) and not v.get("ok")]
     return "failing: " + ", ".join(bad) if bad else "a background job is failing"
+
+
+def _jobs_fix(d: dict) -> str:
+    missing = not ((d.get("nightly_steps") or {}).get("notes_reconcile_ok") or {"ok": True}).get("ok", True)
+    return "run `khipu jobs install notes_watch`, then `khipu jobs status`" if missing else "run `khipu jobs status`"
 
 
 AREAS = ("Saving memory", "Finding things", "Routing", "Database and disk", "Jobs and other checks")
@@ -102,7 +120,7 @@ WORDS = {
     "schema_migrations_ok": (3, "the database has pending migrations", "apply them"),
     "dsn_file_ok": (3, "the database address file is stale", None),
     "jobs_ok": (4, _jobs, "run `khipu jobs status`"),
-    "nightly_steps_ok": (4, _jobs, "run `khipu jobs status`"),
+    "nightly_steps_ok": (4, _jobs, _jobs_fix),
     "synth_budget_ok": (4, "the summariser's daily limit is spent", "wait for UTC midnight or `khipu budget lift synth`"),
     "synth_provider_ok": (4, "the summariser's provider is not usable", None),
     "launchers_ok": (4, "an agent launcher points at a missing file", None),
@@ -111,20 +129,25 @@ WORDS = {
 }
 
 
-def failing(report: dict) -> list[tuple[int, str, str]]:
-    """(area, what is wrong, fix) for every gate of overall ``ok`` that is False, plus routing delivery
-    and a capture at risk."""
+def failing_keyed(report: dict, *, skip: tuple[str, ...] = ()) -> list[tuple[str, int, str, str]]:
+    """(check key, area, what is wrong, fix) for every failing gate; ``skip`` leaves named keys unread."""
     from khipu.cli import OK_GATES
 
-    keys = [k for k in (*OK_GATES, "routing_delivery_ok") if k in report and not report[k]]
+    keys = [k for k in (*OK_GATES, "routing_delivery_ok") if k not in skip and k in report and not report[k]]
     out = []
     for key in keys:
         area, what, fix = WORDS.get(key, (OTHER, f"{key.removesuffix('_ok').replace('_', ' ')} is failing", None))
-        out.append((area, what(report) if callable(what) else what,
+        out.append((key, area, what(report) if callable(what) else what,
                     fix(report) if callable(fix) else fix or f"see {key.removesuffix('_ok')} in the report"))
-    if (report.get("outbox") or {}).get("at_risk") and "outbox_ok" not in keys:
-        out.append((0, _outbox(report), _outbox_fix(report)))
-    return list(dict.fromkeys(out))
+    if (report.get("outbox") or {}).get("at_risk") and "outbox_ok" not in keys and "outbox_ok" not in skip:
+        out.append(("outbox_ok", 0, _outbox(report), _outbox_fix(report)))
+    return out
+
+
+def failing(report: dict) -> list[tuple[int, str, str]]:
+    """(area, what is wrong, fix) for every gate of overall ``ok`` that is False, plus routing delivery
+    and a capture at risk."""
+    return list(dict.fromkeys((a, w, f) for _k, a, w, f in failing_keyed(report)))
 
 
 def health_summary(report: dict) -> list[str]:

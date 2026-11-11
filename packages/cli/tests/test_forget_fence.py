@@ -961,58 +961,10 @@ def test_backfill_batches_pass_the_chokepoint_again(list_state):
     assert out == [None, None]
 
 
-def test_rerank_shows_the_model_no_candidate_a_forgotten_episode_feeds(list_state):
-    import time
-
-    from khipu import rerank
-
-    prompts: list = []
-    rows = [{"kind": "topic", "id": "secret-topic", "snippet": "FORGOTTEN-TOPIC"},
-            {"kind": "episode", "id": "904", "snippet": "plain live text"},
-            {"kind": "episode", "id": "905", "snippet": "other live text"}]
-    with mock.patch.object(rerank, "_call_model",
-                           side_effect=lambda p, **k: prompts.append(p) or ('{"order": [0, 1]}', "m")):
-        out = rerank.rerank("q", rows, deadline=time.monotonic() + 5,
-                            topic_sources={"secret-topic": [902]})
-    assert not any("FORGOTTEN-TOPIC" in p for p in prompts)
-    if list_state == "unreadable":
-        assert prompts == [] and out["order"] is None
-    else:
-        assert out["order"] == [1, 2]
 
 
-def test_a_rerank_candidate_with_a_malformed_source_id_is_withheld(caplog):
-    import logging
-    import time
-
-    from khipu import rerank
-
-    prompts: list = []
-    rows = [{"kind": "topic", "id": "t", "snippet": "BAD-ID-TEXT"},
-            {"kind": "episode", "id": "904", "snippet": "a"}, {"kind": "episode", "id": "905", "snippet": "b"},
-            {"kind": "episode", "id": "906", "source_episodes": [905, "x9"], "snippet": "BAD-EPISODE-TEXT"}]
-    with caplog.at_level(logging.INFO, logger="khipu.provider_text"), \
-            mock.patch.object(rerank, "_call_model",
-                              side_effect=lambda p, **k: prompts.append(p) or ('{"order": [0, 1]}', "m")):
-        out = rerank.rerank("q", rows, deadline=time.monotonic() + 5, topic_sources={"t": [904, "zz"]})
-    assert prompts and "BAD-ID-TEXT" not in prompts[0] and "BAD-EPISODE-TEXT" not in prompts[0]
-    assert out["order"] == [1, 2]
-    assert "bad_source_id=2" in caplog.text
 
 
-def test_a_topic_row_with_unknown_sources_is_not_reranked():
-    import time
-
-    from khipu import rerank
-
-    tombstones.publish_episode_ids({999})
-    prompts: list = []
-    rows = [{"kind": "topic", "id": "t", "snippet": "TOPIC-TEXT"},
-            {"kind": "episode", "id": "904", "snippet": "a"}, {"kind": "episode", "id": "905", "snippet": "b"}]
-    with mock.patch.object(rerank, "_call_model",
-                           side_effect=lambda p, **k: prompts.append(p) or ('{"order": [0, 1]}', "m")):
-        out = rerank.rerank("q", rows, deadline=time.monotonic() + 5)
-    assert prompts and "TOPIC-TEXT" not in prompts[0] and out["order"] == [1, 2]
 
 
 def test_the_chokepoint_refuses_the_wrong_door():

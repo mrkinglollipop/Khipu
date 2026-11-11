@@ -26,7 +26,7 @@ describe("Optional features: a write that succeeds and a re-read that fails", ()
       switch (cmd) {
         case "khipu_features_show":
           if (showFails) throw new Error("show failed");
-          return JSON.stringify({ features: { rerank: { enabled, source: "file" } }, unknown: [] });
+          return JSON.stringify({ features: { routing_push: { enabled, source: "file" } }, unknown: [] });
         case "khipu_feature_set":
           enabled = Boolean(args?.enabled);
           showFails = true;
@@ -42,12 +42,12 @@ describe("Optional features: a write that succeeds and a re-read that fails", ()
       }
     });
     render(<OptionalFeatures active />);
-    const sw = await screen.findByRole("switch", { name: /Reorder top results/ });
+    const sw = await screen.findByRole("switch", { name: /Tell conversations which accounts are open/ });
     await waitFor(() => expect(sw).toBeChecked());
     fireEvent.click(sw);
     await waitFor(() => expect(invokeMock.mock.calls.some((c) => c[0] === "khipu_feature_set")).toBe(true));
     await new Promise((r) => setTimeout(r, 300));
-    const stillOn = (screen.getByRole("switch", { name: /Reorder top results/ }) as HTMLInputElement).checked;
+    const stillOn = (screen.getByRole("switch", { name: /Tell conversations which accounts are open/ }) as HTMLInputElement).checked;
     const saysSo = screen.queryAllByRole("alert").length > 0 || /couldn.t (re-?read|read|refresh)|could not (re-?read|read)/i.test(document.body.textContent ?? "");
     expect(stillOn && !saysSo, "switch still shows ON after a successful OFF write and nothing says the re-read failed").toBe(false);
     expect(screen.getByRole("alert").textContent).toMatch(/Couldn't refresh; showing the last value/);

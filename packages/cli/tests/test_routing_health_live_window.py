@@ -114,34 +114,3 @@ def test_a_redelivered_ack_without_a_render_stays_visible(replay):
         data["main"]["flight"]["shown"] = {}
     assert delivery.acknowledge("s1", again["routing_changes"], now=T0)
     assert "ack-unshown" in health.component_health(delivery.snapshot("s1"), T0)["reasons"]
-
-
-def test_a_pre_receipt_ack_of_a_child_account_line_is_paged_again(replay):
-    replay.configure(routing_prompt_chars=2000)
-    routing.report(account="Codex", state="limited", until="1h", author=acceptance.AUTHOR)
-    out = routing.light_status(replay.now, start=True, session_id=None)
-    plan = delivery.plan(dict(out, kind="full"), out.view, replay.now, routing.settings(), session=None)
-    opening = delivery.child_offer(plan, session="s1", component="agent:a", now=replay.now,
-                                   cfg=routing.settings())
-    assert "Codex:" in opening["text"]
-    with delivery._transaction("s1") as data:
-        data["agent:a"]["flight"]["shown"] = None
-    assert delivery.acknowledge("s1", opening["routing_changes"], now=replay.now)
-    with delivery._transaction("s1") as data:
-        entries = data["agent:a"]["entries"]
-        account = next(e for e in entries.values() if e["entity"].startswith("account:"))
-        assert account["acked"] and not account["whole"]
-        for entry in entries.values():
-            entry.pop("shown_offset", None)
-    pages = []
-    for _ in range(len(entries) + 1):
-        page = delivery.child_page(plan, session="s1", component="agent:a", now=replay.now,
-                                   cfg=routing.settings())
-        if not page:
-            break
-        pages.append(page["text"])
-        assert delivery.acknowledge("s1", page["routing_changes"], now=replay.now)
-    assert any("Codex:" in text for text in pages)
-    state = delivery.snapshot("s1", "agent:a")
-    assert not state.get("entries"), "every resent line earned its receipt"
-    assert health.component_health(state, replay.now)["status"] == "green"

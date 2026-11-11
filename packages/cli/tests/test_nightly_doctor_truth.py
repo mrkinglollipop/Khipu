@@ -533,8 +533,8 @@ def test_doctor_step_without_a_receipt_after_a_recent_nightly_is_not_ok(tmp_path
     # The run's code knew summary_kind_backfill (it is in known_steps) yet
     # left no receipt for it: that is unmeasured, not ok.
     (tmp_path / "nightly-last.json").write_text(json.dumps({"steps": [
-        {"name": "notes_reconcile", "ok": True, "error": None, "ts": recent},
-    ], "known_steps": ["notes_reconcile", "summary_kind_backfill"]}))
+        {"name": "embed_backfill", "ok": True, "error": None, "ts": recent},
+    ], "known_steps": ["embed_backfill", "summary_kind_backfill"]}))
     job = {"plist_loaded": True, "plist_mtime": time.time() - 86400, "last_exit": 0,
            "last_exit_ts": recent, "last_run_iso": recent}
     with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
@@ -546,7 +546,7 @@ def test_doctor_step_without_a_receipt_after_a_recent_nightly_is_not_ok(tmp_path
     assert row["ok"] is False and row["unmeasured"] is True and not row.get("skipped")
 
 
-@pytest.mark.parametrize("receipt_extra", [{}, {"known_steps": ["notes_reconcile"]}],
+@pytest.mark.parametrize("receipt_extra", [{}, {"known_steps": ["embed_backfill"]}],
                          ids=["older-receipt", "step-added-since"])
 def test_doctor_step_added_since_the_last_nightly_waits_for_the_next_run(tmp_path, monkeypatch, receipt_extra):
     # An upgrade added a step the last nightly's code did not have; nothing could
@@ -554,7 +554,7 @@ def test_doctor_step_added_since_the_last_nightly_waits_for_the_next_run(tmp_pat
     monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
     recent = datetime.now(timezone.utc).isoformat()
     (tmp_path / "nightly-last.json").write_text(json.dumps({"steps": [
-        {"name": "notes_reconcile", "ok": True, "error": None, "ts": recent},
+        {"name": "embed_backfill", "ok": True, "error": None, "ts": recent},
     ], **receipt_extra}))
     job = {"plist_loaded": True, "plist_mtime": time.time() - 86400, "last_exit": 0,
            "last_exit_ts": recent, "last_run_iso": recent}
@@ -565,12 +565,12 @@ def test_doctor_step_added_since_the_last_nightly_waits_for_the_next_run(tmp_pat
         health = jobs.nightly_step_health()
     row = health["summary_kind_backfill_ok"]
     assert row["ok"] is True and row.get("pending") is True and not row.get("unmeasured")
-    assert health["notes_reconcile_ok"]["ok"] is True
+    assert health["embed_provider_ok"]["ok"] is True
 
 
 def test_nightly_receipt_lists_every_step_its_code_knows(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, "_nightly_last_path", lambda: tmp_path / "nightly-last.json")
-    jobs._record_nightly_step([], "notes_reconcile", ok=True)
+    jobs._record_nightly_step([], "embed_backfill", ok=True)
     doc = json.loads((tmp_path / "nightly-last.json").read_text())
     assert set(doc["known_steps"]) == {step for step, _fix in jobs._NIGHTLY_STEP_CHECKS.values()}
 

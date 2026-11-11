@@ -172,10 +172,6 @@ class ApplyRankingTest(unittest.TestCase):
     def _row(self, state: str, score: float, kind: str = "episode") -> dict:
         return {"kind": kind, "id": "1", "score": score, "validity": {"state": state}}
 
-    def test_switch_off_by_default_never_changes_rows(self):
-        rows = [self._row("superseded", 1.0)]
-        out = v.apply_ranking(rows, historical=False)
-        self.assertEqual(out[0]["score"], 1.0)
 
     def test_switch_on_deranks_superseded_and_retracted(self):
         from khipu import features
@@ -213,13 +209,6 @@ class ApplyRankingTest(unittest.TestCase):
             out = v.apply_ranking(rows, historical=True)
         self.assertEqual(out[0]["score"], 1.0)
 
-    def test_a_switch_lookup_failure_leaves_rows_unchanged(self):
-        from khipu import features
-
-        rows = [self._row("superseded", 1.0)]
-        with mock.patch.object(features, "enabled", side_effect=RuntimeError("boom")):
-            out = v.apply_ranking(rows, historical=False)
-        self.assertEqual(out[0]["score"], 1.0)
 
     def test_empty_rows(self):
         self.assertEqual(v.apply_ranking([], historical=False), [])

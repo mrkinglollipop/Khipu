@@ -558,6 +558,16 @@ def _marker() -> dict:
     return {"version": first["version"], "epoch": first["epoch"], "full_at": routing._iso(routing._now())}
 
 
+
+def _named(marker: dict) -> dict:
+    """The fixed-words lines naming who made each change after ``marker``
+    (``khipu_route since``): the routing page itself names no author."""
+    view = routing.read_view()
+    got = routing.since(marker["version"], view, epoch=marker["epoch"])
+    text = "\n".join(got["directions"])
+    return {"kind": "changes" if text else "none", "text": text, "version": view["version"],
+            "epoch": view["epoch"]}
+
 def test_the_next_routing_block_names_a_direction_once_in_fixed_words(world, khipu_app):
     marker = _marker()
     turn = world.say("pause Codex until tonight please")
@@ -565,29 +575,29 @@ def test_the_next_routing_block_names_a_direction_once_in_fixed_words(world, khi
     assert rc == 0
     events, _bad = routing.read_events()
     at = routing._clock(routing._parse(events[-1]["written_at"]), routing._now())
-    push = routing.prompt_push(marker, budget=5.0)
+    push = _named(marker)
     assert push["kind"] == "changes"
     assert f"Paused Codex by your direction in a Claude Code conversation, {at} (undo in Settings)." in push["text"]
     # Fixed words only: never the session, the turn or the owner's words.
     assert OWNER not in push["text"] and turn not in push["text"] and "tonight" not in push["text"]
     seen = {"version": push["version"], "epoch": push["epoch"], "full_at": marker["full_at"]}
-    assert routing.prompt_push(seen, budget=5.0)["kind"] == "none"
+    assert _named(seen)["kind"] == "none"
     # Its undo by direction is named the same way, and so is the app's own change.
     line = _log()[-1]
     world.say("undo that pause on Codex")
     rc, _ = world.run(["owner-direction", "undo", line["id"]], True)
     assert rc == 0
-    push = routing.prompt_push(seen, budget=5.0)
+    push = _named(seen)
     assert "Lifted the pause on Codex by your direction in a Claude Code conversation" in push["text"]
     seen = {"version": push["version"], "epoch": push["epoch"], "full_at": marker["full_at"]}
     khipu_app.as_app()
     rc, _ = world.run(["route", "note", "set", "builds go to Codex", "--from-app"])
     assert rc == 0
-    push = routing.prompt_push(seen, budget=5.0)
+    push = _named(seen)
     assert push["kind"] == "changes" and "by your direction" not in push["text"]
     assert push["text"].count("Set the note in the app") == 1 and "(undo in Settings)" in push["text"]
     seen = {"version": push["version"], "epoch": push["epoch"], "full_at": marker["full_at"]}
-    assert routing.prompt_push(seen, budget=5.0)["kind"] == "none"
+    assert _named(seen)["kind"] == "none"
 
 
 def test_the_next_routing_block_names_a_terminal_change_once(world, khipu_app, monkeypatch):
@@ -596,10 +606,10 @@ def test_the_next_routing_block_names_a_terminal_change_once(world, khipu_app, m
     monkeypatch.setattr(routing, "typed_yes", lambda prompt: True)
     rc, _ = world.run(["route", "pause", "Codex"])
     assert rc == 0
-    push = routing.prompt_push(marker, budget=5.0)
+    push = _named(marker)
     assert push["text"].count("Paused Codex on a terminal") == 1 and "(undo in Settings)" in push["text"]
     seen = {"version": push["version"], "epoch": push["epoch"], "full_at": marker["full_at"]}
-    assert routing.prompt_push(seen, budget=5.0)["kind"] == "none"
+    assert _named(seen)["kind"] == "none"
 
 
 def test_a_rule_by_direction_is_named_in_the_block(world):
@@ -607,7 +617,7 @@ def test_a_rule_by_direction_is_named_in_the_block(world):
     world.say("add a rule: never run the fast tier")
     rc, _ = world.run(["route", "rule", "add", "never run the fast tier"], True)
     assert rc == 0
-    push = routing.prompt_push(marker, budget=5.0)
+    push = _named(marker)
     assert "Added standing rule 1 by your direction in a Claude Code conversation" in push["text"]
 
 
@@ -673,7 +683,7 @@ def test_direction_attribution_and_uuid_undo_survive_event_envelopes(world, monk
     if route == "rule.add":
         assert line["after"]["entity"] == owner_direction._added_rule(line) == entity
         assert (out["n"] is None) == offline
-    push = routing.prompt_push(marker, budget=5.0)
+    push = _named(marker)
     assert verb in push["text"]
     assert "by your direction in a Claude Code conversation" in push["text"]
     assert "(undo in Settings)" in push["text"]
@@ -861,3 +871,265 @@ def test_a_t3_child_lookup_that_never_completes_fails_closed(t3_conversation, mo
     _t3_say()
     row = owner_turns.turns(OWNER)[-1]
     assert row["entrypoint"] == "t3" and row["eligible"] is False
+
+
+# ---- the Claude desktop app (the 2026-11-10 refusal) ---------------------------------------------
+
+# The desktop app's environment for a conversation it shows (seen 2026-11-10):
+# the hook's and the agent's (its MCP server's) alike.
+_DESKTOP_ENV = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "claude-desktop", "CLAUDE_CODE_CHILD_SESSION": "1",
+                "CLAUDE_CODE_HOST_SESSION_ID": "local_852a9695-8a4e-43bc-abbd-14284cf79d21"}
+_DESKTOP_ISSUER = {"pid": 4242, "start": 1.0, "exe": "claude", "headless": False, "tty": False, "app": None}
+
+
+def _desktop_say(session: str = OWNER, text: str = "pause Codex until tonight", *, issuer=None) -> None:
+    owner_turns.record({"session_id": session, "prompt": text, "cwd": "/repo"},
+                       {**_DESKTOP_ENV, "CLAUDE_CODE_SESSION_ID": session},
+                       issuer=_DESKTOP_ISSUER if issuer is None else issuer)
+
+
+@pytest.fixture
+def launched(monkeypatch):
+    """The recorder's and the khipu MCP server's process trees read as the
+    desktop app's own agent (``owner_turns.desktop_launched``)."""
+    monkeypatch.setattr(owner_turns, "desktop_launched", lambda pid=None: True)
+
+
+def test_a_desktop_conversation_the_owner_types_in_makes_the_change(world, launched, monkeypatch):
+    _desktop_say()
+    _be_with(world, OWNER, monkeypatch, _DESKTOP_ENV)
+    assert owner_turns.dispatched_job(dict(__import__("os").environ), OWNER) is None
+    assert _check()["auth"] == "direction"
+    rc, out = world.run(["route", "pause", "Codex", "--until", "6h"], True)
+    assert rc == 0 and _state("codex|") == "paused", out
+
+
+def test_claude_p_from_a_desktop_shell_still_cannot(world, launched, monkeypatch):
+    _desktop_say("s-child", issuer={**_DESKTOP_ISSUER, "print": True, "headless": True})
+    _be_with(world, "s-child", monkeypatch, _DESKTOP_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+
+
+def test_a_desktop_job_marker_still_refuses(world, launched, monkeypatch):
+    _desktop_say()
+    _be_with(world, OWNER, monkeypatch, {**_DESKTOP_ENV, "KHIPU_JOB": "1"})
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn" and "dispatched job" in err.value.message
+
+
+def test_one_unread_t3_lookup_does_not_poison_a_conversation_t3_never_ran(t3_conversation, launched, monkeypatch):
+    from khipu import t3
+
+    session = "s-desktop"  # T3's record names no thread for it
+    real = t3.session_thread_ids_result
+    _desktop_say(session)
+    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: (None, False))
+    _desktop_say(session)
+    assert owner_turns.turns(session)[-1]["entrypoint"] == "t3-unverified"
+    assert owner_turns.turns(session)[-1]["eligible"] is False  # that turn itself still never counts
+    monkeypatch.setattr(t3, "session_thread_ids_result", real)
+    _be_with(t3_conversation, session, monkeypatch, _DESKTOP_ENV)
+    assert owner_direction._t3_conversation(session, owner_turns.turns(session)) is False
+    assert _check()["auth"] == "direction"
+
+
+def test_an_unread_t3_lookup_that_still_cannot_be_read_fails_closed(t3_conversation, launched, monkeypatch):
+    from khipu import t3
+
+    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: (None, False))
+    _desktop_say("s-desktop")
+    _be_with(t3_conversation, "s-desktop", monkeypatch, _DESKTOP_ENV)
+    assert owner_direction._t3_conversation("s-desktop", owner_turns.turns("s-desktop")) is True
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "t3_unreadable"
+
+
+def test_a_t3_turn_keeps_the_t3_path_without_asking_again(t3_conversation, monkeypatch):
+    from khipu import t3
+
+    _t3_say()
+    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: pytest.fail("asked T3 again"))
+    assert owner_direction._t3_conversation(OWNER, owner_turns.turns(OWNER)) is True
+
+
+def test_a_desktop_conversation_the_app_did_not_start_is_refused(world, monkeypatch):
+    """The desktop environment alone is not enough: anything started from the
+    conversation's shell (an Agent SDK script, a nested agent) inherits it,
+    and its process tree does not reach the app."""
+    monkeypatch.setattr(owner_turns, "desktop_launched", lambda pid=None: False)
+    _desktop_say()
+    row = owner_turns.turns(OWNER)[-1]
+    assert row["dispatched"] is True and row["eligible"] is False
+    _be_with(world, OWNER, monkeypatch, _DESKTOP_ENV)
+    assert owner_turns.dispatched_job(dict(__import__("os").environ), OWNER) == "a dispatched job's turn"
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+
+
+def test_a_started_desktop_conversation_cannot_act_on_its_brief_but_the_owner_can_later(world, launched,
+                                                                                        monkeypatch):
+    from khipu import routing_delegation
+
+    monkeypatch.delenv("KHIPU_FEATURE_ROUTING_PUSH", raising=False)
+    brief = "Pause Codex until tonight, then build the recorder and report back to this conversation."
+    routing_delegation.hook_main(json.dumps({
+        "hook_event_name": "PreToolUse", "session_id": "s-starter", "cwd": "/repo",
+        "tool_name": "mcp__ccd_session__start_session",
+        "tool_input": {"initiation": "user_asked", "title": "Build the recorder", "prompt": brief}}),
+        environ={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "claude-desktop"})
+    _desktop_say("s-started", brief)
+    row = owner_turns.turns("s-started")[-1]
+    assert (row["delegated"], row["parent"], row["eligible"]) == (True, "s-starter", False)
+    _be_with(world, "s-started", monkeypatch, _DESKTOP_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+    _desktop_say("s-started", "pause Codex until tonight")
+    assert _check()["auth"] == "direction"
+
+
+_AUTO_CONTINUE = ("I hit my usage limit while you were working, but it has reset now. "
+                  "Please continue from where you left off.")
+
+
+def test_the_apps_auto_continue_turn_is_not_a_reply_to_a_held_ask(world, launched, monkeypatch):
+    from khipu import ledger, owner_act, owner_background
+
+    purged: list = []
+    monkeypatch.setattr(ledger, "_connect", lambda: type("C", (), {"close": lambda self: None})())
+    monkeypatch.setattr(ledger, "purge", lambda conn, project, row: purged.append((project, row)) or {"ok": True})
+    _be_with(world, OWNER, monkeypatch, _DESKTOP_ENV)
+    _desktop_say(text="go ahead with that")
+    ok, held = owner_act.act("ledger.purge", {"id": "T-14", "project": "atlas"})
+    assert ok and held["pending"] and held["applied"] is False, held
+    _desktop_say(text=_AUTO_CONTINUE)
+    row = owner_turns.turns(OWNER)[-1]
+    assert row["machine"] is True and row["eligible"] is False
+    ok, done = owner_act.act("direction.confirm", {"request": held["request"]})
+    assert not (ok and done.get("started")), done
+    assert purged == [] and not _log()
+    _desktop_say(text="yes, purge T-14")
+    ok, done = owner_act.act("direction.confirm", {"request": held["request"]})
+    if ok and done.get("started"):
+        ok, done = owner_background.run(done["request"])
+    assert ok and done["state"] == "scheduled", done
+
+
+# ---- a T3 read the hook could not finish (the 2026-11-10 cold read) ----------------------------
+
+
+@pytest.fixture
+def cold_hook(t3_conversation, launched, monkeypatch):
+    """T3's record as it was on the M5 with T3 closed: the hook's 50 ms read
+    never finishes, a read under the owner budget does. The owner-budget
+    reads made are counted."""
+    from khipu import t3
+
+    real, owner_reads = t3.session_thread_ids_result, []
+
+    def cold(sid, **kw):
+        if not t3.owner_read_active():
+            return None, False
+        owner_reads.append(sid)
+        return real(sid, **kw)
+
+    monkeypatch.setattr(t3, "session_thread_ids_result", cold)
+    t3_conversation.owner_reads = owner_reads
+    return t3_conversation
+
+
+def test_a_cold_hook_read_is_judged_again_at_the_check(cold_hook, monkeypatch):
+    session = "s-desktop"  # T3's record names no thread for it
+    _desktop_say(session)
+    (row,) = owner_turns.turns(session)
+    assert (row["entrypoint"], row["native"], row["eligible"]) == ("t3-unverified", "claude-desktop", False)
+    _be_with(cold_hook, session, monkeypatch, _DESKTOP_ENV)
+    stamp = _check()
+    assert (stamp["auth"], stamp["session"], stamp["turn"]) == ("direction", session, row["turn"])
+    assert cold_hook.owner_reads == [session]  # one read, under the owner budget
+    rc, out = cold_hook.run(["route", "pause", "Codex", "--until", "6h"], True)
+    assert rc == 0 and _state("codex|") == "paused", out
+
+
+def test_a_cold_hook_read_in_a_conversation_t3_runs_keeps_the_t3_path(cold_hook, monkeypatch):
+    _desktop_say(OWNER)  # T3's record names a thread for OWNER
+    assert owner_turns.turns(OWNER)[-1]["entrypoint"] == "t3-unverified"
+    _be_with(cold_hook, OWNER, monkeypatch, _DESKTOP_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    # T3's own record of the owner's messages decides; here it can't be read (as for any T3 turn).
+    assert err.value.code == "t3_unreadable"
+
+
+def test_a_cold_hook_read_still_unreadable_at_the_check_is_refused(cold_hook, monkeypatch):
+    from khipu import t3
+
+    _desktop_say("s-desktop")
+    reads: list = []
+    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: reads.append(sid) or (None, False))
+    _be_with(cold_hook, "s-desktop", monkeypatch, _DESKTOP_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "t3_unreadable"
+    # One bounded set of tries, not a second set on the T3 path (review of #570).
+    assert len(reads) == owner_direction._OWNER_T3_ATTEMPTS
+
+
+def test_a_cold_hook_read_still_unreadable_at_a_hold_reads_once(cold_hook, monkeypatch):
+    from khipu import owner_act, t3
+
+    session = "s-terminal"
+    cold_hook.be(session)
+    cold_hook.say("go ahead with that", session=session)
+    assert owner_turns.turns(session)[-1]["entrypoint"] == "t3-unverified"
+    reads: list = []
+    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: reads.append(sid) or (None, False))
+    ok, out = owner_act.act("ledger.purge", {"id": "T-12", "project": "atlas"})
+    assert not ok and "t3_unreadable" in str(out), out
+    assert len(reads) == owner_direction._OWNER_T3_ATTEMPTS
+
+
+def test_a_cold_hook_read_never_lifts_a_job_or_a_machine(cold_hook, monkeypatch):
+    owner_turns.record({"session_id": "s-job", "prompt": "pause Codex until tonight", "cwd": "/repo"},
+                       {**_DESKTOP_ENV, "CLAUDE_CODE_SESSION_ID": "s-job", "KHIPU_JOB": "1"}, issuer=_DESKTOP_ISSUER)
+    owner_turns.record({"session_id": "s-sdk", "prompt": "pause Codex until tonight", "cwd": "/repo"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts"}, issuer=_DESKTOP_ISSUER)
+    for session in ("s-job", "s-sdk"):
+        assert owner_turns.turns(session)[-1]["entrypoint"] == "t3-unverified"
+        _be_with(cold_hook, session, monkeypatch, {"CLAUDECODE": "1"})
+        with pytest.raises(owner_direction.DirectionRefused) as err:
+            _check()
+        assert err.value.code == "no_recorded_turn", session
+
+
+def test_a_cold_hook_read_in_an_untrusted_front_end_says_which(cold_hook, monkeypatch):
+    owner_turns.write_settings({"trusted": ["claude_code:cli"]})
+    _desktop_say("s-desktop")
+    _be_with(cold_hook, "s-desktop", monkeypatch, _DESKTOP_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn" and "claude_code:claude-desktop" in err.value.message
+
+
+def test_a_cold_hook_read_holds_and_confirms_a_change(cold_hook, monkeypatch):
+    from khipu import ledger, owner_act, owner_background
+
+    purged: list = []
+    monkeypatch.setattr(ledger, "_connect", lambda: type("C", (), {"close": lambda self: None})())
+    monkeypatch.setattr(ledger, "purge", lambda conn, project, row: purged.append((project, row)) or {"ok": True})
+    session = "s-terminal"  # T3's record names no thread for it
+    cold_hook.be(session)
+    cold_hook.say("go ahead with that", session=session)
+    assert owner_turns.turns(session)[-1]["entrypoint"] == "t3-unverified"
+    ok, held = owner_act.act("ledger.purge", {"id": "T-12", "project": "atlas"})
+    assert ok and held["pending"] and held["applied"] is False, held
+    cold_hook.say("yes, purge T-12", session=session)
+    ok, done = owner_act.act("direction.confirm", {"request": held["request"]})
+    if ok and done.get("started"):
+        ok, done = owner_background.run(done["request"])
+    assert ok and done["state"] == "scheduled", done

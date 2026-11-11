@@ -55,9 +55,11 @@ def test_components_and_sessions_cannot_consume_each_others_batches(replay):
 def test_overlapping_offers_reserve_exactly_one_batch(replay):
     routing.report(account="Codex", state="open", author=AUTHOR)
     agent_view.prepare_routing_table(refresh=True)
-    out = routing._prompt_push({}, budget=1.0)
-    view = out.pop("_delivery_view")
-    planned = routing_delivery.plan(out, view, replay.now, routing.settings())
+    from khipu import routing_page_file
+
+    page = routing_page_file.read()
+    planned = routing_delivery.page_plan(routing._page_answer(page, replay.now, routing.settings()), replay.now,
+                                         routing.settings())
     with ThreadPoolExecutor(max_workers=2) as pool:
         offers = list(pool.map(lambda _: routing_delivery.offer(copy.deepcopy(planned), session="s1"), range(2)))
     assert offers[0]["routing_changes"] == offers[1]["routing_changes"]
@@ -83,54 +85,32 @@ def test_revision_change_cancels_unacknowledged_batch(replay):
     assert routing_delivery.snapshot("s1")["entries"][entity]["offset"] > 0
 
 
-@pytest.mark.usefixtures("unbounded_render")
-def test_owner_words_reassemble_byte_identically_with_unicode_and_paths(replay):
-    words = ("Owner /Users/example/kept-path.\nEmoji 😀 and accent e\u0301. " * 220)
+def test_owner_words_reach_the_page_byte_identically_with_unicode_and_paths(replay):
+    words = "Owner /Users/example/kept-path. Emoji 😀 and accent e\u0301."
     routing.add_rule(words, via="app")
-    payloads = []
-    pages = []
-    for _ in range(300):
-        out, context, info = replay.offer()
-        if not context:
-            break
-        assert recall_rule._utf16_len(context) < 10000
-        if out.get("routing_changes", {}).get("items", [{}])[0].get("page"):
-            assert recall_rule._utf16_len(context.split("\n", 1)[1]) <= (1500 if out["kind"] == "full" else 400)
-        changes = out["routing_changes"]
-        state = routing_delivery.snapshot("s1")
-        for item in changes["items"]:
-            if item["entity"].startswith("rule:"):
-                entry = state["entries"][item["entity"]]
-                end = state["flight"]["progress"][item["entity"]]
-                payload = entry["text"][entry["offset"]:end]
-                assert payload in context
-                payloads.append(payload)
-                pages.append(item.get("page"))
-        replay.ack(info)
-    assert "".join(payloads) == "1. " + words
-    assert pages[0]["n"] == 1
-    assert [p["n"] for p in pages] == list(range(1, len(pages) + 1))
-    # The total follows each prompt's room, so only the last page names the true count.
-    assert pages[-1]["m"] == len(pages)
+    out, context, info = replay.offer()
+    assert words in context
+    assert routing_delivery.snapshot("s1")["entries"]["page"]["text"].count(words) == 1
+    replay.ack(info)
     assert replay.view()["rules"][0]["text"] == words
     assert not recall_prompt.routing_marker("s1").get("owed")
 
 
-@pytest.mark.usefixtures("unbounded_render")
 def test_session_start_and_prompts_share_the_same_reservation(replay):
-    routing.add_rule("x" * 10500, via="app")
+    routing.add_rule("Owner rule one.", via="app")
     start = recall_rule._RoutingAtStart(session_id="s1").begin()
     assert start.text()
     first = start.out
     prompt, _, _ = replay.offer()
     assert prompt["routing_changes"] == first["routing_changes"]
     start.delivered("s1")
-    second, _, info = replay.offer()
-    assert second["routing_changes"]["items"][0]["page"]["n"] == 2
-    replay.ack(info)
+    # Delivered at the start: the prompt owes nothing until the page changes.
+    second, context, _ = replay.offer()
+    assert not second.get("routing_changes") and not context
+    # A resumed session is handed the page again, in a new batch.
     resumed = recall_rule._RoutingAtStart(session_id="s1").begin()
     assert resumed.text()
-    assert resumed.out["routing_changes"]["items"][0]["page"]["n"] == 3
+    assert resumed.out["routing_changes"]["batch"] != first["routing_changes"]["batch"]
 
 
 def test_expired_ack_without_a_retry_cannot_consume_debt(replay):
@@ -179,9 +159,8 @@ def test_projection_checks_paths_once_per_read_and_refreshes_between_reads(repla
     assert len(calls) == 1
 
 
-@pytest.mark.usefixtures("unbounded_render")
 def test_crowded_recall_repacks_an_unshown_batch_without_losing_words(replay):
-    words = "owner words " * 580
+    words = "owner words " * 200
     routing.add_rule(words, via="app")
     agent_view.prepare_routing_table(refresh=True)
     out = routing.prompt_push(recall_prompt.routing_marker("s1"), budget=1.0)
@@ -192,26 +171,23 @@ def test_crowded_recall_repacks_an_unshown_batch_without_losing_words(replay):
     assert recall_rule._utf16_len(ctx) <= recall_rule._HOOK_CONTEXT_BUDGET
     assert info["pending"]["routing_changes"]["batch"] != original["batch"]
     assert not routing_delivery.acknowledge("s1", original)
-    state = routing_delivery.snapshot("s1")
-    entity = routing._rule_component(replay.view()["rules"][0])
-    end = state["flight"]["progress"][entity]
-    payloads = [state["entries"][entity]["text"][:end]]
-    assert payloads[0] in ctx
-    assert entity not in info["pending"]["shown"]
+    # Only part of the page fitted beside recall, so it is not counted shown;
+    # the ledger keeps it owed, never the session marker.
+    assert "page" not in info["pending"]["shown"] and not info["pending"]["owed"]
+    assert not routing_delivery.snapshot("s1")["entries"]["page"]["acked"]
     replay.ack(info)
-    for _ in range(200):
-        out, ctx, info = replay.offer()
-        if not ctx:
+    again, context, info = replay.offer()
+    # The rest of the same page revision follows on the next prompt.
+    item, = again["routing_changes"]["items"]
+    assert (item["entity"], item["revision"]) == (original["items"][0]["entity"], original["items"][0]["revision"])
+    assert "owner words owner words" in context
+    replay.ack(info)
+    for _ in range(10):
+        _out, context, info = replay.offer()
+        if not context:
             break
-        state = routing_delivery.snapshot("s1")
-        if entity in state["flight"]["progress"]:
-            start = state["entries"][entity]["offset"]
-            end = state["flight"]["progress"][entity]
-            payload = state["entries"][entity]["text"][start:end]
-            assert payload in ctx
-            payloads.append(payload)
         replay.ack(info)
-    assert "".join(payloads) == "1. " + words
+    assert routing_delivery.snapshot("s1")["entries"]["page"]["acked"]
     assert not recall_prompt.routing_marker("s1").get("owed")
 
 
@@ -234,8 +210,7 @@ def test_ack_write_failure_is_fail_open_and_keeps_the_reservation(replay, monkey
     assert not recall_prompt.routing_marker("s1").get("owed")
 
 
-@pytest.mark.usefixtures("unbounded_render")
-def test_start_pages_leave_room_for_the_mandatory_memory_rules(replay):
+def test_the_start_page_leaves_room_for_the_mandatory_memory_rules(replay):
     room = recall_rule._HOOK_CONTEXT_BUDGET - recall_rule._utf16_len(recall_rule.RULE_MD.strip())
     routing.add_rule("x" * (room + 1000), via="app")
     start = recall_rule._RoutingAtStart(session_id="s1").begin()
@@ -244,44 +219,22 @@ def test_start_pages_leave_room_for_the_mandatory_memory_rules(replay):
     assert ctx.startswith(recall_rule.RULE_MD.strip())
     assert pushed
     assert recall_rule._utf16_len(ctx) <= recall_rule._HOOK_CONTEXT_BUDGET
-    assert "x" * 100 in text and "page 1/" in text
-    start.delivered("s1")
-    assert recall_prompt.routing_marker("s1")["owed"]
+    # The page leaves out a rule too long for it and says so; it never pages it.
+    assert "page 1/" not in text and "more rule lines (cut from RULES)" in text
 
 
-@pytest.mark.parametrize("partial", [False, True])
-def test_new_hold_invalidates_rule_pages_and_arrives_on_next_prompt(replay, partial):
-    routing.request_rule("Grok builds " + "x" * 10000, author=AUTHOR)
+def test_a_new_hold_arrives_on_the_next_prompt(replay):
+    routing.add_rule("Grok builds go first.", via="app")
     first, _, info = replay.offer()
-    entity = first["routing_changes"]["items"][0]["entity"]
-    if partial:
-        replay.ack(info)
-        replay.offer()
-    hold = routing.add_hold("Launch no new Grok jobs", scope="account", account="Grok",
-                            reason="keep", author=AUTHOR)
+    replay.ack(info)
+    routing.add_hold("Launch no new Grok jobs", scope="account", account="Grok", reason="keep", owner=True, via="app")
     newer, context, _ = replay.offer()
-    state = routing_delivery.snapshot("s1")
-    assert "contradicts active hold" in state["entries"][entity]["text"]
-    assert state["entries"][entity]["revision"] != first["routing_changes"]["items"][0]["revision"]
-    assert hold["id"] in context
-    assert any(i["entity"] == "hold:" + hold["id"] for i in newer["routing_changes"]["items"])
-
-
-def test_level_suffix_invalidates_live_rule_page(replay):
-    routing.request_rule("Codex is low. " + "x" * 3000, author=AUTHOR)
-    first, _, _ = replay.offer()
-    routing.report(account="Codex", state="open", author=AUTHOR)
-    replay.usage(used=4)
-    newer, _, _ = replay.offer()
-    entity = first["routing_changes"]["items"][0]["entity"]
-    state = routing_delivery.snapshot("s1")
-    assert "stale level claim" in state["entries"][entity]["text"]
-    assert state["entries"][entity]["revision"] != first["routing_changes"]["items"][0]["revision"]
-    assert newer["routing_changes"]["batch"] != first["routing_changes"]["batch"]
+    assert "Launch no new Grok jobs" in context
+    assert newer["routing_changes"]["items"][0]["revision"] != first["routing_changes"]["items"][0]["revision"]
 
 
 def test_prompt_offer_serializes_with_ack_instead_of_reusing_unlocked_snapshot(replay, monkeypatch):
-    routing.request_rule("x" * 3000, author=AUTHOR)
+    routing.add_rule("x" * 3000, via="app")
     first, _, _ = replay.offer()
     snapshot = routing_delivery.snapshot
     transaction = routing_delivery._transaction
@@ -301,38 +254,34 @@ def test_prompt_offer_serializes_with_ack_instead_of_reusing_unlocked_snapshot(r
             yield data
     monkeypatch.setattr(routing_delivery, "snapshot", stale_snapshot)
     monkeypatch.setattr(routing_delivery, "_transaction", racing_transaction)
-    second, _, _ = replay.offer()
+    second, context, _ = replay.offer()
     assert acked
-    assert second["routing_changes"]["batch"] != first["routing_changes"]["batch"]
-    assert second["routing_changes"]["items"][0]["page"]["n"] == 2
+    # The ack landed first: nothing is owed, so nothing is offered again.
+    assert not second.get("routing_changes") and not context
 
 
-@pytest.mark.parametrize("entity_kind", ["note", "rule"])
+def test_the_owners_note_is_never_on_the_page(replay):
+    routing.set_note("OLD OWNER WORDS " * 20, via="app")
+    _out, context, _info = replay.offer()
+    assert context and "OLD OWNER WORDS" not in context
+
+
 @pytest.mark.parametrize("expired", [False, True])
-def test_full_summary_replaces_deleted_entity_debt(replay, entity_kind, expired):
-    words = "OLD OWNER WORDS " * 250
-    if entity_kind == "note":
-        routing.set_note(words, via="app")
-    else:
-        routing.add_rule(words, via="app")
-    first, _, _ = replay.offer()
-    entity = next(i["entity"] for i in first["routing_changes"]["items"] if i["entity"].startswith(entity_kind))
-    if entity_kind == "note":
-        routing.end_note(via="app")
-    else:
-        routing.retire_rule(1, via="app")
+def test_the_page_replaces_a_retired_rules_debt(replay, expired):
+    routing.add_rule("OLD OWNER WORDS " * 20, via="app")
+    first, context, _ = replay.offer()
+    assert "OLD OWNER WORDS" in context
+    routing.retire_rule(1, via="app")
     if expired:
         replay.advance(61)
-    # No marker was acknowledged: this must take the full-summary path.
     newer, context, info = replay.offer()
     assert newer["kind"] == "full"
     assert "OLD OWNER WORDS" not in context
     state = routing_delivery.snapshot("s1")
-    assert "OLD OWNER WORDS" not in state["entries"][entity]["text"]
-    assert "ended" in context if entity_kind == "note" else "retired" in context
+    assert "OLD OWNER WORDS" not in state["entries"]["page"]["text"]
     assert not routing_delivery.acknowledge("s1", first["routing_changes"])
     replay.ack(info)
-    assert routing_delivery.snapshot("s1")["entries"][entity]["acked"]
+    assert routing_delivery.snapshot("s1")["entries"]["page"]["acked"]
 
 
 def test_stalled_volume_refresh_keeps_prompt_routing_and_restores_alarm(replay, monkeypatch):
@@ -354,7 +303,7 @@ def test_stalled_volume_refresh_keeps_prompt_routing_and_restores_alarm(replay, 
     start = time.monotonic()
     out, context, _ = replay.offer(helper_tick=False)
     elapsed = time.monotonic() - start
-    assert visited
+    # The prompt reads the page file; a stalled volume listing never delays it.
     assert elapsed < 0.15, elapsed
     assert "Grok builds" in context
     assert out["version"] == view["version"]
@@ -362,13 +311,12 @@ def test_stalled_volume_refresh_keeps_prompt_routing_and_restores_alarm(replay, 
     assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
 
 
-@pytest.mark.usefixtures("unbounded_render")
 def test_ack_history_is_bounded_and_recent_ack_is_idempotent(replay):
-    routing.add_rule("x" * 100000, via="app")
-    # This direct renderer call starts with the complete inventory a helper prepares.
-    agent_view.prepare_routing_table(refresh=True)
+    routing.add_rule("Rule 0.", via="app")
     batches = []
-    for _ in range(140):
+    for i in range(140):
+        if i:
+            routing.edit_rule(1, f"Rule {i}.", via="app")
         out, _, info = replay.offer()
         batches.append(out["routing_changes"])
         replay.ack(info)
@@ -376,7 +324,6 @@ def test_ack_history_is_bounded_and_recent_ack_is_idempotent(replay):
     assert len(state["batches"]) <= 128
     assert routing_delivery.acknowledge("s1", batches[-1])
     assert not routing_delivery.acknowledge("s1", batches[0])
-    assert not state["entries"][batches[-1]["items"][0]["entity"]]["acked"]
 
 
 def test_refit_page_total_never_claims_completion_with_text_still_owed(replay):
