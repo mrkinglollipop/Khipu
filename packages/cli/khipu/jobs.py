@@ -1553,18 +1553,20 @@ def notes_watch_health() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - a failed check must not look like a pass
         return {"ok": False, "applicable": True, "state": "check_failed",
                 "error": f"{type(exc).__name__}: {exc}", "fix": fix}
-    if loaded:
-        try:
-            run = launchd_state(PLIST_NOTES_WATCH)
-        except Exception as exc:  # noqa: BLE001 - a failed check must not look like a pass
-            return {"ok": False, "applicable": True, "state": "check_failed",
-                    "error": f"could not read the notes watcher's launchd state: {type(exc).__name__}: {exc}",
-                    "fix": fix}
-        if not run.get("loaded"):
-            return {"ok": False, "applicable": True, "state": "check_failed", "launchd": run,
-                    "error": "could not read the notes watcher's launchd state: "
-                             + (run.get("error") or "launchctl no longer reports it loaded"),
-                    "fix": fix}
+    # The initial boolean read also returns False on timeout. Read the state
+    # even then, so an unavailable launchctl is not called an absent watcher.
+    try:
+        run = launchd_state(PLIST_NOTES_WATCH)
+    except Exception as exc:  # noqa: BLE001 - an unread check is not a pass
+        return {"ok": False, "applicable": True, "state": "check_failed",
+                "error": f"could not read the notes watcher's launchd state: {type(exc).__name__}: {exc}",
+                "fix": fix}
+    if not run.get("loaded") and (loaded or run.get("error")):
+        return {"ok": False, "applicable": True, "state": "check_failed", "launchd": run,
+                "error": "could not read the notes watcher's launchd state: "
+                         + (run.get("error") or "launchctl no longer reports it loaded"),
+                "fix": fix}
+    if run.get("loaded"):
         if run.get("spawn_failed"):
             return {"ok": False, "applicable": True, "state": "cannot_start", "launchd": run,
                     "error": "launchd cannot start the notes watcher"

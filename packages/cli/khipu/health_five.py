@@ -26,6 +26,28 @@ SEVERE = {"hub_ok", "outbox_ok", "ledger_outbox_ok", "disk_space_ok"}
 ROUTING_STALE = timedelta(hours=24)
 SILENT_QUIET = timedelta(days=7)
 RANK = {"ok": 0, "unknown": 0, "warn": 1, "err": 2}
+# Three Today refresh cycles. Retained reads never move this evidence clock.
+READ_GRACE = timedelta(minutes=15)
+
+
+def _unread(report: dict) -> tuple[set[str], set[int]]:
+    """Presentation uncertainty, separate from doctor's conservative gates."""
+    if not report:
+        return set(every_key()), set(range(5))
+    skip, areas = set(), set()
+    delivery = report.get("routing_delivery") or {}
+    if report.get("routing_delivery_ok") is False and delivery.get("status") == "unknown" and not delivery.get("reasons"):
+        skip.add("routing_delivery_ok")
+        areas.add(2)
+    steps = report.get("nightly_steps") or {}
+    notes = steps.get("notes_reconcile_ok") or {}
+    if notes.get("state") == "check_failed":
+        areas.add(4)
+        # An independent failed step still has immediate precedence.
+        if not any(not row.get("ok") for key, row in steps.items()
+                   if key != "notes_reconcile_ok" and isinstance(row, dict)):
+            skip.add("nightly_steps_ok")
+    return skip, areas
 
 OK_LINES = (
     "Captures are being saved.",
@@ -159,7 +181,7 @@ def _with_other_macs(rows: list[dict], notes: list[str], peers: dict | None, mac
 
 
 def build(report: dict, *, now: datetime | None = None, mac: str | None = None, why: str = "",
-          peers: dict | None = None) -> dict:
+          peers: dict | None = None, kept: dict | None = None) -> dict:
     """The health document for one doctor report (an empty report means the checks could not run).
     ``peers`` is ``{"routing_version", "others": [macs.others() entries]}``; without it the document is this Mac's alone."""
     now = now or datetime.now(timezone.utc)
@@ -172,8 +194,14 @@ def build(report: dict, *, now: datetime | None = None, mac: str | None = None, 
     notes: list[str] = []
     problems: list[list[tuple[str, str, str, str]]] = [[] for _ in range(5)]  # (state, line, doing, you_do)
     silent: list[dict] = []
+    skip, unread = _unread(report)
     if ran:
-        for key, area, what, fix in failing_keyed(report):
+        # Leave unread notes out of a mixed failure's list too.
+        shown = dict(report)
+        if 4 in unread:
+            shown["nightly_steps"] = {k: v for k, v in (report.get("nightly_steps") or {}).items()
+                                      if k != "notes_reconcile_ok"}
+        for key, area, what, fix in failing_keyed(shown, skip=tuple(skip)):
             delivery = key == "routing_delivery_ok"
             doing = DELIVERY_DOING if delivery else DOING[area]
             if key in {"embed_coverage_ok", "topics_embed_lag_ok", "index_freshness_ok"}:
@@ -216,6 +244,22 @@ def build(report: dict, *, now: datetime | None = None, mac: str | None = None, 
     if ran and not problems[4]:
         rows[4]["line"] = ("No job is running." if not running else
                            f"{running} job{'s are' if running != 1 else ' is'} running.")
+    for i in unread:
+        notes.append(f"[{AREAS[i]}] one check could not be read just now; Khipu shows its last answer for up to 15 minutes")
+        if problems[i]:
+            continue  # A reported fault always beats a failed read in the same area.
+        old = (kept or {}).get(KEYS[i]) or {}
+        if not isinstance(old, dict):
+            old = {}
+        at = _parse(old.get("at"))
+        row = old.get("row")
+        if (at and timedelta(0) <= now - at <= READ_GRACE and isinstance(row, dict)
+                and row.get("key") == KEYS[i] and row.get("state") in {"ok", "warn", "err"}
+                and set(row) == set(rows[i])):
+            rows[i] = dict(row)
+        else:
+            rows[i].update(state="unknown", line="Khipu could not run its checks.",
+                           khipu_doing="Khipu tries again on the next check.", you_do=NOTHING)
     others = _with_other_macs(rows, notes, peers if ran else None, mac)
     lead = next((r for s in ("err", "warn", "unknown") for r in rows if r["state"] == s), None)
     headline = ("Everything is working." if lead is None
@@ -261,7 +305,41 @@ def cmd_health(args) -> int:
         peers = {"routing_version": macs.routing_version(), "others": rest}
     except Exception:  # noqa: BLE001 - the other Mac's row is never worth failing the report
         peers = None
-    doc = build(report, why=why, peers=peers)
+    from khipu.paths import data_dir
+    import os
+    import tempfile
+
+    now = datetime.now(timezone.utc)
+    path = data_dir() / "health-read-evidence.json"
+    try:
+        saved = json.loads(path.read_text())
+        kept = saved.get("areas", {}) if saved.get("version") == 1 else {}
+        if not isinstance(kept, dict):
+            kept = {}
+    except (OSError, ValueError, AttributeError):
+        kept = {}
+    fresh = build(report, now=now, why=why, peers=peers)
+    # Store only newly read areas; an unavailable read cannot renew its grace.
+    _skip, unread = _unread(report)
+    for i, row in enumerate(fresh["areas"]):
+        if i not in unread or row["state"] in {"warn", "err"}:
+            kept[KEYS[i]] = {"at": _iso(now), "row": row}
+    doc = build(report, now=now, why=why, peers=peers, kept=kept)
+    tmp = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".health-read-", dir=path.parent)
+        with os.fdopen(fd, "w") as stream:
+            json.dump({"version": 1, "areas": kept}, stream)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # Persistence is optional; unread checks still remain unknown.
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
     print(json.dumps(doc, indent=2, ensure_ascii=False))
     if report:
         # Tell the hub how this Mac is, after the report is out. The running part is the one `khipu running` last
