@@ -345,3 +345,105 @@ def test_every_typed_line_among_peer_messages_stays_the_owners(tmp_path, monkeyp
     for words in ('cobalt lane', 'archive lane'):
         phrase, tokens = memory_rows.query_terms(words)
         assert memory_rows.owner_line(lines, phrase, tokens) is None, lines
+
+
+# ---- a headless run outside T3, and a desktop conversation's start brief -----------
+
+SDK = {'entrypoint': 'sdk-ts', 'turnOrigin': 'sdk', 'promptSource': 'sdk'}
+HEADLESS_BRIEF = 'Do the work yourself and repair the magnolia gearbox, then stop.'
+HEADLESS_ROWS = [_user_row(HEADLESS_BRIEF, **SDK), _assistant_row('Working. ' + 'x' * 350)]
+
+
+def _synthetic_t3(tmp_path, monkeypatch, *, thread=True):
+    """A synthetic T3 database: it names an ordinary thread for ``T3_SID`` when
+    ``thread``, and only for some other session otherwise."""
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setattr(session_capture, 'ancestor_pids', lambda: [])
+    path = tmp_path / 'synthetic-t3-headless.sqlite'
+    db = T3(path)
+    if thread:
+        db.thread('ordinary-thread-561', T3_SID)
+    monkeypatch.setenv('KHIPU_T3_DB', str(path))
+
+
+def _assert_a_job_without_owner_lines(job):
+    assert job.get('origin') == 'job' and 'owner_lines' not in job, job
+    assert session_capture._job_origin(job) == 'job'
+
+
+def test_a_headless_sdk_run_with_no_t3_database_keeps_no_owner_lines(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'no-t3-here.sqlite'))
+    job_path = _queue(tmp_path, HEADLESS_ROWS)
+    _assert_a_job_without_owner_lines(json.loads(job_path.read_text()))
+    payload, _ = _drain_job(job_path)
+    assert not payload['verbatim'].get('owner_lines')
+
+
+def test_a_headless_sdk_run_t3_has_no_thread_for_keeps_no_owner_lines(tmp_path, monkeypatch):
+    _synthetic_t3(tmp_path, monkeypatch, thread=False)
+    _assert_a_job_without_owner_lines(json.loads(_queue(tmp_path, HEADLESS_ROWS).read_text()))
+
+
+def test_the_same_lines_in_a_thread_t3_names_are_the_owners(tmp_path, monkeypatch):
+    _synthetic_t3(tmp_path, monkeypatch, thread=True)
+    job = json.loads(_queue(tmp_path, HEADLESS_ROWS).read_text())
+    assert job.get('t3_thread_id') == 'ordinary-thread-561' and 'origin' not in job
+    assert job.get('owner_lines') == [HEADLESS_BRIEF]
+
+
+def test_an_unreadable_t3_database_keeps_a_headless_looking_runs_lines(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    broken = tmp_path / 'broken-t3.sqlite'
+    broken.write_bytes(b'this is not a sqlite database' * 50)
+    monkeypatch.setenv('KHIPU_T3_DB', str(broken))
+    assert _t3.session_thread_ids_result(T3_SID) == (None, False)
+    job = json.loads(_queue(tmp_path, HEADLESS_ROWS).read_text())
+    assert 'origin' not in job and job.get('owner_lines') == [HEADLESS_BRIEF]
+
+
+def test_a_headless_run_swept_while_idle_keeps_no_owner_lines(tmp_path, monkeypatch):
+    import os
+    import time
+
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'no-t3-here.sqlite'))
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('KHIPU_PARENT_SESSION', '')
+    monkeypatch.setattr('khipu.identity.resolve_repo_root',
+                        lambda cwd: {'repo_root': '/repo', 'project': 'acme/project', 'is_worktree': False})
+    sid = 'aaaaaaaa-2222-3333-4444-555555555555'
+    path = tmp_path / '.claude' / 'projects' / 'p' / f'{sid}.jsonl'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(''.join(json.dumps(r) + '\n' for r in HEADLESS_ROWS))
+    old = time.time() - session_capture.MIN_MINUTES * 60 - 60
+    os.utime(path, (old, old))
+    session_capture.save_state('claude_code', sid, {
+        'offset': 0, 'last_ts': old - 100, 'captures': 0, 'seen_ts': old,
+        'seen_end': path.stat().st_size, 'transcript_path': str(path), 'cwd': str(tmp_path)})
+    out = session_capture.sweep_idle(now=time.time())
+    assert out['jobs'] == 1, out
+    job = json.loads(session_capture.queued_jobs()[0].read_text())
+    assert job['event'] == 'idle_sweep'
+    _assert_a_job_without_owner_lines(job)
+
+
+def test_in_a_desktop_conversation_only_the_humans_line_is_an_owner_line(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'no-t3-here.sqlite'))
+    desk = {'entrypoint': 'claude-desktop'}
+    start = 'You are a dispatched agent on the quartz repo. Do the work yourself.'
+    typed = 'Now also check the lapis hinge before you stop.'
+    rows = [_user_row(start, turnOrigin='sdk', **desk), _assistant_row(REPLY),
+            _user_row(typed, turnOrigin='human', **desk), _assistant_row('Checked.')]
+    assert _typed(_write(tmp_path, 'desk.jsonl', rows)) == [typed]
+    job = json.loads(_queue(tmp_path, rows).read_text())
+    assert job.get('owner_lines') == [typed], job.get('owner_lines')
+
+
+def test_lines_with_no_origin_fields_are_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'no-t3-here.sqlite'))
+    rows = [_user_row('Check the walnut valve for me.'), _assistant_row(REPLY)]
+    job = json.loads(_queue(tmp_path, rows).read_text())
+    assert 'origin' not in job and job.get('owner_lines') == ['Check the walnut valve for me.']

@@ -676,6 +676,21 @@ def _fingerprints_for_msgs(msgs: list[tuple[str, str]]) -> list[str]:
     return out
 
 
+def _sdk_line(d: dict) -> bool:
+    """The transcript line says an Agent SDK host delivered it: an ``sdk-``
+    entrypoint or ``turnOrigin: "sdk"``. A line with neither says nothing."""
+    entry, origin = d.get("entrypoint"), d.get("turnOrigin")
+    return (isinstance(entry, str) and entry.startswith("sdk-")) or origin == "sdk"
+
+
+def _not_typed_in_desktop(d: dict) -> bool:
+    """A user line of a Claude desktop conversation whose ``turnOrigin`` is
+    present and is not ``"human"``. No origin field: not decided here."""
+    origin = d.get("turnOrigin")
+    return (d.get("entrypoint") in ("claude-desktop", "claude-desktop-3p")
+            and isinstance(origin, str) and bool(origin.strip()) and origin.strip() != "human")
+
+
 def read_window(path: Path, offset: int, *, seen: Any = None,
                 stats: dict | None = None, prefix: dict | None = None,
                 replay_prefix: dict | None = None,
@@ -705,7 +720,7 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     fresh: list[str] = []
     dropped = dropped_chars = 0
     if stats is not None:
-        stats.update(deduped_msgs=0, deduped_chars=0, fresh=fresh, skip_to=offset, typed=[])
+        stats.update(deduped_msgs=0, deduped_chars=0, fresh=fresh, skip_to=offset, typed=[], typed_sdk=[])
     try:
         size = path.stat().st_size
     except OSError:
@@ -841,6 +856,11 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             real = stand_in is None
             if stand_in is not None:
                 text = stand_in
+            elif _not_typed_in_desktop(d):
+                # A desktop conversation's line Claude Code marks as started by
+                # anything but the person (the brief another session began it
+                # with, a scheduled or peer line) is never a typed line.
+                real = False
         streamed = isinstance(d.get("params"), dict)
         # ACP chunks are fragments of one message (" the", "\n"), never whole
         # messages, so they are not fingerprinted; nor are tool markers.
@@ -959,6 +979,7 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             head_open = False
         if real and stats is not None and not d.get("isCompactSummary"):
             stats["typed"].append(text)
+            stats["typed_sdk"].append(_sdk_line(d))
         if msgs and msgs[-1][0] == role and (role != "user" or streamed or real == open_real):
             # ACP streams chunks (concatenate); the others emit whole
             # messages (join on a newline).
@@ -2862,6 +2883,30 @@ def _redact_messages(msgs: list[tuple[str, str]], harness: str, sid: str) -> lis
     return redacted_msgs
 
 
+def _sdk_run(stats: dict) -> bool:
+    """Every typed line of the window says an Agent SDK host delivered it (and
+    there is at least one). A line with no origin fields makes it False."""
+    flags = stats.get("typed_sdk") or []
+    return bool(flags) and all(flags)
+
+
+def _headless_outside_t3(thread: str | None, sid: str) -> bool:
+    """T3's record definitively has no thread for this session, so an SDK-driven
+    run is a script's or an orchestrator's, not a person's. No T3 database on
+    the machine is that answer too (not every user has T3); one that cannot be
+    read is not, and the lines are kept. Never raises."""
+    if thread:
+        return False
+    try:
+        path = _t3._thread_db_path()
+        if not path.is_file():
+            return True
+        threads, definitive = _t3.session_thread_ids_result(sid)
+    except Exception:  # noqa: BLE001 — a lookup must never fail a capture
+        return False
+    return bool(definitive and threads == [])
+
+
 def _t3_child_thread(thread: str | None) -> bool:
     """T3's record definitively names a parent for this thread: one started
     as another thread's child (``t3_thread_launch``), so a job. One read under
@@ -2923,7 +2968,8 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
                     path: Path, st: dict, msgs: list[tuple[str, str]], new_off: int,
                     turns: int, job_parent: str | None = None, capture_note: str = "",
                     preserve_mtime: bool = False, fresh_seen: list[str] | None = None,
-                    capture_request_id: str = "", typed: list[str] | None = None) -> list[str]:
+                    capture_request_id: str = "", typed: list[str] | None = None,
+                    sdk_run: bool = False) -> list[str]:
     """Queue every part before advancing the shared capture offset. ``typed``
     (``read_window``'s typed user messages, redacted) becomes each part's
     ``owner_lines``, except in a job's capture, which keeps none."""
@@ -2980,7 +3026,8 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
                  or (not (job_parent or st.get("origin") == "job") and _t3_child_thread(thread)))
     # Decided once, here: the job label below and the owner-lines skip use it.
     # Nobody types into a job, so its user turns are briefs and relays.
-    is_job = bool(job_parent or st.get("origin") == "job" or delegated)
+    is_job = bool(job_parent or st.get("origin") == "job" or delegated
+                  or (sdk_run and _headless_outside_t3(thread, sid)))
     owner_lines = [[] for _ in parts] if is_job else _owner_lines_by_part(parts, typed)
     for i, part in enumerate(parts, start=1):
         job = {"harness": harness, "session_id": sid, "cwd": cwd, "event": event,
@@ -3247,7 +3294,7 @@ def hook_main(raw: str, harness: str | None = None, event: str | None = None) ->
                         harness=harness, sid=track_sid if is_subagent_stop else sid, track_sid=track_sid,
                         cwd=session_cwd(env), event=event, path=path, st=st, msgs=msgs,
                         new_off=new_off, turns=turns, job_parent=st["parent_session_id"],
-                        capture_note=capture_note, fresh_seen=fresh_seen, typed=typed,
+                        capture_note=capture_note, fresh_seen=fresh_seen, typed=typed, sdk_run=_sdk_run(dedupe),
                         capture_request_id=_capture_request_id(capture_now) if capture_now is not None else "",
                     )
                     out["queued"] = queued_names[0] if len(queued_names) == 1 else queued_names
@@ -3459,7 +3506,7 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                                 harness=harness, sid=sid, track_sid=track_sid, cwd=cwd,
                                 event="idle_sweep", path=path, st=st, msgs=msgs,
                                 new_off=new_off, turns=turns, job_parent=st.get("parent_session_id"),
-                                preserve_mtime=True, fresh_seen=fresh_seen, typed=typed,
+                                preserve_mtime=True, fresh_seen=fresh_seen, typed=typed, sdk_run=_sdk_run(dedupe),
                             )
                             out["jobs"] += len(names)
                             _log(f"sweep {harness}:{sid}: queued {len(names)} part(s) "
