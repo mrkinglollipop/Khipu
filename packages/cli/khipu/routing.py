@@ -7111,7 +7111,7 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
             runners = _clip(", ".join(sorted(lane_map)), 300) or "none"
             raise RouteError("Khipu doesn't know that runner's lane; a conversation can report on a lane only "
                              "when its provider or account declaration resolves, or the lane map "
-                             "(Settings \u2192 Routing, routing_lane_map) names it, or on the "
+                             "(the routing_lane_map setting, changed with khipu config) names it, or on the "
                              f"account with --account. Runners in the lane map: {runners}")
         from khipu.routing_sources import model_family
 
@@ -10045,7 +10045,7 @@ def doctor_block(now: datetime | None = None) -> dict:
     if view.get("unchecked"):
         warnings.append("Owner changes in effect did not pass Khipu's owner check (they claim the app or a terminal, "
                         "but no checked command wrote them): " + ", ".join(view["unchecked"]) + ". Check them in "
-                        "Settings \u2192 Routing.")
+                        "the Khipu app (usually Accounts, Order and rules).")
     warnings += _priority_warnings(view, now, cfg)
     if any(r.get("pending") for r in view.get("rules") or []):
         warnings.append("One or more standing rules were added or changed at the owner's request and still need confirmation.")
@@ -10135,7 +10135,7 @@ def doctor_block(now: datetime | None = None) -> dict:
         warnings.append(f"Reading the routing record before a prompt ran out of time on {budget['rate_pct']:g}% of "
                         f"the last {budget['count']} prompts (more than {budget['warn_pct']:g}%); those prompts "
                         "went without their routing lines until a later prompt. Raise the time allowed before "
-                        "a prompt in Settings \u2192 Routing, or see whether the Mac is busy.")
+                        "a prompt with khipu config (the routing_prompt_budget_ms setting), or see whether the Mac is busy.")
     pending_rules = sum(1 for r in view.get("rules") or [] if r.get("pending"))
     from khipu import routing_health
 
@@ -10209,8 +10209,7 @@ def _silent_source_note(runner: dict, beat: datetime) -> str:
     command = ("khipu config --unset routing_sources" if not kept else
                "khipu config --set routing_sources " + shlex.quote(json.dumps(kept, separators=(",", ":"))))
     return (f"Your {name} job runner has not reported since {_iso(beat)}, more than {SILENT_SOURCE_QUIET_DAYS} days. "
-            f"If it is gone for good, stop reading it: Settings \u2192 Routing \u2192 Job runner folders \u2192 "
-            f"Remove {name}, or run `{command}` (it asks you to type yes).")
+            f"If it is gone for good, stop reading it: run `{command}` (it asks you to type yes).")
 
 
 def _priority_warnings(view: dict, now: datetime, cfg: dict) -> list[str]:
@@ -10225,7 +10224,7 @@ def _priority_warnings(view: dict, now: datetime, cfg: dict) -> list[str]:
     at = _parse(held.get("at"))
     if held.get("pending") and after and at is not None and (now - at).total_seconds() > after:
         out.append(f"Your priority was set by {held.get('pending_by') or 'a conversation'} at your request "
-                   f"{_ago(at, now)} and is not confirmed yet; confirm or undo it in Settings \u2192 Routing, or "
+                   f"{_ago(at, now)} and is not confirmed yet; confirm or undo it in Accounts, Order and rules, or "
                    "tell any conversation to (khipu_owner_act route.priority.confirm or route.priority.undo).")
     first = held["entries"][0]
     entry = next((a for a in view["accounts"] if a["key"] == first["account"]), None)
@@ -11313,7 +11312,7 @@ OWNER_ACTIONS = {"pause": "Pausing an account", "lift": "Lifting a pause", "clea
                  "tier_table": "The tier table", "set_tier_table": "The tier table",
                  "tier_table_set": "The tier table", "confirm_tier_table": "The tier table",
                  "clear_tier_table": "The tier table"}
-OWNER_REFUSAL = ("{what} is the owner's to change: in the app (Settings \u2192 Routing) or on a terminal with "
+OWNER_REFUSAL = ("{what} is the owner's to change: in the Khipu app (usually Accounts, Order and rules) or on a terminal with "
                  "`khipu route`, which asks for a typed confirmation. A conversation can report what it "
                  "learned about an account and add or end its holds.")
 _ACTION_ARGS = {
@@ -11366,7 +11365,7 @@ def _conversation_write(args: dict, *, author: dict, now: datetime | None = None
     claimed = [k for k in _AUTHOR_ARGS if k in args]
     if claimed:
         raise RouteError(f"Khipu sets who wrote this and the basis of its times; it takes no {claimed[0]!r} from "
-                         "a conversation. An owner's hold is set in the app (Settings \u2192 Routing) or on a "
+                         "a conversation. An owner's hold is set in the Khipu app (Accounts, Room right now, Pause) or on a "
                          "terminal.")
     unknown = sorted(k for k in args if k not in _ACTION_ARGS[action])
     if unknown:
@@ -12641,8 +12640,8 @@ def owner_receipt(text: str, line_id: str, harness: str | None = None) -> dict:
     return _done(written, view)
 
 
-_REFUSED = ("This is the owner's command: it needs a typed confirmation on a terminal, or the app "
-            "(Settings \u2192 Routing). --from-app is accepted only when the Khipu app itself runs the command.")
+_REFUSED = ("This is the owner's command: it needs a typed confirmation on a terminal, or in the Khipu app "
+            "(usually Accounts, Order and rules). --from-app is accepted only when the Khipu app itself runs the command.")
 
 
 def _print_json(data: dict) -> None:
@@ -12656,7 +12655,7 @@ def _print_view(view: dict, now: datetime, account: str | None) -> None:
     if view.get("rules"):
         print("Standing rules:")
         for rule in view["rules"]:
-            mark = "" if rule["confirmed"] else "  [seeded; confirm in Settings \u2192 Routing]"
+            mark = "" if rule["confirmed"] else "  [seeded; confirm in Accounts, Order and rules]"
             if rule.get("pending"):
                 print(f"  {rule_line(rule)}")
                 continue

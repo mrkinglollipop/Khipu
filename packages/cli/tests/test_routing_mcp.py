@@ -211,7 +211,7 @@ def test_the_owners_changes_are_refused_through_mcp(home, action):
     is_error, body = _call("khipu_route_report", {"action": action, "account": "Codex",
                                                   "text": "Codex is the only lane for builds"})
     assert is_error
-    assert "is the owner's to change: in the app (Settings → Routing) or on a terminal" in body["error"]
+    assert "is the owner's to change: in the Khipu app (usually Accounts, Order and rules) or on a terminal" in body["error"]
     assert _events() == []
 
 

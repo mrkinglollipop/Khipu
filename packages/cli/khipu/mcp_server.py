@@ -859,7 +859,7 @@ TOOLS: list[dict] = [
             "the requester. From a turn that is provably the owner's it is also "
             "confirmed at once (`applied: true`, `instant.undo`); any other "
             "call remains pending until the owner confirms it in "
-            "Settings -> Routing or with a terminal confirmation. This tool "
+            "Accounts, Order and rules or with a terminal confirmation. This tool "
             "cannot confirm, retire, dismiss or undo a rule."
         ),
         "inputSchema": {
@@ -895,7 +895,7 @@ TOOLS: list[dict] = [
             "answers that it did not take effect), marked "
             "with this conversation and unconfirmed, with the priority it "
             "replaced shown beside it, until the owner confirms or undoes it "
-            "in Settings -> Routing or by telling a conversation (khipu_owner_act route.priority.confirm or "
+            "in Accounts, Order and rules or by telling a conversation (khipu_owner_act route.priority.confirm or "
             "route.priority.undo, each with expect, the priority's version) (from a turn that is provably the "
             "owner's it is confirmed at once: `applied: true`, `instant.undo`). Khipu keeps his order as given "
             "and never reorders it. This tool cannot confirm, undo or clear a priority. "
@@ -1106,7 +1106,7 @@ def _validate_tool_args(name: str, arguments) -> dict:
         if name == "khipu_capture" and field == "summary":
             message = "requires a non-empty string 'summary'"
         if name == "khipu_route_report" and field == "action":
-            message += "; an owner's action is the owner's to change: in the app (Settings → Routing) or on a terminal"
+            message += "; an owner's action is the owner's to change: in the Khipu app (usually Accounts, Order and rules) or on a terminal"
         raise _ToolFailure({"ok": False, "code": "bad_args", "error": f"{field} {message}"})
 
     nonempty = {
