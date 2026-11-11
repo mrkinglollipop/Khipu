@@ -1980,6 +1980,22 @@ def _local_mac() -> str | None:
     return value if re.fullmatch(r"[0-9a-f]{32}", value) else None
 
 
+def _ensure_local_mac() -> str:
+    """This Mac's routing identity.  None yet: made now, under the routing lock, exactly as the first routing
+    write would make it, so a subject frozen before that write names the same Mac after it.  A Mac that has
+    one reads it and writes nothing."""
+    mac = _local_mac()
+    if mac is not None:
+        return mac
+    try:
+        with _lock():
+            return _mac_locked()
+    except LockBusy as exc:
+        raise RouteError(str(exc)) from exc
+    except UnicodeError as exc:
+        raise RouteError("the routing Mac identity is unreadable; restore its mac-id file") from exc
+
+
 def _hub_configured() -> bool:
     # Detection only: never connect, migrate credentials or start a probe.
     from khipu import db, keychain

@@ -1533,6 +1533,14 @@ def _other_mac_target(event: dict) -> str:
         return "priority"
     if kind.startswith("note_"):
         return "note"
+    if kind.startswith("rule_"):
+        # The rule's stable entity, as routing resolves it; the view names it by the number the hub gave it.
+        # A provisional ``n`` an older pending row kept can be another rule's number.
+        from khipu import routing
+
+        entity = routing.event_identity.entity(event)
+        if isinstance(entity, str) and entity:
+            return entity
     for key in ("n", "entity", "account", "target", "id"):
         if isinstance(event.get(key), (str, int)) and not isinstance(event.get(key), bool):
             return str(event[key])

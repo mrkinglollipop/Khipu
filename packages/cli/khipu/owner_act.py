@@ -268,6 +268,12 @@ def _with_frozen_subject(args) -> dict:
         raise _bad("route.override.grant takes arguments")
     if "subject" in args:
         raise _bad("the conversation an override is for is Khipu's to name, not the call's")
+    from khipu import routing
+
+    try:
+        routing._ensure_local_mac()  # the frozen subject names this Mac as it will be after the first routing write
+    except routing.RouteError as err:
+        raise Refused("unknown_conversation", str(err)) from None
     subject, why = conversation_overrides.subject(scope="project" if args.get("whole_folder") is True else "conversation")
     if subject is None:
         raise Refused("unknown_conversation", why or "Khipu can't tell which conversation this is.")
