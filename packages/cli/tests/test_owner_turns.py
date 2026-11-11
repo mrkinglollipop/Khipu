@@ -1332,3 +1332,112 @@ def test_noting_an_ordinary_brief_keeps_a_three_day_old_start_brief(home, monkey
     assert owner_turns.brief_for(BRIEF, now=T0) is not None
     owner_turns.sweep(now=T0 + 6 * DAY)
     assert owner_turns.brief_for(BRIEF, now=T0 + 6 * DAY) is None
+
+
+# ---- a T3 lookup the hook could not finish (the 2026-11-10 cold read) ----------------------------
+# With T3 closed and the Mac busy, T3's 14 GB record is not in the page cache
+# and the hook's 50 ms read never finishes, so every typed turn is
+# "t3-unverified". The line keeps the entrypoint a settled "none" would have
+# given ("native"); only an owner check that reads T3's record definitively
+# and finds no thread for the session judges the turn by it.
+
+_UNREAD_WHY = "Khipu could not read T3's record"
+
+
+@pytest.fixture
+def cold_t3(home, monkeypatch):
+    """A T3 database whose lookup never finishes in the hook; the calls made."""
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], "some-other-session")))
+    calls: list[str] = []
+
+    def unread(sid, **kw):
+        calls.append(sid)
+        return None, False
+
+    monkeypatch.setattr(owner_turns.t3, "session_thread_ids_result", unread)
+    monkeypatch.setattr(owner_turns, "desktop_launched", lambda pid=None: True)
+    return calls
+
+
+def test_an_unread_t3_lookup_keeps_the_native_entrypoint_beside_it(cold_t3):
+    _desktop_record("pause Codex until tonight")
+    turn = _last()
+    assert (turn["entrypoint"], turn["native"]) == ("t3-unverified", "claude-desktop")
+    assert turn["eligible"] is False and turn["why"].startswith(_UNREAD_WHY)
+    ok, why = owner_turns.eligible(turn)
+    assert not ok and why.startswith(_UNREAD_WHY)
+    # Judged again once T3's record settles that no thread runs the session.
+    assert owner_turns.eligible(turn, t3_settled_none=True) == (True, "")
+
+
+def test_the_hook_reads_t3s_record_no_more_than_before(cold_t3, monkeypatch):
+    _desktop_record("pause Codex until tonight")
+    assert len(cold_t3) == 2  # the hook's two attempts, nothing more
+    calls: list[str] = []
+    monkeypatch.setattr(owner_turns.t3, "session_thread_ids_result",
+                        lambda sid, **kw: calls.append(sid) or ([], True))
+    _desktop_record("pause Codex until tonight")
+    assert len(calls) == 1
+    turn = _last()
+    assert turn["entrypoint"] == "claude-desktop" and "native" not in turn and turn["eligible"] is True
+
+
+def test_a_settled_none_never_lifts_a_machine_native(cold_t3):
+    owner_turns.record(_payload("pause Codex until tonight"), env={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts"},
+                       now=T0, issuer=DESKTOP_ISSUER)
+    turn = _last()
+    assert (turn["entrypoint"], turn["native"]) == ("t3-unverified", "sdk-ts")
+    ok, why = owner_turns.eligible(turn, t3_settled_none=True)
+    assert not ok and "machine entrypoint" in why
+    line = {"entrypoint": "t3-unverified", "native": "sdk-cli", "harness": "claude_code", "typed": True}
+    ok, why = owner_turns.eligible(line, t3_settled_none=True)
+    assert not ok and "machine entrypoint" in why
+
+
+def test_a_settled_none_never_lifts_an_untrusted_native(cold_t3):
+    owner_turns.write_settings({"trusted": ["claude_code:cli"]})
+    _desktop_record("pause Codex until tonight")
+    turn = _last()
+    ok, why = owner_turns.eligible(turn, t3_settled_none=True)
+    assert not ok and why == owner_turns.untrusted_why("claude_code:claude-desktop")
+    assert owner_turns.untrusted_front_end([turn]) is None
+    assert owner_turns.untrusted_front_end([turn], t3_settled_none=True) == "claude_code:claude-desktop"
+
+
+@pytest.mark.parametrize("flag", ["dispatched", "delegated", "machine", "wrapped", "helper"])
+def test_a_settled_none_never_lifts_a_refused_turn(home, flag):
+    line = {"entrypoint": "t3-unverified", "native": "claude-desktop", "harness": "claude_code", "typed": True,
+            flag: True}
+    assert owner_turns.eligible({**line, flag: False}, t3_settled_none=True)[0]
+    assert owner_turns.eligible(line, t3_settled_none=True)[0] is False
+
+
+def test_a_settled_none_never_lifts_a_job_the_recorder_marked(cold_t3):
+    _desktop_record("pause Codex until tonight", env={"KHIPU_JOB": "1"})
+    turn = _last()
+    assert turn["entrypoint"] == "t3-unverified" and turn["dispatched"] is True
+    assert owner_turns.eligible(turn, t3_settled_none=True)[0] is False
+    _desktop_record("pause Codex until tonight", env={"CLAUDE_DISPATCHED_LANE": "claude_secondary"})
+    assert owner_turns.eligible(_last(), t3_settled_none=True)[0] is False
+
+
+def test_an_untyped_unverified_turn_stays_refused(home):
+    line = {"entrypoint": "t3-unverified", "native": "claude-desktop", "harness": "claude_code", "typed": False}
+    ok, why = owner_turns.eligible(line, t3_settled_none=True)
+    assert not ok and why == "no typed text"
+
+
+@pytest.mark.parametrize("native", [None, "", "t3", "t3-unverified", 7, ["claude-desktop"]])
+def test_an_unverified_line_without_a_usable_native_stays_refused(home, native):
+    line = {"entrypoint": "t3-unverified", "harness": "claude_code", "typed": True}
+    if native is not None:
+        line["native"] = native
+    ok, why = owner_turns.eligible(line, t3_settled_none=True)
+    assert not ok and (why.startswith(_UNREAD_WHY) or "T3 conversation" in why)
+
+
+def test_a_native_is_never_read_from_a_turn_that_is_not_unverified(home):
+    # Only "t3-unverified" lines are judged again: a T3 turn stays on the T3 path.
+    line = {"entrypoint": "t3", "native": "claude-desktop", "harness": "claude_code", "typed": True}
+    ok, why = owner_turns.eligible(line, t3_settled_none=True)
+    assert not ok and "T3 conversation" in why
