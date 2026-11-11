@@ -283,7 +283,7 @@ const WHERE: Record<HarnessId, string> = {
   cursor: "~/.cursor/hooks.json · ~/.cursor/mcp.json",
   aegis: "~/.grok/config.toml",
   codex: "~/.codex/config.toml · ~/.codex/hooks.json",
-  grok_bot: "per repo: .cursor/mcp.json → your Khipu gateway",
+  grok_bot: "per repo: .cursor/mcp.json → your Khipu cloud server",
   antigravity: "~/.gemini/config/hooks.json · ~/.gemini/config/mcp_config.json",
 };
 
@@ -293,7 +293,7 @@ const HOW: Record<HarnessId, { title: string; items: Array<{ term: string; text:
     title: "How Claude Code connects",
     items: [
       { term: "Install, then restart", text: "Install adds Khipu's hooks to each Claude folder. Claude Code loads them when it starts." },
-      { term: "What the checks mean", text: "'Capture hook' turns green after a real session has run it. 'Verified' is a full round trip." },
+      { term: "What the checks mean", text: "'Saving hook' turns green after a real session has run it. 'Verified' is a full round trip." },
     ],
   },
   codex: {
@@ -314,15 +314,15 @@ const HOW: Record<HarnessId, { title: string; items: Array<{ term: string; text:
     title: "How Aegis connects",
     items: [
       { term: "A queue this Mac drains", text: "Aegis's sandbox saves through a queue, and this Mac sends it on." },
-      { term: "The gateway key", text: "Aegis reaches your gateway with the key saved on this page." },
+      { term: "The cloud server key", text: "Aegis reaches your cloud server with the key saved on this page." },
     ],
   },
   antigravity: AG_HOW,
   grok_bot: {
     title: "How Grok Bot connects",
     items: [
-      { term: "Nothing is installed on this Mac", text: "Grok Bot runs in Cursor's cloud. You connect it in Cursor's website, with your gateway address and a secret key." },
-      { term: "What the checks mean", text: "'Gateway answered this Mac' means your gateway is up and accepts your key. It doesn't prove Grok Bot itself got through." },
+      { term: "Nothing is installed on this Mac", text: "Grok Bot runs in Cursor's cloud. You connect it in Cursor's website, with your cloud server address and a secret key." },
+      { term: "What the checks mean", text: "'Cloud server answered this Mac' means your cloud server is up and accepts your key. It doesn't prove Grok Bot itself got through." },
       { term: "Saving is up to Grok Bot", text: "There's no automatic saving in the cloud. Grok Bot saves when it calls the memory tool." },
     ],
   },
@@ -334,7 +334,7 @@ export function t3CardStatus(t3: T3Health): CardStatus {
   if (reason === "hooks") return { tone: "warn", label: "Providers without hooks" };
   if (reason === "partial") return { tone: "warn", label: "Providers partly set up" };
   if (reason === "other") return { tone: "warn", label: "Needs a look" };
-  if (reason != null) return { tone: "warn", label: "Needs a linked capture" };
+  if (reason != null) return { tone: "warn", label: "Needs a linked save" };
   return { tone: "ok", label: "Linking threads" };
 }
 
@@ -362,23 +362,23 @@ export function captureHookLine(
   lv: HarnessLiveness | undefined,
 ): { mark: Mark; text: string } {
   return harness === "grok_bot"
-    ? { mark: "off", text: "Capture hook · cloud writes through the memory tool" }
+    ? { mark: "off", text: "Saving hook · cloud writes through the memory tool" }
     : !installed
-      ? { mark: "err", text: "Capture hook · not installed" }
+      ? { mark: "err", text: "Saving hook · not installed" }
       : lv?.ok === false
-        ? { mark: "err", text: `Capture hook · ${firstReason(lv) || "stopped recording"}` }
+        ? { mark: "err", text: `Saving hook · ${firstReason(lv) || "stopped recording"}` }
         : lv?.seen && (lv.captures ?? 0) > 0
           ? {
               mark: captureIsIdle(lv.last_captured_age_s) ? "off" : "ok",
               text: captureIsIdle(lv.last_captured_age_s)
-                ? `Capture hook · idle, last capture ${fmtAgo(lv.last_captured_age_s)}`
-                : `Capture hook · last capture ${fmtAgo(lv.last_captured_age_s)}`,
+                ? `Saving hook · idle, last save ${fmtAgo(lv.last_captured_age_s)}`
+                : `Saving hook · last save ${fmtAgo(lv.last_captured_age_s)}`,
             }
           : lv?.seen
-            ? { mark: "warn", text: "Capture hook · ran, nothing captured yet" }
+            ? { mark: "warn", text: "Saving hook · ran, nothing saved yet" }
             : lv
-              ? { mark: "off", text: "Capture hook · no session has run it yet" }
-              : { mark: "off", text: "Capture hook · recording not checked yet" };
+              ? { mark: "off", text: "Saving hook · no session has run it yet" }
+              : { mark: "off", text: "Saving hook · recording not checked yet" };
 }
 
 
@@ -511,7 +511,7 @@ export function cardStatus(
     // gateway, so it cannot say Reachable or Not reachable.
     const own = stored?.harnesses?.[row.harness];
     if (own?.ts && own.status !== "skipped") {
-      return { tone: "neutral", label: "Gateway not checked yet" };
+      return { tone: "neutral", label: "Cloud server not checked yet" };
     }
     return { tone: "neutral", label: "Not checked yet" };
   }
@@ -560,7 +560,7 @@ export function verifiedLine(
     if (fresh.status === "skipped") {
       return {
         mark: "off",
-        text: `Recall probe skipped — ${fresh.reason ?? "legacy capture mode writes no database row"}`,
+        text: `Recall probe skipped — ${fresh.reason ?? "legacy saving mode writes no database row"}`,
       };
     }
     if (fresh.ok) {
@@ -571,7 +571,7 @@ export function verifiedLine(
     }
     return {
       mark: "err",
-      text: `Verify failed — ${(fresh.error ?? fresh.reason ?? "the capture never became findable").slice(0, 120)}`,
+      text: `Verify failed — ${(fresh.error ?? fresh.reason ?? "the saved conversation never became findable").slice(0, 120)}`,
     };
   }
   const own = stored?.harnesses?.[harness];
@@ -579,7 +579,7 @@ export function verifiedLine(
     if (own.status === "skipped") {
       return {
         mark: "off",
-        text: `Recall probe skipped — ${own.reason ?? "legacy capture mode writes no database row"}`,
+        text: `Recall probe skipped — ${own.reason ?? "legacy saving mode writes no database row"}`,
       };
     }
     const ownAge = own.age_seconds;
@@ -598,7 +598,7 @@ export function verifiedLine(
     }
     return {
       mark: "err",
-      text: `Last verify failed${ownAge != null ? ` ${fmtAgo(ownAge)}` : ""} — ${(own.error ?? own.reason ?? "the capture never became findable").slice(0, 120)}`,
+      text: `Last verify failed${ownAge != null ? ` ${fmtAgo(ownAge)}` : ""} — ${(own.error ?? own.reason ?? "the saved conversation never became findable").slice(0, 120)}`,
     };
   }
   const last = stored?.last_probe;
@@ -634,7 +634,7 @@ export function verifiedLine(
   if (last.status === "skipped") {
     return {
       mark: "off",
-      text: `Recall probe skipped — ${last.reason ?? "legacy capture mode writes no database row"}`,
+      text: `Recall probe skipped — ${last.reason ?? "legacy saving mode writes no database row"}`,
     };
   }
   const age = stored?.age_seconds;
@@ -650,7 +650,7 @@ export function verifiedLine(
   }
   return {
     mark: "err",
-    text: `Last verify failed — ${(last.error ?? stored?.reason ?? "the capture never became findable").slice(0, 120)}`,
+    text: `Last verify failed — ${(last.error ?? stored?.reason ?? "the saved conversation never became findable").slice(0, 120)}`,
   };
 }
 
@@ -693,7 +693,7 @@ function verifySchemaFailure(list: VerifyRow[], expected: readonly string[]): st
   if (list.length === 0) return "verify result was empty";
   for (const harness of expected) {
     const row = list.find((item) => item.harness === harness);
-    if (!row || typeof row.detected !== "boolean") return "verify result did not cover the requested harness";
+    if (!row || typeof row.detected !== "boolean") return "verify result did not cover the requested app";
     if (row.detected && typeof row.ok !== "boolean") return "verify result did not say whether the probe passed";
   }
   return null;
@@ -704,7 +704,7 @@ function actionSchemaFailure(results: ActResult[], expected: readonly string[]):
   for (const harness of expected) {
     const row = results.find((item) => item.harness === harness);
     if (!row || (row.ok !== true && !Array.isArray(row.changes))) {
-      return "action result did not cover the requested harness";
+      return "action result did not cover the requested app";
     }
   }
   return null;
@@ -880,7 +880,7 @@ export function IntegrationsPanel({
       const raw = await runKhipu(["integrations", "status"]);
       if (latestLoad.current !== request) return;
       const nextRows = parseStatusRows(raw);
-      if (nextRows == null) throw new Error("Khipu returned an unreadable harness status.");
+      if (nextRows == null) throw new Error("Khipu returned an unreadable app status.");
       setRows(nextRows);
       agWanted.current = Boolean(t3?.detected) || nextRows.some((r) => r.harness === "antigravity" && r.detected);
       void loadAntigravity();
@@ -984,11 +984,11 @@ export function IntegrationsPanel({
             });
             message = run.verifyFailed
               ? `Installed; verify failed: ${run.verifyFailed}`
-              : "Installed. Restart each harness, then select Verify to check capture and recall.";
+              : "Installed. Restart each app, then select Verify to check saving and recall.";
             const skipped = list?.filter((v) => v.detected === false).map((v) => LABEL[v.harness]) ?? [];
             if (!run.verifyFailed && skipped.length > 0) {
               message = list?.every((v) => v.detected === false)
-                ? `Skipped: ${skipped.join(", ")}. No harness was checked.`
+                ? `Skipped: ${skipped.join(", ")}. No app was checked.`
                 : `${message} Skipped: ${skipped.join(", ")}.`;
             }
           }
@@ -1182,7 +1182,7 @@ export function IntegrationsPanel({
 
   const detected = (rows ?? []).filter((r) => r.detected);
   const unreadableStatus =
-    loadError?.includes("Khipu returned an unreadable harness status.") ?? false;
+    loadError?.includes("Khipu returned an unreadable app status.") ?? false;
 
   const agProvider = (t3?.providers ?? []).find((p) => p.driver === "antigravity");
   const agT3Visible = Boolean(t3?.detected) || agProjects.length > 0;
@@ -1241,11 +1241,11 @@ export function IntegrationsPanel({
           busy == null
             ? null
             : busy === "load"
-              ? "Checking harnesses…"
+              ? "Checking apps…"
               : busy.startsWith("install:")
-                ? "Installing harness packs…"
+                ? "Installing app packs…"
                 : busy.startsWith("verify:")
-                  ? "Verifying — capturing a throwaway session and searching for it…"
+                  ? "Verifying — saving a throwaway session and searching for it…"
                   : busy.startsWith("uninstall:")
                     ? "Removing Khipu entries…"
                     : "Working…"
@@ -1255,7 +1255,7 @@ export function IntegrationsPanel({
         <Callout
           tone="err"
           stripe
-          title="Couldn't read the harness configs"
+          title="Couldn't read the app configs"
           action={
             <button type="button" disabled={busy != null} onClick={() => void load()}>
               <RefreshCw size={14} strokeWidth={1.75} aria-hidden /> Retry
@@ -1263,7 +1263,7 @@ export function IntegrationsPanel({
           }
         >
           {unreadableStatus
-            ? "Khipu returned an unreadable harness status. The last known state is still shown."
+            ? "Khipu returned an unreadable app status. The last known state is still shown."
             : "The CLI didn't answer, so this is the last known state. Check that Python 3.11 and the Khipu folder are set under Settings → Advanced."}
         </Callout>
       ) : null}
@@ -1290,12 +1290,12 @@ export function IntegrationsPanel({
           <RefreshCw size={14} strokeWidth={1.75} aria-hidden /> Refresh
         </button>
         <span className="meta push">
-          Verified = a real capture went in and came back out of search on this Mac
+          Verified = a real conversation was saved and came back out of search on this Mac
         </span>
       </div>
 
       {rows == null && !loadError ? (
-        <p className="muted">Reading harness configs…</p>
+        <p className="muted">Reading app configs…</p>
       ) : null}
 
       <div className="hgrid">
@@ -1354,18 +1354,18 @@ export function IntegrationsPanel({
                   <CheckMark mark={latest != null ? (lookup ? "ok" : "off") : (recentWithoutCapture ? "warn" : "off")} />
                   <span>{latest != null
                     ? lookup
-                      ? `Last capture linked to a thread ${fmtAgo(latest)}${t3.last_thread_linked_capture_harness ? ` · ${LABEL[t3.last_thread_linked_capture_harness as HarnessId] ?? t3.last_thread_linked_capture_harness}` : ""}`
-                      : `Last capture linked to a thread ${fmtAgo(latest)} · captures since then are recorded but not linked`
+                      ? `Last save linked to a thread ${fmtAgo(latest)}${t3.last_thread_linked_capture_harness ? ` · ${LABEL[t3.last_thread_linked_capture_harness as HarnessId] ?? t3.last_thread_linked_capture_harness}` : ""}`
+                      : `Last save linked to a thread ${fmtAgo(latest)} · saves since then are recorded but not linked`
                     : recentWithoutCapture
-                      ? "T3 was used in the last day without a thread-linked capture"
-                      : "No thread-linked capture yet"}</span>
+                      ? "T3 was used in the last day without a thread-linked save"
+                      : "No thread-linked save yet"}</span>
                 </div>
                 <div>
                   <CheckMark mark={lookup ? (linkedToday > 0 ? "ok" : "off") : "warn"} />
                   <span>{lookup
                     ? linkedToday > 0
-                      ? `${linkedToday} capture${linkedToday === 1 ? "" : "s"} linked to a T3 thread today`
-                      : "No T3 captures linked today"
+                      ? `${linkedToday} save${linkedToday === 1 ? "" : "s"} linked to a T3 thread today`
+                      : "No T3 saves linked today"
                     : "Search by thread and switch-aware recall paused"}</span>
                 </div>
                 {hooklessNames.length > 0 ? (
@@ -1398,20 +1398,20 @@ export function IntegrationsPanel({
                     {(t3.notes ?? []).map((n) => (
                       <div className="note wrap flat" key={n}>{plainNote(n)}</div>
                     ))}
-                    <div className="note wrap flat">Partial is amber, never red: it means a harness limit or a feature you haven't added, not a fault.</div>
+                    <div className="note wrap flat">Partial is amber, never red: it means an app limit or a feature you haven't added, not a fault.</div>
                   </div>
                 </div>
               ) : null}
               <div className="note wrap">{lookup
                 ? "When you switch account or provider inside a thread, Khipu recalls that thread’s decisions and open commitments first."
-                : "Nothing is lost: captures still land and search still finds them. Until a Khipu update reads T3's new layout, search can't filter by thread and recall after a switch falls back to the usual top 3."}</div>
+                : "Nothing is lost: saves still land and search still finds them. Until a Khipu update reads T3's new layout, search can't filter by thread and recall after a switch falls back to the usual top 3."}</div>
               <div className="note wrap">Khipu reads T3's settings and thread records. It never changes them.</div>
               <div className="hacts">
                 <button type="button" className="sm" disabled={busy != null} onClick={() => void refreshHealth()}>
                   <RefreshCw size={14} strokeWidth={1.75} aria-hidden /> Recheck
                 </button>
                 <button type="button" className="sm link push" onClick={onSearchT3Captures}>
-                  Search T3 captures
+                  Search T3 saves
                 </button>
               </div>
             </div>
@@ -1452,7 +1452,7 @@ export function IntegrationsPanel({
             : r.recall_rule;
           const recall: { mark: Mark; text: string } =
             recallRule === "n/a"
-              ? { mark: "off", text: "Recall at start · not available in this harness" }
+              ? { mark: "off", text: "Recall at start · not available in this app" }
               : recallRule === "mcp_instructions"
                 ? { mark: "ok", text: "Recall at start · served with the memory tools" }
                 : recallRule === "project_scoped"
@@ -1469,9 +1469,9 @@ export function IntegrationsPanel({
           const mcp: { mark: Mark; text: string } =
             r.harness === "grok_bot"
               ? mcpProbe?.ok
-                ? { mark: "ok", text: "Gateway answered this Mac · token accepted" }
+                ? { mark: "ok", text: "Cloud server answered this Mac · token accepted" }
                 : mcpProbe
-                  ? { mark: "err", text: `Gateway · ${(mcpProbe.error ?? "no answer").slice(0, 110)}` }
+                  ? { mark: "err", text: `Cloud server · ${(mcpProbe.error ?? "no answer").slice(0, 110)}` }
                   : { mark: "off", text: "Memory tools (MCP) · set in the Cursor cloud, not readable here" }
               : mcpProbe?.ok
                 ? {
@@ -1606,12 +1606,12 @@ export function IntegrationsPanel({
                 <div className="note">Re-run Install for this repo to refresh its rule.</div>
               ) : awaitingAutoVerify ? (
                 <div className="note">
-                  Installed. Restart {LABEL[r.harness]}, then select Verify to check capture and recall.
+                  Installed. Restart {LABEL[r.harness]}, then select Verify to check saving and recall.
                 </div>
               ) : r.harness === "grok_bot" ? (
                 <div className="note wrap" title={WHERE[r.harness]}>
                   Nothing is installed on this Mac. You connect Grok Bot once in
-                  Cursor's website, with your gateway address and a secret key.
+                  Cursor's website, with your cloud server address and a secret key.
                 </div>
               ) : !r.detected ? (
                 <div className="note">Config folder not found — nothing to install.</div>
@@ -1658,7 +1658,7 @@ export function IntegrationsPanel({
                       {busy === `verify:${r.harness}` ? (
                         <Loader2 size={14} className="spin" aria-hidden />
                       ) : null}
-                      {r.harness === "grok_bot" ? "Check the gateway" : "Verify"}
+                      {r.harness === "grok_bot" ? "Check the cloud server" : "Verify"}
                     </button>
                     {homes.length > 0 ? null : (
                       <button
@@ -1708,14 +1708,14 @@ export function IntegrationsPanel({
 
       <p className="muted">
         Install writes Khipu's own entries next to whatever is already there and
-        backs each file up first. Your existing capture hooks keep running.
-        Restart a harness after installing so it loads the change.
+        backs each file up first. Your existing saving hooks keep running.
+        Restart an app after installing so it loads the change.
       </p>
       {liveness == null ? (
         <p className="muted">
           <TriangleAlert size={14} strokeWidth={1.75} aria-hidden className="warn" />{" "}
           Recording evidence comes from the health report — open Home once, or
-          Refresh here, to fill in the capture and verified lines.
+          Refresh here, to fill in the saving and verified lines.
         </p>
       ) : null}
       <Dialog
@@ -1725,8 +1725,8 @@ export function IntegrationsPanel({
         onCancel={() => setRemoveConfirm(null)}
       >
         <div className="kit-dialog-body">
-          <h2 id="remove-harness-title">Remove Khipu from {removeConfirm?.label ?? "this harness"}?</h2>
-          <p>This stops future capture and recall for this harness until you install it again.</p>
+          <h2 id="remove-harness-title">Remove Khipu from {removeConfirm?.label ?? "this app"}?</h2>
+          <p>This stops future saving and recall for this app until you install it again.</p>
           <div className="kit-dialog-actions">
             <button type="button" onClick={() => setRemoveConfirm(null)}>Cancel</button>
             <button type="button" className="danger" disabled={busy != null} onClick={() => {

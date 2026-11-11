@@ -622,21 +622,6 @@ async fn khipu_secrets_verify() -> Result<String, String> {
         .await
 }
 
-/// Index everything missing or changed (`khipu embed backfill`, no arguments).
-///
-/// `embed` stays OUT of `ALLOWED_SUBCOMMANDS` on purpose: that path forwards
-/// arbitrary argv, and `embed` reaches paid Gemini calls, a `--profile` switch
-/// and vector deletes. Settings → Search index needs exactly one of those
-/// things, so it gets exactly one fixed argv and no arguments of its own —
-/// the same shape as `khipu_migrate` and `secrets_presence`. The button is
-/// behind a confirm dialog in the UI because it spends money.
-const EMBED_BACKFILL_ARGV: &[&str] = &["embed", "backfill"];
-
-#[tauri::command]
-async fn khipu_embed_backfill() -> Result<String, String> {
-    run_khipu_cli_async(EMBED_BACKFILL_ARGV.iter().map(|s| s.to_string()).collect()).await
-}
-
 /// Re-render + reload whichever scheduled LaunchAgents are already installed
 /// (`khipu jobs refresh`, no arguments). `jobs` stays OUT of
 /// `ALLOWED_SUBCOMMANDS` on purpose: `jobs install`/`jobs uninstall` change
@@ -656,11 +641,6 @@ const JOBS_REFRESH_ARGV: &[&str] = &["jobs", "refresh"];
 /// owner reviews it); the CLI side enforces both. A fixed argv, like the jobs
 /// refresh: `integrations` stays one subcommand the webview names itself.
 const HOOKS_REFRESH_ARGV: &[&str] = &["integrations", "refresh"];
-
-#[tauri::command]
-async fn khipu_jobs_refresh() -> Result<String, String> {
-    run_khipu_cli_async(JOBS_REFRESH_ARGV.iter().map(|s| s.to_string()).collect()).await
-}
 
 /// Harnesses -> Antigravity card: `khipu t3 antigravity add|remove|list`, the
 /// per-project files for Antigravity inside T3 Code. `t3` stays out of
@@ -692,35 +672,6 @@ fn t3_antigravity_argv(action: &str, project: Option<&str>) -> Result<Vec<String
 #[tauri::command]
 async fn khipu_t3_antigravity(action: String, project: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(t3_antigravity_argv(&action, project.as_deref())?).await
-}
-
-/// D3: Home's "Right now" card — pending turns per live harness, queue
-/// depth, captured-today — without waiting on the slower full `doctor` pass
-/// (DB round trips, backup checks, etc.) that also carries this same data
-/// under `capture_liveness`. `khipu sessions liveness` always prints JSON
-/// (`session_capture.liveness_all()`, the same call doctor makes); fixed
-/// argv, no arguments, exits non-zero when a harness is red but still
-/// prints JSON (`run_khipu_cli` already treats that as Ok, not an invoke
-/// error).
-const LIVENESS_NOW_ARGV: &[&str] = &["sessions", "liveness"];
-
-#[tauri::command]
-async fn liveness_now() -> Result<String, String> {
-    run_khipu_cli_async(LIVENESS_NOW_ARGV.iter().map(|s| s.to_string()).collect()).await
-}
-
-/// D3: Home's "Capture now" button — `khipu capture now`, no arguments, so
-/// it flags the most recently active local session (K1's
-/// `resolve_session_ref()`) for capture at its next Stop/PreCompact/
-/// SessionEnd instead of waiting on the fixed cadence. Fixed argv: `capture`
-/// stays out of `ALLOWED_SUBCOMMANDS` like every other state-changing verb
-/// here, and the button never lets the webview pick a harness/session id of
-/// its own.
-const CAPTURE_NOW_ARGV: &[&str] = &["capture", "now"];
-
-#[tauri::command]
-async fn khipu_capture_now() -> Result<String, String> {
-    run_khipu_cli_async(CAPTURE_NOW_ARGV.iter().map(|s| s.to_string()).collect()).await
 }
 
 // --- Settings parity (docs/plans/2026-09-30-settings-parity.md). Every setting
@@ -762,7 +713,6 @@ const COSINE_FLOOR_BY_PROFILE_PREFIX: &str = "relevance.cosine_floor_by_profile.
 const FEATURES_SHOW_ARGV: &[&str] = &["features"];
 const CONFIG_SHOW_ARGV: &[&str] = &["config"];
 const JOBS_STATUS_ARGV: &[&str] = &["jobs", "status"];
-const RECALL_STATUS_ARGV: &[&str] = &["recall", "status"];
 const GATEWAY_TOKEN_STATUS_ARGV: &[&str] = &["gateway", "token", "status"];
 const GATEWAY_TOKEN_SET_ARGV: &[&str] = &["gateway", "token", "set"];
 /// Guides -> Grok Bot -> "Copy gateway key". The CLI copies the key to the
@@ -1048,6 +998,8 @@ const ROUTING_SWITCH_KEYS: &[&str] = &[
 const ROUTING_RETRIES_KEY: &str = "routing_reset_check_retries";
 const ROUTING_SOURCES_KEY: &str = "routing_sources";
 const ROUTING_LANE_MAP_KEY: &str = "routing_lane_map";
+/// The names the owner gives the Macs, by Mac id (Settings › Your Macs).
+const ROUTING_MAC_NAMES_KEY: &str = "routing_mac_names";
 /// The routing table file: a full path, read only (fix round 2, R2-1).
 const ROUTING_TABLE_KEY: &str = "routing_table";
 const ROUTING_SOURCES_MAX: usize = 32;
@@ -1269,6 +1221,7 @@ fn routing_key(key: &str) -> bool {
         || key == ROUTING_RETRIES_KEY
         || key == ROUTING_SOURCES_KEY
         || key == ROUTING_LANE_MAP_KEY
+        || key == ROUTING_MAC_NAMES_KEY
         || key == ROUTING_TABLE_KEY
 }
 
@@ -1348,6 +1301,26 @@ fn checked_routing_lane_map(raw: &str) -> Result<String, String> {
     serde_json::to_string(&out).map_err(|e| e.to_string())
 }
 
+/// The Mac names, parsed and re-printed: an object of at most 32 Mac ids (32
+/// lower-case hex characters) to one-line names, the shape `khipu config`
+/// itself checks (`routing._coerce`, kind `mac_names`).
+fn checked_routing_mac_names(raw: &str) -> Result<String, String> {
+    let bad = || "the Mac names must be JSON like {\"<mac id>\": \"M5\"}".to_string();
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|_| bad())?;
+    let macs = value.as_object().ok_or_else(bad)?;
+    if macs.len() > 32 {
+        return Err("at most 32 Mac names".to_string());
+    }
+    let mut out = serde_json::Map::new();
+    for (mac, name) in macs {
+        if mac.len() != 32 || !mac.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+            return Err(format!("{mac:?} is not a Mac id"));
+        }
+        out.insert(mac.clone(), serde_json::Value::String(routing_json_text("a Mac name", name, 64)?));
+    }
+    serde_json::to_string(&out).map_err(|e| e.to_string())
+}
+
 /// A routing setting's value as argv takes it, re-printed from the parsed
 /// value: whole seconds, a whole number, on or off, or checked JSON.
 fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
@@ -1363,6 +1336,9 @@ fn routing_setting_value(key: &str, value: &str) -> Result<String, String> {
     }
     if key == ROUTING_LANE_MAP_KEY {
         return checked_routing_lane_map(v);
+    }
+    if key == ROUTING_MAC_NAMES_KEY {
+        return checked_routing_mac_names(v);
     }
     if key == ROUTING_TABLE_KEY {
         return checked_routing_path("the routing table file", v);
@@ -1525,18 +1501,6 @@ fn config_unset_argv_expect(key: &str, expect: Option<&str>) -> Result<Vec<Strin
     Ok(vec!["config".to_string(), format!("--unset={key}")])
 }
 
-/// The owner's answer to a conversation's change to a routing setting.
-fn config_request_argv(key: &str, action: &str) -> Result<Vec<String>, String> {
-    if !routing_key(key) {
-        return Err(format!("not a routing setting: {key:?}"));
-    }
-    if !matches!(action, "confirm" | "undo") {
-        return Err(format!("not an answer to a request: {action:?}"));
-    }
-    Ok(vec!["config".to_string(), "--from-app".to_string(), "--answer-request".to_string(), key.to_string(),
-            action.to_string()])
-}
-
 /// The owner's yes or no to a request held for him, here or on another Mac
 /// (`khipu owner-direction answer`). The id can never read as a flag.
 fn owner_answer_argv(request: &str, answer: &str) -> Result<Vec<String>, String> {
@@ -1570,23 +1534,6 @@ fn checked_profile(profile: &str) -> Result<&str, String> {
     } else {
         Err(format!("not an embedding profile id: {profile:?}"))
     }
-}
-
-fn embed_status_argv(profile: Option<&str>) -> Result<Vec<String>, String> {
-    let mut args = vec!["embed".to_string(), "status".to_string()];
-    if let Some(p) = profile {
-        args.push(format!("--profile={}", checked_profile(p)?));
-    }
-    Ok(args)
-}
-
-/// Never `--force`: the CLI refuses a profile that is missing vectors.
-fn embed_activate_argv(profile: &str) -> Result<Vec<String>, String> {
-    Ok(vec![
-        "embed".to_string(),
-        "activate".to_string(),
-        checked_profile(profile)?.to_string(),
-    ])
 }
 
 fn gateway_token_input(value: &str) -> Result<String, String> {
@@ -1633,11 +1580,6 @@ async fn khipu_config_set(key: String, value: String, expect: Option<String>) ->
 #[tauri::command]
 async fn khipu_config_unset(key: String, expect: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(config_unset_argv_expect(&key, expect.as_deref())?).await
-}
-
-#[tauri::command]
-async fn khipu_config_request(key: String, action: String) -> Result<String, String> {
-    run_khipu_cli_async(config_request_argv(&key, &action)?).await
 }
 
 #[tauri::command]
@@ -1847,10 +1789,6 @@ async fn khipu_route_view() -> Result<String, String> {
 // webview sends can become a flag: not a value starting with `-`, and not a
 // line break (refused in every one-line field). No shell is involved.
 
-/// `--reason` values `khipu route hold` accepts.
-const ROUTE_HOLD_REASONS: &[&str] = &["machine-busy", "disk-low", "keep", "outage", "other"];
-/// The rule verbs the app offers (`khipu route rule ACTION`).
-const ROUTE_RULE_ACTIONS: &[&str] = &["add", "edit", "retire", "restore", "confirm", "undo", "dismiss"];
 /// The most owner's words the app hands the CLI in one change (a rule, the
 /// note, a hold), in bytes of UTF-8. Not a limit on what the owner may say:
 /// the CLI keeps a note and a rule at any length, and a hold up to the
@@ -1949,17 +1887,6 @@ fn route_lift_argv(account: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
-/// Check one already configured account.  The CLI validates it against the
-/// routing record before it starts its fixed usage probe.
-fn route_check_argv(account: &str) -> Result<Vec<String>, String> {
-    Ok(vec!["route".to_string(), "check".to_string(), "--".to_string(), checked_route_account(account)?])
-}
-
-/// The owner's retry of the routing-copy cleanup (forced, past the cap).
-fn gateway_copy_cleanup_argv() -> Vec<String> {
-    vec!["route".to_string(), "copy".to_string(), "cleanup".to_string()]
-}
-
 /// Clear the account, or with `report` dismiss that one report.
 fn route_clear_argv(account: &str, report: Option<&str>) -> Result<Vec<String>, String> {
     let mut argv = route_base("clear");
@@ -1969,19 +1896,6 @@ fn route_clear_argv(account: &str, report: Option<&str>) -> Result<Vec<String>, 
     argv.push("--".to_string());
     argv.push(checked_route_account(account)?);
     Ok(argv)
-}
-
-fn route_note_set_argv(text: &str) -> Result<Vec<String>, String> {
-    let words = checked_route_words(text, true)?;
-    let mut argv = route_base("note");
-    argv.extend(["--".to_string(), "set".to_string(), words]);
-    Ok(argv)
-}
-
-fn route_note_end_argv() -> Vec<String> {
-    let mut argv = route_base("note");
-    argv.extend(["--".to_string(), "end".to_string()]);
-    argv
 }
 
 fn route_operation_argv(mut argv: Vec<String>, op: Option<&str>) -> Result<Vec<String>, String> {
@@ -2005,70 +1919,6 @@ fn checked_holds_arg(holds: &serde_json::Map<String, Value>) -> Result<String, S
         return Err("holds must map each hold id to end or keep".to_string());
     }
     Ok(format!("--holds={}", Value::Object(holds.clone())))
-}
-
-fn route_rule_argv(action: &str, n: Option<u32>, text: Option<&str>) -> Result<Vec<String>, String> {
-    route_rule_argv_holds(action, n, text, None, None, None)
-}
-
-fn route_rule_argv_holds(
-    action: &str,
-    n: Option<u32>,
-    text: Option<&str>,
-    holds: Option<&serde_json::Map<String, Value>>,
-    entity: Option<&str>,
-    expect: Option<&str>,
-) -> Result<Vec<String>, String> {
-    if !ROUTE_RULE_ACTIONS.contains(&action) {
-        return Err(format!("not a rule change: {action:?}"));
-    }
-    let mut argv = route_base("rule");
-    if let Some(expect) = expect {
-        argv.push(format!("--expect={}", checked_route_id(expect)?));
-    }
-    if let Some(holds) = holds {
-        argv.push(checked_holds_arg(holds)?);
-    }
-    argv.extend(["--".to_string(), action.to_string()]);
-    if action != "add" {
-        if let Some(n) = n.filter(|n| *n >= 1) {
-            argv.push(n.to_string());
-        } else if let Some(entity) = entity {
-            argv.push(checked_route_id(entity)?);
-        } else {
-            return Err("name the rule's number".to_string());
-        }
-    }
-    if action == "add" || action == "edit" {
-        argv.push(checked_route_words(text.unwrap_or(""), false)?);
-    }
-    Ok(argv)
-}
-
-fn route_hold_add_argv(
-    text: &str,
-    reason: &str,
-    scope: &str,
-    account: Option<&str>,
-    until: Option<&str>,
-) -> Result<Vec<String>, String> {
-    let words = checked_route_words(text, false)?;
-    if !ROUTE_HOLD_REASONS.contains(&reason) {
-        return Err(format!("not a kind of hold: {reason:?}"));
-    }
-    let mut argv = route_base("hold");
-    argv.push(format!("--reason={reason}"));
-    match scope {
-        "all" => argv.push("--all".to_string()),
-        "machine" => argv.push("--machine".to_string()),
-        "account" => argv.push(format!("--account={}", checked_route_account(account.unwrap_or(""))?)),
-        _ => return Err(format!("a hold is about all work, this Mac or one account, not {scope:?}")),
-    }
-    if let Some(t) = until.filter(|t| !t.trim().is_empty()) {
-        argv.push(format!("--until={}", checked_route_until(t)?));
-    }
-    argv.extend(["--".to_string(), words]);
-    Ok(argv)
 }
 
 fn route_hold_end_argv(id: &str) -> Result<Vec<String>, String> {
@@ -2143,19 +1993,6 @@ fn route_cap_argv(action: &str, account: &str, cap: &RouteCapArgs) -> Result<Vec
     }
     argv.extend(["--".to_string(), action.to_string(), checked_route_account(account)?]);
     Ok(argv)
-}
-
-fn route_definition_argv(definition: &str, value: &Value) -> Result<Vec<String>, String> {
-    if !matches!(definition, "provider" | "account" | "lane_map") || !value.is_object() {
-        return Err("choose a provider, account or lane definition".to_string());
-    }
-    let encoded = serde_json::to_string(value).map_err(|_| "could not read the definition".to_string())?;
-    if encoded.len() > ROUTE_WORDS_MAX_BYTES {
-        return Err("the definition is too long".to_string());
-    }
-    // JSON stays joined to its option. The CLI applies the closed definition schema and owner gate.
-    Ok(vec!["route".into(), "definition".into(), "set".into(), definition.into(),
-            format!("--value={encoded}"), "--from-app".into()])
 }
 
 /// The owner's priority verbs (`khipu route priority ACTION`, routing truth
@@ -2455,18 +2292,6 @@ fn accounts_auto_track_argv(on: bool) -> Vec<String> {
     argv
 }
 
-/// `expect` is the list's version as the owner read it, required: his
-/// answer never lands on a newer request than the one he saw.
-fn accounts_request_argv(action: &str, expect: &str) -> Result<Vec<String>, String> {
-    if !matches!(action, "confirm" | "undo") {
-        return Err(format!("not an answer to a request: {action:?}"));
-    }
-    let mut argv = accounts_base("request");
-    argv.push(format!("--expect={}", required_expect(Some(expect), "the answer to a request")?));
-    argv.push(action.to_string());
-    Ok(argv)
-}
-
 #[tauri::command]
 async fn khipu_accounts_status() -> Result<String, String> {
     run_khipu_cli_async(accounts_status_argv()).await
@@ -2527,11 +2352,6 @@ async fn khipu_accounts_offer_again(harness: String, folder: Option<String>) -> 
 #[tauri::command]
 async fn khipu_accounts_auto_track(on: bool) -> Result<String, String> {
     run_khipu_cli_async(accounts_auto_track_argv(on)).await
-}
-
-#[tauri::command]
-async fn khipu_accounts_request(action: String, expect: String) -> Result<String, String> {
-    run_khipu_cli_async(accounts_request_argv(&action, &expect)?).await
 }
 
 /// The CLIs whose own login the app can start (`khipu.usage.SIGN_IN_ARGS`):
@@ -2597,16 +2417,6 @@ async fn khipu_route_pause(account: String, until: Option<String>, op: Option<St
 #[tauri::command]
 async fn khipu_route_lift(account: String, op: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(route_operation_argv(route_lift_argv(&account)?, op.as_deref())?).await
-}
-
-#[tauri::command]
-async fn khipu_gateway_copy_cleanup() -> Result<String, String> {
-    run_khipu_cli_async(gateway_copy_cleanup_argv()).await
-}
-
-#[tauri::command]
-async fn khipu_route_check(account: String) -> Result<String, String> {
-    run_khipu_cli_async(route_check_argv(&account)?).await
 }
 
 // --- Settings -> Owner actions (owner direction, scope 2.5 and section 4).
@@ -2676,11 +2486,6 @@ async fn khipu_owner_direction_show() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn khipu_owner_request_decline(id: String) -> Result<String, String> {
-    run_khipu_cli_async(vec!["owner-direction".into(), "decline".into(), "--from-app".into(), "--".into(), id]).await
-}
-
-#[tauri::command]
 async fn khipu_owner_direction_actions() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(OWNER_DIRECTION_ACTIONS_ARGV)).await
 }
@@ -2700,122 +2505,9 @@ async fn khipu_owner_direction_set(key: String, value: String) -> Result<String,
     run_khipu_cli_async(owner_direction_set_argv(&key, &value)?).await
 }
 
-/// A project name as the app sends it, held to the safe shape the CLI holds
-/// it to (`identity.safe_project_name`): a remote's `owner/repo`
-/// (`[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9._-]{1,100}`) or a folder name
-/// (`[A-Za-z0-9._][A-Za-z0-9._ -]{0,99}`). Anything else (a `|`, a newline,
-/// a backtick, a leading dash) is refused here, before the CLI is run.
-fn checked_project_name(name: &str) -> Result<String, String> {
-    let name = name.trim();
-    let word = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
-    let slug = match name.split_once('/') {
-        Some((owner, repo)) => {
-            let n = owner.chars().count();
-            let r = repo.chars().count();
-            owner.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-                && n <= 100
-                && owner.chars().all(word)
-                && (1..=100).contains(&r)
-                && repo.chars().all(word)
-        }
-        None => false,
-    };
-    let folder = name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
-        && name.chars().count() <= 100
-        && name.chars().all(|c| word(c) || c == ' ');
-    if !(slug || folder) {
-        return Err("that is not a project name Khipu uses (letters, digits, dots, dashes and underscores, \
-                    with one owner/repo slash at most)"
-            .to_string());
-    }
-    Ok(name.to_string())
-}
-
-const PROJECTS_LIST_ARGV: &[&str] = &["project", "list", "--json"];
-
-fn project_owner_argv(verb: &[&str], flags: &[(&str, &str)], names: &[&str]) -> Result<Vec<String>, String> {
-    let mut argv: Vec<String> = vec!["project".to_string()];
-    argv.extend(verb.iter().map(|s| s.to_string()));
-    argv.push("--from-app".to_string());
-    for (flag, value) in flags {
-        argv.push(flag.to_string());
-        argv.push(checked_project_name(value)?);
-    }
-    argv.push("--".to_string());
-    for n in names {
-        argv.push(checked_project_name(n)?);
-    }
-    Ok(argv)
-}
-
-#[tauri::command]
-async fn khipu_projects_list() -> Result<String, String> {
-    run_khipu_cli_async(fixed_argv(PROJECTS_LIST_ARGV)).await
-}
-
-#[tauri::command]
-async fn khipu_project_name_add(older: String, current: String) -> Result<String, String> {
-    run_khipu_cli_async(project_owner_argv(&["alias", "add"], &[], &[&older, &current])?).await
-}
-
-#[tauri::command]
-async fn khipu_project_name_remove(older: String) -> Result<String, String> {
-    run_khipu_cli_async(project_owner_argv(&["alias", "remove"], &[], &[&older])?).await
-}
-
-#[tauri::command]
-async fn khipu_project_separate(name: String) -> Result<String, String> {
-    run_khipu_cli_async(project_owner_argv(&["separate"], &[], &[&name])?).await
-}
-
-#[tauri::command]
-async fn khipu_project_merge(a: String, b: String, show_as: String) -> Result<String, String> {
-    run_khipu_cli_async(project_owner_argv(&["merge"], &[("--show-as", &show_as)], &[&a, &b])?).await
-}
-
-#[tauri::command]
-async fn khipu_project_keep_separate(a: String, b: String) -> Result<String, String> {
-    run_khipu_cli_async(project_owner_argv(&["keep-separate"], &[], &[&a, &b])?).await
-}
-
 #[tauri::command]
 async fn khipu_route_clear(account: String, report: Option<String>, op: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(route_operation_argv(route_clear_argv(&account, report.as_deref())?, op.as_deref())?).await
-}
-
-#[tauri::command]
-async fn khipu_route_note_set(text: String, op: Option<String>) -> Result<String, String> {
-    run_khipu_cli_async(route_operation_argv(route_note_set_argv(&text)?, op.as_deref())?).await
-}
-
-#[tauri::command]
-async fn khipu_route_note_end(op: Option<String>) -> Result<String, String> {
-    run_khipu_cli_async(route_operation_argv(route_note_end_argv(), op.as_deref())?).await
-}
-
-#[tauri::command]
-async fn khipu_route_rule(
-    action: String,
-    n: Option<u32>,
-    entity: Option<String>,
-    expect: Option<String>,
-    text: Option<String>,
-    holds: Option<serde_json::Map<String, Value>>,
-    op: Option<String>,
-) -> Result<String, String> {
-    run_khipu_cli_async(route_operation_argv(route_rule_argv_holds(&action, n, text.as_deref(), holds.as_ref(), entity.as_deref(), expect.as_deref())?, op.as_deref())?).await
-}
-
-#[tauri::command]
-async fn khipu_route_hold_add(
-    text: String,
-    reason: String,
-    scope: String,
-    account: Option<String>,
-    until: Option<String>,
-    op: Option<String>,
-) -> Result<String, String> {
-    run_khipu_cli_async(route_operation_argv(route_hold_add_argv(&text, &reason, &scope, account.as_deref(), until.as_deref())?, op.as_deref())?).await
 }
 
 #[tauri::command]
@@ -3042,9 +2734,6 @@ async fn khipu_route_exception_end(account: String, id: String, expect: String) 
 /// limit on the ledger (the CLI applies the owner's `ledger_*` limits); it
 /// keeps one argument well inside what a program can be started with.
 const LEDGER_TEXT_MAX_BYTES: usize = 64 * 1024;
-/// `--children` choices `khipu ledger remove` accepts.
-const LEDGER_CHILDREN: &[&str] = &["remove", "move-up"];
-
 /// A ledger project key (`owner/repo`, a name): one line of at most 200
 /// characters without `#`, as `ledger._check_project` takes it.
 fn checked_ledger_project(raw: &str) -> Result<String, String> {
@@ -3090,16 +2779,6 @@ fn checked_ledger_text(raw: &str, lines: bool) -> Result<String, String> {
     Ok(raw.to_string())
 }
 
-/// A commitment's id (`khipu owed`): digits only.
-fn checked_commitment_id(raw: &str) -> Result<String, String> {
-    let v = raw.trim();
-    if !v.is_empty() && v.len() <= 20 && v.chars().all(|c| c.is_ascii_digit()) {
-        Ok(v.to_string())
-    } else {
-        Err("that is not a commitment Khipu knows".to_string())
-    }
-}
-
 fn ledger_base(verb: &str, project: &str, write: bool) -> Result<Vec<String>, String> {
     let mut argv = vec!["ledger".to_string(), verb.to_string(), "--json".to_string()];
     if write {
@@ -3127,16 +2806,6 @@ fn work_view_argv() -> Vec<String> {
 
 fn ledger_list_argv(project: &str) -> Result<Vec<String>, String> {
     ledger_base("list", project, false)
-}
-
-fn ledger_get_argv(project: &str, id: &str) -> Result<Vec<String>, String> {
-    let mut argv = ledger_base("get", project, false)?;
-    argv.extend(["--".to_string(), checked_ledger_id(id)?]);
-    Ok(argv)
-}
-
-fn ledger_removed_argv(project: &str) -> Result<Vec<String>, String> {
-    ledger_base("removed", project, false)
 }
 
 /// One change to a row from the app. A field left out (None) is not
@@ -3182,47 +2851,6 @@ fn ledger_set_argv(project: &str, id: &str, change: &LedgerChange) -> Result<Vec
     Ok(argv)
 }
 
-fn ledger_remove_argv(project: &str, id: &str, note: Option<&str>, children: Option<&str>) -> Result<Vec<String>, String> {
-    let mut argv = ledger_base("remove", project, true)?;
-    if let Some(c) = children.filter(|c| !c.is_empty()) {
-        if !LEDGER_CHILDREN.contains(&c) {
-            return Err(format!("not a choice for the rows under it: {c:?}"));
-        }
-        argv.push(format!("--children={c}"));
-    }
-    if let Some(n) = note.filter(|n| !n.trim().is_empty()) {
-        argv.push(format!("--note={}", checked_ledger_text(n, true)?));
-    }
-    argv.extend(["--".to_string(), checked_ledger_id(id)?]);
-    Ok(argv)
-}
-
-fn ledger_restore_argv(project: &str, id: &str) -> Result<Vec<String>, String> {
-    let mut argv = ledger_base("restore", project, true)?;
-    argv.extend(["--".to_string(), checked_ledger_id(id)?]);
-    Ok(argv)
-}
-
-/// `work hide|unhide -- ID`: Khipu's own record of a commitment hidden from
-/// Waiting on you until its words change.
-fn work_hide_argv(id: &str, hide: bool) -> Result<Vec<String>, String> {
-    let verb = if hide { "hide" } else { "unhide" };
-    Ok(vec!["work".to_string(), verb.to_string(), "--".to_string(), checked_commitment_id(id)?])
-}
-
-/// `work same|not-same -- PROJECT#ROW COMMITMENT`: the owner's answer to
-/// "Looks like".
-fn work_same_argv(project: &str, row: &str, commitment: &str, same: bool) -> Result<Vec<String>, String> {
-    let verb = if same { "same" } else { "not-same" };
-    Ok(vec![
-        "work".to_string(),
-        verb.to_string(),
-        "--".to_string(),
-        format!("{}#{}", checked_ledger_project(project)?, checked_ledger_id(row)?),
-        checked_commitment_id(commitment)?,
-    ])
-}
-
 // ---- Owed: several items at once, and the one-time clean-up
 // (docs/plans/2026-10-16-owed-and-ledger-ssot.md, slice 5)
 //
@@ -3233,80 +2861,6 @@ fn work_same_argv(project: &str, row: &str, commitment: &str, same: bool) -> Res
 // joined to their flag; the reason is one line joined to `--reason=`, so
 // nothing the webview sends can become a flag.
 
-/// The most ids one change carries, so the argument stays well inside what
-/// a program can be started with. Not Owed's own limit: the CLI applies
-/// `owed_bulk_max`, which the owner can lift in Settings.
-const OWED_IDS_MAX: usize = 10_000;
-/// The longest reason the app hands over, in characters.
-const OWED_REASON_MAX_CHARS: usize = 500;
-/// The longest label for an agent owner ("orchestrator", "PR author").
-const OWED_LABEL_MAX_CHARS: usize = 60;
-const OWED_OWNERS: &[&str] = &["user", "assistant", "agent"];
-
-/// `owed --close=IDS --reason=R` or `owed --reassign=IDS --to=OWNER
-/// [--label=L] --reason=R`: one call, one transaction, one result per id.
-fn owed_change_argv(
-    action: &str,
-    ids: &[String],
-    reason: &str,
-    to: Option<&str>,
-    label: Option<&str>,
-) -> Result<Vec<String>, String> {
-    if ids.is_empty() {
-        return Err("choose at least one item".to_string());
-    }
-    if ids.len() > OWED_IDS_MAX {
-        return Err(format!("the app changes at most {OWED_IDS_MAX} items at once; choose fewer"));
-    }
-    let mut seen: Vec<String> = Vec::with_capacity(ids.len());
-    for raw in ids {
-        let id = checked_commitment_id(raw)?;
-        if id.trim_start_matches('0').is_empty() {
-            return Err("that is not a commitment Khipu knows".to_string());
-        }
-        if !seen.contains(&id) {
-            seen.push(id);
-        }
-    }
-    let reason = reason.trim();
-    if reason.is_empty() {
-        return Err("say why, in a few words".to_string());
-    }
-    if reason.chars().count() > OWED_REASON_MAX_CHARS || has_control(reason) {
-        return Err(format!("keep the reason to one line of at most {OWED_REASON_MAX_CHARS} characters"));
-    }
-    let joined = seen.join(",");
-    let mut argv = vec!["owed".to_string()];
-    match action {
-        "close" => {
-            if to.is_some() || label.is_some_and(|l| !l.trim().is_empty()) {
-                return Err("a close takes no new owner".to_string());
-            }
-            argv.push(format!("--close={joined}"));
-        }
-        "reassign" => {
-            let owner = to.map(str::trim).unwrap_or("");
-            if !OWED_OWNERS.contains(&owner) {
-                return Err("choose who it moves to".to_string());
-            }
-            argv.push(format!("--reassign={joined}"));
-            argv.push(format!("--to={owner}"));
-            if let Some(l) = label.map(str::trim).filter(|l| !l.is_empty()) {
-                if owner != "agent" {
-                    return Err("only an agent or a job takes a label".to_string());
-                }
-                if l.chars().count() > OWED_LABEL_MAX_CHARS || has_control(l) {
-                    return Err(format!("keep the label to one line of at most {OWED_LABEL_MAX_CHARS} characters"));
-                }
-                argv.push(format!("--label={l}"));
-            }
-        }
-        _ => return Err(format!("not a change Owed makes to several items: {action:?}")),
-    }
-    argv.push(format!("--reason={reason}"));
-    Ok(argv)
-}
-
 /// Khipu's data folder, as `app_cli_timeout_secs` finds it.
 fn khipu_data_dir() -> Result<PathBuf, String> {
     data_dir_from_pointer()
@@ -3314,72 +2868,13 @@ fn khipu_data_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "Khipu's data folder could not be found".to_string())
 }
 
-#[tauri::command]
-async fn khipu_owed_change(
-    action: String,
-    ids: Vec<String>,
-    reason: String,
-    to: Option<String>,
-    label: Option<String>,
-) -> Result<String, String> {
-    run_khipu_cli_async(owed_change_argv(&action, &ids, &reason, to.as_deref(), label.as_deref())?).await
-}
-
 fn ledger_projects_argv() -> Vec<String> {
     vec!["ledger".to_string(), "projects".to_string(), "--json".to_string()]
-}
-
-/// `ledger project`: the owner's rename (empty: the key again) or hide or
-/// show of one project, from the app (`--from-app`, the owner gate).
-fn ledger_project_argv(project: &str, name: Option<&str>, hidden: Option<bool>) -> Result<Vec<String>, String> {
-    if name.is_none() && hidden.is_none() {
-        return Err("say what to change about the project".to_string());
-    }
-    let mut argv = ledger_base("project", project, true)?;
-    if let Some(n) = name {
-        let n = n.trim();
-        if n.chars().count() > LEDGER_PROJECT_NAME_CHARS || has_control(n) {
-            return Err(format!("a project's name is one line of at most {LEDGER_PROJECT_NAME_CHARS} characters"));
-        }
-        argv.push(format!("--rename={n}"));
-    }
-    match hidden {
-        Some(true) => argv.push("--hide".to_string()),
-        Some(false) => argv.push("--show".to_string()),
-        None => {}
-    }
-    Ok(argv)
-}
-
-fn work_hidden_argv() -> Vec<String> {
-    vec!["work".to_string(), "hidden".to_string(), "--json".to_string()]
-}
-
-/// `work check --json -- FILE`: a summary file's first read before it is
-/// added. Read-only; the CLI refuses a file inside a private folder.
-fn work_check_argv(path: &str) -> Result<Vec<String>, String> {
-    let file = checked_routing_path("the summary file", path)?;
-    Ok(vec!["work".to_string(), "check".to_string(), "--json".to_string(), "--".to_string(), file])
 }
 
 #[tauri::command]
 async fn khipu_ledger_projects() -> Result<String, String> {
     run_khipu_cli_async(ledger_projects_argv()).await
-}
-
-#[tauri::command]
-async fn khipu_ledger_project_set(project: String, name: Option<String>, hidden: Option<bool>) -> Result<String, String> {
-    run_khipu_cli_async(ledger_project_argv(&project, name.as_deref(), hidden)?).await
-}
-
-#[tauri::command]
-async fn khipu_work_hidden() -> Result<String, String> {
-    run_khipu_cli_async(work_hidden_argv()).await
-}
-
-#[tauri::command]
-async fn khipu_work_check(path: String) -> Result<String, String> {
-    run_khipu_cli_async(work_check_argv(&path)?).await
 }
 
 #[tauri::command]
@@ -3408,43 +2903,8 @@ async fn khipu_ledger_list(project: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn khipu_ledger_get(project: String, id: String) -> Result<String, String> {
-    run_khipu_cli_async(ledger_get_argv(&project, &id)?).await
-}
-
-#[tauri::command]
 async fn khipu_ledger_set(project: String, id: String, change: LedgerChange) -> Result<String, String> {
     run_khipu_cli_async(ledger_set_argv(&project, &id, &change)?).await
-}
-
-#[tauri::command]
-async fn khipu_ledger_remove(
-    project: String,
-    id: String,
-    note: Option<String>,
-    children: Option<String>,
-) -> Result<String, String> {
-    run_khipu_cli_async(ledger_remove_argv(&project, &id, note.as_deref(), children.as_deref())?).await
-}
-
-#[tauri::command]
-async fn khipu_ledger_removed(project: String) -> Result<String, String> {
-    run_khipu_cli_async(ledger_removed_argv(&project)?).await
-}
-
-#[tauri::command]
-async fn khipu_ledger_restore(project: String, id: String) -> Result<String, String> {
-    run_khipu_cli_async(ledger_restore_argv(&project, &id)?).await
-}
-
-#[tauri::command]
-async fn khipu_work_hide(id: String, hide: bool) -> Result<String, String> {
-    run_khipu_cli_async(work_hide_argv(&id, hide)?).await
-}
-
-#[tauri::command]
-async fn khipu_work_same(project: String, row: String, commitment: String, same: bool) -> Result<String, String> {
-    run_khipu_cli_async(work_same_argv(&project, &row, &commitment, same)?).await
 }
 
 #[tauri::command]
@@ -3463,11 +2923,6 @@ async fn khipu_route_priority(
         )?,
     )
     .await
-}
-
-#[tauri::command]
-async fn khipu_route_definition(definition: String, value: Value, op: Option<String>) -> Result<String, String> {
-    run_khipu_cli_async(route_operation_argv(route_definition_argv(&definition, &value)?, op.as_deref())?).await
 }
 
 /// Sign in again: the CLI starts the account's own login (it opens the
@@ -3764,11 +3219,6 @@ async fn khipu_job_uninstall(name: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn khipu_recall_status() -> Result<String, String> {
-    run_khipu_cli_async(fixed_argv(RECALL_STATUS_ARGV)).await
-}
-
-#[tauri::command]
 async fn khipu_gateway_token_status() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(GATEWAY_TOKEN_STATUS_ARGV)).await
 }
@@ -3850,29 +3300,13 @@ async fn khipu_recall_log() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(RECALL_LOG_ARGV)).await
 }
 
-#[tauri::command]
-async fn khipu_embed_status(profile: Option<String>) -> Result<String, String> {
-    run_khipu_cli_async(embed_status_argv(profile.as_deref())?).await
-}
-
-#[tauri::command]
-async fn khipu_embed_activate(profile: String) -> Result<String, String> {
-    run_khipu_cli_async(embed_activate_argv(&profile)?).await
-}
-
 // --- Embeddings screen (docs/plans/2026-10-07-library-sources-byoe.md, "The
 // user's view"). Every verb is a fixed argv built here from validated pieces;
 // the webview names a command and passes ids, never argv. `embed` and
 // `library` stay OUT of `ALLOWED_SUBCOMMANDS`, and so do the two job verbs
 // below, which spawn detached and are written to a job file the screen reads.
 
-const EMBED_PROVIDERS: &[&str] = &["gemini", "voyage", "openai-compatible"];
-/// The only two top-level verbs `khipu_job_start` can spawn. Separate from
-/// `SPAWN_ALLOWED_SUBCOMMANDS`, which stays as it was.
-const JOB_SPAWN_VERBS: &[&str] = &["embed-backfill", "library-backfill"];
 const EMBED_PROFILES_LIST_ARGV: &[&str] = &["embed", "profiles", "list"];
-const EMBED_JOBS_ARGV: &[&str] = &["embed", "jobs"];
-const EMBED_JOBS_CLEAR_ARGV: &[&str] = &["embed", "jobs", "--clear"];
 const LIBRARY_LIST_ARGV: &[&str] = &["library", "list"];
 
 /// Library names are `[a-z0-9_-]{1,40}` (`khipu.library.validate_name`).
@@ -3888,65 +3322,6 @@ fn checked_library(name: &str) -> Result<&str, String> {
         Ok(n)
     } else {
         Err(format!("not a library name (a-z, 0-9, _ and -, up to 40): {name:?}"))
-    }
-}
-
-fn checked_provider(provider: &str) -> Result<&str, String> {
-    let p = provider.trim();
-    if EMBED_PROVIDERS.contains(&p) {
-        Ok(p)
-    } else {
-        Err(format!("not an embedding provider: {provider:?}"))
-    }
-}
-
-fn checked_dim(dim: i64) -> Result<i64, String> {
-    if (1..=8192).contains(&dim) {
-        Ok(dim)
-    } else {
-        Err(format!("dimensions must be between 1 and 8192, got {dim}"))
-    }
-}
-
-/// A model id as providers spell them (`voyage-3`, `nomic-embed-text:latest`).
-fn checked_model(model: &str) -> Result<&str, String> {
-    let m = model.trim();
-    let ok = !m.is_empty()
-        && m.len() <= 100
-        && m.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && m.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/'));
-    if ok {
-        Ok(m)
-    } else {
-        Err(format!("not a model id: {model:?}"))
-    }
-}
-
-/// `https://...`, or plain `http://` only for localhost / 127.0.0.1.
-fn checked_endpoint(endpoint: &str) -> Result<&str, String> {
-    let e = endpoint.trim();
-    if e.len() > 2048 || e.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err("endpoint must be one line with no spaces".to_string());
-    }
-    let local = ["http://localhost", "http://127.0.0.1"].iter().any(|pre| {
-        e.strip_prefix(pre)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(':') || rest.starts_with('/'))
-    });
-    if (e.starts_with("https://") && e.len() > "https://".len()) || local {
-        Ok(e)
-    } else {
-        Err("endpoint must start with https:// (http:// is allowed only for localhost or 127.0.0.1)".to_string())
-    }
-}
-
-fn checked_space(space: &str) -> Result<String, String> {
-    let s = space.trim();
-    if s == "memory" {
-        return Ok(s.to_string());
-    }
-    match s.strip_prefix("library:") {
-        Some(name) => Ok(format!("library:{}", checked_library(name)?)),
-        None => Err(format!("space must be memory or library:<name>, got {space:?}")),
     }
 }
 
@@ -4013,273 +3388,11 @@ fn in_credential_folder(target: &Path, home: &Path) -> bool {
     })
 }
 
-fn embed_estimate_argv(profile: &str, space: &str, stale: bool) -> Result<Vec<String>, String> {
-    let mut a = vec![
-        "embed".to_string(),
-        "estimate".to_string(),
-        format!("--profile={}", checked_profile(profile)?),
-        format!("--space={}", checked_space(space)?),
-    ];
-    if stale {
-        a.push("--stale".to_string());
-    }
-    Ok(a)
-}
-
-fn embed_test_key_argv(
-    provider: &str,
-    endpoint: Option<&str>,
-    model: Option<&str>,
-) -> Result<Vec<String>, String> {
-    let provider = checked_provider(provider)?;
-    let mut a = vec![
-        "embed".to_string(),
-        "test-key".to_string(),
-        format!("--provider={provider}"),
-    ];
-    if let Some(e) = endpoint.filter(|e| !e.trim().is_empty()) {
-        if provider != "openai-compatible" {
-            return Err("only an openai-compatible model has an endpoint".to_string());
-        }
-        a.push(format!("--endpoint={}", checked_endpoint(e)?));
-    }
-    if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
-        a.push(format!("--model={}", checked_model(m)?));
-    }
-    Ok(a)
-}
-
-fn embed_profile_add_argv(
-    id: &str,
-    provider: &str,
-    model: &str,
-    dim: i64,
-    endpoint: Option<&str>,
-) -> Result<Vec<String>, String> {
-    let id = checked_profile(id)?;
-    let provider = checked_provider(provider)?;
-    let model = checked_model(model)?;
-    let dim = checked_dim(dim)?;
-    if id != format!("{model}@{dim}") {
-        return Err(format!("profile id must be {model}@{dim}, got {id:?}"));
-    }
-    let mut a = vec![
-        "embed".to_string(),
-        "profiles".to_string(),
-        "add".to_string(),
-        id.to_string(),
-        format!("--provider={provider}"),
-        format!("--model={model}"),
-        format!("--dim={dim}"),
-    ];
-    match endpoint.filter(|e| !e.trim().is_empty()) {
-        Some(e) => {
-            if provider != "openai-compatible" {
-                return Err("only an openai-compatible model has an endpoint".to_string());
-            }
-            a.push(format!("--endpoint={}", checked_endpoint(e)?));
-        }
-        None if provider == "openai-compatible" => {
-            return Err("an openai-compatible model needs an endpoint".to_string());
-        }
-        None => {}
-    }
-    Ok(a)
-}
-
-/// Always `--yes`: the screen asks first, and the CLI refuses a profile that
-/// is in use.
-fn embed_profile_delete_argv(id: &str) -> Result<Vec<String>, String> {
-    Ok(vec![
-        "embed".to_string(),
-        "profiles".to_string(),
-        "delete".to_string(),
-        checked_profile(id)?.to_string(),
-        "--yes".to_string(),
-    ])
-}
-
 fn library_argv(verb: &str, name: &str) -> Result<Vec<String>, String> {
     if !["status", "scan", "enable", "disable"].contains(&verb) {
         return Err(format!("not a library verb: {verb:?}"));
     }
     Ok(vec!["library".to_string(), verb.to_string(), checked_library(name)?.to_string()])
-}
-
-/// `library set-profile NAME PROFILE`: the CLI refuses unless PROFILE covers
-/// every chunk of the library, so there is no force flag to forward.
-fn library_set_profile_argv(name: &str, profile: &str) -> Result<Vec<String>, String> {
-    Ok(vec![
-        "library".to_string(),
-        "set-profile".to_string(),
-        checked_library(name)?.to_string(),
-        checked_profile(profile)?.to_string(),
-    ])
-}
-
-fn library_add_argv(name: &str, root: &str, profile: &str) -> Result<Vec<String>, String> {
-    Ok(vec![
-        "library".to_string(),
-        "add".to_string(),
-        checked_library(name)?.to_string(),
-        format!("--root={}", checked_path("folder", root)?),
-        format!("--profile={}", checked_profile(profile)?),
-    ])
-}
-
-fn library_remove_argv(name: &str) -> Result<Vec<String>, String> {
-    Ok(vec![
-        "library".to_string(),
-        "remove".to_string(),
-        checked_library(name)?.to_string(),
-        "--yes".to_string(),
-    ])
-}
-
-fn library_import_argv(
-    name: &str,
-    path: &str,
-    strip_prefix: Option<&str>,
-    profile: Option<&str>,
-) -> Result<Vec<String>, String> {
-    let mut a = vec![
-        "library".to_string(),
-        "import".to_string(),
-        checked_library(name)?.to_string(),
-        checked_path("index file", path)?,
-    ];
-    if let Some(p) = strip_prefix.filter(|p| !p.is_empty()) {
-        // Not trimmed: a trailing slash is part of the prefix.
-        if has_control(p) || p.len() > 4096 {
-            return Err("strip prefix must be one line".to_string());
-        }
-        a.push(format!("--strip-prefix={p}"));
-    }
-    if let Some(p) = profile.filter(|p| !p.trim().is_empty()) {
-        a.push(format!("--profile={}", checked_profile(p)?));
-    }
-    Ok(a)
-}
-
-/// A job id the app makes up for itself: `app-<unix seconds>-<8 hex>`. It
-/// matches the CLI's `[A-Za-z0-9][A-Za-z0-9._-]{0,79}` and is never taken from
-/// the webview.
-fn new_job_id() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(secs);
-    h.write_u32(std::process::id());
-    format!("app-{}-{:08x}", secs / 1_000_000_000, h.finish() as u32)
-}
-
-fn job_id_ok(id: &str) -> bool {
-    let mut chars = id.chars();
-    id.len() <= 80
-        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
-/// argv for a detached backfill. `kind` is `memory` (needs `profile`) or
-/// `library` (needs `library`; `profile` re-embeds under another model).
-fn job_start_argv(
-    kind: &str,
-    profile: Option<&str>,
-    library: Option<&str>,
-    stale: bool,
-    job_id: &str,
-) -> Result<Vec<String>, String> {
-    if !job_id_ok(job_id) {
-        return Err(format!("not a job id: {job_id:?}"));
-    }
-    let profile = profile.map(str::trim).filter(|p| !p.is_empty());
-    let mut a: Vec<String>;
-    match kind {
-        "memory" => {
-            let p = profile.ok_or_else(|| "a memory job needs a profile".to_string())?;
-            a = vec![JOB_SPAWN_VERBS[0].to_string(), format!("--profile={}", checked_profile(p)?)];
-        }
-        "library" => {
-            let name = library.ok_or_else(|| "a library job needs a library".to_string())?;
-            a = vec![JOB_SPAWN_VERBS[1].to_string(), checked_library(name)?.to_string()];
-            if let Some(p) = profile {
-                a.push(format!("--profile={}", checked_profile(p)?));
-            }
-            if stale {
-                a.push("--stale".to_string());
-            }
-        }
-        other => return Err(format!("not a job kind: {other:?}")),
-    }
-    a.push(format!("--job-id={job_id}"));
-    Ok(a)
-}
-
-/// Where job files live: `<data dir>/jobs`, the same folder
-/// `khipu.embed_jobs.jobs_dir()` writes to.
-fn jobs_dir_path() -> PathBuf {
-    if let Some(d) = data_dir_from_pointer() {
-        return d.join("jobs");
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config/khipu/jobs")
-}
-
-/// The pid to stop for `job_id`, from that job's file: only a file that names
-/// this job id and says `running` yields a pid.
-fn cancel_target(raw_job_file: &str, job_id: &str) -> Result<u32, String> {
-    if !job_id_ok(job_id) {
-        return Err(format!("not a job id: {job_id:?}"));
-    }
-    let v: Value = serde_json::from_str(raw_job_file).map_err(|_| "the job file is unreadable".to_string())?;
-    if v.get("job").and_then(Value::as_str) != Some(job_id) {
-        return Err("the job file names a different job".to_string());
-    }
-    if v.get("state").and_then(Value::as_str) != Some("running") {
-        return Err("that job is not running".to_string());
-    }
-    match v.get("pid").and_then(Value::as_u64) {
-        Some(pid) if pid > 1 && pid <= u32::MAX as u64 => Ok(pid as u32),
-        _ => Err("the job file has no process id".to_string()),
-    }
-}
-
-fn process_is_current_job(command: &str, job_id: &str) -> bool {
-    let args: Vec<&str> = command.split_whitespace().collect();
-    let expected = format!("--job-id={job_id}");
-    args.iter().any(|arg| *arg == "khipu")
-        && (args.iter().any(|arg| *arg == "embed-backfill" || *arg == "library-backfill")
-            || args.windows(2).any(|pair| pair == ["embed", "backfill"] || pair == ["library", "backfill"]))
-        && (args.iter().any(|arg| *arg == expected.as_str()) || args.windows(2).any(|pair| pair == ["--job-id", job_id]))
-}
-
-fn cancel_job_sync(job_id: &str) -> Result<Value, String> {
-    let path = jobs_dir_path().join(format!("{job_id}.json"));
-    if !job_id_ok(job_id) {
-        return Err(format!("not a job id: {job_id:?}"));
-    }
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("no job file for {job_id}: {e}"))?;
-    let pid = cancel_target(&raw, job_id)?;
-    // A pid can be reused after a crash: only stop a process that is a khipu run.
-    let cmd = Command::new("/bin/ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .map_err(|e| format!("could not check process {pid}: {e}"))?;
-    let cmdline = String::from_utf8_lossy(&cmd.stdout).to_string();
-    if !cmd.status.success() || !process_is_current_job(&cmdline, job_id) {
-        return Err("that job's process is no longer running".to_string());
-    }
-    let out = Command::new("/bin/kill")
-        .args(["-TERM", &pid.to_string()])
-        .output()
-        .map_err(|e| format!("could not stop process {pid}: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("could not stop process {pid}"));
-    }
-    Ok(serde_json::json!({ "ok": true, "job": job_id, "pid": pid }))
 }
 
 #[tauri::command]
@@ -4288,91 +3401,8 @@ async fn khipu_embed_profiles_list() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn khipu_embed_profile_add(
-    id: String,
-    provider: String,
-    model: String,
-    dim: i64,
-    endpoint: Option<String>,
-) -> Result<String, String> {
-    run_khipu_cli_async(embed_profile_add_argv(&id, &provider, &model, dim, endpoint.as_deref())?).await
-}
-
-#[tauri::command]
-async fn khipu_embed_profile_delete(id: String) -> Result<String, String> {
-    run_khipu_cli_async(embed_profile_delete_argv(&id)?).await
-}
-
-#[tauri::command]
-async fn khipu_embed_estimate(profile: String, space: String, stale: bool) -> Result<String, String> {
-    run_khipu_cli_async(embed_estimate_argv(&profile, &space, stale)?).await
-}
-
-/// The key is read from the Keychain by the CLI itself (`embed test-key`), so
-/// no secret travels here, in argv or in env.
-#[tauri::command]
-async fn khipu_embed_test_key(
-    provider: String,
-    endpoint: Option<String>,
-    model: Option<String>,
-) -> Result<String, String> {
-    run_khipu_cli_async(embed_test_key_argv(&provider, endpoint.as_deref(), model.as_deref())?).await
-}
-
-#[tauri::command]
-async fn khipu_embed_jobs() -> Result<String, String> {
-    run_khipu_cli_async(fixed_argv(EMBED_JOBS_ARGV)).await
-}
-
-#[tauri::command]
-async fn khipu_embed_jobs_clear() -> Result<String, String> {
-    run_khipu_cli_async(fixed_argv(EMBED_JOBS_CLEAR_ARGV)).await
-}
-
-#[tauri::command]
-async fn khipu_job_start(
-    kind: String,
-    profile: Option<String>,
-    library: Option<String>,
-    stale: bool,
-) -> Result<Value, String> {
-    let job_id = new_job_id();
-    let args = job_start_argv(&kind, profile.as_deref(), library.as_deref(), stale, &job_id)?;
-    spawn_blocking_cli(move || {
-        let (pid, log_path) = spawn_detached_cli(&args, &args[0])?;
-        Ok(serde_json::json!({
-            "ok": true,
-            "job_id": job_id,
-            "pid": pid,
-            "log_path": log_path.to_string_lossy(),
-        }))
-    })
-    .await
-}
-
-#[tauri::command]
-async fn khipu_job_cancel(job_id: String) -> Result<Value, String> {
-    spawn_blocking_cli(move || cancel_job_sync(&job_id)).await
-}
-
-#[tauri::command]
 async fn khipu_library_list() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(LIBRARY_LIST_ARGV)).await
-}
-
-#[tauri::command]
-async fn khipu_library_status(name: String) -> Result<String, String> {
-    run_khipu_cli_async(library_argv("status", &name)?).await
-}
-
-#[tauri::command]
-async fn khipu_library_add(name: String, root: String, profile: String) -> Result<String, String> {
-    run_khipu_cli_async(library_add_argv(&name, &root, &profile)?).await
-}
-
-#[tauri::command]
-async fn khipu_library_remove(name: String) -> Result<String, String> {
-    run_khipu_cli_async(library_remove_argv(&name)?).await
 }
 
 #[tauri::command]
@@ -4383,26 +3413,6 @@ async fn khipu_library_enable(name: String) -> Result<String, String> {
 #[tauri::command]
 async fn khipu_library_disable(name: String) -> Result<String, String> {
     run_khipu_cli_async(library_argv("disable", &name)?).await
-}
-
-#[tauri::command]
-async fn khipu_library_scan(name: String) -> Result<String, String> {
-    run_khipu_cli_async(library_argv("scan", &name)?).await
-}
-
-#[tauri::command]
-async fn khipu_library_set_profile(name: String, profile: String) -> Result<String, String> {
-    run_khipu_cli_async(library_set_profile_argv(&name, &profile)?).await
-}
-
-#[tauri::command]
-async fn khipu_library_import(
-    name: String,
-    path: String,
-    strip_prefix: Option<String>,
-    profile: Option<String>,
-) -> Result<String, String> {
-    run_khipu_cli_async(library_import_argv(&name, &path, strip_prefix.as_deref(), profile.as_deref())?).await
 }
 
 /// `khipu <args>` with `stdin_text` piped to stdin. The text is never echoed
@@ -4615,11 +3625,6 @@ async fn bootstrap_local_backup() -> Result<String, String> {
 #[tauri::command]
 async fn components_status() -> Result<String, String> {
     run_khipu_cli_async(vec!["components".into(), "status-json".into()]).await
-}
-
-#[tauri::command]
-async fn upgrade_postgres() -> Result<String, String> {
-    run_khipu_cli_async(vec!["components".into(), "upgrade-postgres".into()]).await
 }
 
 #[tauri::command]
@@ -4979,15 +3984,9 @@ fn join_receive_sync(passphrase: String, pin: String, out_path: Option<String>) 
 /// row by id, and `--until` is parsed by the CLI (a value it cannot read as a
 /// date is refused, never bound).
 const ALLOWED_SUBCOMMANDS: &[&str] = &[
-    "status", "doctor", "activity", "search", "graph", "revisions", "paths",
-    "backup-local", "import-local", "integrations", "sources", "models",
-    "episode", "owed", "storage",
+    "status", "doctor", "activity", "search", "backup-local", "integrations",
+    "models", "episode", "owed",
 ];
-
-/// Fire-and-forget job runners — long-running consolidate passes.
-/// Deliberately separate from `ALLOWED_SUBCOMMANDS`: these spawn detached and
-/// return immediately; the UI must not block on `.output()`.
-const SPAWN_ALLOWED_SUBCOMMANDS: &[&str] = &["nightly", "monthly"];
 
 /// Env the desktop runner adds for selected CLI verbs. Search from Recall must
 /// not look like an agent in the query log (guides "Ask your agent" tick).
@@ -5012,101 +4011,6 @@ async fn run_khipu(args: Vec<String>) -> Result<String, String> {
     } else {
         run_khipu_cli_with_env_async(args, extra).await
     }
-}
-
-#[tauri::command]
-fn spawn_khipu(subcommand: String) -> Result<Value, String> {
-    if !SPAWN_ALLOWED_SUBCOMMANDS.contains(&subcommand.as_str()) {
-        eprintln!("[khipu] refused spawn subcommand from the UI: {subcommand:?}");
-        return Err(format!("subcommand not permitted for spawn: {subcommand:?}"));
-    }
-    let (pid, log_path) = spawn_detached_cli(&[subcommand.clone()], &subcommand)?;
-    let engine_log_path = engine_job_log_path(&subcommand);
-    Ok(serde_json::json!({
-        "ok": true,
-        "pid": pid,
-        "log_path": log_path.to_string_lossy(),
-        "engine_log_path": engine_log_path.to_string_lossy(),
-        "subcommand": subcommand,
-    }))
-}
-
-/// Start `khipu <args>` detached: stdout and stderr go to a log file next to
-/// the data folder's `dsn`, the child is reaped in the background, and the
-/// caller gets the pid and the log path back immediately. `args` must already
-/// be validated (fixed argv built in Rust); `label` only names the log file.
-fn spawn_detached_cli(args: &[String], label: &str) -> Result<(u32, PathBuf), String> {
-    let root = khipu_root()?;
-    let py = khipu_python()?;
-    let pythonpath = khipu_pythonpath(&root);
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let log_path = dirs_fallback_dsn()
-        .parent()
-        .map(|p| p.join(format!("khipu-job-{label}-{stamp}.log")))
-        .unwrap_or_else(|| PathBuf::from(format!("/tmp/khipu-job-{label}-{stamp}.log")));
-    if let Some(parent) = log_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| format!("open spawn log {}: {e}", log_path.display()))?;
-    let err_file = log_file
-        .try_clone()
-        .map_err(|e| format!("clone spawn log handle: {e}"))?;
-    let (bc_key, bc_val) = khipu_bytecode_env();
-    let mut child = Command::new(&py)
-        .arg("-m")
-        .arg("khipu")
-        .args(args)
-        .env("PYTHONPATH", &pythonpath)
-        .env("KHIPU_ROOT", &root)
-        .env("KHIPU_APP_VERSION", khipu_app_version())
-        .env(bc_key, &bc_val)
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(err_file))
-        .spawn()
-        .map_err(|e| format!("spawn khipu {label} failed ({py:?}): {e}"))?;
-    let pid = child.id();
-    // Reap in the background so the Unix zombie does not linger until Tauri
-    // exits. Must not `.wait()` / `.output()` on this thread (C8 fire-and-forget).
-    std::thread::spawn(move || {
-        if let Err(e) = child.wait() {
-            eprintln!("[khipu] wait on spawned job failed: {e}");
-        }
-    });
-    Ok((pid, log_path))
-}
-
-/// Engine stdout for spawnable jobs — same stems as `jobs.py` `_JOB_SPECS`
-/// (`khipu-nightly` / `khipu-monthly`) under
-/// `~/Library/Logs/Khipu/`, falling back to `~/Library/Logs/<KHIPU_LEGACY_LOG_DIR>`
-/// when that env var is set and the Khipu dir does not exist yet (an upgrade
-/// whose launchd jobs still write to the product's pre-rename log directory).
-/// Distinct from the wrapper spawn log.
-fn engine_job_log_path(subcommand: &str) -> PathBuf {
-    let stem = match subcommand {
-        "nightly" => "khipu-nightly",
-        "monthly" => "khipu-monthly",
-        other => other,
-    };
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let khipu_dir = PathBuf::from(&home).join("Library/Logs/Khipu");
-    let log_dir = if khipu_dir.is_dir() {
-        khipu_dir
-    } else {
-        match std::env::var("KHIPU_LEGACY_LOG_DIR") {
-            Ok(legacy) if !legacy.is_empty() => {
-                PathBuf::from(&home).join("Library/Logs").join(legacy)
-            }
-            _ => khipu_dir,
-        }
-    };
-    log_dir.join(format!("{stem}.out.log"))
 }
 
 fn dsn_configured_uncached() -> bool {
@@ -5245,12 +4149,6 @@ fn dirs_fallback_dsn() -> PathBuf {
         return khipu;
     }
     PathBuf::from(home).join(".config/alzy/dsn")
-}
-
-#[tauri::command]
-async fn health_snapshot() -> Result<Value, String> {
-    let raw = run_khipu_cli_async(vec!["status".into()]).await?;
-    serde_json::from_str(&raw).map_err(|e| format!("status JSON: {e}"))
 }
 
 const FEEDBACK_ATTACH_MAX_BYTES: u64 = 15 * 1024 * 1024;
@@ -5527,16 +4425,23 @@ async fn check_for_update_at_launch(app: AppHandle) {
     }
 }
 
+/// The "Open Khipu when this Mac starts" plugin. Building it registers
+/// nothing: a login item is made only when the page calls `enable`, from
+/// Settings › Look. The default macOS launcher is a LaunchAgent.
+fn autostart_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri_plugin_autostart::Builder::new().build()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(autostart_plugin())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             run_khipu,
-            spawn_khipu,
             set_khipu_secret,
             join_export,
             join_import,
@@ -5545,15 +4450,12 @@ pub fn run() {
             secrets_presence,
             khipu_secrets_verify,
             khipu_migrate,
-            khipu_embed_backfill,
-            khipu_jobs_refresh,
             khipu_t3_antigravity,
             khipu_features_show,
             khipu_feature_set,
             khipu_config_show,
             khipu_config_set,
             khipu_snapshot_refresh,
-            khipu_config_request,
             khipu_owner_answer,
             khipu_needs_you,
             khipu_needs_you_answer,
@@ -5569,25 +4471,12 @@ pub fn run() {
             khipu_route_view,
             khipu_route_pause,
             khipu_route_lift,
-            khipu_route_check,
-            khipu_gateway_copy_cleanup,
             khipu_owner_direction_show,
             khipu_owner_direction_actions,
-            khipu_owner_request_decline,
             khipu_owner_direction_undo,
             khipu_owner_direction_switch,
             khipu_owner_direction_set,
-            khipu_projects_list,
-            khipu_project_name_add,
-            khipu_project_name_remove,
-            khipu_project_separate,
-            khipu_project_merge,
-            khipu_project_keep_separate,
             khipu_route_clear,
-            khipu_route_note_set,
-            khipu_route_note_end,
-            khipu_route_rule,
-            khipu_route_hold_add,
             khipu_route_hold_end,
             khipu_route_override_view,
             khipu_route_override_act,
@@ -5597,24 +4486,13 @@ pub fn run() {
             khipu_route_cap,
             khipu_route_say,
             khipu_route_priority,
-            khipu_route_definition,
             khipu_work_view,
             khipu_health,
             khipu_macs,
             khipu_running,
             khipu_ledger_list,
-            khipu_ledger_get,
             khipu_ledger_set,
-            khipu_ledger_remove,
-            khipu_ledger_removed,
-            khipu_ledger_restore,
-            khipu_work_hide,
-            khipu_work_same,
-            khipu_owed_change,
             khipu_ledger_projects,
-            khipu_ledger_project_set,
-            khipu_work_hidden,
-            khipu_work_check,
             khipu_account_sign_in,
             khipu_account_sign_in_offers,
             khipu_account_new_folder,
@@ -5629,39 +4507,19 @@ pub fn run() {
             khipu_accounts_decline,
             khipu_accounts_offer_again,
             khipu_accounts_auto_track,
-            khipu_accounts_request,
             khipu_jobs_status,
             khipu_job_install,
             khipu_job_uninstall,
-            khipu_recall_status,
             khipu_gateway_token_status,
             khipu_gateway_token_set,
             khipu_gateway_token_copy,
             khipu_guides_prefs_get,
             khipu_guides_prefs_set,
             khipu_recall_log,
-            khipu_embed_status,
-            khipu_embed_activate,
             khipu_embed_profiles_list,
-            khipu_embed_profile_add,
-            khipu_embed_profile_delete,
-            khipu_embed_estimate,
-            khipu_embed_test_key,
-            khipu_embed_jobs,
-            khipu_embed_jobs_clear,
-            khipu_job_start,
-            khipu_job_cancel,
             khipu_library_list,
-            khipu_library_status,
-            khipu_library_add,
-            khipu_library_remove,
             khipu_library_enable,
             khipu_library_disable,
-            khipu_library_scan,
-            khipu_library_import,
-            khipu_library_set_profile,
-            liveness_now,
-            khipu_capture_now,
             khipu_db_status,
             khipu_db_preflight,
             khipu_db_connect,
@@ -5672,10 +4530,8 @@ pub fn run() {
             install_local_postgres,
             bootstrap_local_backup,
             components_status,
-            upgrade_postgres,
             check_remote_postgres,
             dsn_configured,
-            health_snapshot,
             select_feedback_attachments,
             send_feedback,
             feedback_file_sizes
@@ -6097,16 +4953,16 @@ mod run_khipu_guard_tests {
 
     #[test]
     fn every_subcommand_the_ui_calls_is_allowed() {
-        for s in ["status", "doctor", "activity", "search", "graph", "revisions",
-                  "paths", "backup-local", "import-local", "integrations", "sources",
-                  "models", "episode", "owed", "storage"] {
+        for s in ["status", "doctor", "activity", "search", "backup-local", "integrations",
+                  "models", "episode", "owed"] {
             assert!(ALLOWED_SUBCOMMANDS.contains(&s), "UI calls `{s}` but it is not allowed");
         }
     }
 
     #[test]
     fn state_changing_subcommands_are_not_reachable_from_the_ui() {
-        for s in ["capture", "regen-memory", "gateway", "mcp"] {
+        for s in ["capture", "regen-memory", "gateway", "mcp", "graph", "revisions", "paths",
+                  "import-local", "sources", "storage"] {
             assert!(!ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must not be callable from the webview");
         }
     }
@@ -6127,7 +4983,7 @@ mod run_khipu_guard_tests {
     fn the_allowlist_is_exactly_what_the_front_end_invokes() {
         // Grown by hand, so pin the size: adding an entry without a call site is
         // how the five above got in.
-        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 15);
+        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 9);
     }
 
     #[test]
@@ -6143,16 +4999,6 @@ mod run_khipu_guard_tests {
         }
         assert!(t3_antigravity_argv("uninstall", Some("/x")).is_err());
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"t3"));
-    }
-
-    #[test]
-    fn index_now_is_a_fixed_argv_command_not_an_allowlist_entry() {
-        // Settings -> Search index needs `embed backfill` and nothing else.
-        // It gets it as a fixed argv (khipu_embed_backfill) so the webview
-        // cannot reach `--profile`, `--kind` or any other embed verb.
-        use super::EMBED_BACKFILL_ARGV;
-        assert_eq!(EMBED_BACKFILL_ARGV, &["embed", "backfill"]);
-        assert!(!ALLOWED_SUBCOMMANDS.contains(&"embed"));
     }
 
     #[test]
@@ -6193,7 +5039,7 @@ mod settings_command_tests {
         for s in ["features", "config", "jobs", "recall", "gateway", "embed", "budget", "usage", "route"] {
             assert!(!ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of the allowlist");
         }
-        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 15);
+        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 9);
     }
 
     #[test]
@@ -6201,7 +5047,6 @@ mod settings_command_tests {
         assert_eq!(fixed_argv(FEATURES_SHOW_ARGV), v(&["features"]));
         assert_eq!(fixed_argv(CONFIG_SHOW_ARGV), v(&["config"]));
         assert_eq!(fixed_argv(JOBS_STATUS_ARGV), v(&["jobs", "status"]));
-        assert_eq!(fixed_argv(RECALL_STATUS_ARGV), v(&["recall", "status"]));
         assert_eq!(fixed_argv(GATEWAY_TOKEN_STATUS_ARGV), v(&["gateway", "token", "status"]));
         assert_eq!(fixed_argv(GATEWAY_TOKEN_SET_ARGV), v(&["gateway", "token", "set"]));
         assert_eq!(fixed_argv(GATEWAY_TOKEN_COPY_ARGV), v(&["gateway", "token", "copy"]));
@@ -6219,39 +5064,6 @@ mod settings_command_tests {
             assert!(!argv.iter().any(|a| a.starts_with("--max-age")));
         }
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"usage"));
-    }
-
-    #[test]
-    fn project_commands_are_fixed_verbs_marked_from_the_app() {
-        assert_eq!(fixed_argv(PROJECTS_LIST_ARGV), v(&["project", "list", "--json"]));
-        assert_eq!(
-            project_owner_argv(&["alias", "add"], &[], &["o/old", "o/new"]).unwrap(),
-            v(&["project", "alias", "add", "--from-app", "--", "o/old", "o/new"])
-        );
-        assert_eq!(
-            project_owner_argv(&["merge"], &[("--show-as", "o/b")], &["o/a", "o/b"]).unwrap(),
-            v(&["project", "merge", "--from-app", "--show-as", "o/b", "--", "o/a", "o/b"])
-        );
-        assert_eq!(
-            project_owner_argv(&["separate"], &[], &["o/old"]).unwrap(),
-            v(&["project", "separate", "--from-app", "--", "o/old"])
-        );
-        assert!(project_owner_argv(&["alias", "remove"], &[], &[""]).is_err());
-        assert!(project_owner_argv(&["alias", "remove"], &[], &["a\nb"]).is_err());
-    }
-
-    #[test]
-    fn project_names_are_held_to_the_safe_shape_before_the_cli_runs() {
-        for ok in ["o/old", "my-folder", "my folder.v2", "_x", "a.b/c_d-e", "  o/padded  "] {
-            assert!(checked_project_name(ok).is_ok(), "{ok:?} should pass");
-        }
-        let long_owner = format!("{}/r", "a".repeat(101));
-        let long_folder = "a".repeat(101);
-        for bad in ["", "o/a|o/b", "a|b", "o/a\no/b", "o/a`x`", "--x", "-x", "o/", "/r", "a/b/c", "o /r", "o/a b", "é/x", &long_owner, &long_folder] {
-            assert!(checked_project_name(bad).is_err(), "{bad:?} should be refused");
-        }
-        assert!(project_owner_argv(&["keep-separate"], &[], &["--x", "o/b"]).is_err());
-        assert!(project_owner_argv(&["merge"], &[("--show-as", "o/a|o/b")], &["o/a", "o/b"]).is_err());
     }
 
     #[test]
@@ -6304,7 +5116,7 @@ mod settings_command_tests {
 
     #[test]
     fn routing_click_operation_is_a_joined_flag_before_the_words() {
-        let base = route_rule_argv("add", None, Some("--synthetic-words")).unwrap();
+        let base = v(&["route", "rule", "--from-app", "--", "add", "--synthetic-words"]);
         let argv = route_operation_argv(base.clone(), Some("synthetic-click-1")).unwrap();
         assert_eq!(argv, v(&["route", "rule", "--from-app", "--op=synthetic-click-1", "--", "add", "--synthetic-words"]));
         assert_eq!(route_operation_argv(base.clone(), None).unwrap(), base);
@@ -6322,60 +5134,10 @@ mod settings_command_tests {
         );
         assert_eq!(route_pause_argv("Codex", None).unwrap(), v(&["route", "pause", "--from-app", "--", "Codex"]));
         assert_eq!(route_lift_argv("Codex").unwrap(), v(&["route", "lift", "--from-app", "--", "Codex"]));
-        assert_eq!(gateway_copy_cleanup_argv(), v(&["route", "copy", "cleanup"]));
-        assert_eq!(route_check_argv("Codex").unwrap(), v(&["route", "check", "--", "Codex"]));
         assert_eq!(route_clear_argv("Codex", None).unwrap(), v(&["route", "clear", "--from-app", "--", "Codex"]));
         assert_eq!(
             route_clear_argv("Codex", Some("e1a2b3c4")).unwrap(),
             v(&["route", "clear", "--from-app", "--report=e1a2b3c4", "--", "Codex"])
-        );
-        assert_eq!(
-            route_note_set_argv("Codex first.\nThen Grok.").unwrap(),
-            v(&["route", "note", "--from-app", "--", "set", "Codex first.\nThen Grok."])
-        );
-        assert_eq!(route_note_end_argv(), v(&["route", "note", "--from-app", "--", "end"]));
-        assert_eq!(
-            route_rule_argv("add", None, Some("Never a -fast tier.")).unwrap(),
-            v(&["route", "rule", "--from-app", "--", "add", "Never a -fast tier."])
-        );
-        assert_eq!(
-            route_rule_argv("edit", Some(3), Some("Never a fast tier.")).unwrap(),
-            v(&["route", "rule", "--from-app", "--", "edit", "3", "Never a fast tier."])
-        );
-        for action in ["retire", "restore", "confirm", "undo", "dismiss"] {
-            assert_eq!(
-                route_rule_argv(action, Some(6), None).unwrap(),
-                v(&["route", "rule", "--from-app", "--", action, "6"])
-            );
-        }
-        let holds = serde_json::Map::from_iter([(String::from("h-grok"), Value::String(String::from("end")))]);
-        assert_eq!(
-            route_rule_argv_holds("confirm", Some(6), None, Some(&holds), None, Some("shown-revision")).unwrap(),
-            v(&["route", "rule", "--from-app", "--expect=shown-revision", "--holds={\"h-grok\":\"end\"}", "--", "confirm", "6"])
-        );
-        // A rule revision is an event id (UUID), not a priority version.
-        let revision = "ff724c09-6767-42bd-8b91-dc05490ad654";
-        assert_eq!(
-            route_rule_argv_holds("confirm", Some(6), None, None, None, Some(revision)).unwrap(),
-            v(&["route", "rule", "--from-app", &format!("--expect={revision}"), "--", "confirm", "6"])
-        );
-        for invalid in ["", "--from-app", "revision\nconfirm", "revision value"] {
-            assert!(route_rule_argv_holds("confirm", Some(6), None, None, None, Some(invalid)).is_err());
-        }
-        let bad = serde_json::Map::from_iter([(String::from("h-grok"), Value::String(String::from("drop")))]);
-        assert!(route_rule_argv_holds("confirm", Some(6), None, Some(&bad), None, Some("shown-revision")).is_err());
-        assert_eq!(
-            route_rule_argv_holds("confirm", None, None, None, Some("rule:pending-1"), Some("shown-revision")).unwrap(),
-            v(&["route", "rule", "--from-app", "--expect=shown-revision", "--", "confirm", "rule:pending-1"])
-        );
-        assert_eq!(
-            route_hold_add_argv("No new launches", "machine-busy", "machine", None, None).unwrap(),
-            v(&["route", "hold", "--from-app", "--reason=machine-busy", "--machine", "--", "No new launches"])
-        );
-        assert_eq!(
-            route_hold_add_argv("Keep it", "keep", "account", Some("muse|"), Some("2026-10-17T20:00:00Z")).unwrap(),
-            v(&["route", "hold", "--from-app", "--reason=keep", "--account=muse|", "--until=2026-10-17T20:00:00Z",
-                "--", "Keep it"])
         );
         assert_eq!(
             route_hold_end_argv("h1a2b3c4").unwrap(),
@@ -6423,23 +5185,7 @@ mod settings_command_tests {
 
     #[test]
     fn a_routing_value_that_looks_like_a_flag_never_becomes_one() {
-        // Free words always travel after "--": the CLI reads them as words.
-        let argv = route_rule_argv("add", None, Some("--owner")).unwrap();
-        let sep = argv.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&argv[sep + 1..], &v(&["add", "--owner"])[..]);
-        let argv = route_note_set_argv("-x\n--from-app").unwrap();
-        assert_eq!(argv.last().unwrap(), "-x\n--from-app");
-        assert_eq!(argv.iter().position(|a| a == "--").unwrap(), argv.len() - 3);
-        let argv = route_hold_add_argv("-x words", "other", "all", None, None).unwrap();
-        assert_eq!(argv[argv.len() - 2..], v(&["--", "-x words"])[..]);
-        // One-line fields refuse a line break; ids, accounts and times refuse
-        // a leading "-" or anything that is not their shape.
-        assert!(route_rule_argv("add", None, Some("one\n--from-app")).is_err());
-        assert!(route_rule_argv("edit", Some(1), Some("a\rb")).is_err());
-        assert!(route_hold_add_argv("one\ntwo", "other", "all", None, None).is_err());
         assert!(route_pause_argv("--owner", None).is_err());
-        assert!(route_check_argv("--owner").is_err());
-        assert!(route_check_argv("Codex\n--from-app").is_err());
         assert!(route_pause_argv("Codex\n--until=1h", None).is_err());
         assert!(route_pause_argv("Codex", Some("--from-app")).is_err());
         assert!(route_pause_argv("Codex", Some("1h")).is_err());
@@ -6493,19 +5239,6 @@ mod settings_command_tests {
         );
         assert!(route_hold_end_argv("--all").is_err());
         assert!(route_hold_end_argv("h1\nend").is_err());
-        assert!(route_hold_add_argv("x", "--all", "all", None, None).is_err());
-        assert!(route_hold_add_argv("x", "other", "--machine", None, None).is_err());
-        assert!(route_hold_add_argv("x", "other", "account", Some("-c"), None).is_err());
-        assert!(route_rule_argv("--from-app", Some(1), None).is_err());
-        assert!(route_rule_argv("retire", Some(0), None).is_err());
-        assert!(route_rule_argv("retire", None, None).is_err());
-        assert!(route_rule_argv("add", None, Some("   ")).is_err());
-        assert!(route_note_set_argv(&"x".repeat(ROUTE_WORDS_MAX_BYTES + 1)).is_err());
-        assert!(route_note_set_argv("a\u{0}b").is_err());
-        // Nothing but these fixed verbs: no report, no wait, no sources.
-        for verb in ["report", "wait", "sources"] {
-            assert!(!ROUTE_RULE_ACTIONS.contains(&verb));
-        }
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"route"));
     }
 
@@ -6590,6 +5323,15 @@ mod settings_command_tests {
         for bad in [r#"{"B": {"lane": 3}}"#, r#"{"B": ["lane"]}"#, r#"{"B": {"la\nne": "x"}}"#, "[]"] {
             assert!(config_set_argv("routing_lane_map", bad).is_err(), "{bad}");
         }
+        // Settings › Your Macs: the owner's names for the Macs, as the CLI checks them.
+        let id = "0123456789abcdef0123456789abcdef";
+        let names = config_set_argv("routing_mac_names", &format!(r#"{{"{id}": " M5 "}}"#)).unwrap();
+        assert_eq!(names, v(&["config", "--from-app", "--set", "routing_mac_names", &format!(r#"{{"{id}":"M5"}}"#)]));
+        assert_eq!(config_set_argv("routing_mac_names", "{}").unwrap()[4], "{}");
+        for bad in [r#"{"not-an-id": "M5"}"#, &format!(r#"{{"{id}": ""}}"#), &format!(r#"{{"{id}": "M5\n--x"}}"#),
+                    &format!(r#"{{"{id}": 5}}"#), r#"["M5"]"#, "-x", &format!(r#"{{"{}": "M5"}}"#, id.to_uppercase())] {
+            assert!(config_set_argv("routing_mac_names", bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -6619,31 +5361,11 @@ mod settings_command_tests {
     }
 
     #[test]
-    fn provider_definitions_use_fixed_app_argv_and_never_turn_values_into_flags() {
-        let value = serde_json::json!({"id": "glm", "label": "--owner-direction", "family": "Zhipu"});
-        let argv = route_definition_argv("provider", &value).unwrap();
-        assert_eq!(&argv[..4], v(&["route", "definition", "set", "provider"]));
-        assert_eq!(argv.last().unwrap(), "--from-app");
-        assert_eq!(argv.len(), 6);
-        assert_eq!(serde_json::from_str::<Value>(argv[4].strip_prefix("--value=").unwrap()).unwrap(), value);
-        assert!(route_definition_argv("--from-app", &value).is_err());
-        assert!(route_definition_argv("account", &Value::Null).is_err());
-    }
-
-    #[test]
     fn a_routing_setting_is_saved_and_answered_as_the_owner() {
         // A conversation's shell is refused a routing setting; the app's own
         // save carries --from-app, one step, and answers a waiting request.
         assert_eq!(config_set_argv("routing_lane_map", "{}").unwrap(), v(&["config", "--from-app", "--set", "routing_lane_map", "{}"]));
         assert_eq!(config_set_argv("synth_fallback", "none").unwrap()[1], "--set");
-        assert_eq!(
-            config_request_argv("routing_lane_map", "confirm").unwrap(),
-            v(&["config", "--from-app", "--answer-request", "routing_lane_map", "confirm"])
-        );
-        assert_eq!(config_request_argv("routing_stale_after", "undo").unwrap()[4], "undo");
-        assert!(config_request_argv("routing_lane_map", "--x").is_err());
-        assert!(config_request_argv("usage_accounts", "confirm").is_err());
-        assert!(config_request_argv("--from-app", "confirm").is_err());
         assert_eq!(
             owner_answer_argv("rm-req-0a1b2c3d4e5f", "yes").unwrap(),
             ["owner-direction", "answer", "--from-app", "rm-req-0a1b2c3d4e5f", "--yes"]
@@ -6705,27 +5427,6 @@ mod settings_command_tests {
     }
 
     #[test]
-    fn the_owners_words_are_not_cut_at_a_fixed_length() {
-        // Fix round 2, R2-4: a note, a rule or a hold longer than the old
-        // 4,000 characters reaches the CLI, which applies the owner's own
-        // routing_hold_chars (0: no limit). Only an argument too big to hand
-        // over is refused.
-        let long = "word ".repeat(2000);
-        assert!(long.trim().chars().count() > 4000);
-        assert_eq!(route_note_set_argv(&long).unwrap().last().unwrap(), long.trim());
-        assert_eq!(route_rule_argv("add", None, Some(&long)).unwrap().last().unwrap(), long.trim());
-        assert_eq!(route_rule_argv("edit", Some(2), Some(&long)).unwrap().last().unwrap(), long.trim());
-        assert_eq!(
-            route_hold_add_argv(&long, "other", "all", None, None).unwrap().last().unwrap(),
-            long.trim()
-        );
-        let at_most = "x".repeat(ROUTE_WORDS_MAX_BYTES);
-        assert!(route_note_set_argv(&at_most).is_ok());
-        let err = route_hold_add_argv(&format!("{at_most}x"), "other", "all", None, None).unwrap_err();
-        assert!(err.contains("128 KB"), "{err}");
-    }
-
-    #[test]
     fn the_routing_view_is_one_fixed_read_only_argv() {
         assert_eq!(fixed_argv(ROUTE_VIEW_ARGV), v(&["route", "--json"]));
         // No write verb, no owner flag, no --since or account the webview could steer.
@@ -6769,7 +5470,6 @@ mod settings_command_tests {
         assert!(config_set_argv("synth_usage_keep_days", "1.5").is_err());
         assert!(config_set_argv("disk_unknown", "1").is_err());
         assert!(config_unset_argv("disk_unknown").is_err());
-        assert!(ALLOWED_SUBCOMMANDS.contains(&"storage"));
     }
 
     #[test]
@@ -7015,7 +5715,6 @@ mod settings_command_tests {
         ] {
             assert!(checked_path("folder", bad).is_err(), "folder accepted {bad:?}");
             assert!(config_set_argv("memory_root", bad).is_err(), "memory_root accepted {bad:?}");
-            assert!(library_add_argv("books", bad, "voyage-3@1024").is_err(), "library add accepted {bad:?}");
         }
         for ok in ["~/Memory notes", "/Volumes/X/mem", "~/.config/khipu/mem", "~/sshkeys", "a..b/c"] {
             assert_eq!(checked_path("folder", ok).unwrap(), ok);
@@ -7241,31 +5940,6 @@ mod settings_command_tests {
     }
 
     #[test]
-    fn embed_status_is_fixed_or_takes_a_checked_profile() {
-        assert_eq!(embed_status_argv(None).unwrap(), v(&["embed", "status"]));
-        assert_eq!(
-            embed_status_argv(Some("gemini-embedding-2@768")).unwrap(),
-            v(&["embed", "status", "--profile=gemini-embedding-2@768"])
-        );
-        assert!(embed_status_argv(Some("--profile=x")).is_err());
-    }
-
-    #[test]
-    fn embed_activate_never_forces_and_checks_the_profile() {
-        assert_eq!(
-            embed_activate_argv("gemini-embedding-001@768").unwrap(),
-            v(&["embed", "activate", "gemini-embedding-001@768"])
-        );
-        for ok in ["a", "x.y_z-1@2", "nomic-embed-text:latest@768"] {
-            assert!(embed_activate_argv(ok).is_ok(), "rejected {ok:?}");
-        }
-        for bad in ["", " ", "-f", "--force", "a b", "a;b", "a\nb", "gemini$", "@768", "..", &"x".repeat(65)] {
-            assert!(embed_activate_argv(bad).is_err(), "accepted {bad:?}");
-        }
-        assert!(!embed_activate_argv("gemini-embedding-2@768").unwrap().iter().any(|a| a.contains("force")));
-    }
-
-    #[test]
     fn the_gateway_token_is_stdin_only_and_never_in_argv() {
         // The token has no argv builder at all: its argv is the fixed
         // constant, and the value goes through `run_khipu_cli_with_stdin`.
@@ -7290,8 +5964,6 @@ mod embeddings_command_tests {
     #[test]
     fn read_only_commands_are_fixed_argv() {
         assert_eq!(fixed_argv(EMBED_PROFILES_LIST_ARGV), v(&["embed", "profiles", "list"]));
-        assert_eq!(fixed_argv(EMBED_JOBS_ARGV), v(&["embed", "jobs"]));
-        assert_eq!(fixed_argv(EMBED_JOBS_CLEAR_ARGV), v(&["embed", "jobs", "--clear"]));
         assert_eq!(fixed_argv(LIBRARY_LIST_ARGV), v(&["library", "list"]));
     }
 
@@ -7299,110 +5971,8 @@ mod embeddings_command_tests {
     fn neither_embed_nor_library_nor_the_job_verbs_join_an_allowlist() {
         for s in ["embed", "library", "embed-backfill", "library-backfill"] {
             assert!(!ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of ALLOWED_SUBCOMMANDS");
-            assert!(!SPAWN_ALLOWED_SUBCOMMANDS.contains(&s), "`{s}` must stay out of SPAWN_ALLOWED_SUBCOMMANDS");
         }
-        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 15);
-        assert_eq!(SPAWN_ALLOWED_SUBCOMMANDS, &["nightly", "monthly"]);
-        assert_eq!(JOB_SPAWN_VERBS, &["embed-backfill", "library-backfill"]);
-    }
-
-    #[test]
-    fn estimate_argv_names_profile_and_space() {
-        assert_eq!(
-            embed_estimate_argv("nomic-embed-text@768", "memory", false).unwrap(),
-            v(&["embed", "estimate", "--profile=nomic-embed-text@768", "--space=memory"])
-        );
-        assert_eq!(
-            embed_estimate_argv("voyage-3@1024", "library:biblical", true).unwrap(),
-            v(&["embed", "estimate", "--profile=voyage-3@1024", "--space=library:biblical", "--stale"])
-        );
-    }
-
-    #[test]
-    fn estimate_refuses_bad_profiles_and_spaces() {
-        for bad in ["", "-x", "--force", "a b", "a;b"] {
-            assert!(embed_estimate_argv(bad, "memory", false).is_err(), "profile {bad:?}");
-        }
-        for bad in ["", "libraries", "library:", "library:Bad", "library:a b", "library:../x", "memory --stale", "--space=x", "library:-x"] {
-            assert!(embed_estimate_argv("a@1", bad, false).is_err(), "space {bad:?}");
-        }
-    }
-
-    #[test]
-    fn test_key_takes_a_provider_and_optional_endpoint_and_model() {
-        assert_eq!(
-            embed_test_key_argv("voyage", None, Some("voyage-3")).unwrap(),
-            v(&["embed", "test-key", "--provider=voyage", "--model=voyage-3"])
-        );
-        assert_eq!(
-            embed_test_key_argv("openai-compatible", Some("http://localhost:11434"), Some("nomic-embed-text")).unwrap(),
-            v(&["embed", "test-key", "--provider=openai-compatible", "--endpoint=http://localhost:11434", "--model=nomic-embed-text"])
-        );
-        assert_eq!(embed_test_key_argv("gemini", Some("  "), None).unwrap(), v(&["embed", "test-key", "--provider=gemini"]));
-    }
-
-    #[test]
-    fn test_key_refuses_unknown_providers_and_bad_endpoints() {
-        for bad in ["", "openai", "Gemini", "gemini --model x", "-p"] {
-            assert!(embed_test_key_argv(bad, None, None).is_err(), "provider {bad:?}");
-        }
-        for bad in [
-            "http://example.com", "ftp://x", "localhost:11434", "https://", "http://localhost.evil.com",
-            "http://127.0.0.1.evil.com", "https://a b", "https://a\nb", "-x", "http://localhostevil",
-        ] {
-            assert!(
-                embed_test_key_argv("openai-compatible", Some(bad), Some("m")).is_err(),
-                "endpoint {bad:?}"
-            );
-        }
-        assert!(embed_test_key_argv("voyage", Some("https://api.example.com"), None).is_err());
-        for bad in ["-m", "--model=x", "a b", "a\nb", "a;b"] {
-            assert!(embed_test_key_argv("voyage", None, Some(bad)).is_err(), "model {bad:?}");
-        }
-    }
-
-    #[test]
-    fn endpoint_allows_https_and_loopback_http() {
-        for ok in ["https://api.openai.com", "https://x.example.com/v1", "http://localhost", "http://localhost:1234/v1", "http://127.0.0.1:8080"] {
-            assert!(checked_endpoint(ok).is_ok(), "rejected {ok:?}");
-        }
-    }
-
-    #[test]
-    fn profile_add_argv_checks_every_piece_and_that_the_id_is_model_at_dim() {
-        assert_eq!(
-            embed_profile_add_argv("voyage-3@1024", "voyage", "voyage-3", 1024, None).unwrap(),
-            v(&["embed", "profiles", "add", "voyage-3@1024", "--provider=voyage", "--model=voyage-3", "--dim=1024"])
-        );
-        assert_eq!(
-            embed_profile_add_argv("nomic-embed-text@768", "openai-compatible", "nomic-embed-text", 768, Some("http://localhost:11434")).unwrap(),
-            v(&["embed", "profiles", "add", "nomic-embed-text@768", "--provider=openai-compatible", "--model=nomic-embed-text", "--dim=768", "--endpoint=http://localhost:11434"])
-        );
-        // The id must be exactly model@dim.
-        assert!(embed_profile_add_argv("voyage-3@512", "voyage", "voyage-3", 1024, None).is_err());
-        assert!(embed_profile_add_argv("other@1024", "voyage", "voyage-3", 1024, None).is_err());
-        // Dimensions 1..=8192.
-        for bad in [0, -1, 8193, i64::MAX] {
-            assert!(embed_profile_add_argv(&format!("m@{bad}"), "voyage", "m", bad, None).is_err(), "dim {bad}");
-        }
-        assert!(embed_profile_add_argv("m@8192", "voyage", "m", 8192, None).is_ok());
-        assert!(embed_profile_add_argv("m@1", "voyage", "m", 1, None).is_ok());
-        // OpenAI-compatible needs an endpoint; the others refuse one.
-        assert!(embed_profile_add_argv("m@8", "openai-compatible", "m", 8, None).is_err());
-        assert!(embed_profile_add_argv("m@8", "gemini", "m", 8, Some("https://x.example.com")).is_err());
-        assert!(embed_profile_add_argv("m@8", "nope", "m", 8, None).is_err());
-        assert!(embed_profile_add_argv("-m@8", "voyage", "-m", 8, None).is_err());
-    }
-
-    #[test]
-    fn profile_delete_always_confirms_and_checks_the_id() {
-        assert_eq!(
-            embed_profile_delete_argv("voyage-3@1024").unwrap(),
-            v(&["embed", "profiles", "delete", "voyage-3@1024", "--yes"])
-        );
-        for bad in ["", "-1", "--yes", "a b", "a;b"] {
-            assert!(embed_profile_delete_argv(bad).is_err(), "accepted {bad:?}");
-        }
+        assert_eq!(ALLOWED_SUBCOMMANDS.len(), 9);
     }
 
     #[test]
@@ -7418,117 +5988,6 @@ mod embeddings_command_tests {
         }
         assert!(library_argv("scan", &"x".repeat(40)).is_ok());
         assert!(library_argv("scan", "a_b-9").is_ok());
-    }
-
-    #[test]
-    fn library_set_profile_argv_never_forces_and_checks_both_ids() {
-        assert_eq!(
-            library_set_profile_argv("biblical", "nomic-embed-text@768").unwrap(),
-            v(&["library", "set-profile", "biblical", "nomic-embed-text@768"])
-        );
-        for bad in ["", "-x", "Bad", "a b", "a/b"] {
-            assert!(library_set_profile_argv(bad, "a@1").is_err(), "name {bad:?}");
-        }
-        for bad in ["", "-f", "--force", "a b", "a;b", "a\nb"] {
-            assert!(library_set_profile_argv("biblical", bad).is_err(), "profile {bad:?}");
-        }
-        assert!(!library_set_profile_argv("biblical", "a@1").unwrap().iter().any(|a| a.contains("force")));
-    }
-
-    #[test]
-    fn library_add_and_remove_argv() {
-        assert_eq!(
-            library_add_argv("talks", "/Users/me/Documents/talks", "voyage-3@1024").unwrap(),
-            v(&["library", "add", "talks", "--root=/Users/me/Documents/talks", "--profile=voyage-3@1024"])
-        );
-        assert_eq!(library_remove_argv("talks").unwrap(), v(&["library", "remove", "talks", "--yes"]));
-        for bad in ["", "   ", "-x", "--root=/", "a\nb", "a\0b"] {
-            assert!(library_add_argv("talks", bad, "a@1").is_err(), "root {bad:?}");
-        }
-        assert!(library_add_argv("Talks", "/x", "a@1").is_err());
-        assert!(library_add_argv("talks", "/x", "--bad").is_err());
-        assert!(library_remove_argv("../x").is_err());
-    }
-
-    #[test]
-    fn library_import_argv_keeps_the_prefix_verbatim() {
-        assert_eq!(
-            library_import_argv("biblical", "/Users/me/g.sqlite", Some("Biblical System/corpus/"), Some("voyage-3@1024")).unwrap(),
-            v(&["library", "import", "biblical", "/Users/me/g.sqlite", "--strip-prefix=Biblical System/corpus/", "--profile=voyage-3@1024"])
-        );
-        assert_eq!(
-            library_import_argv("biblical", "/x.jsonl", Some(""), None).unwrap(),
-            v(&["library", "import", "biblical", "/x.jsonl"])
-        );
-        for bad in ["", "-x", "--profile=x", "a\nb"] {
-            assert!(library_import_argv("biblical", bad, None, None).is_err(), "path {bad:?}");
-        }
-        assert!(library_import_argv("biblical", "/x", Some("a\nb"), None).is_err());
-        assert!(library_import_argv("biblical", "/x", None, Some("-p")).is_err());
-        assert!(library_import_argv("Bad", "/x", None, None).is_err());
-    }
-
-    #[test]
-    fn job_start_builds_the_two_detached_verbs() {
-        assert_eq!(
-            job_start_argv("memory", Some("nomic-embed-text@768"), None, false, "app-1-abc").unwrap(),
-            v(&["embed-backfill", "--profile=nomic-embed-text@768", "--job-id=app-1-abc"])
-        );
-        assert_eq!(
-            job_start_argv("library", None, Some("biblical"), false, "app-1-abc").unwrap(),
-            v(&["library-backfill", "biblical", "--job-id=app-1-abc"])
-        );
-        assert_eq!(
-            job_start_argv("library", Some("voyage-3@1024"), Some("biblical"), true, "app-1-abc").unwrap(),
-            v(&["library-backfill", "biblical", "--profile=voyage-3@1024", "--stale", "--job-id=app-1-abc"])
-        );
-    }
-
-    #[test]
-    fn job_start_refuses_bad_kinds_missing_pieces_and_bad_ids() {
-        assert!(job_start_argv("memory", None, None, false, "app-1").is_err());
-        assert!(job_start_argv("memory", Some("  "), None, false, "app-1").is_err());
-        assert!(job_start_argv("library", None, None, false, "app-1").is_err());
-        assert!(job_start_argv("library", None, Some("Bad Name"), false, "app-1").is_err());
-        assert!(job_start_argv("nightly", Some("a@1"), None, false, "app-1").is_err());
-        assert!(job_start_argv("", None, None, false, "app-1").is_err());
-        assert!(job_start_argv("memory", Some("--x"), None, false, "app-1").is_err());
-        for bad in ["", "-x", "a b", "a/b", "../x", &"x".repeat(81)] {
-            assert!(job_start_argv("memory", Some("a@1"), None, false, bad).is_err(), "id {bad:?}");
-        }
-    }
-
-    #[test]
-    fn generated_job_ids_are_valid_and_distinct() {
-        let a = new_job_id();
-        let b = new_job_id();
-        assert!(job_id_ok(&a), "{a}");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn cancel_only_targets_a_running_job_that_names_its_own_pid() {
-        let running = r#"{"job":"app-1-abc","state":"running","pid":4242}"#;
-        assert_eq!(cancel_target(running, "app-1-abc").unwrap(), 4242);
-        // A different id, a finished job, no pid, a tiny pid and junk all refuse.
-        assert!(cancel_target(running, "app-2-abc").is_err());
-        for raw in [
-            r#"{"job":"app-1-abc","state":"done","pid":4242}"#,
-            r#"{"job":"app-1-abc","state":"cancelled","pid":4242}"#,
-            r#"{"job":"app-1-abc","state":"running"}"#,
-            r#"{"job":"app-1-abc","state":"running","pid":0}"#,
-            r#"{"job":"app-1-abc","state":"running","pid":1}"#,
-            r#"{"job":"app-1-abc","state":"running","pid":-5}"#,
-            r#"{"job":"app-1-abc","state":"running","pid":"4242"}"#,
-            "not json",
-            "",
-        ] {
-            assert!(cancel_target(raw, "app-1-abc").is_err(), "accepted {raw:?}");
-        }
-        for bad in ["", "-1", "../x", "a b"] {
-            assert!(cancel_target(running, bad).is_err(), "id {bad:?}");
-            assert!(cancel_job_sync(bad).is_err(), "cancel_job_sync {bad:?}");
-        }
     }
 
     #[test]
@@ -7619,13 +6078,11 @@ mod audit_1010_regression_tests {
             std::fs::create_dir_all(home.join(".config/khipu")).unwrap();
             std::fs::write(home.join(".config/khipu/data_root.json"), r#"{"path":"~/pointer-data"}"#).unwrap();
             assert_eq!(dirs_fallback_dsn(), pointer_data.join("dsn"));
-            assert_eq!(jobs_dir_path(), pointer_data.join("jobs"));
             let env_data = home.join("env-data");
             std::fs::create_dir_all(env_data.join("jobs")).unwrap();
             std::fs::write(env_data.join("dsn"), "postgres://env").unwrap();
             std::env::set_var("KHIPU_DATA_DIR", "~/env-data");
             assert_eq!(dirs_fallback_dsn(), env_data.join("dsn"));
-            assert_eq!(jobs_dir_path(), env_data.join("jobs"));
             return;
         }
         let home = std::env::temp_dir().join(format!("khipu-rs10-{}", std::process::id()));
@@ -7669,13 +6126,6 @@ mod audit_1010_regression_tests {
             .env("KHIPU_RS7_CHILD", "1").env("KHIPU_RS7_FIXTURE", &fixture).env("HOME", &temp)
             .env_remove("PYTHONPYCACHEPREFIX").env_remove("PYTHONDONTWRITEBYTECODE").status().unwrap();
         let _ = std::fs::remove_dir_all(temp); assert!(status.success());
-    }
-
-    #[test]
-    fn cancel_requires_exact_backfill_job_not_another_khipu_daemon() {
-        assert!(!process_is_current_job("python -m khipu recall --job-id=app-1", "app-1"));
-        assert!(!process_is_current_job("python -m khipu embed-backfill --job-id=other", "app-1"));
-        assert!(process_is_current_job("python -m khipu embed-backfill --job-id=app-1", "app-1"));
     }
 
     #[test]
@@ -7996,13 +6446,6 @@ mod priority_and_sign_in_tests {
         assert!(accounts_offer_argv("decline", "claude", Some("--folder")).is_err());
         assert_eq!(accounts_auto_track_argv(true), v(&["accounts", "auto-track", "--from-app", "on"]));
         assert_eq!(accounts_auto_track_argv(false), v(&["accounts", "auto-track", "--from-app", "off"]));
-        assert_eq!(accounts_request_argv("confirm", "a1b2").unwrap(), v(&["accounts", "request", "--from-app", "--expect=a1b2", "confirm"]));
-        assert_eq!(accounts_request_argv("undo", "a1b2").unwrap(), v(&["accounts", "request", "--from-app", "--expect=a1b2", "undo"]));
-        for missing in ["", "  ", "-x"] {
-            assert!(accounts_request_argv("undo", missing).is_err(), "{missing:?}");
-        }
-        assert!(accounts_request_argv("--x", "a1").is_err());
-        assert!(accounts_request_argv("clear", "a1").is_err());
         assert_eq!(accounts_status_argv(), v(&["accounts", "status"]));
     }
 
@@ -8641,20 +7084,6 @@ mod work_command_tests {
     }
 
     #[test]
-    fn reads_are_fixed_and_join_the_project_to_its_flag() {
-        assert_eq!(work_view_argv(), vec!["work", "--json"]);
-        assert_eq!(health_argv(), vec!["health", "--json"]);
-        assert_eq!(macs_argv(), vec!["macs", "--json"]);
-        assert_eq!(running_argv(), vec!["running", "--json"]);
-        assert_eq!(ledger_list_argv("owner/atlas").unwrap(), vec!["ledger", "list", "--json", "--project=owner/atlas"]);
-        assert_eq!(
-            ledger_get_argv("atlas", "s-3.2").unwrap(),
-            vec!["ledger", "get", "--json", "--project=atlas", "--", "s-3.2"]
-        );
-        assert_eq!(ledger_removed_argv("atlas").unwrap(), vec!["ledger", "removed", "--json", "--project=atlas"]);
-    }
-
-    #[test]
     fn a_set_carries_from_app_its_fields_and_the_state_it_was_shown() {
         let c = LedgerChange {
             state: Some("DONE".into()),
@@ -8702,94 +7131,6 @@ mod work_command_tests {
     }
 
     #[test]
-    fn remove_asks_for_a_known_children_choice() {
-        assert_eq!(
-            ledger_remove_argv("atlas", "g-1", Some("duplicate"), Some("move-up")).unwrap(),
-            vec!["ledger", "remove", "--json", "--from-app", "--project=atlas", "--children=move-up",
-                 "--note=duplicate", "--", "g-1"]
-        );
-        assert_eq!(
-            ledger_remove_argv("atlas", "s-1", None, None).unwrap(),
-            vec!["ledger", "remove", "--json", "--from-app", "--project=atlas", "--", "s-1"]
-        );
-        assert!(ledger_remove_argv("atlas", "g-1", None, Some("--all")).is_err());
-        assert_eq!(
-            ledger_restore_argv("atlas", "s-1").unwrap(),
-            vec!["ledger", "restore", "--json", "--from-app", "--project=atlas", "--", "s-1"]
-        );
-    }
-
-    #[test]
-    fn hide_and_same_take_only_ids() {
-        assert_eq!(work_hide_argv("42", true).unwrap(), vec!["work", "hide", "--", "42"]);
-        assert_eq!(work_hide_argv("42", false).unwrap(), vec!["work", "unhide", "--", "42"]);
-        assert!(work_hide_argv("--json", true).is_err());
-        assert_eq!(
-            work_same_argv("owner/atlas", "n-7", "42", true).unwrap(),
-            vec!["work", "same", "--", "owner/atlas#n-7", "42"]
-        );
-        assert_eq!(work_same_argv("atlas", "n-7", "42", false).unwrap()[1], "not-same");
-        assert!(work_same_argv("atlas", "n-7", "4 2", true).is_err());
-    }
-
-    fn ids(n: usize) -> Vec<String> {
-        (1..=n).map(|i| i.to_string()).collect()
-    }
-
-    #[test]
-    fn a_bulk_close_is_one_call_with_every_id_and_the_reason() {
-        let argv = owed_change_argv("close", &ids(50), "Merged in the release", None, None).unwrap();
-        let joined = (1..=50).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-        assert_eq!(argv, vec!["owed".to_string(), format!("--close={joined}"), "--reason=Merged in the release".to_string()]);
-        // The same id twice goes once; spaces round an id are dropped.
-        assert_eq!(
-            owed_change_argv("close", &["7".into(), " 8 ".into(), "7".into()], "done", None, None).unwrap(),
-            vec!["owed", "--close=7,8", "--reason=done"]
-        );
-    }
-
-    #[test]
-    fn a_move_names_the_new_owner_and_an_agent_s_label() {
-        assert_eq!(
-            owed_change_argv("reassign", &ids(2), "Job items", Some("agent"), Some("orchestrator")).unwrap(),
-            vec!["owed", "--reassign=1,2", "--to=agent", "--label=orchestrator", "--reason=Job items"]
-        );
-        assert_eq!(
-            owed_change_argv("reassign", &ids(1), "Mine after all", Some("user"), None).unwrap(),
-            vec!["owed", "--reassign=1", "--to=user", "--reason=Mine after all"]
-        );
-        // A label belongs only to an agent; a blank one is left out.
-        assert_eq!(
-            owed_change_argv("reassign", &ids(1), "x", Some("assistant"), Some("  ")).unwrap(),
-            vec!["owed", "--reassign=1", "--to=assistant", "--reason=x"]
-        );
-        assert!(owed_change_argv("reassign", &ids(1), "x", Some("assistant"), Some("builder")).is_err());
-        assert!(owed_change_argv("reassign", &ids(1), "x", None, None).is_err());
-        assert!(owed_change_argv("reassign", &ids(1), "x", Some("everyone"), None).is_err());
-        assert!(owed_change_argv("reassign", &ids(1), "x", Some("agent"), Some("a\nb")).is_err());
-        assert!(owed_change_argv("close", &ids(1), "x", Some("agent"), None).is_err());
-    }
-
-    #[test]
-    fn a_bulk_change_refuses_what_is_not_an_id_a_reason_or_an_action() {
-        for bad in [vec![], vec!["".to_string()], vec!["1,2".to_string()], vec!["-1".to_string()],
-                    vec!["--reopen=3".to_string()], vec!["0".to_string()], vec!["12a".to_string()]] {
-            assert!(owed_change_argv("close", &bad, "done", None, None).is_err(), "{bad:?}");
-        }
-        for reason in ["", "   ", "one\ntwo"] {
-            assert!(owed_change_argv("close", &ids(2), reason, None, None).is_err(), "{reason:?}");
-        }
-        assert!(owed_change_argv("close", &ids(1), &"x".repeat(OWED_REASON_MAX_CHARS + 1), None, None).is_err());
-        for action in ["delete", "reopen", "snooze", "--close", ""] {
-            assert!(owed_change_argv(action, &ids(1), "x", None, None).is_err(), "{action:?}");
-        }
-        assert!(owed_change_argv("close", &ids(OWED_IDS_MAX + 1), "x", None, None).is_err());
-        // A reason that looks like a flag stays the reason's value.
-        let argv = owed_change_argv("close", &ids(1), "--reopen=1", None, None).unwrap();
-        assert_eq!(argv.last().unwrap(), "--reason=--reopen=1");
-    }
-
-    #[test]
     fn the_owed_limits_and_the_github_switch_are_settable_and_resettable() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         for key in ["owed_page_max", "owed_bulk_max"] {
@@ -8809,37 +7150,6 @@ mod work_command_tests {
 
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn settings_work_reads_are_fixed() {
-        assert_eq!(ledger_projects_argv(), v(&["ledger", "projects", "--json"]));
-        assert_eq!(work_hidden_argv(), v(&["work", "hidden", "--json"]));
-        assert_eq!(
-            work_check_argv("/runners/atlas/state/work-summary.json").unwrap(),
-            v(&["work", "check", "--json", "--", "/runners/atlas/state/work-summary.json"])
-        );
-        assert_eq!(work_check_argv(" ~/r/w.json ").unwrap()[4], "~/r/w.json");
-        for bad in ["", "relative/w.json", "--json", "/a\nb.json"] {
-            assert!(work_check_argv(bad).is_err(), "accepted {bad:?}");
-        }
-    }
-
-    #[test]
-    fn a_project_change_is_the_owners_and_names_one_change() {
-        assert_eq!(
-            ledger_project_argv("owner/atlas", Some(" Atlas "), None).unwrap(),
-            v(&["ledger", "project", "--json", "--from-app", "--project=owner/atlas", "--rename=Atlas"])
-        );
-        assert_eq!(
-            ledger_project_argv("atlas", None, Some(true)).unwrap(),
-            v(&["ledger", "project", "--json", "--from-app", "--project=atlas", "--hide"])
-        );
-        assert_eq!(ledger_project_argv("atlas", Some(""), Some(false)).unwrap()[5..], v(&["--rename=", "--show"]));
-        assert!(ledger_project_argv("atlas", None, None).is_err());
-        assert!(ledger_project_argv("atlas", Some(&"x".repeat(81)), None).is_err());
-        assert!(ledger_project_argv("atlas", Some("two\nlines"), None).is_err());
-        assert!(ledger_project_argv("a#b", None, Some(true)).is_err());
     }
 
     #[test]
@@ -8886,5 +7196,29 @@ mod work_command_tests {
         let many: Vec<String> = (0..65).map(|i| format!(r#"{{"project":"p{i}","file":"/w{i}.json"}}"#)).collect();
         assert!(config_set_argv("work_projects", &format!("[{}]", many.join(","))).is_err());
         assert!(config_unset_argv("work_projects").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod autostart_wiring_tests {
+    // Wiring only: nothing here asks the system to add a login item.
+    #[test]
+    fn plugin_builds_without_touching_the_system() {
+        let plugin = super::autostart_plugin::<tauri::Wry>();
+        assert_eq!(tauri::plugin::Plugin::name(&plugin), "autostart");
+    }
+
+    #[test]
+    fn main_window_may_call_the_autostart_commands() {
+        let caps: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let perms = caps["permissions"].as_array().unwrap();
+        assert!(perms.iter().any(|p| p == "autostart:default"));
+    }
+
+    #[test]
+    fn run_registers_the_plugin() {
+        let src = include_str!("lib.rs");
+        assert!(src.contains(".plugin(autostart_plugin())"));
     }
 }

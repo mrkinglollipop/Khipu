@@ -41,7 +41,7 @@ describe("claudeHomesGap", () => {
 
 describe("railHealthLine", () => {
   it("stays green when every found home is installed", () => {
-    expect(railHealthLine(true, OK, NONE)).toEqual({ tone: "ok", text: "All harnesses recording" });
+    expect(railHealthLine(true, OK, NONE)).toEqual({ tone: "ok", text: "All apps recording" });
   });
 
   it("does not call an explicitly failed liveness read healthy when it has no red rows", () => {
@@ -58,7 +58,7 @@ describe("railHealthLine", () => {
     });
   });
 
-  it("does not call unseen or absent harness evidence healthy", () => {
+  it("does not call unseen or absent app evidence healthy", () => {
     expect(railHealthLine(true, { ok: true, red: [], harnesses: {} }, NONE)).toEqual({
       tone: "warn",
       text: "Recording not checked",
@@ -69,7 +69,7 @@ describe("railHealthLine", () => {
   it("keeps named red evidence ahead of a false aggregate verdict", () => {
     expect(railHealthLine(true, { ok: false, red: ["claude_code"], harnesses: {} }, NONE)).toEqual({
       tone: "err",
-      text: "1 harness not recording",
+      text: "1 app not recording",
     });
   });
 
@@ -88,14 +88,14 @@ describe("railHealthLine", () => {
     });
   });
 
-  it("keeps known Claude-home and T3 warnings ahead of generic unproved harness state", () => {
+  it("keeps known Claude-home and T3 warnings ahead of generic unproved app state", () => {
     expect(railHealthLine(true, { ok: true, red: [], harnesses: {} }, { missing: 1, unreadable: 0 })).toEqual({
       tone: "warn",
       text: "1 Claude home not installed",
     });
     expect(railHealthLine(true, { ok: true, red: [], harnesses: {} }, NONE, { warning: true, lookupFailed: false })).toEqual({
       tone: "warn",
-      text: "T3 needs a linked capture",
+      text: "T3 needs a linked save",
     });
   });
 
@@ -107,9 +107,9 @@ describe("railHealthLine", () => {
     const gap = { missing: 1, unreadable: 0 };
     expect(railHealthLine(true, { ...OK, red: ["claude_code"] }, gap)).toEqual({
       tone: "err",
-      text: "1 harness not recording",
+      text: "1 app not recording",
     });
-    expect(railHealthLine(true, { ...OK, red: ["a", "b"] }, gap).text).toBe("2 harnesses not recording");
+    expect(railHealthLine(true, { ...OK, red: ["a", "b"] }, gap).text).toBe("2 apps not recording");
     expect(railHealthLine(false, OK, gap)).toEqual({ tone: "err", text: "Database not reachable" });
     expect(railHealthLine(true, { ...OK, red: ["claude_code"] }, FAILED).tone).toBe("err");
   });
@@ -117,7 +117,7 @@ describe("railHealthLine", () => {
   it("says it is checking until the heartbeat has loaded", () => {
     expect(railHealthLine(true, null, { missing: 1, unreadable: 0 })).toEqual({
       tone: "warn",
-      text: "Checking harnesses…",
+      text: "Checking apps…",
     });
   });
 });
@@ -127,7 +127,7 @@ describe("harnessesBadge", () => {
     expect(harnessesBadge(OK, NONE)).toBeNull();
   });
 
-  it("counts red harnesses first, else the Claude homes that need attention", () => {
+  it("counts red apps first, else the Claude homes that need attention", () => {
     expect(harnessesBadge({ ...OK, red: ["claude_code"] }, { missing: 2, unreadable: 0 })).toEqual({
       n: 1,
       quiet: false,
@@ -158,7 +158,7 @@ describe("T3 health", () => {
     expect(harnessesBadge(OK, NONE, gap)).toEqual({ n: 1, quiet: false });
   });
 
-  it("names a provider-hooks warning as that, not as a missing linked capture", () => {
+  it("names a provider-hooks warning as that, not as a missing linked save", () => {
     const t3 = {
       detected: true,
       lookup: { ok: true },

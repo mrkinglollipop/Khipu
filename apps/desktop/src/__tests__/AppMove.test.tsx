@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
+import { openSettingsRow } from "./nav";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
@@ -23,7 +24,6 @@ describe("App — Move", () => {
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "dsn_configured") return true;
       if (cmd === "khipu_db_status") return JSON.stringify({ ok: true, host_kind: "remote" });
-      if (cmd === "liveness_now") return JSON.stringify({ ok: true, harnesses: {} });
       if (cmd === "khipu_db_preflight") return JSON.stringify({ ok: true, stages: [] });
       if (cmd === "khipu_db_move" && args?.dryRun === true) {
         previews += 1;
@@ -34,7 +34,7 @@ describe("App — Move", () => {
       return JSON.stringify({ ok: true });
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    await openSettingsRow("Where memory is kept");
     fireEvent.click(screen.getByRole("button", { name: /Move this memory to another database/ }));
     fireEvent.change(screen.getByLabelText("Target connection string"), { target: { value: "postgresql://target" } });
     fireEvent.click(screen.getByRole("button", { name: "Check the target" }));
@@ -49,7 +49,7 @@ describe("App — Move", () => {
   it("UI-20 does not offer an unsupported certificate picker for moves", async () => {
     invokeMock.mockResolvedValue(JSON.stringify({ ok: true, host_kind: "remote" }));
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    await openSettingsRow("Where memory is kept");
     fireEvent.click(screen.getByRole("button", { name: /Move this memory to another database/ }));
     expect(screen.getByText(/Custom certificate files are not supported for moves yet/)).toBeInTheDocument();
     expect(screen.queryByText(/destination already trusts/)).not.toBeInTheDocument();

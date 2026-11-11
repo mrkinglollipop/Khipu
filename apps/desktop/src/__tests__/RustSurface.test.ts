@@ -68,3 +68,38 @@ describe("the run-ahead grant and its picker", () => {
     expect(handler).toMatch(/khipu_route_override_act,\s*khipu_route_override_candidates,/);
   });
 });
+
+describe("the registered command set", () => {
+  const names = [...lib.matchAll(/#\[tauri::command\]\s*(?:async )?fn (\w+)/g)].map((m) => m[1]);
+  const handler = lib.slice(lib.indexOf("generate_handler!["));
+  const registered = handler
+    .slice(handler.indexOf("[") + 1, handler.indexOf("])"))
+    .split(",")
+    .map((n) => n.trim())
+    .filter(Boolean);
+
+  it("registers exactly the 94 commands the file defines (A12 removed 50 that nothing called)", () => {
+    expect(names).toHaveLength(94);
+    expect(registered).toHaveLength(94);
+    expect([...registered].sort()).toEqual([...names].sort());
+  });
+
+  it("keeps the needs-you, grant and route-say commands", () => {
+    for (const n of ["khipu_needs_you", "khipu_needs_you_answer", "khipu_route_override_act", "khipu_route_override_candidates", "khipu_route_say", "khipu_route_cap"]) {
+      expect(registered, n).toContain(n);
+    }
+  });
+
+  it("no longer has the commands only the removed screens called", () => {
+    for (const n of ["spawn_khipu", "khipu_embed_backfill", "khipu_job_start", "khipu_library_add", "khipu_work_hide", "khipu_ledger_remove", "khipu_project_merge", "khipu_route_rule", "khipu_capture_now", "liveness_now", "upgrade_postgres", "health_snapshot"]) {
+      expect(registered, n).not.toContain(n);
+    }
+  });
+
+  it("lets the app run only the CLI subcommands a kept screen runs", () => {
+    const list = lib.slice(lib.indexOf("const ALLOWED_SUBCOMMANDS"));
+    const body = list.slice(list.indexOf("[", list.indexOf("=")), list.indexOf("];"));
+    const subs = [...body.matchAll(/"([\w-]+)"/g)].map((m) => m[1]);
+    expect(subs).toEqual(["status", "doctor", "activity", "search", "backup-local", "integrations", "models", "episode", "owed"]);
+  });
+});

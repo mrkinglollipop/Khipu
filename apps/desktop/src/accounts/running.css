@@ -1,0 +1,49 @@
+/* Accounts › Running now (slice A5). Khipu's own tokens from App.css;
+   every class starts `rn-`. Spacing follows the 4 / 8 / 12 / 16 / 24 / 32 scale. */
+
+.rn-page { width: 100%; max-width: 1320px; padding: 24px 32px 48px; }
+.rn-sub { margin: 0; font-size: 16px; color: var(--text); }
+.rn-note-line { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
+.rn-mac { margin-top: 32px; }
+.rn-mac h2 { margin: 0 0 8px; font-size: 18px; font-weight: 650; }
+.rn-stale { margin: 0; padding: 12px 16px; border-radius: 10px; background: var(--warn-soft); color: var(--text-2); font-size: 14.5px; max-width: 70ch; }
+.rn-foot { margin: 32px 0 0; color: var(--muted); font-size: 13.5px; }
+
+.rn-jobs { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 14.5px; }
+.rn-jobs th, .rn-jobs td { text-align: left; vertical-align: top; padding: 12px; }
+.rn-jobs thead th { padding-top: 0; padding-bottom: 8px; font-size: 13px; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--border-strong); }
+.rn-jobs td { border-bottom: 1px solid var(--border); }
+.rn-c-acct { width: 150px; } .rn-c-model { width: 120px; } .rn-c-state { width: 200px; } .rn-c-when { width: 180px; }
+.rn-jobs td.rn-when { white-space: nowrap; }
+.rn-rg th { padding: 24px 12px 8px; border-bottom: 1px solid var(--border); }
+.rn-rgh { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.rn-rgh b { font-weight: 650; font-size: 15px; }
+.rn-beat { display: inline-flex; align-items: center; gap: 8px; font-weight: 400; font-size: 14px; color: var(--text-2); }
+.rn-beat.warn { color: var(--warn); font-weight: 600; }
+.rn-note td { border-bottom: 0; padding: 8px 0 4px; }
+.rn-runner-note { margin: 0; padding: 12px 16px; border-radius: 10px; background: var(--warn-soft); font-size: 14.5px; color: var(--text-2); }
+.rn-runner-note b { color: var(--text); }
+.rn-t { font-weight: 650; }
+.rn-now { font-size: 14px; color: var(--text-2); margin-top: 4px; }
+.rn-w { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+.rn-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--border-strong); }
+.rn-dot.ok { background: var(--ok); }
+.rn-dot.warn { background: var(--warn); }
+.rn-dot.err { background: var(--err); }
+.rn-jobs td.rn-muted, .rn-unknown td, .rn-unknown .rn-t, .rn-unknown .rn-now { color: var(--muted); }
+
+/* The account page's "Running here now". */
+.rn-here-sec { margin-top: 24px; }
+.rn-here { display: flex; align-items: baseline; gap: 8px; }
+
+/* Below 900 px the table becomes stacked rows: no sideways scrolling. */
+@media (max-width: 899px) {
+  .rn-page { padding: 16px 16px 32px; }
+  .rn-jobs thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  .rn-jobs, .rn-jobs tbody, .rn-jobs tr, .rn-jobs td, .rn-jobs th { display: block; width: auto; }
+  .rn-jobs tr:not(.rn-rg):not(.rn-note) { padding: 12px 0; border-bottom: 1px solid var(--border); }
+  .rn-jobs td { border: 0; padding: 2px 0; }
+  .rn-jobs td.rn-when { white-space: normal; color: var(--muted); }
+  .rn-rg th { padding: 16px 0 8px; }
+}
+@media (hover: hover) and (pointer: fine) { .rn-jobs tbody tr:not(.rn-rg):not(.rn-note):hover td { background: var(--surface-2); } }

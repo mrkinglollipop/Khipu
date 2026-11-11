@@ -8,7 +8,7 @@
 // app has an honest fix) a button.
 
 import { capitalise, whenLocal } from "./routing";
-import { fmtAgo, fmtAgoSince } from "./time";
+import { fmtAgo } from "./time";
 import { shortProject } from "./work";
 import { captureCauseWords, plainError, waitedWords } from "./humanWords";
 
@@ -32,8 +32,7 @@ export const HARNESS_LABEL: Record<string, string> = {
   cursor: "Cursor",
   aegis: "Aegis",
   codex: "Codex",
-  grok_bot: "Grok Bot",
-};
+  grok_bot: "Grok Bot" };
 
 /** " in the last 60 minutes" for a rate check's window, or "" when unknown. */
 function windowWords(minutes: number | undefined): string {
@@ -74,12 +73,11 @@ export function buildAttention(parsed: Record<string, unknown>): {
         items.push({
           key: "liveness:gateway",
           tone: "err",
-          title: "Gateway is not reachable",
+          title: "Cloud server is not reachable",
           cause: why
-            ? `The gateway check failed: ${why}. Open Harnesses to inspect the gateway connection.`
-            : "The gateway check failed. Open Harnesses to inspect the gateway connection.",
-          fix: { label: "Open Harnesses", kind: "open-harnesses" },
-        });
+            ? `The cloud server check failed: ${why}. Open Apps to inspect the cloud server connection.`
+            : "The cloud server check failed. Open Apps to inspect the cloud server connection.",
+          fix: { label: "Open Apps", kind: "open-harnesses" } });
         continue;
       }
       // Reinstall only helps a missing/broken hook. Drain failures, a stale
@@ -104,12 +102,11 @@ export function buildAttention(parsed: Record<string, unknown>): {
             : hookish
               ? `${captureCauseWords(why)}. Reinstalling the hook puts it back without losing the session.`
               : `${captureCauseWords(why)}.`
-          : "Its capture hook is no longer reporting. Reinstalling the hook puts it back without losing the session.",
+          : "Its saving hook is no longer reporting. Reinstalling the hook puts it back without losing the session.",
         ...(hookish || !why
           ? { fix: { label: "Reinstall hook" as const, kind: "reinstall-hook" as const } }
           : {}),
-        harness: h,
-      });
+        harness: h });
     }
   }
 
@@ -123,8 +120,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       title: "The nightly copy of your notes is not reaching GitHub",
       cause: why
         ? `${why}. Everything is still in the database; only the off-site copy of the note files is behind.`
-        : "Everything is still in the database; only the off-site copy of the note files is behind.",
-    });
+        : "Everything is still in the database; only the off-site copy of the note files is behind." });
   }
 
   if ((parsed as { drift_ok?: boolean }).drift_ok === false) {
@@ -135,20 +131,18 @@ export function buildAttention(parsed: Record<string, unknown>): {
       title: "Some note files no longer match the database",
       cause:
         "A file was edited in two places, so one version is not the one search returns. Conflicting edits lists them.",
-      fix: { label: "Conflicting edits", kind: "revisions" },
-    });
+      fix: { label: "Conflicting edits", kind: "revisions" } });
   }
 
   if ((parsed as { outbox_ok?: boolean }).outbox_ok === false) {
-    issues.push("Captures waiting to sync");
+    issues.push("Saves waiting to sync");
     const box = (parsed as { outbox?: OutboxFields }).outbox;
     const notice = outboxNotice(box);
     items.push({
       key: "outbox",
       tone: "warn",
       title: notice.title,
-      cause: notice.cause,
-    });
+      cause: notice.cause });
   }
 
   if ((parsed as { backup_ok?: boolean }).backup_ok === false) {
@@ -157,8 +151,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       key: "backup",
       tone: "err",
       title: "The newest backup is older than it should be",
-      cause: "Backups run on a schedule off this Mac. Until one lands, a restore would lose recent sessions.",
-    });
+      cause: "Backups run on a schedule off this Mac. Until one lands, a restore would lose recent sessions." });
   }
 
   if ((parsed as { index_freshness_ok?: boolean }).index_freshness_ok === false) {
@@ -167,8 +160,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       key: "index_freshness",
       tone: "warn",
       title: "The memory index has not been rebuilt since the last nightly run",
-      cause: "Recall still works; the summary index an agent reads first is a day behind.",
-    });
+      cause: "Recall still works; the summary index an agent reads first is a day behind." });
   }
 
   if ((parsed as { embed_coverage_ok?: boolean }).embed_coverage_ok === false) {
@@ -192,8 +184,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       title: "The search index is behind",
       cause: missing
         ? `${missing} not indexed yet. They are still findable by their exact words; search by meaning misses them until the nightly catches up.`
-        : "Some rows are not indexed yet. They are still findable by their exact words until the nightly catches up.",
-    });
+        : "Some rows are not indexed yet. They are still findable by their exact words until the nightly catches up." });
   }
 
   // Every red field doctor aggregates into `ok` needs a named issue here, or
@@ -210,8 +201,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       cause: why
         ? `${why}. The probe records a session, searches for it and removes it again.`
         : "The check that records a session, searches for it and removes it again has not run in the last seven days.",
-      fix: { label: "Run recall probe", kind: "recall-probe" },
-    });
+      fix: { label: "Run recall probe", kind: "recall-probe" } });
   }
 
   if ((parsed as { bundle_seal_ok?: boolean }).bundle_seal_ok === false) {
@@ -220,8 +210,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       key: "bundle_seal",
       tone: "err",
       title: "This copy of Khipu has been altered since it was signed",
-      cause: "macOS will refuse to open it after the next restart. Reinstall from the downloaded disk image to repair it.",
-    });
+      cause: "macOS will refuse to open it after the next restart. Reinstall from the downloaded disk image to repair it." });
   }
 
   if ((parsed as { dsn_file_ok?: boolean }).dsn_file_ok === false) {
@@ -230,8 +219,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       key: "dsn_file",
       tone: "err",
       title: "The saved database connection cannot be read",
-      cause: "Harnesses that cannot reach the Keychain fall back to this file. Set the connection again under Settings.",
-    });
+      cause: "Apps that cannot reach the Keychain fall back to this file. Set the connection again under Settings." });
   }
 
   // D1: one nightly-step check per doctor key, each read from its own
@@ -257,8 +245,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
         key: key.replace(/_ok$/, ""),
         tone: "err",
         title,
-        cause: step.fix ? `${why}. ${step.fix}.` : why,
-      });
+        cause: step.fix ? `${why}. ${step.fix}.` : why });
     }
   }
 
@@ -272,8 +259,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       key: "topics_embed_lag",
       tone: "warn",
       title: waited ? "A note has waited over an hour to become findable by meaning" : "A note is waiting to become findable by meaning",
-      cause: `${waited ? `The oldest one has waited ${waited}. ` : ""}It is still findable by its exact words meanwhile.`,
-    });
+      cause: `${waited ? `The oldest one has waited ${waited}. ` : ""}It is still findable by its exact words meanwhile.` });
   }
 
   if ((parsed as { degraded_rate_ok?: boolean }).degraded_rate_ok === false) {
@@ -286,8 +272,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       key: "degraded_rate",
       tone: "warn",
       title: "Search has been falling back to keyword-only often",
-      cause: `${pct}% of the last ${dr?.sampled ?? 0} searches${windowWords(dr?.window_minutes)} (${dr?.degraded ?? 0}) could not use meaning-based search, usually a missing or exhausted embedding budget. Searches made while the database was out of reach are not counted, and this clears by itself once recent searches are healthy.`,
-    });
+      cause: `${pct}% of the last ${dr?.sampled ?? 0} searches${windowWords(dr?.window_minutes)} (${dr?.degraded ?? 0}) could not use meaning-based search, usually a missing or exhausted embedding budget. Searches made while the database was out of reach are not counted, and this clears by itself once recent searches are healthy.` });
   }
 
   // Prompt-time recall's real outcomes over the rate window (doctor's
@@ -312,8 +297,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
         cause:
           po.available === false
             ? "Its log could not be read on this Mac, so whether recall answers before your prompts is unknown."
-            : `It answered ${po.count ?? 0} prompts in the last seven days; 20 are needed before Khipu judges it.`,
-      });
+            : `It answered ${po.count ?? 0} prompts in the last seven days; 20 are needed before Khipu judges it.` });
     } else {
       const pct = po?.failure_rate != null ? Math.round(po.failure_rate * 100) : 0;
       issues.push(`Prompt-time recall missed ${pct}% of recent prompts`);
@@ -322,8 +306,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
         tone: "err",
         title: "Recall before each prompt is missing its deadline",
         cause: `${pct}% of the last ${po?.count ?? 0} prompts${windowWords(po?.window_minutes)} got no prior work in time. Refreshing the offline copy lets recall answer from this Mac. This clears by itself once recent prompts answer in time.`,
-        fix: { label: "Refresh offline copy", kind: "refresh-snapshot" },
-      });
+        fix: { label: "Refresh offline copy", kind: "refresh-snapshot" } });
     }
   }
 
@@ -338,8 +321,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       tone: "warn",
       title: "The offline copy is being rebuilt for this version of Khipu",
       cause: prs.message,
-      fix: { label: "Refresh offline copy", kind: "refresh-snapshot" },
-    });
+      fix: { label: "Refresh offline copy", kind: "refresh-snapshot" } });
   }
   if (prs && prs.fresh === false) {
     issues.push("Prompt-time recall is using the database, not the offline copy");
@@ -348,8 +330,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       tone: "warn",
       title: "Recall before each prompt is reading the slower database",
       cause: replicaUntrustedWords(prs),
-      fix: { label: "Refresh offline copy", kind: "refresh-snapshot" },
-    });
+      fix: { label: "Refresh offline copy", kind: "refresh-snapshot" } });
   }
 
   // The summariser: its provider can run (key present / CLI found), and it is
@@ -365,9 +346,8 @@ export function buildAttention(parsed: Record<string, unknown>): {
       tone: "err",
       title: "The summariser cannot run",
       cause: login
-        ? `The ${bin} command was not found on this Mac. Install it and sign in, or pick another summariser under Settings › Capture. Captures wait in the queue meanwhile.`
-        : `No key is stored for the ${sp?.provider ?? "chosen"} summariser. Set it under Settings › Capture, next to the provider. Captures wait in the queue meanwhile.`,
-    });
+        ? `The ${bin} command was not found on this Mac. Install it and sign in, or pick another summariser under Settings › Who writes the summaries. Saves wait in the queue meanwhile.`
+        : `No key is stored for the ${sp?.provider ?? "chosen"} summariser. Set it under Settings › Who writes the summaries, next to the provider. Saves wait in the queue meanwhile.` });
   }
 
   if ((parsed as { synth_budget_ok?: boolean }).synth_budget_ok === false) {
@@ -378,9 +358,8 @@ export function buildAttention(parsed: Record<string, unknown>): {
       tone: "warn",
       title: sb?.error ? "The summariser's call count cannot be read" : "The summariser reached today's call ceiling",
       cause: sb?.error
-        ? `${sb.error}. Captures wait in the queue; nothing is lost.`
-        : `${sb?.calls ?? "?"} of ${sb?.cap ?? "?"} calls used. Captures wait in the queue until UTC midnight, nothing is lost; lift it for today under Settings › Capture.`,
-    });
+        ? `${sb.error}. Saves wait in the queue; nothing is lost.`
+        : `${sb?.calls ?? "?"} of ${sb?.cap ?? "?"} calls used. Saves wait in the queue until UTC midnight, nothing is lost; lift it for today under Settings › Who writes the summaries.` });
   }
 
   // The hub lacks a migration this version ships (0028 sat unapplied on
@@ -396,8 +375,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
         tone: "err",
         title: "The memory database needs an update this version of Khipu expects",
         cause: `Not yet applied: ${pending.join(", ")}. Until it is, the parts of Khipu that rely on it can fail. Applying it changes only the database's layout and keeps every memory.`,
-        fix: { label: "Apply update", kind: "apply-migrations" },
-      });
+        fix: { label: "Apply update", kind: "apply-migrations" } });
     } else {
       issues.push(`Database version check failed${sm?.error ? `: ${sm.error}` : ""}`);
       items.push({
@@ -406,8 +384,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
         title: "Khipu could not check the memory database's version",
         cause: sm?.error
           ? `${sm.error}. Whether the database has every update this version expects is unknown until the check runs.`
-          : "Whether the database has every update this version expects is unknown until the check runs.",
-      });
+          : "Whether the database has every update this version expects is unknown until the check runs." });
     }
   }
 
@@ -431,8 +408,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       tone: "warn",
       title: "The offline copy of your memory is out of date",
       cause: `${why} Recall reads it first, and turns to the slower database once a full rebuild is more than a day old.`,
-      fix: { label: "Refresh offline copy", kind: "refresh-snapshot" },
-    });
+      fix: { label: "Refresh offline copy", kind: "refresh-snapshot" } });
   }
 
   const ledgerCopy = (parsed as {
@@ -452,8 +428,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       tone: "warn",
       title: "The offline copy of your ledger is out of date",
       cause: `${why} The background job retries every 15 minutes; until one succeeds, the ledger read offline is older than the database's.`,
-      fix: { label: "Refresh offline copy", kind: "refresh-snapshot" },
-    });
+      fix: { label: "Refresh offline copy", kind: "refresh-snapshot" } });
   }
 
   // Disk space: amber warns while doctor's flag is still true, red is an error.
@@ -466,8 +441,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       tone: red ? "err" : "warn",
       title: red ? "This Mac is almost out of disk space" : "This Mac is running low on disk space",
       cause: ds.message || "Free space is below the level Khipu watches for.",
-      fix: { label: "Open storage report", kind: "storage-report" },
-    });
+      fix: { label: "Open storage report", kind: "storage-report" } });
   }
 
   // Work (Work view phase 5): a project stopped reporting, a summary file
@@ -485,8 +459,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
         tone: "warn",
         title: `${name} stopped reporting`,
         cause: `Its job runner's summary has not changed since ${s.as_of ? whenLocal(s.as_of, new Date()) : "a while ago"}. Its board is folded; its ledger is still shown.`,
-        fix: { label: "Open Work settings", kind: "work-settings" },
-      });
+        fix: { label: "Open Work settings", kind: "work-settings" } });
     } else if (s.state === "too_big") {
       issues.push(`The summary file for ${name} is over its limit`);
       items.push({
@@ -494,16 +467,14 @@ export function buildAttention(parsed: Record<string, unknown>): {
         tone: "warn",
         title: `The summary file for ${name} is over its size limit`,
         cause: `${s.problem ?? "The summary file is over its size limit."} Khipu shows the last good read.`,
-        fix: { label: "Raise the limit", kind: "work-settings" },
-      });
+        fix: { label: "Raise the limit", kind: "work-settings" } });
     } else if (s.state === "newer_format") {
       issues.push(`The summary file for ${name} is in a newer format`);
       items.push({
         key: `work:newer_format:${s.project}`,
         tone: "warn",
         title: `The summary file for ${name} is in a newer format`,
-        cause: s.problem ?? "Written in a newer format than this Khipu reads. Update Khipu to see it.",
-      });
+        cause: s.problem ?? "Written in a newer format than this Khipu reads. Update Khipu to see it." });
     }
   }
   const pending = (parsed as { ledger?: { outbox?: { pending?: number | null } } }).ledger?.outbox?.pending ?? 0;
@@ -514,29 +485,10 @@ export function buildAttention(parsed: Record<string, unknown>): {
       key: "work:outbox",
       tone: "warn",
       title: capitalise(what),
-      cause: "They are saved on this Mac and reach the ledger when the database answers. Nothing is lost.",
-    });
+      cause: "They are saved on this Mac and reach the ledger when the database answers. Nothing is lost." });
   }
 
   return { issues, items };
-}
-
-/** A new version of Khipu that was refused only because the database was out
- *  of reach, and is waiting to be checked again by itself. */
-export function promotionAttention(parsed: Record<string, unknown> | null | undefined): Attention[] {
-  const q = (parsed as { promotion?: { queued?: { queued_at?: string } | null } } | null | undefined)?.promotion?.queued;
-  if (!q) return [];
-  const when = fmtAgoSince(q.queued_at) ?? "";
-  return [
-    {
-      key: "promotion",
-      tone: "warn",
-      title: "A new version of Khipu is waiting for the database",
-      cause:
-        `It was queued${when ? ` ${when}` : ""} because the database could not be reached while it was checked. ` +
-        "It goes live by itself once the database answers and its checks pass.",
-    },
-  ];
 }
 
 /** The `outbox status` fields the notice reads (also nested in the doctor report). */
@@ -560,36 +512,32 @@ export function outboxNotice(box: OutboxFields | undefined): { title: string; ca
   const offline = box?.offline ?? 0;
   if (conflicts > 0) {
     return {
-      title: `${conflicts === 1 ? "A capture is" : `${conflicts} captures are`} held for a conflict`,
+      title: `${conflicts === 1 ? "A save is" : `${conflicts} saves are`} held for a conflict`,
       cause:
-        "What this Mac recorded disagrees with what the database already holds, so these captures are not sent automatically. The database is reachable and nothing is lost. Ask your agent to reconcile them.",
-    };
+        "What this Mac recorded disagrees with what the database already holds, so these saves are not sent automatically. The database is reachable and nothing is lost. Ask your agent to reconcile them." };
   }
   if (dead > 0 && pending === 0) {
     return {
-      title: "Some captures are held on this Mac",
+      title: "Some saves are held on this Mac",
       cause:
         (box?.announce_refused ?? 0) > 0
           ? "Buried jobs are held on this Mac outside the normal queue, so the automatic retry does not touch them. Nothing is lost. Putting some of these back may add duplicates: ask your agent to count the ones another episode already covers first."
-          : "Buried jobs are held on this Mac outside the normal queue, so the automatic retry does not touch them. Nothing is lost. Once the cause is fixed, ask your agent to put them back.",
-    };
+          : "Buried jobs are held on this Mac outside the normal queue, so the automatic retry does not touch them. Nothing is lost. Once the cause is fixed, ask your agent to put them back." };
   }
   // With no state fields at all (an older report), keep the long-standing wording.
   const known = box?.offline !== undefined || box?.evidence_conflicts !== undefined;
   if (offline > 0 || box?.offline_only || !known) {
     return {
-      title: "Some captures are still waiting to reach the database",
+      title: "Some saves are still waiting to reach the database",
       cause:
-        "They were recorded while the database was unreachable and are queued on this Mac. They are delivered automatically once the database answers; nothing is lost meanwhile.",
-    };
+        "They were recorded while the database was unreachable and are queued on this Mac. They are delivered automatically once the database answers; nothing is lost meanwhile." };
   }
   const stuck = (box?.oldest_age_s ?? 0) > 3600;
   return {
-    title: "Some captures are queued on this Mac",
+    title: "Some saves are queued on this Mac",
     cause: stuck
       ? "The oldest has been waiting over an hour although the database is not reported down. Nothing is lost; ask your agent to look at why the queue is not draining."
-      : "They are waiting for the next delivery pass and go to the database automatically; nothing is lost meanwhile.",
-  };
+      : "They are waiting for the next delivery pass and go to the database automatically; nothing is lost meanwhile." };
 }
 
 /** The doctor's `prompt_recall_snapshot` block (`hub_snapshot.prompt_recall_snapshot_status`).

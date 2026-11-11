@@ -128,7 +128,7 @@ describe("provider list and defaults (pure)", () => {
   it("gives each provider a short name, kind and line for its row", () => {
     expect(SYNTH_PROVIDERS.map((p) => [p.name, p.kind ?? null, p.line])).toEqual([
       ["Gemini Flash", "API key", "Fastest, about 3 s, least accurate"],
-      ["Claude Haiku", "API key", "Best memory, about 11 s a capture"],
+      ["Claude Haiku", "API key", "Best memory, about 11 s a save"],
       ["OpenAI", "API key", "Accurate, thinner on open loops, about 8 s"],
       ["OpenRouter", "API key", "One key, any model"],
       ["Claude", "your login", "Uses the login you already have; counts against that plan"],
@@ -342,7 +342,7 @@ describe("summariser fallback (synth_fallback)", () => {
     );
     expect(wait().checked).toBe(true);
     expect(wait().disabled).toBe(false);
-    expect(screen.getByText(/Nothing is dropped: a failed capture waits and is retried/)).toBeTruthy();
+    expect(screen.getByText(/Nothing is dropped: a failed save waits and is retried/)).toBeTruthy();
     expect(screen.getByRole("group", { name: "If the provider fails" })).toBeTruthy();
     cleanup();
     render(<Harness initial={anthropicRow} doctorSynth={{ provider: "anthropic", fallback: {} }} />);
@@ -412,7 +412,7 @@ describe("summariser fallback (synth_fallback)", () => {
     expect(screen.queryByText("No Gemini key")).toBeNull();
   });
 
-  it("says a refused Gemini key leaves a failed capture waiting", () => {
+  it("says a refused Gemini key leaves a failed save waiting", () => {
     render(
       <Harness
         initial={anthropicRow}
@@ -421,7 +421,7 @@ describe("summariser fallback (synth_fallback)", () => {
         verifyResult={verifyOf([["gemini_generate", false, "refused"]])}
       />,
     );
-    expect(screen.getByText(/While that key is refused, a failed capture waits and is retried/)).toBeTruthy();
+    expect(screen.getByText(/While that key is refused, a failed save waits and is retried/)).toBeTruthy();
   });
 
   it("shows Reading… only while the config read is in flight, then both choices", async () => {
@@ -524,7 +524,7 @@ describe("SummariserCalls", () => {
     (budget.synth as Record<string, unknown>).exhausted = true;
     const { container } = render(<SummariserCalls active />);
     await waitFor(() =>
-      expect(screen.getByText("Calls today: 5,000 of 5,000. Captures wait until midnight UTC; nothing is dropped.")).toBeTruthy(),
+      expect(screen.getByText("Calls today: 5,000 of 5,000. Saves wait until midnight UTC; nothing is dropped.")).toBeTruthy(),
     );
     expect(container.querySelector(".calls.warn")).not.toBeNull();
     expect(screen.getByRole("button", { name: "Lift for today" }).className).toMatch(/primary/);

@@ -208,40 +208,6 @@ export function ListRow({
   );
 }
 
-/** One number with a label and a supporting line. `tone="err"` outlines it. */
-export function Tile({
-  label,
-  value,
-  sub,
-  tone = "neutral",
-  onOpen,
-  openLabel,
-}: {
-  label: string;
-  value: ReactNode;
-  sub?: ReactNode;
-  tone?: "neutral" | "err" | "warn";
-  /** Makes the whole tile a button that opens the tile's details. */
-  onOpen?: () => void;
-  openLabel?: string;
-}) {
-  const cls = tone === "neutral" ? "tile" : `tile ${tone}`;
-  const body = (
-    <>
-      <div className="label">{label}</div>
-      <div className="value">{value}</div>
-      {sub ? <div className="sub">{sub}</div> : null}
-    </>
-  );
-  if (!onOpen) return <div className={cls}>{body}</div>;
-  return (
-    <button type="button" className={`${cls} tile-btn`} onClick={onOpen} aria-label={openLabel ?? `${label}: open details`}>
-      {body}
-      <ChevronRight size={16} className="tile-chev" aria-hidden />
-    </button>
-  );
-}
-
 export type SegmentedOption<T extends string> = {
   value: T;
   label: string;
