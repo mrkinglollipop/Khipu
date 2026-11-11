@@ -79,6 +79,19 @@ describe("the sentence above the tables", () => {
     expect(h).toBe("No job runner is reporting on M5.");
     expect(h).not.toMatch(/nothing/i);
   });
+  it("does not call a Mac with no job runner idle beside a silent runner on another Mac", () => {
+    const h = headline(data([mac({ runners: [] }), mac({ mac: "m1", name: "M1", runners: [runner({ silent: true })] })]));
+    expect(h).toBe("No job runner is reporting on M5. Activity on M1 is unknown: a job runner there stopped reporting.");
+    expect(h).not.toContain("Nothing is running right now on M5");
+  });
+  it("says nothing is running only for the Mac whose runner reports, and names the Mac with no runner apart", () => {
+    const h = headline(data([mac({ runners: [runner({ jobs: [] })] }), mac({ mac: "m1", name: "M1", runners: [] })]));
+    expect(h).toBe("Nothing is running right now on M5. No job runner is reporting on M1.");
+  });
+  it("with jobs running, counts and names only the Macs that have runners", () => {
+    const h = headline(data([mac({ runners: [runner({ jobs: [job({ state: "running" })] })] }), mac({ mac: "m1", name: "M1", runners: [] })]));
+    expect(h).toBe("1 job running or waiting on M5. No job runner is reporting on M1.");
+  });
   it("never says nothing is running about a stale Mac", () => {
     const h = headline(data([mac({ runners: [] }), mac({ mac: "m1", name: "M1", stale: true })]));
     expect(h).toContain("M1 hasn’t reported recently, so Khipu can’t tell what it is running.");

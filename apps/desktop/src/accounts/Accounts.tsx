@@ -7,7 +7,7 @@
    Reading changes nothing. Only a click on a control makes a change, through
    `useAccountWrites`. */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft } from "lucide-react";
 import { Body, Split, useListKeys } from "../shell";
 import { callCli } from "../settingsCli";
@@ -98,8 +98,11 @@ export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp,
   // The job-slot map, read the way the older Accounts screen read it (`khipu config`),
   // so Stop tracking can say which slots use the account. Unread stays null.
   const [laneMap, setLaneMap] = useState<Record<string, Record<string, string>> | null>(null);
+  const laneRead = useRef(0);
   const loadLaneMap = useCallback(async () => {
+    const mine = ++laneRead.current;
     const res = await callCli<{ routing?: { routing_lane_map?: { value?: unknown } } }>("khipu_config_show");
+    if (mine !== laneRead.current) return; // a newer read owns the answer
     const raw = res.ok ? res.data?.routing?.routing_lane_map?.value : undefined;
     setLaneMap(raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, Record<string, string>>) : null);
   }, []);
@@ -208,7 +211,7 @@ export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp,
         runningHere={running ? <RunningHere accountKey={selected.key} accountLabel={selected.label} hook={running} now={nowProp} /> : undefined}
         more={<AccountMore a={selected} view={view} now={now} reread={reread}
           onRename={manageable ? () => finder.openRename(managed!) : undefined}
-          onStop={manageable ? () => finder.openStop(managed!) : undefined} />} />
+          onStop={manageable ? () => (setLaneMap(null), void loadLaneMap(), finder.openStop(managed!)) : undefined} />} />
     </>
   ) : null;
   return (

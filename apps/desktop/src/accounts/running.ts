@@ -187,22 +187,24 @@ export function headline(data: Running): string {
     ? ` ${joinNames(stale.map((m) => m.name))} ${stale.length === 1 ? "hasn’t" : "haven’t"} reported recently, so Khipu can’t tell what ${stale.length === 1 ? "it is" : "they are"} running.`
     : "";
   if (!fresh.length) return staleLine.trim();
-  const names = joinNames(fresh.map((m) => m.name));
-  const reporting = fresh.some((m) => m.runners.length > 0);
-  if (!reporting) return `No job runner is reporting on ${names}.${staleLine}`;
+  const withRunner = fresh.filter((m) => m.runners.length > 0);
+  const noRunner = fresh.filter((m) => m.runners.length === 0);
+  const noRunnerLine = noRunner.length ? `No job runner is reporting on ${joinNames(noRunner.map((m) => m.name))}.` : "";
+  if (!withRunner.length) return `${noRunnerLine}${staleLine}`;
   const n = countLive(data.macs);
   // A runner that stopped reporting counts for nothing, so its Mac is never "quiet":
   // Khipu can't tell, and the headline keeps saying so, as the table does.
-  const silent = fresh.filter((m) => m.runners.some((r) => r.silent));
-  const clear = fresh.filter((m) => !silent.includes(m));
+  const silent = withRunner.filter((m) => m.runners.some((r) => r.silent));
+  const clear = withRunner.filter((m) => !silent.includes(m));
   const silentLine = silent.length
-    ? ` Activity on ${joinNames(silent.map((m) => m.name))} is unknown: a job runner there stopped reporting.`
+    ? `Activity on ${joinNames(silent.map((m) => m.name))} is unknown: a job runner there stopped reporting.`
     : "";
+  const tail = [noRunnerLine, silentLine].filter(Boolean).map((x) => ` ${x}`).join("") + staleLine;
   if (n === 0) {
-    if (!clear.length) return `${silentLine.trim()}${staleLine}`;
-    return `Nothing is running right now on ${joinNames(clear.map((m) => m.name))}.${silentLine}${staleLine}`;
+    if (!clear.length) return tail.trim();
+    return `Nothing is running right now on ${joinNames(clear.map((m) => m.name))}.${tail}`;
   }
-  return `${n === 1 ? "1 job" : `${n} jobs`} running or waiting on ${names}.${silentLine}${staleLine}`;
+  return `${n === 1 ? "1 job" : `${n} jobs`} running or waiting on ${joinNames(withRunner.map((m) => m.name))}.${tail}`;
 }
 
 /** The answer as it can be trusted now. When the latest read failed and an
