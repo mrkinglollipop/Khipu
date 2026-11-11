@@ -713,7 +713,9 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     ``stats["typed"]`` receives the text of every kept user message the person
     wrote, decided here on the original message, before a machine message is
     rewritten (a relayed cross-session body loses its tag below and would read
-    as typed). Capture's ``verbatim.owner_lines`` come only from this list."""
+    as typed). Capture's ``verbatim.owner_lines`` come only from this list.
+    ``stats["first_line_ts"]`` (epoch seconds) is the ``timestamp`` of the
+    window's first line that has one; absent when none does."""
     msgs: list[tuple[str, str]] = []
     users = 0
     known = set(seen) if seen is not None else None
@@ -721,6 +723,7 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     dropped = dropped_chars = 0
     if stats is not None:
         stats.update(deduped_msgs=0, deduped_chars=0, fresh=fresh, skip_to=offset, typed=[], typed_sdk=[])
+        stats.pop("first_line_ts", None)
     try:
         size = path.stat().st_size
     except OSError:
@@ -753,6 +756,12 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             continue
         if not isinstance(d, dict) or d.get("isMeta"):
             continue
+        if stats is not None and "first_line_ts" not in stats and isinstance(d.get("timestamp"), str):
+            # The window's earliest line's own time (transcripts are written in
+            # order): how old the window is when it is captured.
+            first = _parse_ts(d["timestamp"])
+            if first is not None:
+                stats["first_line_ts"] = first
         parsed.extend((d, role, text, min(line_end, end)) for role, text in _parse_line(d))
     # Deduplicate only paired representations of the same turn (adjacent in
     # order, ignoring tools), never a later repeat that reuses the same text.
@@ -2890,17 +2899,29 @@ def _sdk_run(stats: dict) -> bool:
     return bool(flags) and all(flags)
 
 
-def _headless_outside_t3(thread: str | None, sid: str) -> bool:
+# T3 writes the row naming a new thread's session a little after the thread
+# starts ("a provider row can land after its first Stop", t3.cache_thread), so
+# "no thread" means no thread only for a window at least this old.
+T3_NAMING_GRACE_S = 600
+
+
+def _headless_outside_t3(thread: str | None, sid: str, window_ts: float | None = None,
+                         now: float | None = None) -> bool:
     """T3's record definitively has no thread for this session, so an SDK-driven
     run is a script's or an orchestrator's, not a person's. No T3 database on
     the machine is that answer too (not every user has T3); one that cannot be
-    read is not, and the lines are kept. Never raises."""
+    read is not, and the lines are kept. With T3 present, the answer counts
+    only when the window's first line (``window_ts``) is at least
+    T3_NAMING_GRACE_S old: younger or unknown, T3 may not have named the
+    thread yet, and the lines are kept. Never raises."""
     if thread:
         return False
     try:
         path = _t3._thread_db_path()
         if not path.is_file():
             return True
+        if window_ts is None or (time.time() if now is None else now) - window_ts < T3_NAMING_GRACE_S:
+            return False
         threads, definitive = _t3.session_thread_ids_result(sid)
     except Exception:  # noqa: BLE001 — a lookup must never fail a capture
         return False
@@ -2969,10 +2990,12 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
                     turns: int, job_parent: str | None = None, capture_note: str = "",
                     preserve_mtime: bool = False, fresh_seen: list[str] | None = None,
                     capture_request_id: str = "", typed: list[str] | None = None,
-                    sdk_run: bool = False) -> list[str]:
+                    sdk_run: bool = False, window_ts: float | None = None) -> list[str]:
     """Queue every part before advancing the shared capture offset. ``typed``
     (``read_window``'s typed user messages, redacted) becomes each part's
-    ``owner_lines``, except in a job's capture, which keeps none."""
+    ``owner_lines``, an empty list when none was typed, except in a job's
+    capture, which carries no ``owner_lines`` at all. ``window_ts`` is the
+    window's first line's time (``read_window``'s ``first_line_ts``)."""
     off_before = int(st.get("offset", 0))
     # W1.2/W1.3: resolve identity from the cwd, not the model. Never
     # raises (identity.resolve_repo_root is itself fail-open); this
@@ -3027,7 +3050,7 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     # Decided once, here: the job label below and the owner-lines skip use it.
     # Nobody types into a job, so its user turns are briefs and relays.
     is_job = bool(job_parent or st.get("origin") == "job" or delegated
-                  or (sdk_run and _headless_outside_t3(thread, sid)))
+                  or (sdk_run and _headless_outside_t3(thread, sid, window_ts)))
     owner_lines = [[] for _ in parts] if is_job else _owner_lines_by_part(parts, typed)
     for i, part in enumerate(parts, start=1):
         job = {"harness": harness, "session_id": sid, "cwd": cwd, "event": event,
@@ -3047,7 +3070,10 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
             job["subagent"] = True
         if checkout:
             job["checkout"] = checkout
-        if owner_lines[i - 1]:
+        if not is_job:
+            # Always present for a conversation, empty when nothing in the part
+            # was typed: "none typed" is then told apart from a capture made
+            # before owner_lines existed (memory_rows.owner_lines_of).
             job["owner_lines"] = owner_lines[i - 1]
         if window_id:
             job["window_id"] = window_id
@@ -3295,6 +3321,7 @@ def hook_main(raw: str, harness: str | None = None, event: str | None = None) ->
                         cwd=session_cwd(env), event=event, path=path, st=st, msgs=msgs,
                         new_off=new_off, turns=turns, job_parent=st["parent_session_id"],
                         capture_note=capture_note, fresh_seen=fresh_seen, typed=typed, sdk_run=_sdk_run(dedupe),
+                        window_ts=dedupe.get("first_line_ts"),
                         capture_request_id=_capture_request_id(capture_now) if capture_now is not None else "",
                     )
                     out["queued"] = queued_names[0] if len(queued_names) == 1 else queued_names
@@ -3507,6 +3534,7 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                                 event="idle_sweep", path=path, st=st, msgs=msgs,
                                 new_off=new_off, turns=turns, job_parent=st.get("parent_session_id"),
                                 preserve_mtime=True, fresh_seen=fresh_seen, typed=typed, sdk_run=_sdk_run(dedupe),
+                                window_ts=dedupe.get("first_line_ts"),
                             )
                             out["jobs"] += len(names)
                             _log(f"sweep {harness}:{sid}: queued {len(names)} part(s) "
@@ -3631,13 +3659,12 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         # messages and queued with the job (none for a job's capture, decided
         # at enqueue); never re-derived from the rendered window, where a
         # rewritten machine message reads as typed. A job queued before this
-        # existed has none.
-        if isinstance(job.get("owner_lines"), list):
+        # existed has none. A conversation's list is stored even when empty:
+        # the owner's words are then exactly these, never ``quotes``.
+        if isinstance(job.get("owner_lines"), list) and _job_origin(job) != "job":
             from khipu.extract import owner_lines as _owner_lines
 
-            kept = _owner_lines([t for t in job["owner_lines"] if isinstance(t, str)])
-            if kept:
-                verbatim["owner_lines"] = kept
+            verbatim["owner_lines"] = _owner_lines([t for t in job["owner_lines"] if isinstance(t, str)])
         # O4: same tier as verbatim above — paths written/created, PR/issue
         # URLs, release tags, never lost to summarisation either.
         deliverables = extract_deliverables(job.get("transcript", ""))

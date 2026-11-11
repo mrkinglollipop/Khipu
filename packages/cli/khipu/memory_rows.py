@@ -18,9 +18,11 @@ Fields added to an episode row (appended after the existing keys):
 The owner's own lines are ``episodes.verbatim.quotes`` (up to three user turns
 of the window) and, for conversations captured since ``owner_lines`` existed,
 ``episodes.verbatim.owner_lines`` (every typed user turn of the window). Only
-"only my words" reads ``owner_lines``; the quote shown without it, the title
-and ``activity`` read ``quotes`` alone, as before. Errors, commands, paths and
-the capture note are not the owner's words.
+"only my words" reads ``owner_lines``, and on a row that has the list it reads
+nothing else (``owner_lines_of``); a job's row has no owner words
+(``job_row_sql``). The quote shown without it, the title and ``activity``
+read ``quotes`` alone, as before. Errors, commands, paths and the capture
+note are not the owner's words.
 """
 from __future__ import annotations
 
@@ -69,12 +71,17 @@ def quotes_of(verbatim: Any) -> list[str]:
 
 
 def owner_lines_of(verbatim: Any) -> list[str]:
-    """Every stored owner line, for "only my words": ``quotes`` first (an old
-    row has only those), then ``owner_lines``."""
+    """Every stored owner line, for "only my words". A row with an
+    ``owner_lines`` list (a conversation captured since the list was always
+    stored; empty when nothing was typed) has exactly those: its ``quotes`` can
+    hold a start brief or a relay the capture knew was not typed. A row
+    without the key (captured before) has its ``quotes``."""
     verbatim = _verbatim_dict(verbatim)
     if not isinstance(verbatim, dict):
         return []
-    return list(dict.fromkeys(_strings(verbatim.get("quotes")) + _strings(verbatim.get("owner_lines"))))
+    if isinstance(verbatim.get("owner_lines"), list):
+        return list(dict.fromkeys(_strings(verbatim["owner_lines"])))
+    return list(dict.fromkeys(_strings(verbatim.get("quotes"))))
 
 
 def typed_quotes(quotes: list[str]) -> list[str]:
@@ -186,7 +193,21 @@ def _columns(cur) -> dict[str, bool]:
     from khipu.db import has_columns
 
     return {c: has_columns(cur, "episodes", c)
-            for c in ("verbatim", "origin", "harness", "project", "scope", "raw")}
+            for c in ("verbatim", "origin", "harness", "project", "scope", "raw", "parent_session_id")}
+
+
+def job_row_sql(cur) -> str:
+    """SQL true for an episode a job captured, as commitments.capture_origin
+    decides it: lineage (``parent_session_id``) or ``session_origin: job`` in
+    the stored payload. A job's user turns are briefs and relays, never the
+    owner's words."""
+    have = _columns(cur)
+    tests = []
+    if have["parent_session_id"]:
+        tests.append("COALESCE(btrim(parent_session_id), '') <> ''")
+    if have["raw"]:
+        tests.append("lower(btrim(COALESCE(raw->>'session_origin', ''))) = 'job'")
+    return "(" + " OR ".join(tests) + ")" if tests else "FALSE"
 
 
 def episode_facts(cur, ids: list[Any], *, owner_lines: bool = False) -> dict[str, dict[str, Any]]:
@@ -204,7 +225,7 @@ def episode_facts(cur, ids: list[Any], *, owner_lines: bool = False) -> dict[str
         + ", " + ("harness" if have["harness"] else "NULL")
         + ", session_id, " + project + ", "
         + ("raw->>'summary_kind'" if have["raw"] else "NULL")
-        + (", verbatim->'owner_lines'" if owner_lines and have["verbatim"] else "")
+        + (", verbatim->'owner_lines', " + job_row_sql(cur) if owner_lines and have["verbatim"] else "")
         + " FROM episodes WHERE id = ANY(%s)",
         (numbers,),
     )
@@ -213,8 +234,12 @@ def episode_facts(cur, ids: list[Any], *, owner_lines: bool = False) -> dict[str
         out[str(r[0])] = {"summary": r[1], "quotes": quotes_of(r[2]), "origin": r[3], "harness": r[4],
                           "session_id": r[5], "project": r[6], "summary_kind": r[7]}
         if owner_lines:
-            out[str(r[0])]["owner_lines"] = owner_lines_of(
-                {"quotes": r[2], "owner_lines": r[8] if len(r) > 8 else None})
+            # A job's row has no owner lines; a row with the key has exactly
+            # those (owner_lines_of), a row without it its quotes.
+            vb = {"quotes": r[2]}
+            if len(r) > 8 and isinstance(r[8], list):
+                vb["owner_lines"] = r[8]
+            out[str(r[0])]["owner_lines"] = [] if len(r) > 9 and r[9] else owner_lines_of(vb)
     return out
 
 
@@ -288,7 +313,9 @@ def owner_candidates(cur, term: str, limit: int, filters=None) -> list[dict]:
     """Episodes with an owner line holding the phrase or every query word, newest
     first, in the shape ``cli._literal_candidates`` returns. The index from 0051
     narrows by the words in any verbatim string (``owner_lines`` included);
-    the check on ``quotes`` and ``owner_lines`` is exact."""
+    the check is exact, on ``owner_lines`` when the row has the list and on
+    ``quotes`` when it does not (``owner_lines_of``). A job's row is never
+    a candidate."""
     from khipu import cli
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
 
@@ -319,9 +346,10 @@ def owner_candidates(cur, term: str, limit: int, filters=None) -> list[dict]:
         f"FROM episodes WHERE {cli._episode_live_clause(cur)}"
         + (" AND ".join(index_tests) + " AND " if indexed else "")
         + "EXISTS (SELECT 1 FROM jsonb_array_elements_text("
-        + _owner_array(verbatim, "quotes") + " || " + _owner_array(verbatim, "owner_lines")
+        + f"(CASE WHEN jsonb_typeof({verbatim}->'owner_lines') = 'array' THEN {verbatim}->'owner_lines' "
+        + "ELSE " + _owner_array(verbatim, "quotes") + " END)"
         + ") AS q WHERE " + " AND ".join(line_tests) + ") "
-        f"AND ({ep_filter}) ORDER BY ts DESC NULLS LAST, id DESC LIMIT %(lim)s OFFSET %(off)s"
+        f"AND NOT {job_row_sql(cur)} AND ({ep_filter}) ORDER BY ts DESC NULLS LAST, id DESC LIMIT %(lim)s OFFSET %(off)s"
     )
     # A scheduled prompt that quotes the owner matches in SQL but is not his
     # line, so the exact check can drop rows: read on until ``want`` typed

@@ -2861,8 +2861,9 @@ def hybrid_search(
     ``ts`` / ``project`` / ``harness``; a topic or node carries ``ts`` only.
 
     ``owner_words_only`` ("only my words"): episodes only, and only those with a
-    line of the owner's own (``verbatim.quotes``) holding the phrase or every
-    query word; that line is the row's ``quote``. ``memory_fields`` (implied by
+    line of the owner's own (``memory_rows.owner_lines_of``: ``verbatim.owner_lines``
+    when the row has the list, else ``verbatim.quotes``; none on a job's row)
+    holding the phrase or every query word; that line is the row's ``quote``. ``memory_fields`` (implied by
     it) appends ``quote``, ``title``, ``tool``, ``mac`` and ``project`` to every
     row, for ``khipu search`` and the Memory screen; the per-prompt path passes
     neither, so it pays nothing.
