@@ -193,7 +193,7 @@ export function OrderAndRules({ active, onSeeAll }: { active: boolean; onSeeAll?
                   className="or-field"
                   type="text"
                   value={words}
-                  placeholder="For example: put Codex first until Friday"
+                  placeholder="e.g. put Codex first"
                   autoComplete="off"
                   autoCorrect="off"
                   spellCheck={false}

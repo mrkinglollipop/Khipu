@@ -2248,10 +2248,10 @@ button.t3-detail {
 }
 
 .home {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  column-gap: var(--s4);
+  gap: var(--s2) var(--s4);
   padding: var(--s3);
   border-bottom: 1px solid var(--border);
 }
@@ -2264,6 +2264,9 @@ button.t3-detail {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  /* The path keeps a readable width; when the row is too narrow the marks and
+     buttons drop below it instead of squeezing it to one letter a line. */
+  flex: 1 1 20em;
   min-width: 0;
 }
 
@@ -2322,6 +2325,7 @@ button.t3-detail {
   gap: var(--s2);
   justify-content: flex-end;
   min-width: 190px;
+  margin-left: auto;
 }
 
 .hcard .note.wrap {

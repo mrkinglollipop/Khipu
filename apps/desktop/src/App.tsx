@@ -807,7 +807,8 @@ export default function App() {
   const workingLabel = (() => {
     if (feedbackSending) return "Sending feedback…";
     if (advertiseBusy) return "Advertising a join PIN…";
-    if (loading.doctor) return "Reading the health check…";
+    // The health check reads for a long time on Settings; the rail item shows
+    // it busy and the page's own rows say "Checking…", so no pill sits over text.
     return null;
   })();
   const tabBusy = (id: Tab): boolean => id === "settings" && Boolean(loading.doctor);

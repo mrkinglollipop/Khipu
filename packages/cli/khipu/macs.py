@@ -167,6 +167,22 @@ def name_of(mac: str | None, row_name: str | None = None) -> str:
     return _given_name(mac) or row_name or OTHER_MAC
 
 
+def sole_other_name() -> str | None:
+    """The owner's name for the other Mac when exactly one other Mac has been named, else None. A search or
+    activity row carries a hardware origin, not a Mac id, so with two Macs it is the only way to tell which
+    name a row from the other Mac is meant to carry; with more it stays unknown."""
+    try:
+        from khipu import routing
+
+        names = routing.settings().get("routing_mac_names") or {}
+        here = local_mac_id()
+        others = {n.strip() for m, n in names.items()
+                  if m != here and isinstance(n, str) and n.strip()}
+        return next(iter(others)) if len(others) == 1 else None
+    except Exception:  # noqa: BLE001 - a label is never worth failing a read
+        return None
+
+
 def local_mac_id() -> str | None:
     try:
         from khipu import routing

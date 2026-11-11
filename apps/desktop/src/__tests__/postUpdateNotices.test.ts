@@ -126,3 +126,14 @@ describe("the notice list", () => {
     expect(CARD_MAX_ITEMS).toBe(3);
   });
 });
+
+describe("notices that pointed at the removed Home screen", () => {
+  it("offer no Show me button and do not say 'on Home'", () => {
+    for (const v of POST_UPDATE_NOTICES) {
+      for (const item of v.items) {
+        if (item.target.kind === "home") expect(itemAction(item, false, ALL_CAPABILITIES)).toBeNull();
+        expect(`${item.title} ${item.text} ${item.short ?? ""}`).not.toMatch(/\b(on|Routing card on|Plans on) Home\b/);
+      }
+    }
+  });
+});

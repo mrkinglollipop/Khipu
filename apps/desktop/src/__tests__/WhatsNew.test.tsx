@@ -46,6 +46,12 @@ describe("PostUpdateNoticeDialog", () => {
       const onShow = vi.fn();
       const onDismiss = vi.fn();
       const { unmount } = render(<PostUpdateNoticeDialog caps={ALL_CAPABILITIES} plan={p} needsRoutingSetup={false} onShow={onShow} onDismiss={onDismiss} />);
+      if (item.target.kind === "home") {
+        // The old Home screen is gone: no button to nowhere.
+        expect(screen.queryByRole("button", { name: `Show me: ${item.title}` })).toBeNull();
+        unmount();
+        continue;
+      }
       fireEvent.click(screen.getByRole("button", { name: `Show me: ${item.title}` }));
       expect(onShow).toHaveBeenCalledWith(item.target);
       expect(onDismiss).toHaveBeenCalled();

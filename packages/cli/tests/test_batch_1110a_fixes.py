@@ -68,6 +68,15 @@ def test_search_activity_health_and_macs_name_an_unnamed_mac_the_same(monkeypatc
     assert macs.name_of(OTHER, None) == macs.name_of(None) == macs.OTHER_MAC == resolve("local:someone-else")
 
 
+def test_a_row_from_the_other_mac_carries_its_name_when_only_one_other_is_named(monkeypatch):
+    _routing(monkeypatch, {THIS: "M5", OTHER: "M1 Max"})
+    assert memory_rows.mac_resolver()("local:someone-else") == "M1 Max"
+    _routing(monkeypatch, {THIS: "M5", OTHER: "M1 Max", "f" * 32: "Studio"})
+    assert memory_rows.mac_resolver()("local:someone-else") == macs.OTHER_MAC
+    _routing(monkeypatch, {THIS: "M5"})
+    assert memory_rows.mac_resolver()("local:someone-else") == macs.OTHER_MAC
+
+
 def test_a_failing_settings_read_never_fails_a_name(monkeypatch):
     def broken(config=None):
         raise OSError("no config")

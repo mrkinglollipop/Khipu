@@ -154,20 +154,17 @@ describe("integrations status", () => {
 });
 
 
-it("keeps the loading banner outside the content scroll area", async () => {
+it("does not float a pill over Settings while the health check reads", async () => {
   script("late");
   render(<App />);
-  // Settings reads the health check, which shows the banner while it runs.
   await openScreen("Settings");
   const main = screen.getByRole("main");
-  await waitFor(() => expect(main.querySelector(".working-banner")).not.toBeNull());
-  const banner = main.querySelector<HTMLElement>(".working-banner")!;
   const scroller = main.querySelector(".main-content");
   expect(scroller).not.toBeNull();
-  expect(banner.parentElement).toBe(main);
-  expect(scroller!.parentElement).toBe(main);
-  expect(banner.nextElementSibling).toBe(scroller);
-  expect(scroller).not.toContainElement(banner);
+  // The wait shows on the rail item and in the page's own rows, never as a pill over the text.
+  await new Promise((r) => setTimeout(r, 300));
+  expect(main.querySelector(".working-banner")).toBeNull();
+  expect(document.body.textContent).not.toContain("Reading the health check");
   // jsdom does not expand the overflow shorthand, so read the shipped rules themselves.
   const rule = (selector: string) =>
     appCss.match(new RegExp(`^\\${selector}\\s*\\{[^}]*\\}`, "m"))?.[0].replace(/\/\*[\s\S]*?\*\//g, "") ?? "";

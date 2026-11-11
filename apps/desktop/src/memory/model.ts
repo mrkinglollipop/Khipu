@@ -4,6 +4,8 @@
 // print (slice B7): `quote`, `title`, `tool`, `mac` and `project` are
 // computed there. Nothing is guessed here; a missing field is left out.
 
+import { parseCommandJson } from "../shared/parseOutput";
+
 export type Run = (args: string[]) => Promise<string>;
 
 export type MemoryRow = {
@@ -189,10 +191,8 @@ export type SearchOutcome =
   | { kind: "error"; message: string; needsHub: boolean };
 
 export function readSearch(raw: string): SearchOutcome {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw.trim().split("\n").pop() ?? "");
-  } catch {
+  const parsed = parseCommandJson(raw);
+  if (parsed === undefined) {
     return { kind: "error", message: "Search gave an answer the app could not read.", needsHub: false };
   }
   const p = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;

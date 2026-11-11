@@ -69,6 +69,8 @@ const BASE_SETUP_STEPS = ["welcome", "database", "model", "graph", "agents", "fi
 const SETUP_STEP_CAPABILITY: Record<string, Capability> = { accounts: "setup-accounts-step" };
 
 export function targetAvailable(target: NoticeTarget, caps: ReadonlySet<Capability>): boolean {
+  // The old Home screen is gone; an item that points there shows no button.
+  if (target.kind === "home") return false;
   if (target.kind === "settings") return !target.group || caps.has("routing-overview");
   if (target.kind === "setup") {
     if (BASE_SETUP_STEPS.includes(target.step)) return true;
@@ -117,8 +119,8 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
     items: [
       {
         title: "Khipu has a new layout",
-        text: "Six screens, one per job; health checks live on Home and nothing you set up has moved.",
-        short: "Six screens, one per job; health checks live on Home.",
+        text: "Six screens, one per job; health checks live on Today and nothing you set up has moved.",
+        short: "Six screens, one per job; health checks live on Today.",
         target: { kind: "home" },
       },
     ],
@@ -128,8 +130,8 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
     items: [
       {
         title: "Setup and health checks were rebuilt",
-        text: "Home runs the full health report on every launch, and every red row says what to do.",
-        short: "Every red row on Home says what broke and what to do.",
+        text: "Today runs the full health report on every launch, and every red row says what to do.",
+        short: "Every red row on Today says what broke and what to do.",
         target: { kind: "home" },
       },
     ],
@@ -139,7 +141,7 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
     items: [
       {
         title: "Right now and Capture now",
-        text: "Home shows the turns waiting for capture, and Capture now saves the current conversation.",
+        text: "Today shows the turns waiting for capture, and Capture now saves the current conversation.",
         short: "Turns waiting for capture, and a Capture now button.",
         target: { kind: "home" },
       },
@@ -226,9 +228,9 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
     version: "0.4.14",
     items: [
       {
-        title: "Plans on Home",
-        text: "Home has one row per account showing its tightest usage window, with a Refresh button; Settings lists every window.",
-        short: "One row per account on Home, with Refresh.",
+        title: "Plans in Accounts",
+        text: "Accounts has one row per account showing its tightest usage window, with a Refresh button; Settings lists every window.",
+        short: "One row per account in Accounts, with Refresh.",
         target: { kind: "home" },
       },
     ],
@@ -237,9 +239,9 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
     version: "0.4.15",
     items: [
       {
-        title: "Routing card on Home",
-        text: "Home shows one row per account with who said so and when, any holds, your note word for word, and the standing rules.",
-        short: "Per-account routing, holds, your note and the rules on Home.",
+        title: "Routing card in Accounts",
+        text: "Accounts shows one row per account with who said so and when, any holds, your note word for word, and the standing rules.",
+        short: "Per-account routing, holds, your note and the rules in Accounts.",
         target: { kind: "home" },
       },
     ],
@@ -299,8 +301,8 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
       },
       {
         requires: "plans-per-account",
-        title: "Home",
-        text: "Plan rows on Home say why a figure is missing.",
+        title: "Plan rows",
+        text: "Plan rows in Accounts say why a figure is missing.",
         short: "Plan rows say why a figure is missing.",
         target: { kind: "home" },
       },

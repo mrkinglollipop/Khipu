@@ -22,6 +22,13 @@ describe("PendingForgets", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
+  it("reads an indented, many-line answer", async () => {
+    const doc = JSON.stringify({ ok: true, strings: ["k:aa"], ids: [], count: 1 }, null, 2);
+    const run = async () => doc;
+    render(<PendingForgets run={run} />);
+    expect(await screen.findByRole("button", { name: "Send 1 forget now" })).toBeInTheDocument();
+  });
+
   it("sends the listed forgets from the app and reads the list again", async () => {
     const { run, calls } = runner({
       "episode forget-pending --from-app": [{ ok: true, strings: ["k:aa", "h:bb"], ids: [], count: 2 }, NONE],

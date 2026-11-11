@@ -178,7 +178,7 @@ export function Memory({
         <input
           type="search"
           aria-label="Search what you and your agents said"
-          placeholder="Search what you and your agents said"
+          placeholder="Search your memory"
           value={query}
           autoComplete="off"
           onChange={(e) => {
