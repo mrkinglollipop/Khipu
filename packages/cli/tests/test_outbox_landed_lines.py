@@ -1,13 +1,12 @@
 """Memory-file lines the hub already holds land; lines with facts the hub
 lacks stay held, unchanged, for the owner. Real captures retry first."""
 from copy import deepcopy
-import hashlib
 import json
 from unittest.mock import Mock
 
 import pytest
 
-from khipu import capture, hook_background, mirror, outbox
+from khipu import capture, hook_background, outbox
 from tests.test_outbox_legacy_projection import REASON, world  # noqa: F401 — fixture
 
 # The hub row carries what the file line dropped (the 2026-10-27 backlog).
@@ -112,41 +111,6 @@ def test_a_landed_proof_cannot_be_relabelled_in_the_archive(hub):
 ])
 def test_landed_line_proof(original, incoming, landed):
     assert capture._legacy_landed_line(original, incoming) is landed
-
-
-class _ConflictCursor:
-    def __init__(self, raw):
-        self.raw = raw
-        self._rows = []
-
-    def execute(self, sql, params=()):
-        assert sql.startswith("SELECT v.ts, v.md,"), sql
-        md = hashlib.md5(self.raw["summary"].encode()).hexdigest()
-        self._rows = [(self.raw["ts"], md, None, self.raw,
-                       *[self.raw.get(k) for k in mirror._FACT_KEYS], *([[]] * len(mirror._FACT_KEYS)))]
-
-    def fetchall(self):
-        return self._rows
-
-
-def _conflicts(raw, line, monkeypatch):
-    monkeypatch.setattr(capture, "_refusals_settled", lambda cur: None)
-    monkeypatch.setattr("khipu.capture_identity.sources_ready", lambda cur: False)
-    key = (line["ts"], hashlib.md5(line["summary"].encode()).hexdigest())
-    return mirror._legacy_key_conflicts(_ConflictCursor(raw), [(line, key)])
-
-
-def test_nightly_conflict_check_skips_a_landed_line(monkeypatch):
-    assert _conflicts(deepcopy(HUB), deepcopy(LINE), monkeypatch) == []
-
-
-@pytest.mark.parametrize("change", [
-    {"preferences": ["A preference the hub never got"]},
-    {"decisions": ["Keep the hub", "something else"]},
-])
-def test_nightly_conflict_check_still_queues_a_line_with_new_facts(monkeypatch, change):
-    line = {**deepcopy(LINE), **change}
-    assert _conflicts(deepcopy(HUB), line, monkeypatch) == [line]
 
 
 def test_real_captures_retry_before_recovery_jobs(tmp_path, monkeypatch):

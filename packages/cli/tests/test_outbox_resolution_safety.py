@@ -3,24 +3,30 @@ import json
 import pytest
 from copy import deepcopy
 from tests.test_outbox_legacy_projection import world, queue, projection, ORIGINAL
-from khipu import capture, outbox, mirror, tombstones, paths
+from khipu import capture, outbox, tombstones, paths
+
+
+def _queue_recovered_conflict(payload):
+    """A recovery job as the removed file → hub recovery (mirror._queue_conflict)
+    queued it. Jobs of this shape can still sit in an outbox from before row 11."""
+    outbox.enqueue(payload, reason="recovery: the legacy key holds different facts", origin=None, recovery=True)
 
 
 def test_held_conflict_stays_held_on_recovery(world, monkeypatch):
     monkeypatch.setattr(outbox, 'MAX_ATTEMPTS', 1)
     payload = {**projection(), 'preferences': ['real additional evidence']}
-    mirror._queue_conflict(payload)
+    _queue_recovered_conflict(payload)
     assert outbox.drain().get('buried') == 1
     assert outbox.status()['held_conflicts'] == 1
-    mirror._queue_conflict(payload)
+    _queue_recovered_conflict(payload)
     assert not outbox.jobs(), 'Recovery recreated held conflict with attempts=0'
 
 
 def test_resolved_projection_is_terminal_on_recovery(world):
-    mirror._queue_conflict(projection())
+    _queue_recovered_conflict(projection())
     assert outbox.drain().get('resolved') == 1
     first_records = list(outbox.resolved_dir().glob('*.json'))
-    mirror._queue_conflict(projection())
+    _queue_recovered_conflict(projection())
     outbox.drain()
     assert len(list(outbox.resolved_dir().glob('*.json'))) == len(first_records), 'Same file projection creates another resolution record on each recovery'
 
@@ -72,42 +78,6 @@ def test_existing_record_must_match_canonical_payload(world):
     report = outbox.drain()
     assert report.get('resolution_failed') == 1
     assert path.exists() or outbox.dead_jobs(), f'Different original evidence accepted as equal: {report}'
-
-
-def _recovery(world, monkeypatch, tmp_path, payload):
-    from khipu import provenance, drift
-    cur, original = world
-    monkeypatch.setattr(provenance, 'ready', lambda cur: True)
-    monkeypatch.setattr(capture, '_refusals_settled', lambda cur: None)
-    monkeypatch.setattr(drift, 'episodes_missing_in_pg', lambda *a, **kw: [])
-    execute = cur.execute
-    def sql(statement, params=()):
-        if statement.startswith('SELECT v.ts, v.md,'):
-            cur._result = [(original['ts'], hashlib.md5(original['summary'].encode()).hexdigest(),
-                            None, cur.episodes[1]['raw'],
-                            *[original.get(k) for k in mirror._FACT_KEYS], *([[]] * 5))]
-            return
-        return execute(statement, params)
-    monkeypatch.setattr(cur, 'execute', sql)
-    root = tmp_path / 'memory'
-    root.mkdir()
-    (root / 'episodes.jsonl').write_text(json.dumps(payload) + '\n')
-    return lambda: mirror.sync_recent_episodes(root)
-
-
-def test_full_recovery_requeues_held_conflict(world, monkeypatch, tmp_path):
-    monkeypatch.setattr(outbox, 'MAX_ATTEMPTS', 1)
-    recover = _recovery(world, monkeypatch, tmp_path, {**projection(), 'preferences': ['extra']})
-    assert recover()['conflicts'] == 1
-    assert outbox.drain().get('buried') == 1
-    recover()
-    assert not outbox.jobs(), 'Full sync_recent_episodes recreated held job'
-
-
-def test_full_recovery_does_not_queue_a_landed_line(world, monkeypatch, tmp_path):
-    recover = _recovery(world, monkeypatch, tmp_path, projection())
-    assert recover().get('conflicts', 0) == 0
-    assert not outbox.jobs() and not list(outbox.resolved_dir().glob('*.json'))
 
 
 def test_full_import_restores_forgotten_nested_payload(world, tmp_path):
@@ -263,10 +233,10 @@ def test_resolution_failure_rechecks_forget_before_retry_publication(world, monk
 def test_recovery_matches_strict_evidence_and_preserves_owner_retry(world, monkeypatch):
     monkeypatch.setattr(outbox, "MAX_ATTEMPTS", 1)
     first = {**projection(), "future_evidence": 1}
-    mirror._queue_conflict(first)
+    _queue_recovered_conflict(first)
     assert outbox.drain().get("buried") == 1
     held = outbox.dead_jobs()[0].read_bytes()
-    mirror._queue_conflict({**first, "future_evidence": True})
+    _queue_recovered_conflict({**first, "future_evidence": True})
     assert len(outbox.jobs()) == 1
     assert outbox.dead_jobs()[0].read_bytes() == held
     assert outbox.retry_dead()["moved"] == 1
@@ -292,7 +262,7 @@ def test_failed_publication_then_success_reuses_original_journal_identity(world,
     assert records[0].name == hashlib.sha256(original_bytes).hexdigest() + ".json"
     assert json.loads(records[0].read_bytes())["queued_evidence"] == original_job
     assert not path.exists()
-    mirror._queue_conflict(projection())
+    _queue_recovered_conflict(projection())
     assert not outbox.jobs()
 
 
@@ -312,7 +282,7 @@ def test_recovery_does_not_trust_corrupt_resolution_evidence(world, damage):
         record["resolution"]["original_payload_sha256"] = payload_sha256(record["payload"])
     record_path.write_text(json.dumps(record))
     before = record_path.read_bytes()
-    mirror._queue_conflict(projection())
+    _queue_recovered_conflict(projection())
     assert len(outbox.jobs()) == 1
     assert record_path.read_bytes() == before
 

@@ -1645,6 +1645,76 @@ async fn khipu_owner_answer(request: String, answer: String) -> Result<String, S
     run_khipu_cli_async(owner_answer_argv(&request, &answer)?).await
 }
 
+/// Needs you, the one list the MCP's `khipu_needs_you` gives, read for the
+/// app: each item also says who asked, on which Mac and how long ago. A read
+/// never counts as the owner having been shown it in a conversation.
+const NEEDS_YOU_ARGV: &[&str] = &["needs-you", "--json", "--from-app"];
+
+/// A Needs-you item's key as the app sends it: it starts with a letter or
+/// digit, so it can never read as a flag, and may hold the spaces, colons and
+/// slashes item keys use, never a control character.
+fn checked_needs_you_key(key: &str) -> Result<&str, String> {
+    let plain = !key.is_empty()
+        && key.chars().count() <= 400
+        && key.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && !has_control(key);
+    if plain {
+        Ok(key)
+    } else {
+        Err(format!("not a Needs-you item: {key:?}"))
+    }
+}
+
+/// The list, or with `key` that one item with its words whole (`--item`,
+/// the terminal's own single-item read), joined to its flag.
+fn needs_you_argv(key: Option<&str>) -> Result<Vec<String>, String> {
+    let mut argv = fixed_argv(NEEDS_YOU_ARGV);
+    if let Some(key) = key {
+        argv.push(format!("--item={}", checked_needs_you_key(key)?));
+    }
+    Ok(argv)
+}
+
+/// The owner's Yes or No in the app to one Needs-you item, by its key
+/// (`khipu needs-you --from-app --answer KEY yes|no`). The CLI checks that
+/// the app itself started it, as every `--from-app` write does. A key starts
+/// with a letter or digit, so it can never read as a flag; it may hold the
+/// spaces, colons and slashes item keys use, never a control character.
+/// `expect` is the pin the read gave the item (`expect`, null for an item
+/// with none), sent back joined to its flag so it can never read as one; the
+/// CLI refuses a missing or moved pin as `changed`.
+fn needs_you_answer_argv(key: &str, answer: &str, expect: Option<&str>) -> Result<Vec<String>, String> {
+    let key = checked_needs_you_key(key)?;
+    if !matches!(answer, "yes" | "no") {
+        return Err(format!("not an answer: {answer:?}"));
+    }
+    let mut argv = vec![
+        "needs-you".to_string(),
+        "--from-app".to_string(),
+        "--json".to_string(),
+        "--answer".to_string(),
+        key.to_string(),
+        answer.to_string(),
+    ];
+    if let Some(pin) = expect {
+        if pin.is_empty() || pin.chars().count() > 200 || has_control(pin) {
+            return Err(format!("not a pin Khipu gave: {pin:?}"));
+        }
+        argv.push(format!("--expect={pin}"));
+    }
+    Ok(argv)
+}
+
+#[tauri::command]
+async fn khipu_needs_you(key: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(needs_you_argv(key.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_needs_you_answer(key: String, answer: String, expect: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(needs_you_answer_argv(&key, &answer, expect.as_deref())?).await
+}
+
 #[tauri::command]
 async fn khipu_budget_status() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(BUDGET_STATUS_ARGV)).await
@@ -5346,6 +5416,8 @@ pub fn run() {
             khipu_snapshot_refresh,
             khipu_config_request,
             khipu_owner_answer,
+            khipu_needs_you,
+            khipu_needs_you_answer,
             khipu_config_unset,
             khipu_budget_status,
             khipu_budget_lift_synth_today,
@@ -6407,6 +6479,37 @@ mod settings_command_tests {
         assert!(owner_answer_argv("", "yes").is_err());
         assert!(owner_answer_argv("rm-req-1", "--no").is_err());
         assert!(owner_answer_argv("rm-req-1 --yes", "yes").is_err());
+    }
+
+    #[test]
+    fn needs_you_reads_and_answers_by_key_with_fixed_argv() {
+        assert_eq!(NEEDS_YOU_ARGV, ["needs-you", "--json", "--from-app"]);
+        assert_eq!(needs_you_argv(None).unwrap(), ["needs-you", "--json", "--from-app"]);
+        assert_eq!(
+            needs_you_argv(Some("rule:rule-1")).unwrap(),
+            ["needs-you", "--json", "--from-app", "--item=rule:rule-1"]
+        );
+        assert_eq!(needs_you_argv(Some("plan:Claude client")).unwrap()[3], "--item=plan:Claude client");
+        assert!(needs_you_argv(Some("--yes")).is_err());
+        assert!(needs_you_argv(Some("")).is_err());
+        assert!(needs_you_argv(Some("rule:x\n--answer")).is_err());
+        assert_eq!(
+            needs_you_answer_argv("setting:routing_replication_live", "yes", Some("sr-0123456789abcdef")).unwrap(),
+            ["needs-you", "--from-app", "--json", "--answer", "setting:routing_replication_live", "yes",
+             "--expect=sr-0123456789abcdef"]
+        );
+        assert_eq!(needs_you_answer_argv("held:req-1", "no", None).unwrap().len(), 6);
+        assert_eq!(needs_you_answer_argv("rule:x", "no", Some("--yes")).unwrap()[6], "--expect=--yes");
+        assert_eq!(needs_you_answer_argv("plan:Claude client", "no", None).unwrap()[4], "plan:Claude client");
+        assert_eq!(needs_you_answer_argv("pair:acme/old/acme/new", "no", None).unwrap()[5], "no");
+        assert!(needs_you_answer_argv("--yes", "yes", None).is_err());
+        assert!(needs_you_answer_argv("", "yes", None).is_err());
+        assert!(needs_you_answer_argv("priority", "--no", None).is_err());
+        assert!(needs_you_answer_argv("priority", "maybe", None).is_err());
+        assert!(needs_you_answer_argv("held:req-1\n--yes", "yes", None).is_err());
+        assert!(needs_you_answer_argv(&"k".repeat(401), "yes", None).is_err());
+        assert!(needs_you_answer_argv("priority", "yes", Some("")).is_err());
+        assert!(needs_you_answer_argv("priority", "yes", Some("p1\n--x")).is_err());
     }
 
     #[test]
@@ -8083,6 +8186,57 @@ esac
         assert_eq!(parsed["ok"], false, "{out}");
         assert_eq!(parsed["code"], "owner_only", "{out}");
         assert!(bad_id.is_err(), "an id that reads as a flag never reaches the CLI");
+    }
+
+    /// Needs you's Yes and No call `khipu_needs_you_answer`. Run the real
+    /// command function through the real CLI against a fictional data folder.
+    /// A test binary is not the installed app, so the CLI refuses the answer
+    /// (`owner_only`): that proves the argv, the spawn and that a refusal comes
+    /// back as JSON the page reads. The CLI's own tests drive an accepted
+    /// answer with the app as the caller. Not a click.
+    #[cfg(unix)]
+    #[test]
+    fn the_needs_you_commands_reach_the_real_cli() {
+        let python = std::path::Path::new("/opt/homebrew/bin/python3.11");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap();
+        if !python.is_file() || !root.join(".python_libs").is_dir() {
+            eprintln!("skipped: needs python3.11 and the checkout's .python_libs");
+            return;
+        }
+        let _env = CLI_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("khipu-needs-you-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        let keys = ["KHIPU_ROOT", "KHIPU_PYTHON", "KHIPU_DATA_DIR", "KHIPU_CAPTURE_HOME", "KHIPU_KEYCHAIN", "HOME"];
+        let saved: Vec<_> = keys.iter().map(|k| std::env::var_os(k)).collect();
+        std::env::set_var("KHIPU_ROOT", &root);
+        std::env::set_var("KHIPU_PYTHON", python);
+        std::env::set_var("KHIPU_DATA_DIR", dir.join("data"));
+        std::env::set_var("KHIPU_CAPTURE_HOME", dir.join("capture"));
+        std::env::set_var("KHIPU_KEYCHAIN", "0");
+        std::env::set_var("HOME", dir.join("home"));
+        let list = tauri::async_runtime::block_on(khipu_needs_you(None));
+        let one = tauri::async_runtime::block_on(khipu_needs_you(Some("priority".to_string())));
+        let yes = tauri::async_runtime::block_on(khipu_needs_you_answer("priority".to_string(), "yes".to_string(), Some("p1".to_string())));
+        let bad = tauri::async_runtime::block_on(khipu_needs_you_answer("--yes".to_string(), "yes".to_string(), None));
+        for (key, value) in keys.iter().zip(saved) {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let list = list.expect("the list is JSON the page reads");
+        let parsed: serde_json::Value = serde_json::from_str(&list).expect("the CLI answered in JSON");
+        assert_eq!(parsed["ok"], true, "{list}");
+        assert!(parsed["this_mac"].is_string(), "{list}");
+        let one = one.expect("a missing item is JSON the page reads");
+        let parsed: serde_json::Value = serde_json::from_str(&one).expect("the CLI answered in JSON");
+        assert_eq!(parsed["code"], "not_found", "{one}");
+        let out = yes.expect("a refusal is JSON the page reads, not a failed invoke");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("the CLI answered in JSON");
+        assert_eq!(parsed["ok"], false, "{out}");
+        assert_eq!(parsed["code"], "owner_only", "{out}");
+        assert!(bad.is_err(), "a key that reads as a flag never reaches the CLI");
     }
 
     #[test]

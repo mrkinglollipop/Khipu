@@ -104,7 +104,6 @@ def _stop_hook_drain():
     from khipu import hook_background as hb
 
     with mock.patch.object(hb, "_drain"), \
-            mock.patch("khipu.mirror.sync_recent_episodes", return_value={}), \
             mock.patch("khipu.notes.reconcile", return_value={}), \
             mock.patch.object(hb, "_say"):
         hb.run("", "claude_code", "s1")
