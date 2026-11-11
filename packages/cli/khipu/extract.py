@@ -49,6 +49,22 @@ Transcript:
 {transcript}
 """
 
+# Spliced in before the "Session project (cwd):" block for a dispatched job's
+# transcript only (a subagent, Workflow agent, T3 delegated thread or a
+# `claude -p` child). Its USER turns are mostly the dispatcher's brief, and a
+# brief's rules stored as the owner's preferences come back in search as if
+# the owner had said them. A conversation's prompt never contains this text.
+JOB_SECTION = """
+This transcript is a dispatched job's (a subagent, helper or delegated task).
+Its USER turns are mostly the brief and follow-ups written by the agent that
+dispatched it, not by the project owner. Never list the brief's rules, limits,
+method or output format as preferences or decisions. decisions: only what this
+job itself decided, found or changed. preferences: only a preference or
+correction the owner typed into this job directly; owner words that a brief
+relays are already recorded in the dispatching session, so leave them out.
+The summary still says what the job was asked to do and what it did.
+"""
+
 
 def _key() -> str:
     from khipu.keychain import resolve_gemini_key
@@ -1015,4 +1031,11 @@ def extract_memory(transcript: str, *, cwd: str = "", job: bool = False) -> dict
 
 
 def _build_prompt(*, cwd: str, transcript: str, job: bool = False) -> str:
-    return PROMPT.format(cwd=cwd or "(unknown)", transcript=transcript)
+    """PROMPT, plus JOB_SECTION before its "Session project (cwd):" block for
+    a dispatched job's transcript. For a conversation this is exactly
+    ``PROMPT.format(...)``."""
+    template = PROMPT
+    if job:
+        idx = template.index("\nSession project (cwd):")
+        template = template[:idx] + JOB_SECTION + template[idx:]
+    return template.format(cwd=cwd or "(unknown)", transcript=transcript)
