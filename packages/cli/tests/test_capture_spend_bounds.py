@@ -82,9 +82,10 @@ class MachineUserMessageTest(unittest.TestCase):
         self.assertEqual(text.count("[notification: task-notification, "), 20)
         self.assertEqual(text.count("[notification: task-notification] "), 1)
         self.assertNotIn("r" * 100, text)
-        relayed = [m for _, m in msgs if m.startswith("please re-run")]
-        self.assertEqual(relayed, [TEAMMATE, TEAMMATE], "whole body, outer tag stripped")
-        self.assertNotIn("cross-session-message", text)
+        relayed = [m for _, m in msgs if "please re-run" in m]
+        marked = "[notification: cross-session-message] " + TEAMMATE
+        self.assertEqual(relayed, [marked, marked], "whole body, outer tag stripped, marked")
+        self.assertNotIn("<cross-session-message", text)
         self.assertFalse(hasattr(sc, "CROSS_SESSION_KEEP"))
         self.assertIn('[notification: task-notification] Agent "parity run" completed', text)
         self.assertIn(("user", "second real question"), msgs)
@@ -113,10 +114,11 @@ class MachineUserMessageTest(unittest.TestCase):
         self.assertTrue(sc._machine_user_message("<local-command-stdout>ok</local-command-stdout>")
                         .startswith("[notification: local-command-stdout, "))
         short = sc._machine_user_message("<cross-session-idle>idle</cross-session-idle>")
-        self.assertEqual(short, "idle")
+        self.assertEqual(short, "[notification: cross-session-idle] idle")
         long_body = "line one\n" + "w" * 5000
         self.assertEqual(sc._machine_user_message(
-            f'<cross-session-delivery to="x">{long_body}</cross-session-delivery>'), long_body)
+            f'<cross-session-delivery to="x">{long_body}</cross-session-delivery>'),
+            "[notification: cross-session-delivery] " + long_body)
         self.assertEqual(sc._machine_user_message("<cross-session-idle></cross-session-idle>"),
                          "[notification: cross-session-idle, 41 chars]")
         self.assertEqual(sc._machine_user_message(

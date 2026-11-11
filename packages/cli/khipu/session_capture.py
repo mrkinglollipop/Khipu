@@ -390,9 +390,10 @@ def _clean_user_text(text: str) -> str:
 # rendered in full they made a 398 MB transcript look like 529 turns and queue
 # 104 summariser calls in one capture (2026-10-13). None of them counts as a
 # user turn. A relayed cross-session message carries a teammate's words, so its
-# whole body stays (outer tag stripped); a task notification keeps its
-# <summary> text; the rest stay as one line so the summariser knows they
-# happened.
+# whole body stays (outer tag stripped, behind a "[notification: <tag>]" marker
+# that ``turn_text.is_automated`` reads, so it is never the owner's line); a
+# task notification keeps its <summary> text; the rest stay as one line so the
+# summariser knows they happened.
 _TAG_NAME = re.compile(r"<([A-Za-z][\w-]*)")
 _OUTER_TAG = re.compile(r"^<[^>]*>|</[^>]*>\s*$")
 _SUMMARY = re.compile(r"<summary>(.*?)</summary>", re.S)
@@ -411,8 +412,8 @@ def _machine_user_message(text: str) -> str | None:
     m = _TAG_NAME.match(head)
     tag = m.group(1) if m else "notification"
     if tag.startswith("cross-session-"):
-        return (_OUTER_TAG.sub("", head.strip()).strip()
-                or f"[notification: {tag}, {len(text):,} chars]")
+        body = _OUTER_TAG.sub("", head.strip()).strip()
+        return f"[notification: {tag}] {body}" if body else f"[notification: {tag}, {len(text):,} chars]"
     if tag == "task-notification":
         s = _SUMMARY.search(head)
         summary = s.group(1).strip() if s else ""
@@ -511,14 +512,18 @@ def _parse_antigravity(d: dict) -> list[tuple[str, str]] | None:
 # ``peer`` (another session: <agent-message>, <cross-session-message>) reached
 # the window through an unclosed <system-reminder> in its request-log copy,
 # counted as a typed turn; it is kept now as a relayed message is (its body,
-# outer tag stripped) and never counted. ``task-notification`` (commandMode
-# ``task-notification``) and, with no origin, a monitor's tagged event
-# (<ci-monitor-event>) had copies only in system blocks or closed reminders,
-# which never reached the window, so they still yield nothing. ``_parse_line``
+# outer tag stripped, behind the "[notification: peer message]" marker) and
+# never counted. ``task-notification`` (commandMode ``task-notification``)
+# and, with no origin, a monitor's tagged event (<ci-monitor-event>: a line
+# opening with "<" and a letter or "/") had copies only in system blocks or
+# closed reminders, which never reached the window, so they still yield
+# nothing. ``_parse_line``
 # gives both kept kinds the role ``user``; ``read_window`` asks again here to
 # keep a peer's message out of the count.
 _QUEUED_USER = "queued:user"
 _QUEUED_PEER = "queued:peer"
+# A tag's opening: "<" then a letter or "/". "< 5 minutes" is a typed line.
+_OPENS_LIKE_A_TAG = re.compile(r"\s*</?[A-Za-z]")
 
 
 def _queued_command(d: dict) -> list[tuple[str, str]]:
@@ -533,7 +538,7 @@ def _queued_command(d: dict) -> list[tuple[str, str]]:
     origin = a.get("origin")
     kind = origin.get("kind") if isinstance(origin, dict) else None
     if kind == "human" or (kind is None and a.get("commandMode") == "prompt"
-                           and not prompt.lstrip().startswith("<")):
+                           and not _OPENS_LIKE_A_TAG.match(prompt)):
         return [(_QUEUED_USER, prompt)]
     if kind == "peer":
         return [(_QUEUED_PEER, prompt)]
@@ -829,9 +834,10 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             if (stand_in is None and d.get("type") == "attachment"
                     and any(r == _QUEUED_PEER for r, _ in _queued_command(d))):
                 # Another session's message queued mid-turn: kept as a relayed
-                # message is, never a typed turn.
-                stand_in = (_OUTER_TAG.sub("", text.strip()).strip()
-                            or f"[notification: peer message, {len(text):,} chars]")
+                # message is, marked so it is never a typed turn or owner line.
+                body = _OUTER_TAG.sub("", text.strip()).strip()
+                stand_in = (f"[notification: peer message] {body}" if body
+                            else f"[notification: peer message, {len(text):,} chars]")
             real = stand_in is None
             if stand_in is not None:
                 text = stand_in
@@ -914,7 +920,8 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
                    and not _db_step(entries[printed[p]][0])):
                 copied.add(printed[p])
                 p += step
-    last_user_counted = False   # the open user block already holds a real turn
+    last_user_counted = False   # the open run of user blocks already holds a real turn
+    open_real = False           # the open user block holds typed messages, not stand-ins
     head_open = True            # every message so far was an already-seen copy
     for i, (d, role, text, line_end, checkpoint, real, streamed, fp) in enumerate(entries):
         if role == "tool":
@@ -952,15 +959,20 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             head_open = False
         if real and stats is not None and not d.get("isCompactSummary"):
             stats["typed"].append(text)
-        if msgs and msgs[-1][0] == role:
+        if msgs and msgs[-1][0] == role and (role != "user" or streamed or real == open_real):
             # ACP streams chunks (concatenate); the others emit whole
             # messages (join on a newline).
             sep = "" if streamed else "\n"
             msgs[-1] = (role, msgs[-1][1] + sep + text)
         else:
+            # A machine stand-in and a typed message never share a block: a
+            # block is quoted as the owner's by its opening alone. Back-to-back
+            # user blocks are still one turn.
+            if role == "user" and not (msgs and msgs[-1][0] == "user"):
+                last_user_counted = False
             msgs.append((role, text))
             if role == "user":
-                last_user_counted = False
+                open_real = real
         if real and not last_user_counted:
             users += 1
             last_user_counted = True

@@ -8,6 +8,8 @@ hermetic one."""
 import json
 from unittest import mock
 
+import pytest
+
 from khipu import embed, extract, session_capture
 from khipu import t3 as _t3
 from tests.test_audit_recall_search import configure_hub
@@ -306,3 +308,40 @@ def test_a_message_that_fits_whole_in_a_later_part_is_found_there(tmp_path, monk
     assert len(jobs) == 2
     assert later in jobs[1]['transcript']
     assert [job.get('owner_lines', []) for job in jobs] == [extract.owner_lines([first]), [later]]
+
+
+# ---- typed lines among other sessions' messages (Muse re-check of PR 566) ---------
+
+def _peer_row(kind, text):
+    if kind == 'queued':
+        return _queued_att(f'<agent-message from="orch" name="lane">{text}</agent-message>',
+                           {'kind': 'peer', 'from': 'orch', 'name': 'lane'})
+    return _user_row(f'<cross-session-message>{text}</cross-session-message>')
+
+
+@pytest.mark.parametrize('kind', ['queued', 'ordinary'])
+def test_every_typed_line_among_peer_messages_stays_the_owners(tmp_path, monkeypatch, kind):
+    # One turn: typed, peer, typed, peer. The three stored quotes (first,
+    # longest, last) can leave the second typed line out; owner_lines keeps it,
+    # and never a peer's words.
+    from khipu import memory_rows
+
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    first, second = 'Please review this capture.', 'Keep the amber schedule for this investigation.'
+    rows = [_user_row(first),
+            _peer_row(kind, 'The background review of the archive lane has finished. ' + 'z' * 200),
+            _user_row(second),
+            _peer_row(kind, 'Use the cobalt lane for all future capture investigations.'),
+            _assistant_row(REPLY)]
+    job_path = _queue(tmp_path, rows)
+    job = json.loads(job_path.read_text())
+    assert job['owner_lines'] == [first, second], job.get('owner_lines')
+    assert 'cobalt lane' in job['transcript'] and 'archive lane' in job['transcript']
+    payload, _ = _drain_job(job_path)
+    lines = memory_rows.owner_lines_of(payload['verbatim'])
+    for words, want in (('amber schedule', second), ('review this capture', first)):
+        phrase, tokens = memory_rows.query_terms(words)
+        assert memory_rows.owner_line(lines, phrase, tokens) == want, lines
+    for words in ('cobalt lane', 'archive lane'):
+        phrase, tokens = memory_rows.query_terms(words)
+        assert memory_rows.owner_line(lines, phrase, tokens) is None, lines
