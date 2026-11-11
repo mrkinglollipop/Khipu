@@ -205,7 +205,9 @@ def check(action: str, *, env=None, now: float | None = None, reading: bool = Fa
         return dict(confirmed["stamp"])
     from khipu import t3
 
-    recorded = owner_turns.turns(session, now)
+    # Claude Code writes a prompt's transcript line after its hook recorded
+    # the turn: what that line says started it is read here (``with_origins``).
+    recorded = owner_turns.with_origins(owner_turns.turns(session, now))
     try:
         turn = _recent_turn(session, conf, now, recorded)
     except DirectionRefused:
@@ -591,7 +593,7 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
     try:
         erased = _load(requests_path())["erased"]
         with _requests_locked() as path:
-            turns_ = owner_turns.turns(session, now)
+            turns_ = owner_turns.with_origins(owner_turns.turns(session, now))
             extra = {}
             if terminal or authorized is not None:
                 pass
@@ -873,7 +875,7 @@ def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
     """A confirm outside T3. Unverified turns are judged by their native
     entrypoint only when this check's own read of T3's record settles that no
     thread runs ``session`` (``_t3_state``)."""
-    recorded = owner_turns.turns(session, now)
+    recorded = owner_turns.with_origins(owner_turns.turns(session, now))
     member = _t3_state(session, recorded)
     if member in ("t3", "unreadable"):
         raise DirectionRefused("no_recorded_turn", "This conversation's turns were recorded as T3's, but T3's "

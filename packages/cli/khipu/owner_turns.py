@@ -305,16 +305,25 @@ def desktop_conversation(env: dict) -> bool:
     return entry in DESKTOP_ENTRYPOINTS and host.startswith("local_")
 
 
+def scheduled_run(env: dict) -> bool:
+    """A session the Claude desktop app started for a scheduled task: the app
+    sets ``CLAUDE_CODE_HOST_SCHEDULED_RUN=1`` for a run with a
+    ``scheduledTaskId`` (app.asar, 2026-11-11). Nobody typed its prompt, and
+    anything started from it inherits the marker. Read before the desktop
+    exemption drops the SDK markers (``_marked``)."""
+    return (env.get("CLAUDE_CODE_HOST_SCHEDULED_RUN") or "").strip() not in ("", "0")
+
+
 def job_marker(env: dict) -> bool:
     """A job marker that holds in every harness, T3 included: the runner's
-    lane marker, ``KHIPU_JOB=1`` or a parent session."""
+    lane marker, a scheduled task's run, ``KHIPU_JOB=1`` or a parent session."""
     return _marked(env, "", t3_thread=True)
 
 
 def _marked(env: dict, session: str, *, t3_thread: bool) -> bool:
     from khipu import routing_advice
 
-    if dispatched_lane(env):
+    if dispatched_lane(env) or scheduled_run(env):
         return True
     # The lane marker's meaning ("0" is the owner's) is ``dispatched_lane``'s.
     # The desktop app's environment alone is not enough: an Agent SDK script,
@@ -343,7 +352,9 @@ def dispatched_job(env: dict, session: str = "", *, t3_thread: bool = False) -> 
     runs in T3, where the Claude Code child and host-id markers are set for
     the owner's own threads too, so they are skipped and T3's record of a
     delegated child thread decides; a lookup that does not complete fails
-    closed."""
+    closed. A scheduled task's run (``scheduled_run``) is never the owner's."""
+    if scheduled_run(env):
+        return "a scheduled task's run"
     if _marked(env, session, t3_thread=t3_thread):
         return "a dispatched job's turn"
     if t3_thread:
@@ -459,6 +470,137 @@ def canonical_prompt(text: str) -> str:
 
 def prompt_sha256(text: str) -> str:
     return hashlib.sha256(canonical_prompt(text).encode("utf-8")).hexdigest()
+
+
+# Claude Code's own mark of who started a prompt, on the prompt's user line
+# in its transcript (``turnOrigin``, Claude Code 2.1.321 and up): "human" is
+# the person typing. "scheduled" (a scheduled wake-up or cron prompt),
+# "peer" (another session's message), "task_notification",
+# "auto_continuation", "host_synthetic", "system" and "sdk" (the brief an
+# Agent SDK host or another session started it with) are not; "unknown" and
+# no mark say nothing. The hook input does not carry it, and Claude Code
+# writes the line after the prompt hooks return, so the recorder also notes
+# where the transcript ended (``transcript_at``) and the owner check reads
+# the line from there (``with_origins``).
+PERSON_ORIGIN = "human"
+_UNSAID_ORIGINS = ("unknown",)
+_ORIGIN_READ_MOST = 4 << 20   # forward from ``transcript_at``
+_ORIGIN_TAIL = 256 << 10      # the recorder's look at the end of the file
+_ORIGIN_CHUNK = 64 << 10
+_ORIGIN_SLACK_S = 120.0
+
+
+def _line_origin(row: dict) -> str | None:
+    origin = row.get("turnOrigin")
+    if isinstance(origin, str) and origin.strip():
+        return None if origin.strip() in _UNSAID_ORIGINS else origin.strip()[:40]
+    if isinstance(row.get("wakeupSource"), str) and row["wakeupSource"].strip():
+        return "scheduled"
+    if row.get("promptSource") == "system":
+        return "system"
+    return None
+
+
+def _prompt_line(raw: bytes) -> tuple[dict, str] | None:
+    """A Claude Code user line that holds a prompt (not a tool's result or a
+    compaction summary), with its text; None for any other line."""
+    if b'"user"' not in raw:
+        return None
+    try:
+        row = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(row, dict) or row.get("type") != "user" or row.get("isCompactSummary"):
+        return None
+    msg = row.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return None
+        content = "\n".join(b["text"] for b in content
+                            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
+    return (row, content) if isinstance(content, str) else None
+
+
+def _same_prompt(found: tuple[dict, str], sha: str, prompt_id) -> bool:
+    row, text = found
+    if isinstance(prompt_id, str) and prompt_id and row.get("promptId") == prompt_id:
+        return True
+    typed = owner_text(text)
+    return sha == prompt_sha256(text) or (typed is not None and sha == prompt_sha256(typed))
+
+
+def _near(stamp, now: float | None) -> bool:
+    if now is None or not isinstance(stamp, str):
+        return False
+    try:
+        at = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return False
+    return abs(at - now) <= _ORIGIN_SLACK_S
+
+
+def transcript_origin(path: str, *, sha: str, prompt_id=None, offset: int | None = None,
+                      now: float | None = None) -> str | None:
+    """What a Claude Code transcript says started the prompt whose canonical
+    hash is ``sha`` (or whose ``promptId`` is the hook input's ``prompt_id``):
+    its origin (``_line_origin``), or None when the line is not found, says
+    nothing or the file can't be read. ``offset`` (the owner check): the first
+    such line from where the file ended when the hook ran, read forward at
+    most ``_ORIGIN_READ_MOST`` bytes. Without it (the recorder): the newest
+    such line in the file's last ``_ORIGIN_TAIL`` bytes stamped within
+    ``_ORIGIN_SLACK_S`` of ``now``. Only the origin leaves here, never text."""
+    try:
+        with open(path, "rb") as fh:
+            if offset is not None:
+                fh.seek(offset)
+                carry, read = b"", 0
+                while read < _ORIGIN_READ_MOST:
+                    chunk = fh.read(min(_ORIGIN_CHUNK, _ORIGIN_READ_MOST - read))
+                    read += len(chunk)
+                    lines = (carry + chunk).split(b"\n")
+                    carry = lines.pop() if chunk else b""
+                    for raw in lines:
+                        found = _prompt_line(raw)
+                        if found is not None and _same_prompt(found, sha, prompt_id):
+                            return _line_origin(found[0])
+                    if not chunk:
+                        break
+                return None
+            end = fh.seek(0, os.SEEK_END)
+            start = max(0, end - _ORIGIN_TAIL)
+            fh.seek(start)
+            lines = fh.read(end - start).split(b"\n")
+    except (OSError, ValueError, TypeError):
+        return None
+    for raw in reversed(lines[1:] if start else lines):
+        found = _prompt_line(raw)
+        if found is not None and _same_prompt(found, sha, prompt_id) and _near(found[0].get("timestamp"), now):
+            return _line_origin(found[0])
+    return None
+
+
+def with_origins(turns_: list[dict]) -> list[dict]:
+    """``turns_`` as their transcript says now: a typed turn recorded before
+    Claude Code wrote its line (``transcript_at``), whose line names an origin
+    other than the person typing, is a machine's (``origin`` says which). The
+    owner check reads this where it picks the turn it judges, and capture's
+    direction scan before it judges a turn. A line not found, saying nothing
+    or unreadable leaves its turn as it was recorded."""
+    out = []
+    for turn in turns_:
+        path, at, sha = turn.get("transcript"), turn.get("transcript_at"), turn.get("prompt_sha256")
+        origin = None
+        if not turn.get("origin") and turn.get("typed") and not turn.get("machine") and isinstance(path, str) \
+                and path and type(at) is int and at >= 0 and isinstance(sha, str):
+            origin = transcript_origin(path, sha=sha, prompt_id=turn.get("prompt_id"), offset=at)
+        if origin is None:
+            out.append(turn)
+        elif origin == PERSON_ORIGIN:
+            out.append(dict(turn, origin=origin))
+        else:
+            out.append(dict(turn, origin=origin, machine=True, typed=False))
+    return out
 
 
 def occurrences_folder() -> Path:
@@ -1210,6 +1352,24 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
     typed = owner_text(prompt)
     machine = is_machine(clean_user_text(prompt, owner=True), anywhere=True)
+    # Who started the prompt, where the harness says: a scheduled task's run,
+    # or Claude Code's mark on the prompt's transcript line when that line is
+    # already written (``transcript_origin``). Where it is not written yet,
+    # the owner check reads it from ``transcript_at`` (``with_origins``).
+    origin = "scheduled_run" if scheduled_run(env) else None
+    transcript = hook_shape.transcript_path(payload) if harness == "claude_code" else ""
+    transcript_at = None
+    if origin is None and transcript and not machine and typed and typed.strip():
+        try:
+            transcript_at = os.stat(transcript).st_size
+        except FileNotFoundError:
+            transcript_at = 0  # a session's first prompt: the file comes with its line
+        except OSError:
+            transcript_at = None
+        origin = transcript_origin(transcript, sha=prompt_sha256(typed), prompt_id=payload.get("prompt_id"),
+                                   now=now)
+    if origin is not None and origin != PERSON_ORIGIN:
+        machine = True
     # A wrapper away from its harness's place: which words are the owner's
     # can't be told, so none are kept and the turn never counts.
     wrapped = typed is None and not machine
@@ -1225,6 +1385,15 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
         "typed": bool(text.strip()) and not machine,
         "machine": machine, "wrapped": wrapped, "helper": t3.is_helper_session(cwd), "issuer": issuer,
     }
+    if origin is not None:
+        turn["origin"] = origin
+    elif transcript_at is not None:
+        # Where the prompt's line will be, for the owner check; a path and a
+        # byte offset, never text.
+        turn["transcript"] = transcript
+        turn["transcript_at"] = transcript_at
+        if isinstance(payload.get("prompt_id"), str) and payload["prompt_id"]:
+            turn["prompt_id"] = payload["prompt_id"][:128]
     if turn["entrypoint"] == "t3-unverified" and isinstance(found.get("native"), str):
         # T3's record could not be read in time: the entrypoint a settled
         # "none" would give, for the owner check to judge it by once it can

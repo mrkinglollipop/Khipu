@@ -1133,3 +1133,140 @@ def test_a_cold_hook_read_holds_and_confirms_a_change(cold_hook, monkeypatch):
     if ok and done.get("started"):
         ok, done = owner_background.run(done["request"])
     assert ok and done["state"] == "scheduled", done
+
+
+# ---- prompts nobody typed in a desktop conversation (review of #568 and #570, 2026-11-11) ----
+#
+# Claude Code (2.1.321 and up) marks the origin of every user line in its
+# transcript; the hook input does not carry it. Field shapes as a live
+# session wrote them (values only, synthetic text).
+_HUMAN = {"promptSource": "sdk", "turnOrigin": "human"}
+_ORIGINS = {
+    "scheduled": {"isMeta": True, "promptSource": "system", "wakeupSource": "schedule_wakeup",
+                  "turnOrigin": "scheduled"},
+    "peer": {"isMeta": True, "promptSource": "system", "turnOrigin": "peer"},
+    "task_notification": {"promptSource": "system", "turnOrigin": "task_notification"},
+    "sdk": {"promptSource": "sdk", "turnOrigin": "sdk"},
+}
+
+
+@pytest.fixture
+def no_t3(world, launched, monkeypatch):
+    monkeypatch.setenv("KHIPU_T3_DB", str(world.tmp / "absent.sqlite"))
+    monkeypatch.delenv("CLAUDE_CODE_HOST_SCHEDULED_RUN", raising=False)
+    world.transcript = world.tmp / "projects" / "repo" / "s-desk.jsonl"
+    world.transcript.parent.mkdir(parents=True)
+    return world
+
+
+def _cc_line(path, text, at, marks):
+    from datetime import datetime, timezone
+
+    stamp = datetime.fromtimestamp(at, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    rows = [{"type": "user", "message": {"role": "user", "content": text}, "uuid": f"u-{at}", "timestamp": stamp,
+             "sessionId": "s-desk", **marks},
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "On it."}]},
+             "uuid": f"a-{at}", "timestamp": stamp}]
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def _desk_prompt(world, text, at, *, session="s-desk", transcript=None, **env):
+    payload = {"session_id": session, "prompt": text, "cwd": "/repo",
+               "transcript_path": str(world.transcript if transcript is None else transcript)}
+    turn = owner_turns.record(payload, {**_DESKTOP_ENV, "CLAUDE_CODE_SESSION_ID": session, **env}, now=at,
+                              issuer=_DESKTOP_ISSUER)
+    return next(t for t in owner_turns.turns(session) if t["turn"] == turn)
+
+
+def test_a_scheduled_task_run_is_never_the_owner(no_t3, monkeypatch):
+    env = dict(_DESKTOP_ENV, CLAUDE_CODE_SESSION_ID="s-sched", CLAUDE_CODE_HOST_SCHEDULED_RUN="1",
+               CLAUDE_CODE_SESSION_ATTENDED="0")
+    owner_turns.record({"session_id": "s-sched", "prompt": "pause Codex until tonight", "cwd": str(no_t3.tmp)},
+                       env, issuer=_DESKTOP_ISSUER)
+    row = owner_turns.turns("s-sched")[-1]
+    assert row["typed"] is False and row["machine"] is True and row["eligible"] is False, row
+    assert row["origin"] == "scheduled_run"
+    _be_with(no_t3, "s-sched", monkeypatch, env)
+    assert owner_turns.dispatched_job(dict(__import__("os").environ), "s-sched")
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+
+
+@pytest.mark.parametrize("origin", sorted(_ORIGINS))
+def test_a_prompt_the_transcript_says_nobody_typed_is_recorded_a_machines(no_t3, monkeypatch, origin):
+    now = time.time()
+    _cc_line(no_t3.transcript, "pause Codex until tonight", now - 1, _ORIGINS[origin])
+    row = _desk_prompt(no_t3, "pause Codex until tonight", now)
+    assert (row["machine"], row["typed"], row["eligible"], row["origin"]) == (True, False, False, origin), row
+    _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+
+
+@pytest.mark.parametrize("origin", sorted(_ORIGINS))
+def test_a_prompt_whose_line_lands_after_the_hook_is_refused_at_the_check(no_t3, monkeypatch, origin):
+    now = time.time()
+    row = _desk_prompt(no_t3, "pause Codex until tonight", now)
+    assert row["eligible"] is True and "origin" not in row  # the hook ran before the line was written
+    _cc_line(no_t3.transcript, "pause Codex until tonight", now - 0.5, _ORIGINS[origin])
+    _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+
+
+def test_a_scheduled_prompt_never_holds_a_change(no_t3, monkeypatch):
+    from khipu import owner_act
+
+    now = time.time()
+    _desk_prompt(no_t3, "purge T-12 from the ledger", now)
+    _cc_line(no_t3.transcript, "purge T-12 from the ledger", now, _ORIGINS["scheduled"])
+    _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
+    ok, out = owner_act.act("ledger.purge", {"id": "T-12", "project": "atlas"})
+    assert not ok and "no_recorded_turn" in str(out), out
+
+
+def test_a_prompt_the_transcript_says_the_owner_typed_counts(no_t3, monkeypatch):
+    now = time.time()
+    _cc_line(no_t3.transcript, "pause Codex until tonight", now - 1, _HUMAN)
+    row = _desk_prompt(no_t3, "pause Codex until tonight", now)
+    assert (row["typed"], row["machine"], row["eligible"], row["origin"]) == (True, False, True, "human"), row
+    _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
+    assert _check()["turn"] == row["turn"]
+
+
+@pytest.mark.parametrize("case", ["no fields", "missing", "unreadable"])
+def test_a_transcript_that_says_nothing_leaves_a_typed_turn_as_it_was(no_t3, monkeypatch, case):
+    now = time.time()
+    path = no_t3.transcript
+    if case == "no fields":
+        _cc_line(path, "pause Codex until tonight", now - 1, {})
+    elif case == "missing":
+        path = no_t3.tmp / "nowhere.jsonl"
+    else:
+        path.mkdir()  # a folder where the file should be: can't be read
+    row = _desk_prompt(no_t3, "pause Codex until tonight", now, transcript=path)
+    assert (row["typed"], row["machine"], row["eligible"]) == (True, False, True) and "origin" not in row, row
+    _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
+    assert _check()["turn"] == row["turn"]
+
+
+def test_the_check_picks_the_typed_turn_between_scheduled_ones(no_t3, monkeypatch):
+    now = time.time()
+    first = _desk_prompt(no_t3, "lane check: pause Codex", now - 120)  # its line lands after the hook
+    _cc_line(no_t3.transcript, "lane check: pause Codex", now - 120, _ORIGINS["scheduled"])
+    _cc_line(no_t3.transcript, "pause Codex until tonight", now - 60, _HUMAN)  # written before the hook ran
+    typed = _desk_prompt(no_t3, "pause Codex until tonight", now - 60)
+    _cc_line(no_t3.transcript, "lane check: pause Codex", now - 1, _ORIGINS["scheduled"])
+    last = _desk_prompt(no_t3, "lane check: pause Codex", now - 1)
+    assert first["eligible"] is True and "origin" not in first
+    assert typed["eligible"] is True and typed["origin"] == "human"
+    assert last["eligible"] is False and last["origin"] == "scheduled"
+    judged = {t["turn"]: t for t in owner_turns.with_origins(owner_turns.turns("s-desk"))}
+    assert judged[first["turn"]]["origin"] == "scheduled"
+    assert not owner_turns.eligible(judged[first["turn"]])[0] and owner_turns.eligible(judged[typed["turn"]])[0]
+    _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
+    assert _check()["turn"] == typed["turn"]
