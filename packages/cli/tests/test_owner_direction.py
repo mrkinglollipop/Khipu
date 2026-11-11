@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import time
 from contextlib import redirect_stdout
@@ -1176,9 +1177,11 @@ def _cc_line(path, text, at, marks):
         fh.write("".join(json.dumps(r) + "\n" for r in rows))
 
 
-def _desk_prompt(world, text, at, *, session="s-desk", transcript=None, **env):
+def _desk_prompt(world, text, at, *, session="s-desk", transcript=None, prompt_id=None, **env):
     payload = {"session_id": session, "prompt": text, "cwd": "/repo",
                "transcript_path": str(world.transcript if transcript is None else transcript)}
+    if prompt_id is not None:
+        payload["prompt_id"] = prompt_id
     turn = owner_turns.record(payload, {**_DESKTOP_ENV, "CLAUDE_CODE_SESSION_ID": session, **env}, now=at,
                               issuer=_DESKTOP_ISSUER)
     return next(t for t in owner_turns.turns(session) if t["turn"] == turn)
@@ -1200,11 +1203,13 @@ def test_a_scheduled_task_run_is_never_the_owner(no_t3, monkeypatch):
 
 
 @pytest.mark.parametrize("origin", sorted(_ORIGINS))
-def test_a_prompt_the_transcript_says_nobody_typed_is_recorded_a_machines(no_t3, monkeypatch, origin):
+def test_a_prompt_the_transcript_says_nobody_typed_is_judged_a_machines(no_t3, monkeypatch, origin):
     now = time.time()
-    _cc_line(no_t3.transcript, "pause Codex until tonight", now - 1, _ORIGINS[origin])
     row = _desk_prompt(no_t3, "pause Codex until tonight", now)
-    assert (row["machine"], row["typed"], row["eligible"], row["origin"]) == (True, False, False, origin), row
+    _cc_line(no_t3.transcript, "pause Codex until tonight", now, _ORIGINS[origin])  # written after the hook
+    judged = owner_turns.with_origins(owner_turns.turns("s-desk"))[-1]
+    assert judged["turn"] == row["turn"] and not owner_turns.eligible(judged)[0]
+    assert (judged["machine"], judged["typed"], judged["origin"]) == (True, False, origin), judged
     _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check()
@@ -1236,9 +1241,11 @@ def test_a_scheduled_prompt_never_holds_a_change(no_t3, monkeypatch):
 
 def test_a_prompt_the_transcript_says_the_owner_typed_counts(no_t3, monkeypatch):
     now = time.time()
-    _cc_line(no_t3.transcript, "pause Codex until tonight", now - 1, _HUMAN)
     row = _desk_prompt(no_t3, "pause Codex until tonight", now)
-    assert (row["typed"], row["machine"], row["eligible"], row["origin"]) == (True, False, True, "human"), row
+    _cc_line(no_t3.transcript, "pause Codex until tonight", now, _HUMAN)  # written after the hook
+    assert (row["typed"], row["machine"], row["eligible"]) == (True, False, True) and "origin" not in row, row
+    judged = owner_turns.with_origins(owner_turns.turns("s-desk"))[-1]
+    assert (judged["typed"], judged["machine"], judged["origin"]) == (True, False, "human"), judged
     _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
     assert _check()["turn"] == row["turn"]
 
@@ -1247,18 +1254,17 @@ def test_a_prompt_the_transcript_says_the_owner_typed_counts(no_t3, monkeypatch)
 def test_a_transcript_that_says_nothing_leaves_a_typed_turn_as_it_was(no_t3, monkeypatch, case):
     now = time.time()
     path = no_t3.transcript
-    if case == "no fields":
-        _cc_line(path, "pause Codex until tonight", now - 1, {})
-    elif case == "sdk":
-        _cc_line(path, "pause Codex until tonight", now - 1, _SDK)
-    elif case == "unknown":
-        _cc_line(path, "pause Codex until tonight", now - 1, {"promptSource": "typed", "turnOrigin": "unknown"})
-    elif case == "missing":
+    if case == "missing":
         path = no_t3.tmp / "nowhere.jsonl"
-    else:
+    elif case == "unreadable":
         path.mkdir()  # a folder where the file should be: can't be read
     row = _desk_prompt(no_t3, "pause Codex until tonight", now, transcript=path)
+    marks = {"no fields": {}, "sdk": _SDK, "unknown": {"promptSource": "typed", "turnOrigin": "unknown"}}
+    if case in marks:
+        _cc_line(path, "pause Codex until tonight", now, marks[case])  # written after the hook
     assert (row["typed"], row["machine"], row["eligible"]) == (True, False, True) and "origin" not in row, row
+    judged = owner_turns.with_origins(owner_turns.turns("s-desk"))[-1]
+    assert (judged["typed"], judged["machine"]) == (True, False) and "origin" not in judged, judged
     _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
     assert _check()["turn"] == row["turn"]
 
@@ -1275,17 +1281,114 @@ def test_an_sdk_marked_line_written_after_the_hook_leaves_the_typed_turn_as_it_w
 
 def test_the_check_picks_the_typed_turn_between_scheduled_ones(no_t3, monkeypatch):
     now = time.time()
-    first = _desk_prompt(no_t3, "lane check: pause Codex", now - 120)  # its line lands after the hook
+    # Each line lands after its prompt's hook, as Claude Code writes them.
+    first = _desk_prompt(no_t3, "lane check: pause Codex", now - 120)
     _cc_line(no_t3.transcript, "lane check: pause Codex", now - 120, _ORIGINS["scheduled"])
-    _cc_line(no_t3.transcript, "pause Codex until tonight", now - 60, _HUMAN)  # written before the hook ran
     typed = _desk_prompt(no_t3, "pause Codex until tonight", now - 60)
-    _cc_line(no_t3.transcript, "lane check: pause Codex", now - 1, _ORIGINS["scheduled"])
+    _cc_line(no_t3.transcript, "pause Codex until tonight", now - 60, _HUMAN)
     last = _desk_prompt(no_t3, "lane check: pause Codex", now - 1)
-    assert first["eligible"] is True and "origin" not in first
-    assert typed["eligible"] is True and typed["origin"] == "human"
-    assert last["eligible"] is False and last["origin"] == "scheduled"
+    _cc_line(no_t3.transcript, "lane check: pause Codex", now - 1, _ORIGINS["scheduled"])
+    assert all(t["eligible"] is True and "origin" not in t for t in (first, typed, last))
     judged = {t["turn"]: t for t in owner_turns.with_origins(owner_turns.turns("s-desk"))}
-    assert judged[first["turn"]]["origin"] == "scheduled"
-    assert not owner_turns.eligible(judged[first["turn"]])[0] and owner_turns.eligible(judged[typed["turn"]])[0]
+    assert judged[first["turn"]]["origin"] == "scheduled" and judged[last["turn"]]["origin"] == "scheduled"
+    assert judged[typed["turn"]]["origin"] == "human"
+    assert not owner_turns.eligible(judged[first["turn"]])[0] and not owner_turns.eligible(judged[last["turn"]])[0]
+    assert owner_turns.eligible(judged[typed["turn"]])[0]
     _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
     assert _check()["turn"] == typed["turn"]
+
+
+# ---- the recorder never reads an origin; ids decide; long lines (review of #571, 2026-11-11) ----
+#
+# Claude Code writes a prompt's line after the prompt hooks return, so every
+# line below is written after its prompt's hook ran, as Claude Code does.
+
+def _ids(with_ids, *names):
+    return [{"promptId": n} if with_ids else {} for n in names]
+
+
+@pytest.mark.parametrize("with_ids", [False, True], ids=["no ids", "different ids"])
+def test_a_scheduled_repeat_of_the_owners_words_is_a_machines_and_confirms_nothing(no_t3, monkeypatch, with_ids):
+    now = time.time()
+    text = "yes, go ahead"
+    first_id, second_id = _ids(with_ids, "typed-1", "scheduled-2")
+    typed = _desk_prompt(no_t3, text, now - 10, prompt_id=first_id.get("promptId"))
+    _cc_line(no_t3.transcript, text, now - 10, {**_HUMAN, **first_id})
+    _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
+    held = owner_direction.hold("ledger.purge", {"id": "T-12", "project": "atlas"}, now=now - 5)
+    scheduled = _desk_prompt(no_t3, text, now, prompt_id=second_id.get("promptId"))
+    _cc_line(no_t3.transcript, text, now, {**_ORIGINS["scheduled"], **second_id})
+    assert "origin" not in typed and "origin" not in scheduled  # the recorder reads no origin
+    judged = {t["turn"]: t for t in owner_turns.with_origins(owner_turns.turns("s-desk"))}
+    assert judged[typed["turn"]]["origin"] == "human" and owner_turns.eligible(judged[typed["turn"]])[0]
+    assert judged[scheduled["turn"]]["origin"] == "scheduled" and judged[scheduled["turn"]]["machine"] is True
+    assert not owner_turns.eligible(judged[scheduled["turn"]])[0]
+    proof = owner_direction._turn_proof(os.environ, "s-desk", held, now)
+    assert not isinstance(proof, dict), proof  # the scheduled "yes" is not the held request's owner yes
+
+
+@pytest.mark.parametrize("with_ids", [False, True], ids=["no ids", "different ids"])
+def test_the_owner_typing_a_scheduled_prompts_words_still_counts(no_t3, monkeypatch, with_ids):
+    now = time.time()
+    text = "pause Codex until tonight"
+    first_id, second_id = _ids(with_ids, "scheduled-1", "typed-2")
+    scheduled = _desk_prompt(no_t3, text, now - 10, prompt_id=first_id.get("promptId"))
+    _cc_line(no_t3.transcript, text, now - 10, {**_ORIGINS["scheduled"], **first_id})
+    typed = _desk_prompt(no_t3, text, now, prompt_id=second_id.get("promptId"))
+    _cc_line(no_t3.transcript, text, now, {**_HUMAN, **second_id})
+    assert typed["eligible"] is True and "origin" not in typed
+    judged = {t["turn"]: t for t in owner_turns.with_origins(owner_turns.turns("s-desk"))}
+    assert judged[scheduled["turn"]]["origin"] == "scheduled"
+    assert not owner_turns.eligible(judged[scheduled["turn"]])[0]
+    assert judged[typed["turn"]]["origin"] == "human" and owner_turns.eligible(judged[typed["turn"]])[0]
+    _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
+    assert _check()["turn"] == typed["turn"]
+
+
+def test_a_line_with_the_same_words_and_another_prompt_id_is_not_the_turns(no_t3, monkeypatch):
+    now = time.time()
+    row = _desk_prompt(no_t3, "pause Codex until tonight", now, prompt_id="mine")
+    _cc_line(no_t3.transcript, "pause Codex until tonight", now, {**_ORIGINS["scheduled"], "promptId": "another"})
+    judged = owner_turns.with_origins(owner_turns.turns("s-desk"))[-1]
+    assert (judged["typed"], judged["machine"]) == (True, False) and "origin" not in judged, judged
+    _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
+    assert _check()["turn"] == row["turn"]
+
+
+_PAST_THE_READ = {"pad": "x" * ((4 << 20) + 4096)}  # a field that carries the line past 4 MiB
+
+
+def test_a_scheduled_prompts_line_past_the_read_limit_is_read_to_its_end(no_t3, monkeypatch):
+    now = time.time()
+    _desk_prompt(no_t3, "please ask me first", now - 10)
+    _cc_line(no_t3.transcript, "please ask me first", now - 10, _HUMAN)
+    _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
+    held = owner_direction.hold("ledger.purge", {"id": "T-12", "project": "atlas"}, now=now - 5)
+    row = _desk_prompt(no_t3, "yes, go ahead", now)
+    _cc_line(no_t3.transcript, "yes, go ahead", now, {**_ORIGINS["scheduled"], **_PAST_THE_READ})
+    judged = owner_turns.with_origins(owner_turns.turns("s-desk"))[-1]
+    assert judged["turn"] == row["turn"] and judged["origin"] == "scheduled" and judged["machine"] is True
+    assert not isinstance(owner_direction._turn_proof(os.environ, "s-desk", held, now), dict)
+
+
+def test_a_typed_prompts_line_past_the_read_limit_still_counts(no_t3, monkeypatch):
+    now = time.time()
+    row = _desk_prompt(no_t3, "pause Codex until tonight", now)
+    _cc_line(no_t3.transcript, "pause Codex until tonight", now, {**_HUMAN, **_PAST_THE_READ})
+    judged = owner_turns.with_origins(owner_turns.turns("s-desk"))[-1]
+    assert judged["origin"] == "human" and owner_turns.eligible(judged)[0], judged
+    _be_with(no_t3, "s-desk", monkeypatch, _DESKTOP_ENV)
+    assert _check()["turn"] == row["turn"]
+
+
+def test_a_line_past_the_longest_read_leaves_the_turn_as_recorded(no_t3, monkeypatch):
+    # The limits made small so the test stays small: the same rule as 4 MiB and 64 MiB.
+    monkeypatch.setattr(owner_turns, "_ORIGIN_READ_MOST", 1 << 10)
+    monkeypatch.setattr(owner_turns, "_ORIGIN_CHUNK", 256)
+    monkeypatch.setattr(owner_turns, "_ORIGIN_LINE_MOST", 8 << 10)
+    now = time.time()
+    row = _desk_prompt(no_t3, "pause Codex until tonight", now)
+    _cc_line(no_t3.transcript, "pause Codex until tonight", now, {**_ORIGINS["scheduled"], "pad": "x" * (16 << 10)})
+    judged = owner_turns.with_origins(owner_turns.turns("s-desk"))[-1]
+    assert (judged["typed"], judged["machine"]) == (True, False) and "origin" not in judged, judged
+    assert row["eligible"] is True

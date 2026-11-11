@@ -481,16 +481,22 @@ def prompt_sha256(text: str) -> str:
 # it, the person's typed ones included, so the turn is judged as it was
 # before this mark was read (the brief another session starts a desktop
 # conversation with also carries it, and is refused by its own record and
-# templates). "unknown" and no mark say nothing either. The hook input does not carry it, and Claude Code
-# writes the line after the prompt hooks return, so the recorder also notes
-# where the transcript ended (``transcript_at``) and the owner check reads
-# the line from there (``with_origins``).
+# templates). "unknown" and no mark say nothing either. The hook input does
+# not carry it, and Claude Code writes the prompt's line after the prompt
+# hooks return, so at record time the line is never in the file and the
+# recorder never reads the transcript for an origin: it notes where the file
+# ended (``transcript_at``) and the hook input's ``prompt_id``, and the owner
+# check reads the first matching line forward from there (``with_origins``).
+# Where the record and the line both carry a prompt id, the ids alone decide
+# the match; the text hash decides only where either has none. The read stops
+# after ``_ORIGIN_READ_MOST`` bytes, but only at a line end: a line the reader
+# is inside is read to its end, up to ``_ORIGIN_LINE_MOST`` bytes for that
+# line; past that the turn stays as it was recorded.
 PERSON_ORIGIN = "human"
 _UNSAID_ORIGINS = ("unknown", "sdk")
-_ORIGIN_READ_MOST = 4 << 20   # forward from ``transcript_at``
-_ORIGIN_TAIL = 256 << 10      # the recorder's look at the end of the file
+_ORIGIN_READ_MOST = 4 << 20   # forward from ``transcript_at``, stopping at a line end
+_ORIGIN_LINE_MOST = 64 << 20  # the longest one line read to its end
 _ORIGIN_CHUNK = 64 << 10
-_ORIGIN_SLACK_S = 120.0
 
 
 def _line_origin(row: dict) -> str | None:
@@ -526,61 +532,53 @@ def _prompt_line(raw: bytes) -> tuple[dict, str] | None:
 
 
 def _same_prompt(found: tuple[dict, str], sha: str, prompt_id) -> bool:
+    """The line is the recorded prompt's: where both carry a prompt id, the
+    ids alone decide; otherwise the canonical text hash does."""
     row, text = found
-    if isinstance(prompt_id, str) and prompt_id and row.get("promptId") == prompt_id:
-        return True
+    line_id = row.get("promptId")
+    if isinstance(prompt_id, str) and prompt_id and isinstance(line_id, str) and line_id:
+        return line_id == prompt_id
     typed = owner_text(text)
     return sha == prompt_sha256(text) or (typed is not None and sha == prompt_sha256(typed))
 
 
-def _near(stamp, now: float | None) -> bool:
-    if now is None or not isinstance(stamp, str):
-        return False
-    try:
-        at = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return False
-    return abs(at - now) <= _ORIGIN_SLACK_S
-
-
-def transcript_origin(path: str, *, sha: str, prompt_id=None, offset: int | None = None,
-                      now: float | None = None) -> str | None:
+def transcript_origin(path: str, *, sha: str, prompt_id=None, offset: int = 0) -> str | None:
     """What a Claude Code transcript says started the prompt whose canonical
-    hash is ``sha`` (or whose ``promptId`` is the hook input's ``prompt_id``):
-    its origin (``_line_origin``), or None when the line is not found, says
-    nothing or the file can't be read. ``offset`` (the owner check): the first
-    such line from where the file ended when the hook ran, read forward at
-    most ``_ORIGIN_READ_MOST`` bytes. Without it (the recorder): the newest
-    such line in the file's last ``_ORIGIN_TAIL`` bytes stamped within
-    ``_ORIGIN_SLACK_S`` of ``now``. Only the origin leaves here, never text."""
+    hash is ``sha`` (or whose ``promptId`` is the hook input's ``prompt_id``,
+    ``_same_prompt``): the origin (``_line_origin``) of the first such line
+    read forward from ``offset`` (where the file ended when the hook ran), or
+    None when no such line is found, it says nothing, or the file can't be
+    read. The read goes in chunks and stops after ``_ORIGIN_READ_MOST`` bytes,
+    but only at a line end: a line it is inside then is read to its end, up to
+    ``_ORIGIN_LINE_MOST`` bytes for that line; past that it stops with None.
+    Only the origin leaves here, never text."""
     try:
         with open(path, "rb") as fh:
-            if offset is not None:
-                fh.seek(offset)
-                carry, read = b"", 0
-                while read < _ORIGIN_READ_MOST:
-                    chunk = fh.read(min(_ORIGIN_CHUNK, _ORIGIN_READ_MOST - read))
-                    read += len(chunk)
-                    lines = (carry + chunk).split(b"\n")
-                    carry = lines.pop() if chunk else b""
-                    for raw in lines:
-                        found = _prompt_line(raw)
-                        if found is not None and _same_prompt(found, sha, prompt_id):
-                            return _line_origin(found[0])
-                    if not chunk:
-                        break
-                return None
-            end = fh.seek(0, os.SEEK_END)
-            start = max(0, end - _ORIGIN_TAIL)
-            fh.seek(start)
-            lines = fh.read(end - start).split(b"\n")
+            fh.seek(offset)
+            line, start = bytearray(), 0  # the line being read; where it starts, from ``offset``
+            while start < _ORIGIN_READ_MOST:
+                chunk = fh.read(_ORIGIN_CHUNK)
+                if not chunk:
+                    found = _prompt_line(bytes(line)) if line else None
+                    return _line_origin(found[0]) if found is not None and _same_prompt(found, sha, prompt_id) \
+                        else None
+                at = 0
+                while (end := chunk.find(b"\n", at)) >= 0:
+                    line += chunk[at:end]
+                    at = end + 1
+                    found = _prompt_line(bytes(line))
+                    if found is not None and _same_prompt(found, sha, prompt_id):
+                        return _line_origin(found[0])
+                    start += len(line) + 1
+                    line.clear()
+                    if start >= _ORIGIN_READ_MOST:
+                        return None
+                line += chunk[at:]
+                if len(line) > _ORIGIN_LINE_MOST:
+                    return None
+            return None
     except (OSError, ValueError, TypeError):
         return None
-    for raw in reversed(lines[1:] if start else lines):
-        found = _prompt_line(raw)
-        if found is not None and _same_prompt(found, sha, prompt_id) and _near(found[0].get("timestamp"), now):
-            return _line_origin(found[0])
-    return None
 
 
 def with_origins(turns_: list[dict]) -> list[dict]:
@@ -1355,10 +1353,10 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
     typed = owner_text(prompt)
     machine = is_machine(clean_user_text(prompt, owner=True), anywhere=True)
-    # Who started the prompt, where the harness says: a scheduled task's run,
-    # or Claude Code's mark on the prompt's transcript line when that line is
-    # already written (``transcript_origin``). Where it is not written yet,
-    # the owner check reads it from ``transcript_at`` (``with_origins``).
+    # Who started the prompt, where the harness says: a scheduled task's run.
+    # Claude Code's mark on the prompt's transcript line is written after this
+    # hook returns, so it is never read here: the owner check reads it from
+    # ``transcript_at`` (``with_origins``).
     origin = "scheduled_run" if scheduled_run(env) else None
     transcript = hook_shape.transcript_path(payload) if harness == "claude_code" else ""
     transcript_at = None
@@ -1369,9 +1367,7 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
             transcript_at = 0  # a session's first prompt: the file comes with its line
         except OSError:
             transcript_at = None
-        origin = transcript_origin(transcript, sha=prompt_sha256(typed), prompt_id=payload.get("prompt_id"),
-                                   now=now)
-    if origin is not None and origin != PERSON_ORIGIN:
+    if origin is not None:
         machine = True
     # A wrapper away from its harness's place: which words are the owner's
     # can't be told, so none are kept and the turn never counts.
