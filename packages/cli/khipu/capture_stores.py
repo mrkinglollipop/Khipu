@@ -134,6 +134,12 @@ STORES: tuple[Store, ...] = (
           "kept: an owner-chosen file outside the data folder that forget cannot find; a known "
           "boundary in the scope doc",
           _w("recall_eval.write_record")),
+    Store("blank-field backup", "a file the owner names with khipu hygiene blank-field --backup",
+          "the old values of the fields one blank-field run changed (preferences, raw, verbatim) "
+          "for the listed episodes",
+          "kept: an owner-chosen file outside the data folder that forget cannot find; --restore "
+          "skips a forgotten row and a forgotten source, so it never brings forgotten text back",
+          _w("blank_field.write_backup")),
     Store("session state", "capture home state/<harness>--<session>.json and .capture-now.json",
           "offsets and hashes; carried text and a capture note that no queued job holds yet",
           "none: carried text and a note belong to the next window, which is not a source until "

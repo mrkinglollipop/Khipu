@@ -44,6 +44,10 @@ GATE_NAMES = ("write_gate", "write_guard", "hub_source_forgotten", "publish_hub_
 #   erase             forget's own tombstoning
 #   metadata          columns that carry no source, on rows that already exist
 ALLOWED = {
+    # Empties one field on listed live rows (forgotten rows skipped); adds no source.
+    ("blank_field", "blank"): "metadata",
+    # Puts a blank-field backup back: each payload checked with hub_source_forgotten.
+    ("blank_field", "_restore_locked"): "gate",
     ("capture", "_claim_unowned_episode"): "metadata",
     ("capture", "_merge_into_episode"): "gate",
     ("capture", "dedup_before_insert"): "calls:capture._merge_into_episode",
@@ -80,6 +84,7 @@ ALLOWED = {
 # shared lock first) or write_guard (which does the same). Forget is the one
 # exclusive holder.
 LOCKED = {
+    "blank_field.restore": "shared",
     "capture.capture": "shared",
     "capture.write_pg": "shared",
     "forget.forget_everywhere": "exclusive",

@@ -282,6 +282,8 @@ through the gate and added here.
 | `ledger` import | ledger rows | writes no episodes | none |
 | migrations 0027, 0029, 0030 | backfills (source rows, origin, `forgotten_sources`) | 0030 backfills the forgotten identities | none (table locks, see below) |
 | `hygiene.apply_backfill_*`, `capture._claim_unowned_episode`, `cli._cmd_episode_edit` | project/repo_root, origin, summary on existing rows | metadata only; the edit skips forgotten rows | none |
+| `blank_field.blank` (`khipu hygiene blank-field --apply`) | empties `preferences` or removes `verbatim.owner_lines` on listed existing rows (column, `raw` and each `raw.merged_from[].payload`) | metadata only; adds no source; skips forgotten rows (`deleted_at`, under `FOR UPDATE`) | none |
+| `blank_field.restore` (`_restore_locked`; `khipu hygiene blank-field --restore`) | puts a blank-field backup's old values back | `hub_source_forgotten` on `raw` and every merged payload; skips forgotten rows; announces the receipts for 0047 | shared |
 | `identity.remove_project_alias` | project on existing rows (alias undo restores `raw.typed_project`) | metadata only; skips forgotten rows (`deleted_at IS NULL`) | none |
 | `forget.forget_episode` | hub tombstone, `forgotten_sources` | erase | exclusive (`forget.forget_everywhere`) |
 
@@ -451,6 +453,7 @@ entry with the reason it holds no capture data. A new writer therefore cannot sh
 | conversation media | data folder `media/conversation_memory/<sha256>.<ext>` | images found in transcripts, shared by content hash | kept: content-addressed, can belong to several episodes |
 | extraction scratch | data folder `state/synth-cli/work-*/` and its output temp | a model call's working folder and output | kept: removed by the call that made it |
 | Antigravity trajectory copy | a private temp folder `khipu-ag-*/` (`t.db` and its WAL) | a copy of a T3 Antigravity session database | kept: removed by the call that made it |
+| blank-field backup | a file the owner names with `khipu hygiene blank-field --backup` | the old values of the fields one run changed, for the listed episodes | kept: an owner-chosen file forget cannot find; `--restore` skips forgotten rows and sources |
 | commitments backup | hygiene backup folder `commitments-<time>/commitments.bin` | a binary copy of the commitments table | kept: closed commitments remain by design |
 | local backup | a backup folder or archive the owner chose | a copy of the data folder | kept: backups are kept for recovery; an import restores only what a store allows, through its scrub |
 
