@@ -467,5 +467,33 @@ class ExtractMemoryTest(unittest.TestCase):
 
 
 
+class JobPromptTest(unittest.TestCase):
+    """A dispatched job's prompt says its USER turns are a brief; a
+    conversation's prompt is exactly PROMPT.format(...)."""
+
+    def test_conversation_prompt_is_exactly_the_base_prompt(self):
+        for cwd, transcript in (("/fixture", "USER: Keep the decision."), ("", "USER: a {brace}")):
+            self.assertEqual(extract._build_prompt(cwd=cwd, transcript=transcript),
+                             extract.PROMPT.format(cwd=cwd or "(unknown)", transcript=transcript))
+            self.assertEqual(extract._build_prompt(cwd=cwd, transcript=transcript, job=False),
+                             extract.PROMPT.format(cwd=cwd or "(unknown)", transcript=transcript))
+
+    def test_job_prompt_adds_only_the_job_section_before_the_project_line(self):
+        base = extract._build_prompt(cwd="/fixture", transcript="USER: brief")
+        job = extract._build_prompt(cwd="/fixture", transcript="USER: brief", job=True)
+        self.assertEqual(job.count(extract.JOB_SECTION), 1)
+        self.assertEqual(job.replace(extract.JOB_SECTION, "", 1), base)
+        self.assertLess(job.index(extract.JOB_SECTION), job.index("Session project (cwd): /fixture"))
+
+    def test_extract_memory_sends_the_job_section_only_for_a_job(self):
+        with mock.patch.object(extract, "_fallback_applies", return_value=False), \
+                mock.patch.object(extract, "_generate", return_value=_reply()) as generate:
+            extract.extract_memory("USER: brief", cwd="/fixture")
+            extract.extract_memory("USER: brief", cwd="/fixture", job=True)
+        conversation, job = (c.args[0] for c in generate.call_args_list)
+        self.assertNotIn(extract.JOB_SECTION, conversation)
+        self.assertIn(extract.JOB_SECTION, job)
+
+
 if __name__ == "__main__":
     unittest.main()

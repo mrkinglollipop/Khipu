@@ -2830,6 +2830,9 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
         ).hexdigest()
     queued_names: list[str] = []
     thread = cache_thread(st, sid)
+    # A T3 delegated child thread is a job: T3 names it by this prefix, so no
+    # read of T3's database is needed (owner_turns treats it the same way).
+    delegated = str(thread or "").startswith(_t3.DELEGATED_THREAD_PREFIX)
     for i, part in enumerate(parts, start=1):
         job = {"harness": harness, "session_id": sid, "cwd": cwd, "event": event,
                "ts": _mint_ts(), "turns": turns, "transcript": part["text"],
@@ -2839,9 +2842,13 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
                "parent_session_id": job_parent,
                "transcript_range": f"{off_before}:{new_off}",
                "truncated_chars": part["truncated_chars"]}
-        if st.get("origin") == "job" and not job_parent:
-            # KHIPU_JOB=1 with no lineage; lineage alone already marks a job.
+        if (st.get("origin") == "job" or delegated) and not job_parent:
+            # KHIPU_JOB=1 or a T3 delegated thread with no lineage; lineage
+            # alone already marks a job.
             job["origin"] = "job"
+        if st.get("subagent"):
+            # Nobody types into a subagent: its user turns are the parent's.
+            job["subagent"] = True
         if checkout:
             job["checkout"] = checkout
         if window_id:
@@ -3504,6 +3511,10 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                 _record_drain(harness, captured=False, error=f"extract checkpoint: {e}")
                 continue
         payload["session_id"] = f"{harness}:{job.get('session_id')}"
+        if job.get("subagent"):
+            # A subagent's preferences can only be its parent's brief: the
+            # owner's own words are captured in the parent session.
+            payload["preferences"] = []
         payload["scope"] = payload.get("scope") or f"{harness} {job.get('event')}"
         # The trigger itself, not just its trace in `scope`: commitments'
         # session-plan closure retires a session's own in-flight/plan items
