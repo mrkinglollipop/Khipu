@@ -336,3 +336,99 @@ def test_restore_skips_a_row_whose_merged_source_was_forgotten_since(pg, tmp_pat
     assert code == 0 and out["restored"] == 1 and out["skipped_forgotten"] == 1, out
     assert row_text(pg, a) == blanked
     assert columns(pg, b) == b_before
+
+
+# ---- round 2: 0047's gates, non-list values, output fields --------------------------
+
+def with_fact_receipt(conn, eid):
+    """Make the row's last merge receipt a capture that also held decisions
+    (0047's writer gate watches the last receipt's payload)."""
+    receipt = {"source_id": f"s-facts-{eid}", "ts": "2026-11-10T10:00:00Z", "score": 0.8000,
+               "payload": {"summary": "merged with facts", "preferences": [MERGED_PREF],
+                           "decisions": [{"text": "keep the kiln lit", "weight": 2.50}],
+                           "verbatim": {"owner_lines": [MERGED_LINE]}}}
+    text = json.dumps(receipt).replace('"weight": 2.5', '"weight": 2.50')
+    cur = conn.cursor()
+    announce(cur, f"s-facts-{eid}")
+    from khipu import provenance
+    provenance.declare_writer(cur)
+    cur.execute("UPDATE episodes SET raw = jsonb_set(raw, '{merged_from}', (raw->'merged_from') "
+                "|| jsonb_build_array(%s::jsonb)) WHERE id = %s", (text, eid))
+    conn.commit()
+
+
+@pytest.mark.parametrize("field", blank_field.FIELDS)
+def test_a_last_receipt_with_decisions_commits_and_keeps_them(pg, tmp_path, capsys, field):
+    a = add(pg, "a")
+    with_fact_receipt(pg, a)
+    before = columns(pg, a)
+    code, out = run(tmp_path, capsys, field=field, ids=(a,), apply=True)
+    assert code == 0 and out["changed"] == 1, out
+    after = columns(pg, a)
+    last = after["raw"]["merged_from"][-1]["payload"]
+    assert last["decisions"] == before["raw"]["merged_from"][-1]["payload"]["decisions"]
+    if field == "preferences":
+        assert after["preferences"] == [] and after["raw"]["preferences"] == [] and last["preferences"] == []
+    else:
+        assert "owner_lines" not in after["verbatim"] and "owner_lines" not in last["verbatim"]
+    code, out = run(tmp_path, capsys, restore="b.json", backup=None, apply=True)
+    assert code == 0 and out["restored"] == 1, out
+    assert columns(pg, a) == before
+
+
+@pytest.mark.parametrize("receipt_value", ["list", "string"])
+def test_a_row_whose_receipt_carries_a_forgotten_identity_is_skipped_and_the_rest_commit(
+        pg, tmp_path, capsys, receipt_value):
+    carrier, plain = add(pg, "carrier"), add(pg, "plain")
+    if receipt_value == "string":
+        # Emptying a bare string is a new receipt to 0047 (not contained in
+        # the old one), so its update check would refuse the whole run.
+        cur = pg.cursor()
+        announce(cur, "s-carrier")
+        cur.execute("UPDATE episodes SET raw = jsonb_set(raw, '{merged_from,0,payload,preferences}', "
+                    "to_jsonb(%s::text)) WHERE id = %s", (MERGED_PREF, carrier))
+        pg.commit()
+    # A forget recorded before 0047 indexed this receipt (no carrier row stops it).
+    pg.execute("SET LOCAL session_replication_role = replica")
+    pg.execute("INSERT INTO forgotten_sources (identity) VALUES (%s)", ("s-carrier",))
+    pg.commit()
+    carrier_before = row_text(pg, carrier)
+    code, out = run(tmp_path, capsys, field="preferences", ids=(carrier, plain))
+    assert code == 0 and out["skipped_forgotten_source"] == 1, out
+    code, out = run(tmp_path, capsys, field="preferences", ids=(carrier, plain), apply=True)
+    assert code == 0 and out["changed"] == 1 and out["skipped_forgotten_source"] == 1, out
+    assert row_text(pg, carrier) == carrier_before
+    assert columns(pg, plain)["preferences"] == []
+    backup = json.loads((tmp_path / "b.json").read_text())
+    assert [r["id"] for r in backup["rows"]] == [plain]
+
+
+def test_a_string_preferences_value_is_blanked_and_counted(pg, tmp_path, capsys):
+    cur = pg.cursor()
+    announce(cur)
+    raw = {"ts": "2026-11-10T09:00:00Z", "summary": "scratch string", "preferences": PREF}
+    cur.execute("INSERT INTO episodes (ts, session_id, summary, raw, preferences) "
+                "VALUES (%s::timestamptz, 'codex:string', %s, %s::jsonb, %s::jsonb) RETURNING id",
+                (raw["ts"], raw["summary"], json.dumps(raw), json.dumps(PREF)))
+    eid = cur.fetchone()[0]
+    pg.commit()
+    code, out = run(tmp_path, capsys, field="preferences", ids=(eid,), apply=True)
+    assert code == 0 and out["changed"] == 1 and out["strings"] == 1 and out["skipped_empty"] == 0, out
+    after = columns(pg, eid)
+    assert after["preferences"] == [] and after["raw"]["preferences"] == []
+
+
+def test_output_reports_the_hub_check_and_repeated_ids(pg, tmp_path, capsys, monkeypatch):
+    a, b = add(pg, "a"), add(pg, "b")
+    code, out = run(tmp_path, capsys, field="preferences", ids=(a, a, b), apply=True)
+    assert code == 0 and out["changed"] == 2, out
+    assert (out["ids_given"], out["ids_distinct"], out["hub_check"]) == (3, 2, "ok"), out
+    code, out = run(tmp_path, capsys, restore="b.json", backup=None)
+    assert code == 0 and out["hub_check"] == "ok", out
+    # A hub role that cannot read its incarnation: the wrong-hub guard is off and says so.
+    monkeypatch.setattr(hs, "_INCARNATION_READ", "SELECT 1/0")
+    code, out = run(tmp_path, capsys, restore="b.json", backup=None)
+    assert code == 0 and out["hub_check"] == "skipped", out
+    c = add(pg, "c")
+    code, out = run(tmp_path, capsys, field="preferences", ids=(c,), backup="b2.json", apply=True)
+    assert code == 0 and out["changed"] == 1 and out["hub_check"] == "skipped", out

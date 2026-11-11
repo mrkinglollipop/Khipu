@@ -14,7 +14,16 @@ Two fields, each emptied in every place an episode stores it on the hub:
 Every JSON edit is a jsonb operator in SQL, so the keys left alone stay
 byte-equal (no Python round trip of numbers). The command selects nothing of
 its own: the ids come from ``--ids-file``. A forgotten, missing or already
-empty row is skipped and counted. Without ``--apply`` nothing changes.
+empty row is skipped and counted, and so is a row naming a forgotten source
+(``skipped_forgotten_source``), which migration 0047 would refuse. A place
+holds the field when blanking moves its text (a bare string counts as one).
+Without ``--apply`` nothing changes.
+
+Migration 0047: each UPDATE announces only the receipts it changes, and the
+run declares itself a fact writer (as capture's merge path does) so a last
+receipt that holds decisions does not refuse the COMMIT; fact items stay
+byte-equal. ``hub_check`` says ``skipped`` when the hub's incarnation cannot
+be read, so a restore cannot tell this hub from another one.
 
 ``--apply`` writes the backup file (refusing an existing one), reads it back
 and checks it, then changes the rows, all inside one transaction that rolls
@@ -50,13 +59,22 @@ class BlankFieldError(Exception):
 
 # ---- SQL: the blanked form of each place -------------------------------------
 
+def _holds_sql(v: str) -> str:
+    """``v`` (a jsonb value) is something to empty: not missing, null or []."""
+    return f"(({v}) IS NOT NULL AND jsonb_typeof({v}) <> 'null' AND ({v}) <> '[]'::jsonb)"
+
+
 def _payload_sql(p: str, field: str) -> str:
-    """``p`` (a jsonb expression for one capture payload) with ``field`` emptied."""
+    """``p`` (a jsonb expression for one capture payload) with ``field`` emptied.
+    A place already missing, null or ``[]`` is left as it is, so "holds the
+    field" is simply "the text moves", whatever shape the value has."""
     if field == "preferences":
-        return (f"(CASE WHEN jsonb_typeof({p}) = 'object' AND ({p}) ? 'preferences' "
+        holds = _holds_sql(f"({p})->'preferences'")
+        return (f"(CASE WHEN jsonb_typeof({p}) = 'object' AND {holds} "
                 f"THEN jsonb_set({p}, '{{preferences}}', '[]'::jsonb) ELSE {p} END)")
+    holds = _holds_sql(f"({p})->'verbatim'->'owner_lines'")
     return (f"(CASE WHEN jsonb_typeof({p}) = 'object' AND jsonb_typeof(({p})->'verbatim') = 'object' "
-            f"THEN ({p}) #- '{{verbatim,owner_lines}}' ELSE {p} END)")
+            f"AND {holds} THEN ({p}) #- '{{verbatim,owner_lines}}' ELSE {p} END)")
 
 
 def _raw_sql(r: str, field: str) -> str:
@@ -75,10 +93,11 @@ def _new_sql(column: str, field: str) -> str:
     if column == "raw":
         return _raw_sql("raw", field)
     if column == "preferences":
-        return "'[]'::jsonb"
+        return f"(CASE WHEN {_holds_sql('preferences')} THEN '[]'::jsonb ELSE preferences END)"
     # verbatim, for owner_lines
-    return ("(CASE WHEN jsonb_typeof(verbatim) = 'object' THEN verbatim - 'owner_lines' "
-            "ELSE verbatim END)")
+    holds = _holds_sql("verbatim->'owner_lines'")
+    return (f"(CASE WHEN jsonb_typeof(verbatim) = 'object' AND {holds} "
+            "THEN verbatim - 'owner_lines' ELSE verbatim END)")
 
 
 def _columns(cur, field: str) -> list[str]:
@@ -91,7 +110,11 @@ def _columns(cur, field: str) -> list[str]:
 # ---- what a row holds ----------------------------------------------------------
 
 def _items(value: Any) -> list[Any]:
-    return [v for v in value if v not in (None, "")] if isinstance(value, list) else []
+    """The strings a value holds: a list's non-empty items, any other
+    non-empty value as one (a legacy payload may store a bare string)."""
+    if isinstance(value, list):
+        return [v for v in value if v not in (None, "")]
+    return [] if value in (None, "") else [value]
 
 
 def _payload_items(payload: Any, field: str) -> list[Any]:
@@ -127,7 +150,8 @@ def _sha(text: str | None) -> str | None:
 
 
 def read_ids(path: str | os.PathLike) -> list[int]:
-    """One episode id per line; blank lines ignored; anything else refuses."""
+    """One episode id per line, repeats kept (``blank`` counts both);
+    blank lines ignored; anything else refuses."""
     ids: list[int] = []
     try:
         lines = Path(path).read_text(encoding="utf-8").splitlines()
@@ -140,21 +164,66 @@ def read_ids(path: str | os.PathLike) -> list[int]:
         if not line.isdigit():
             raise BlankFieldError(f"ids file line {n} is not an episode id")
         ids.append(int(line))
-    return list(dict.fromkeys(ids))
+    return ids
 
 
-def _announce(cur, raw_text: str | None) -> None:
-    """Announce the source identities of the receipts ``raw`` names, for the
-    0047 update check: a ``merged_from`` entry that is not contained in the
-    old one reads as a new merge, which must be announced and is refused when
-    any of its identities is forgotten. A hub without 0047 is not asked."""
-    if raw_text is None:
-        return
+def _changed_receipt_identities(cur, old_raw: str | None, new_raw: str | None) -> list[str]:
+    """The source identities of the receipts this write changes: 0047's
+    update check reads every ``merged_from`` entry not contained in the old
+    one as a new merge (``khipu_new_receipts``) and refuses the UPDATE when
+    any of their identities (``khipu_receipt_identities``) is forgotten. A
+    hub without 0047, or a write that leaves ``raw`` alone, has none."""
+    if old_raw is None or new_raw is None or old_raw == new_raw:
+        return []
+    cur.execute("SELECT to_regproc('khipu_new_receipts') IS NOT NULL")
+    if not cur.fetchone()[0]:
+        return []
+    cur.execute("SELECT coalesce(array_agg(DISTINCT x ORDER BY x), ARRAY[]::text[]) "
+                "FROM khipu_new_receipts(%s::jsonb, %s::jsonb) AS r(e), "
+                "unnest(khipu_receipt_identities(e)) AS t(x)", (old_raw, new_raw))
+    return list(cur.fetchone()[0])
+
+
+def _receipts_forgotten(cur, raw_text: str | None) -> bool:
+    """Whether the hub's ``forgotten_sources`` names any receipt identity
+    ``raw`` carries (``khipu_raw_receipt_identities``: what 0047 checks). A
+    receipt recorded before 0047 indexed it may carry one that
+    ``hub_source_forgotten`` cannot derive from the payload alone. Every
+    receipt, not only the changed ones: 0047 reads an emptied list or a
+    removed key as no new receipt, a bare string emptied as a new one."""
+    from khipu.db import has_table
+
+    if raw_text is None or not has_table(cur, "forgotten_sources"):
+        return False
     cur.execute("SELECT to_regproc('khipu_raw_receipt_identities') IS NOT NULL")
     if not cur.fetchone()[0]:
-        return
-    cur.execute("SELECT set_config('khipu.source_identities', "
-                "array_to_string(khipu_raw_receipt_identities(%s::jsonb), ','), true)", (raw_text,))
+        return False
+    cur.execute("SELECT khipu_raw_receipt_identities(%s::jsonb)", (raw_text,))
+    identities = list(cur.fetchone()[0] or [])
+    if not identities:
+        return False
+    cur.execute("SELECT 1 FROM forgotten_sources WHERE identity = ANY(%s) LIMIT 1", (identities,))
+    return cur.fetchone() is not None
+
+
+def _announce(cur, identities: list[str]) -> None:
+    """Announce only the receipts this write changes (0047 refuses a changed
+    receipt unannounced, and records what is announced as the episode's
+    identities). Always set, so one row's announcement never carries to the
+    next row in the same transaction. A hub without 0047 ignores it."""
+    cur.execute("SELECT set_config('khipu.source_identities', %s, true)", (",".join(identities),))
+
+
+def _declare_writer(cur) -> None:
+    """0047's writer gate refuses at COMMIT a ``merged_from`` change whose
+    last receipt holds open loops, decisions or deliverables unless the
+    transaction declared itself, as capture's merge path does
+    (``capture._declare_history_writer``). This run changes no fact item
+    (they stay byte-equal), so it declares the same way."""
+    from khipu import provenance
+
+    if provenance.ready(cur):
+        provenance.declare_writer(cur)
 
 
 def _payloads(raw_text: str | None) -> list[dict[str, Any]]:
@@ -185,6 +254,12 @@ def _hub_identity(conn) -> str:
             name = cur.fetchone()[0]
         conn.rollback()
         return f"unknown-incarnation:{name}"
+
+
+def _hub_check(*labels: Any) -> str:
+    """``"ok"`` when every hub label is a read incarnation, else
+    ``"skipped"``: the wrong-hub guard cannot tell hubs apart then."""
+    return "skipped" if any(str(label or "").startswith("unknown-") or not label for label in labels) else "ok"
 
 
 # ---- the backup file -----------------------------------------------------------
@@ -248,8 +323,14 @@ def blank(conn, field: str, ids: list[int], *, backup_path: Path | None, apply: 
         raise BlankFieldError("--apply needs --backup")
     if apply and backup_path.exists():
         raise BlankFieldError("the backup file already exists; choose a new path")
-    hub = _hub_identity(conn) if apply else None
-    out: dict[str, Any] = {"ok": True, "field": field, "dry_run": not apply, "ids_given": len(ids)}
+    from khipu.tombstones import hub_source_forgotten
+
+    hub = _hub_identity(conn)
+    given, ids = len(ids), list(dict.fromkeys(ids))
+    # "skipped": the backup's hub label is unknown, so a restore cannot tell
+    # this hub from another one (the per-column hash guard still applies).
+    out: dict[str, Any] = {"ok": True, "field": field, "dry_run": not apply, "ids_given": given,
+                           "ids_distinct": len(ids), "hub_check": _hub_check(hub)}
     try:
         with conn.cursor() as cur:
             cols = _columns(cur, field)
@@ -265,23 +346,32 @@ def blank(conn, field: str, ids: list[int], *, backup_path: Path | None, apply: 
             found = {int(r[0]) for r in rows}
             forgotten = sum(1 for r in rows if r[1])
             change: list[dict[str, Any]] = []
-            strings = 0
+            strings = holding = source_forgotten = 0
             for r in rows:
                 if r[1]:
                     continue
                 old = {c: r[2 + 2 * i] for i, c in enumerate(cols)}
                 new = {c: r[3 + 2 * i] for i, c in enumerate(cols)}
-                held = _held_strings(field, old)
-                if not held:
-                    continue
-                strings += held
                 moved = [c for c in cols if old[c] != new[c]]
+                if not moved:  # nothing to empty in any place
+                    continue
+                holding += 1
+                receipts = _changed_receipt_identities(cur, old.get("raw"), new.get("raw"))
+                # Skipped, never an abort: 0047 would refuse this row's UPDATE
+                # and take the whole run with it. Restore's check, plus the
+                # exact receipt identities 0047 checks.
+                if any(hub_source_forgotten(cur, p) for p in _payloads(old.get("raw"))) \
+                        or _receipts_forgotten(cur, old.get("raw")):
+                    source_forgotten += 1
+                    continue
+                strings += _held_strings(field, old)
                 change.append({"id": int(r[0]), "old": {c: old[c] for c in moved},
-                               "new": {c: new[c] for c in moved}})
+                               "new": {c: new[c] for c in moved}, "receipts": receipts})
             out.update({
-                "live": len(rows) - forgotten, "holding": len(change), "strings": strings,
+                "live": len(rows) - forgotten, "holding": holding, "strings": strings,
                 "skipped_missing": len(set(ids) - found), "skipped_forgotten": forgotten,
-                "skipped_empty": len(rows) - forgotten - len(change),
+                "skipped_forgotten_source": source_forgotten,
+                "skipped_empty": len(rows) - forgotten - holding,
             })
             if field == "preferences" and change:
                 cur.execute("SELECT count(DISTINCT ref) FROM memory_embeddings WHERE kind = 'episode' "
@@ -298,12 +388,14 @@ def blank(conn, field: str, ids: list[int], *, backup_path: Path | None, apply: 
                               "new_sha256": {k: _sha(v) for k, v in c["new"].items()}} for c in change],
                 })
                 for c in change:
-                    _announce(cur, c["new"].get("raw"))
+                    _announce(cur, c["receipts"])
                     sets = ", ".join(f"{k} = %s::jsonb" for k in c["new"])
                     cur.execute(f"UPDATE episodes SET {sets} WHERE id = %s",
                                 (*c["new"].values(), c["id"]))
                     if cur.rowcount != 1:
                         raise BlankFieldError("a row changed under the run; nothing was changed")
+                _announce(cur, [])
+                _declare_writer(cur)
                 out["backup"] = str(backup_path)
             out["changed"] = len(change)
         conn.commit()
@@ -333,12 +425,12 @@ def _restore_locked(conn, backup: dict[str, Any], *, apply: bool) -> dict[str, A
     from khipu.tombstones import hub_source_forgotten
 
     hub = _hub_identity(conn)
-    if not str(backup.get("hub") or "").startswith("unknown-") and not hub.startswith("unknown-") \
-            and backup.get("hub") != hub:
+    hub_check = _hub_check(backup.get("hub"), hub)
+    if hub_check == "ok" and backup.get("hub") != hub:
         raise BlankFieldError("the backup was taken on another hub; nothing was changed")
     rows = {int(r["id"]): r for r in backup["rows"]}
     out: dict[str, Any] = {"ok": True, "restore": True, "field": backup["field"], "dry_run": not apply,
-                           "rows_in_backup": len(rows)}
+                           "rows_in_backup": len(rows), "hub_check": hub_check}
     try:
         with conn.cursor() as cur:
             from khipu.db import has_columns
@@ -362,20 +454,26 @@ def _restore_locked(conn, backup: dict[str, Any], *, apply: bool) -> dict[str, A
                 if any(c not in now or _sha(now[c]) != entry["new_sha256"][c] for c in entry["old"]):
                     changed += 1
                     continue
-                # This Mac's forget list or the hub's forgotten_sources.
-                if any(hub_source_forgotten(cur, p) for p in _payloads(entry["old"].get("raw"))):
+                # This Mac's forget list or the hub's forgotten_sources, and the
+                # receipts this restore changes back, which 0047 checks.
+                receipts = _changed_receipt_identities(cur, now.get("raw"), entry["old"].get("raw"))
+                if any(hub_source_forgotten(cur, p) for p in _payloads(entry["old"].get("raw"))) \
+                        or _receipts_forgotten(cur, entry["old"].get("raw")):
                     forgotten += 1
                     continue
-                put.append(entry)
+                put.append({**entry, "receipts": receipts})
             out.update({"restorable": len(put), "skipped_missing": missing,
                         "skipped_forgotten": forgotten, "skipped_changed_since": changed})
             if not apply:
                 conn.rollback()
                 return out
             for entry in put:
-                _announce(cur, entry["old"].get("raw"))
+                _announce(cur, entry["receipts"])
                 sets = ", ".join(f"{k} = %s::jsonb" for k in entry["old"])
                 cur.execute(f"UPDATE episodes SET {sets} WHERE id = %s", (*entry["old"].values(), entry["id"]))
+            if put:
+                _announce(cur, [])
+                _declare_writer(cur)
             out["restored"] = len(put)
         conn.commit()
     except BaseException:

@@ -282,8 +282,8 @@ through the gate and added here.
 | `ledger` import | ledger rows | writes no episodes | none |
 | migrations 0027, 0029, 0030 | backfills (source rows, origin, `forgotten_sources`) | 0030 backfills the forgotten identities | none (table locks, see below) |
 | `hygiene.apply_backfill_*`, `capture._claim_unowned_episode`, `cli._cmd_episode_edit` | project/repo_root, origin, summary on existing rows | metadata only; the edit skips forgotten rows | none |
-| `blank_field.blank` (`khipu hygiene blank-field --apply`) | empties `preferences` or removes `verbatim.owner_lines` on listed existing rows (column, `raw` and each `raw.merged_from[].payload`) | metadata only; adds no source; skips forgotten rows (`deleted_at`, under `FOR UPDATE`) | none |
-| `blank_field.restore` (`_restore_locked`; `khipu hygiene blank-field --restore`) | puts a blank-field backup's old values back | `hub_source_forgotten` on `raw` and every merged payload; skips forgotten rows; announces the receipts for 0047 | shared |
+| `blank_field.blank` (`khipu hygiene blank-field --apply`) | empties `preferences` or removes `verbatim.owner_lines` on listed existing rows (column, `raw` and each `raw.merged_from[].payload`) | adds no source; skips forgotten rows (`deleted_at`, under `FOR UPDATE`) and rows naming a forgotten source (`hub_source_forgotten` on `raw` and every merged payload, plus the changed receipts' identities in `forgotten_sources`); announces only the receipts it changes and declares the 0047 fact writer | none |
+| `blank_field.restore` (`_restore_locked`; `khipu hygiene blank-field --restore`) | puts a blank-field backup's old values back | `hub_source_forgotten` on `raw` and every merged payload, plus the changed receipts' identities; skips forgotten rows; announces only the receipts it changes and declares the 0047 fact writer | shared |
 | `identity.remove_project_alias` | project on existing rows (alias undo restores `raw.typed_project`) | metadata only; skips forgotten rows (`deleted_at IS NULL`) | none |
 | `forget.forget_episode` | hub tombstone, `forgotten_sources` | erase | exclusive (`forget.forget_everywhere`) |
 

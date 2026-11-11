@@ -44,7 +44,8 @@ GATE_NAMES = ("write_gate", "write_guard", "hub_source_forgotten", "publish_hub_
 #   erase             forget's own tombstoning
 #   metadata          columns that carry no source, on rows that already exist
 ALLOWED = {
-    # Empties one field on listed live rows (forgotten rows skipped); adds no source.
+    # Empties one field on listed live rows; adds no source. A row naming a
+    # forgotten source (hub_source_forgotten, or a receipt identity) is skipped.
     ("blank_field", "blank"): "metadata",
     # Puts a blank-field backup back: each payload checked with hub_source_forgotten.
     ("blank_field", "_restore_locked"): "gate",
