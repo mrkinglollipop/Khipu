@@ -50,6 +50,8 @@ export type RowModel = {
   label: string;
   /** The line under the name: where agents stop, or that rules decide. */
   sub: string | null;
+  /** A report warning alongside the account's own state and figures. */
+  warning: string | null;
   kind: RowKind;
   line: string;
   word: string;
@@ -208,12 +210,10 @@ export function rowModel(
   now: Date,
 ): RowModel {
   const stop = stopAt(a);
-  const base = { key: a.key, label: a.label, sub: stopAtLine(stop), left: null, stopAtPct: null, ahead };
-  const state = accountState(a, now);
   const usage = plans?.accounts?.find((row) => row.key === a.key);
-  if (usage?.same_account_as && usage.note) {
-    return { ...base, kind: "unknown", line: usage.note, word: "Same account", tone: "warn" };
-  }
+  const warning = usage?.same_account_as && usage.note ? usage.note : null;
+  const base = { key: a.key, label: a.label, sub: stopAtLine(stop), warning, left: null, stopAtPct: null, ahead };
+  const state = accountState(a, now);
   switch (a.state) {
     case "paused":
       return { ...base, kind: "paused", line: state.text, word: "Paused", tone: "none" };
@@ -244,7 +244,7 @@ export function rowModel(
   const extra = a.models?.length && state.text !== "Open" ? ` · ${state.text}` : "";
   const line =
     `${w.left}% left ${windowOf(w.key)}${w.resets ? ` · resets ${w.resets}` : ""}` + extra;
-  return { ...base, kind: "room", line, word: w.word, tone: w.tone, left: w.left, stopAtPct: level };
+  return { ...base, kind: "room", line, word: w.word, tone: warning ? "warn" : w.tone, left: w.left, stopAtPct: level };
 }
 
 /** "Read 3 minutes ago." from the record's own check time. */

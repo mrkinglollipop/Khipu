@@ -10719,6 +10719,12 @@ def _public_account(entry: dict, now: datetime, view: dict | None = None) -> dic
         from khipu import routing_advice
 
         out["advice"] = routing_advice.account_advice(view, entry, now)
+        from khipu import routing_page
+
+        ordered, extra = routing_page._same_account_rows(view, now)
+        marked = next((e for e, _ in (*ordered, *extra) if e["key"] == entry["key"]), {})
+        if marked.get("_same_account_as"):
+            out["same_account_as"] = marked["_same_account_as"]
         if routing_advice.has_check_cap(entry):
             out["check_advice"] = routing_advice.check_advice(view, entry, now)
     out["line"] = account_line(entry, now, push=False)
@@ -10801,8 +10807,13 @@ def _public_sources(sources) -> dict | None:
         files = runner.get("files") if isinstance(runner.get("files"), dict) else {}
         item["files"] = {str(n): _pick(f, ("error", "good_at", "since")) for n, f in files.items()}
         runners.append(item)
+    usage = _pick(sources.get("usage"), ("accounts", "newest"))
+    same = (sources.get("usage") or {}).get("same_accounts")
+    if same:
+        usage = dict(usage or {}, same_accounts={account_id(k): [account_id(peer) for peer in peers]
+                                               for k, peers in same.items()})
     return {"runners": runners, "refused": [str(r) for r in sources.get("refused") or []],
-            "invalid": sources.get("invalid"), "usage": _pick(sources.get("usage"), ("accounts", "newest")),
+            "invalid": sources.get("invalid"), "usage": usage,
             "table": _pick(sources.get("table"), _TABLE_FIELDS)}
 
 
@@ -10924,6 +10935,8 @@ def project_route_view(answer: dict, view: str) -> dict:
                        "state": _route_view_clip(row.get("state")),
                        "until": _route_view_clip(row.get("until")),
                        "pace": _route_view_cap(paces, _ROUTE_VIEW_PACE_CAP)}
+        if row.get("same_account_as"):
+            summary_row["same_account_as"] = _route_view_clip(row["same_account_as"])
         if advice.get("verdict") is not None:
             summary_row["advice"] = {"verdict": _route_view_clip(advice.get("verdict")),
                                      "reason": _route_view_clip(advice.get("reason"))}

@@ -76,6 +76,8 @@ KIMI_TIMEOUT_S = 15.0
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 DEEPSEEK_HISTORY_NAME = "deepseek-balance.json"
 DEFAULT_MAX_AGE_S = 120
+# A failed identity read may reuse a confirmation for at most 30 minutes.
+ACCOUNT_IDENTITY_MAX_AGE_S = 30 * 60
 CACHE_NAME = "usage.json"
 CACHE_VERSION = 2
 REFRESH_LOCK_NAME = "usage.refresh.lock"
@@ -744,7 +746,8 @@ def parse_claude(frames: list[dict]) -> dict:
 
 
 @_guard
-def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S, turn: bool = True) -> dict:
+def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S, turn: bool = True,
+                 identity: bool = True) -> dict:
     """Claude Code's own ``/usage`` figures for the login in ``config_dir``
     (``CLAUDE_CONFIG_DIR``; None = the default ``~/.claude``). Never ``--bare``:
     bare mode skips the keychain, so there is no login to read."""
@@ -758,19 +761,22 @@ def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S, t
     ]
     deadline = time.monotonic() + timeout
     env = probe_environment("claude", config_dir, binary)
-    frames = _converse([binary, *_CLAUDE_ARGS], messages, _claude_is_answer, env=env, deadline=deadline,
-                       close_stdin=True)
+    frames = []
     try:
+        frames = _converse([binary, *_CLAUDE_ARGS], messages, _claude_is_answer, env=env, deadline=deadline,
+                           close_stdin=True)
         data = parse_claude(frames)
     except ProbeError as exc:
-        if exc.code != E_NO_FIGURES or not turn or not _turn_due(config_dir):
-            raise
-        # Keep the existing turn budget; identity is optional and uses only
-        # whatever time remains after the figures have been read.
-        observed = _claude_turn(binary, env, deadline + OVERALL_GRACE_S - 0.25)
-        plan = _text(_dict(_dict(frames[-1], "response"), "response").get("subscription_type"))
-        data = dict(observed, plan=plan) if observed else {"ok": False, "error": E_NO_FIGURES}
-    digest = _claude_identity(binary, config_dir, min(time.monotonic() + 1.5, deadline + OVERALL_GRACE_S - 0.25))
+        data = {"ok": False, "error": exc.code}
+        if exc.code == E_NO_FIGURES and turn and _turn_due(config_dir):
+            # The figures turn keeps its existing budget; optional identity
+            # below still stops at the caller's original deadline.
+            observed = _claude_turn(binary, env, deadline + OVERALL_GRACE_S - 0.25)
+            plan = _text(_dict(_dict(frames[-1], "response"), "response").get("subscription_type"))
+            data = dict(observed, plan=plan) if observed else data
+    # Figures and identity fail independently. No optional read may extend
+    # the caller's deadline, including a refused or timed-out figures read.
+    digest = _claude_identity(binary, config_dir, min(time.monotonic() + 1.5, deadline)) if identity else None
     if digest:
         data["account_digest"] = digest
     return data
@@ -3184,7 +3190,7 @@ def _blank_row(account: dict) -> dict:
 
 
 def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = True, turn: bool = True,
-                  login: bool = True) -> dict:
+                  login: bool = True, identity: bool = True) -> dict:
     # probe_all supplies one shared run for its worker threads. A standalone
     # reset check owns one too, so a helper alarm or stop can unwind this call
     # and kill every vendor process group before the child exits.
@@ -3216,7 +3222,7 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
             # home-less account reads its CLI's default folder.
             data = {"ok": False, "error": E_NO_FOLDER, "note": NO_FOLDER_NOTE}
         elif harness == "claude":
-            data = probe_claude(home, timeout=timeout, turn=turn)
+            data = probe_claude(home, timeout=timeout, turn=turn, identity=identity)
         elif harness == "codex":
             data = probe_codex(home, timeout=timeout, rollout=rollout)
         elif harness == "grok":
@@ -3423,13 +3429,20 @@ def _prev_after_roll(previous: dict | None, row: dict) -> dict:
 
 def _merge(previous: dict | None, row: dict) -> dict:
     out = _merge_figures(previous, row)
-    # Identity follows this attempt, independently of which figures were
-    # kept. A missing identity preserves the hash but is not a fresh match.
+    # Identity has its own confirmation clock, independent of kept figures.
+    # Repeated failures must never move that clock forward.
     if row.get("harness") in ("claude", "grok"):
         digest = row.get("account_digest") or (previous or {}).get("account_digest")
         if digest:
             out["account_digest"] = digest
-        out["account_identity_ok"] = row.get("account_identity_ok") is True
+        if row.get("account_identity_ok") is True and row.get("account_digest"):
+            out["account_identity_at"] = row.get("probed_at")
+            out["account_identity_ok"] = True
+        else:
+            confirmed = (previous or {}).get("account_identity_at") or (previous or {}).get("probed_at")
+            out["account_identity_at"] = confirmed
+            out["account_identity_ok"] = ((previous or {}).get("account_identity_ok") is True
+                                          and _identity_recent(confirmed, _parse_time(row.get("probed_at")) or _now()))
     return out
 
 
@@ -3825,12 +3838,19 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
             "accounts": rows, "summary_text": [summary_line(r) for r in rows]}
 
 
+def _identity_recent(confirmed, now: datetime) -> bool:
+    at = _parse_time(confirmed)
+    return at is not None and 0 <= (now - at).total_seconds() <= ACCOUNT_IDENTITY_MAX_AGE_S
+
+
 def same_account_groups(rows: dict[str, dict]) -> dict[str, list[str]]:
-    """Only current, successful CLI identity readings can establish a match."""
+    """Only recently confirmed CLI identities can establish a match."""
     groups: dict[tuple, list[str]] = {}
+    now = _now()
     for key, row in rows.items():
         digest = row.get("account_digest")
         if (row.get("harness") in ("claude", "grok") and row.get("account_identity_ok") is True
+                and _identity_recent(row.get("account_identity_at") or row.get("probed_at"), now)
                 and isinstance(digest, str) and re.fullmatch(r"sub:[0-9a-f]{24}", digest)):
             groups.setdefault((row["harness"], digest), []).append(key)
     return {key: [other for other in group if other != key]

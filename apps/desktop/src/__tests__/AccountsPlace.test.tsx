@@ -100,11 +100,35 @@ it("renders the same-account warning for both successful usage rows", async () =
     return <Accounts routing={routing} plans={{ accounts: notes }} thisMac="M5" now={NOW} />;
   }
   const { container } = render(<SameAccounts />);
-  await waitFor(() => expect(screen.getAllByText("Same account").length).toBeGreaterThanOrEqual(2));
+  await waitFor(() => expect(screen.getAllByText("On pace").length).toBeGreaterThanOrEqual(2));
   for (const row of notes) expect(screen.getAllByText(row.note).length).toBeGreaterThanOrEqual(1);
   expect(container.querySelectorAll(".ac-pace.warn")).toHaveLength(2);
+  expect(container.querySelectorAll(".ac-meter")).toHaveLength(2);
+  expect(screen.getByRole("article", { name: "Claude" }).textContent).toContain("62% left");
   expect(writes()).toEqual([]);
 });
+
+it.each([["limited", "Out of room"], ["paused", "Paused"], ["down", "Down"]])(
+  "keeps a duplicate %s account's state and windows", async (state, word) => {
+    accounts = [claude({ state, until: at(70) })];
+    const note = "Reads the same account as Claude second: both folders are signed in to one account.";
+    function SameAccounts() {
+      const routing = useRouting(true);
+      return <Accounts routing={routing} plans={{ accounts: [{ key: "claude|", ok: true,
+        same_account_as: "Claude second", note }] }} thisMac="M5" now={NOW} />;
+    }
+    render(<SameAccounts />);
+    const button = await screen.findByRole("button", { name: /^Claude/ });
+    expect(button.textContent).toContain(word);
+    expect(within(button).getByText(note)).toBeTruthy();
+    fireEvent.click(button);
+    const page = await screen.findByRole("article", { name: "Claude" });
+    expect(page.textContent).toContain(word);
+    if (state !== "down") expect(page.textContent).toContain("62% left");
+    expect(within(page).getByText(note)).toBeTruthy();
+    expect(writes()).toEqual([]);
+  },
+);
 
 function Place() {
   const routing = useRouting(true);

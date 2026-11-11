@@ -107,7 +107,8 @@ def test_two_folders_same_account_and_owner_order(logins, caplog, capsys):
         page = routing.page(view, datetime.now(timezone.utc))
         assert f"1. {order[0]['label']}: OK." in page
         assert f"2. {order[1]['label']}: SAME ACCOUNT." in page
-        assert usage.same_account_note(order[0]["label"]) in page
+        assert usage.same_account_note(order[1]["label"]) in page
+        assert f"Same account as {order[0]['label']}." in page
     assert settings["usage_accounts"] == accounts[:2]
 
 
@@ -119,15 +120,26 @@ def test_different_accounts_or_organizations_are_not_duplicates(logins, change):
 
 
 @pytest.mark.parametrize("failure", [{"mode": "fail"}, {"mode": "malformed"}, {"loggedIn": False}, {"orgId": None}])
-def test_identity_failure_keeps_hash_without_a_mark_or_usage_error(logins, failure, caplog, capsys):
+def test_identity_failure_keeps_hash_and_match_for_only_thirty_minutes(logins, failure, caplog, capsys, monkeypatch):
     accounts, _, identity, _, _ = logins
+    now = usage._now()
+    monkeypatch.setattr(usage, "_now", lambda: now)
     old = read(accounts[:2])["accounts"][1]["account_digest"]
     identity(1, **failure)
     report = read(accounts[:2])
-    assert all("same_account_as" not in row for row in report["accounts"])
+    assert all(row.get("same_account_as") for row in report["accounts"])
     failed = report["accounts"][1]
     assert failed["account_digest"] == old
-    assert failed["ok"] and failed["error"] is None and failed["note"] is None
+    assert failed["ok"] and failed["error"] is None
+    assert_private(report, caplog, capsys)
+    # Failed attempts must not slide the confirmation time forward.
+    now += timedelta(minutes=29)
+    assert read(accounts[:2])["accounts"][1]["same_account_as"]
+    now += timedelta(minutes=1, seconds=1)
+    report = read(accounts[:2])
+    assert all("same_account_as" not in row for row in report["accounts"])
+    failed = report["accounts"][1]
+    assert failed["account_digest"] == old and failed["note"] is None
     assert not failed["account_identity_ok"]
     assert "same_accounts" not in routing_sources.usage_evidence({usage._key(a) for a in accounts[:2]})[1]
     assert_private(report, caplog, capsys)
@@ -201,3 +213,146 @@ def test_identity_updates_even_when_newer_figures_are_kept():
     merged = usage._merge(before, after)
     assert merged["account_digest"] == after["account_digest"]
     assert merged["account_identity_ok"]
+
+
+@pytest.mark.parametrize("error", [usage.E_NO_FIGURES, usage.E_NO_LIMITS, usage.E_TIMEOUT])
+@pytest.mark.parametrize("turn", [False, True])
+def test_figures_failure_still_reads_identity_and_keeps_cached_room(logins, monkeypatch, error, turn):
+    accounts, _, _, _, _ = logins
+    before = read(accounts[:2])["accounts"]
+    monkeypatch.setattr(usage, "_turn_due", lambda *_a, **_kw: False)
+
+    def refused(*_a, **_kw):
+        if error == usage.E_TIMEOUT:
+            raise usage.ProbeError(error)
+        return [{"type": "control_response", "response": {"request_id": "usage", "response": {
+            "rate_limits": None, "rate_limits_available": error == usage.E_NO_FIGURES}}}]
+
+    monkeypatch.setattr(usage, "_converse", refused)
+    rows = [usage._merge(old, usage.probe_account(a, turn=turn)) for a, old in zip(accounts[:2], before)]
+    usage.mark_same_accounts(rows)
+    assert all(not r["ok"] and r["error"] == error for r in rows)
+    assert all(r["account_identity_ok"] and r.get("same_account_as") for r in rows)
+    assert all(r["last_good_at"] == old["last_good_at"] and r["windows"] == old["windows"]
+               for r, old in zip(rows, before))
+
+
+def test_cached_identity_expires_without_another_attempt(logins, monkeypatch):
+    accounts, _, _, _, _ = logins
+    now = usage._now()
+    monkeypatch.setattr(usage, "_now", lambda: now)
+    rows = read(accounts[:2])["accounts"]
+    now += timedelta(minutes=30, seconds=1)
+    assert not usage.same_account_groups({r["key"]: r for r in rows})
+
+
+def test_identity_deadline_never_extends_the_callers_timeout(logins, monkeypatch):
+    accounts, _, _, _, _ = logins
+    clock = [100.0]
+    deadlines = []
+    monkeypatch.setattr(usage.time, "monotonic", lambda: clock[0])
+
+    def figures(*_a, **_kw):
+        clock[0] = 100.8
+        return []
+
+    monkeypatch.setattr(usage, "_converse", figures)
+    monkeypatch.setattr(usage, "parse_claude", lambda _: {"ok": True})
+    monkeypatch.setattr(usage, "_claude_identity", lambda _b, _h, deadline: deadlines.append(deadline))
+    usage.probe_account(accounts[0], timeout=1, turn=False)
+    assert deadlines == [101.0]
+
+
+def test_identity_can_be_disabled_by_plan_only_callers(logins, monkeypatch):
+    accounts, _, _, calls, _ = logins
+    row = usage.probe_account(accounts[0], turn=False, identity=False)
+    assert row["ok"]
+    assert ["auth", "status", "--json"] not in [json.loads(line) for line in calls.read_text().splitlines()]
+
+
+def paired_view(*, reverse=False, state="open"):
+    entries = [{"key": "claude|/synthetic/first", "label": "Claude", "harness": "claude", "state": "open"},
+               {"key": "claude|/synthetic/second", "label": "Claude second", "harness": "claude", "state": state}]
+    order = list(reversed(entries)) if reverse else entries
+    return {"record": True, "accounts": entries, "priority": {"entries": [{"account": e["key"]} for e in order]},
+            "sources": {"usage": {"same_accounts": {e["key"]: [entries[1-i]["key"]] for i, e in enumerate(entries)}}}}
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("peer_state", ["open", "paused"])
+def test_advice_and_json_never_offer_duplicate_room(reverse, peer_state):
+    from khipu import routing_advice
+
+    view = paired_view(reverse=reverse)
+    first, second = [next(e for e in view["accounts"] if e["key"] == p["account"])
+                     for p in view["priority"]["entries"]]
+    first["state"] = peer_state
+    now = datetime.now(timezone.utc)
+    ranked = routing_advice.rank(view, now)
+    assert [r["label"] for r in ranked] == [first["label"], second["label"]]
+    duplicate = ranked[1]
+    assert duplicate["verdict"] != "go"
+    assert duplicate["same_account_as"] == first["label"]
+    assert f"same account as {first['label']}" in duplicate["why_ranked"]
+    direct = routing_advice.account_advice(view, second, now)
+    assert direct["verdict"] != "go" and direct["same_account_as"] == first["label"]
+    public = routing._public_account(second, now, view)
+    assert public["same_account_as"] == first["label"]
+    summary = routing.project_route_view({"accounts": [public]}, "summary")
+    assert summary["accounts"][0]["same_account_as"] == first["label"]
+    sources = routing._public_sources(view["sources"])
+    expected = {routing.account_id(k): [routing.account_id(p) for p in peers]
+                for k, peers in view["sources"]["usage"]["same_accounts"].items()}
+    assert sources["usage"]["same_accounts"] == expected
+    assert "/synthetic/" not in json.dumps([sources, public, ranked])
+
+
+@pytest.mark.parametrize("state,held,word", [("paused", False, "PAUSED"), ("open", True, "NO JOBS"),
+    ("limited", False, "LIMIT REACHED"), ("down", False, "DOWN"), ("unknown", False, "UNKNOWN")])
+def test_duplicate_page_keeps_closed_state_and_note(state, held, word):
+    view = paired_view(state=state)
+    view["accounts"][1]["until"] = "2026-12-01T12:00:00Z"
+    if held:
+        view["holds"] = [{"scope": {"kind": "account", "account": view["accounts"][1]["key"]},
+                          "owner": True, "text": "Keep this hold visible"}]
+    page = routing.page(view, datetime.now(timezone.utc))
+    line = next(line for line in page.splitlines() if line.startswith("2. "))
+    assert line.startswith(f"2. Claude second: {word}")
+    assert "Same account as Claude" in line
+    if held:
+        assert "Keep this hold visible" in line
+    if state in ("paused", "limited"):
+        assert "Dec 01 12:00Z" in line
+
+
+@pytest.mark.parametrize("state", ["open", "paused"])
+def test_signature_changes_when_same_account_appears_or_clears(state):
+    view = paired_view(state=state)
+    now = datetime.now(timezone.utc)
+    same = view["sources"]["usage"].pop("same_accounts")
+    before = routing_page.signature(view, now)
+    view["sources"]["usage"]["same_accounts"] = same
+    assert routing_page.signature(view, now) != before
+    facts = routing_page.facts(view, now)["accounts"]
+    assert facts[0]["same_as"] == [view["accounts"][1]["key"]]
+    assert facts[1]["same_as"] == [view["accounts"][0]["key"]]
+    assert facts[1]["word"] == ("SAME ACCOUNT" if state == "open" else "PAUSED")
+    assert "SAME ACCOUNT" in routing_page.WORDS
+    view["sources"]["usage"].pop("same_accounts")
+    assert routing_page.signature(view, now) == before
+
+
+def test_page_full_note_only_on_first_row_and_shortens_before_rules(monkeypatch):
+    view = paired_view()
+    view["rules"] = [{"text": "Keep every owner rule. " + "Standing wording. " * 30}]
+    now = datetime.now(timezone.utc)
+    page = routing.page(view, now)
+    assert page.count("Sign one of them in to the other account.") == 1
+    assert "2. Claude second: SAME ACCOUNT. Same account as Claude." in page
+    compact = page.replace(" Sign one of them in to the other account.", "")
+    monkeypatch.setattr(routing_page, "LIMIT", len(compact))
+    fitted = routing.page(view, now)
+    assert "Keep every owner rule." in fitted and "more rule lines" not in fitted
+    assert "Sign one of them in" not in fitted
+    assert "both folders are signed in to one account." in fitted
+    assert len(fitted) <= len(compact)
