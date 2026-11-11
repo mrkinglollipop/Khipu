@@ -305,7 +305,7 @@ def test_a_timed_move_is_an_exception_that_ends_by_itself(seeded):
 
 def test_apply_pauses_until_the_time_shown_and_undo_opens_it(seeded):
     _rc, shown = preview(seeded, "pause grok until Monday")
-    assert shown["now"] == "Open to agents"
+    assert shown["now"] == "Not paused"  # nothing has read it open yet, so the preview doesn't say so
     assert shown["after"] == "Paused until Mon 16 Nov, 12:00 am. It opens again on its own."
     rc, done = save(seeded, shown["token"])
     assert rc == 0 and done["receipt"]["text"] == "Paused Grok until Mon 16 Nov, 12:00 am."
@@ -693,6 +693,14 @@ def test_resume_says_the_pause_ends_and_what_the_account_is_then(seeded):
     text = done["receipt"]["text"]
     assert "open to agents" not in text.lower(), done
     assert text.startswith("Lifted the pause on Grok.") and "still limited until" in text, text
+
+
+def test_a_pause_preview_of_a_limited_account_does_not_call_it_open(seeded):
+    routing.report(account="Grok", state="limited", until="2h", via="cli", now=NOW)
+    rc, shown = preview(seeded, "pause grok until Monday")
+    assert rc == 0, shown
+    assert "open to agents" not in shown["now"].lower(), shown
+    assert shown["now"].startswith("Limited until "), shown
 
 
 def test_resume_of_an_account_with_nothing_else_on_it_says_it_is_open(seeded):

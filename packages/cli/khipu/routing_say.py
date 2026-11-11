@@ -446,7 +446,7 @@ def _pause(key: str, label: str, end_spec: str | None, now: datetime) -> dict:
     current = pin_value(pin, now, view)
     entry = next(a for a in view["accounts"] if a["key"] == key)
     was = (f"Paused until {when_words(routing._parse(entry['until']))}" if current[0] and entry.get("until")
-           else "Paused until you resume it" if current[0] else "Open to agents")
+           else "Paused until you resume it" if current[0] else _unpaused_words(entry))
     return _plan("pause", understood=f"Pause {label} until {when_words(end)}", now_words=was,
                  after_words=f"Paused until {when_words(end)}. It opens again on its own.",
                  argv=["route", "pause", key, "--from-app", "--until=" + _iso(end), _expect(current)],
@@ -468,6 +468,18 @@ def _resume(key: str, label: str, end_spec: str | None, now: datetime) -> dict:
     return _plan("resume", understood=f"Resume {label}", now_words="Paused by you",
                  after_words=after, argv=["route", "lift", key, "--from-app", _expect(current)],
                  pin=dict(pin, value=current), receipt=f"Lifted the pause on {label}.", account=label)
+
+
+def _unpaused_words(entry: dict) -> str:
+    """What an account that is not paused is now: "Open to agents" only when it is."""
+    state, until = entry.get("state"), routing._parse(entry["until"]) if entry.get("until") else None
+    if state == routing.OPEN:
+        return "Open to agents"
+    if state == routing.LIMITED:
+        return f"Limited until {when_words(until)}" if until else "Limited"
+    if state == routing.DOWN:
+        return "Down"
+    return "Not paused"
 
 
 def state_words(entry: dict) -> str:
