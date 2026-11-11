@@ -752,6 +752,9 @@ def _merge_into_episode(
     has_verbatim = has_columns(cur, "episodes", "verbatim")
     if has_verbatim:
         cols += ", verbatim"
+    has_parent = has_columns(cur, "episodes", "parent_session_id")
+    if has_parent:
+        cols += ", parent_session_id"
     live = " AND deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
     cur.execute(f"SELECT {cols} FROM episodes WHERE id = %s{live} FOR UPDATE", (target_id,))
     row = cur.fetchone()
@@ -759,6 +762,7 @@ def _merge_into_episode(
         return False
     topics, decisions, preferences, people, raw, target_ts, target_summary = row[:7]
     tags = row[7] if has_tags else None
+    target_parent = row[-1] if has_parent else None
     from khipu.capture_identity import record_source, source_identity
     from khipu.tombstones import hub_source_forgotten
 
@@ -785,14 +789,26 @@ def _merge_into_episode(
     raw.setdefault("summary", target_summary)
     verbatim = dict((row[8 if has_tags else 7] if has_verbatim else raw.get("verbatim")) or {})
     incoming = payload.get("verbatim") if isinstance(payload.get("verbatim"), dict) else {}
-    if isinstance(verbatim.get("owner_lines"), list) != isinstance(incoming.get("owner_lines"), list):
+    from khipu.commitments import ORIGIN_JOB, capture_origin
+
+    # A job side (lineage or ``session_origin: job``, as memory_rows.job_row_sql
+    # reads a stored row) has no owner words: its user turns are briefs.
+    target_job = bool(str(target_parent or "").strip()) or capture_origin(
+        {"session_origin": (raw or {}).get("session_origin")}) == ORIGIN_JOB
+    incoming_job = capture_origin(payload) == ORIGIN_JOB
+    if (isinstance(verbatim.get("owner_lines"), list) != isinstance(incoming.get("owner_lines"), list)
+            or target_job != incoming_job):
         # One side was captured before owner_lines were always stored: its
         # owner words are its quotes (memory_rows.owner_lines_of). They join
-        # the merged list, so neither side's owner words change.
-        def _owner_words(v: dict) -> list:
+        # the merged list, so neither side's owner words change. A job side
+        # gives none, so its quotes never become the merged row's owner words.
+        def _owner_words(v: dict, job: bool) -> list:
+            if job:
+                return []
             return v["owner_lines"] if isinstance(v.get("owner_lines"), list) else list(v.get("quotes") or [])
 
-        verbatim["owner_lines"] = _union_json_list(_owner_words(verbatim), _owner_words(incoming))
+        verbatim["owner_lines"] = _union_json_list(_owner_words(verbatim, target_job),
+                                                   _owner_words(incoming, incoming_job))
         incoming = {k: v for k, v in incoming.items() if k != "owner_lines"}
     for key, value in incoming.items():
         if isinstance(value, list):

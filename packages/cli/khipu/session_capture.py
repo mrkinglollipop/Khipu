@@ -2905,15 +2905,46 @@ def _sdk_run(stats: dict) -> bool:
 T3_NAMING_GRACE_S = 600
 
 
+_HEAD_BYTES = 64 * 1024
+_HEAD_LINES = 50
+
+
+def _session_start_ts(path: Path) -> float | None:
+    """The session's start: the ``timestamp`` of the transcript's first line
+    that has one, read from the head only (at most the first 64 KiB or 50
+    lines, never the whole file). None when the head has none or cannot be
+    read. Never raises."""
+    try:
+        stream = _db_stream(path)
+        if stream is not None:
+            head = stream[:_HEAD_BYTES]
+        else:
+            with path.open("rb") as f:
+                head = f.read(_HEAD_BYTES)
+        for raw_bytes in head.split(b"\n")[:_HEAD_LINES]:
+            try:
+                d = json.loads(raw_bytes.decode("utf-8", "replace").strip() or "null")
+            except ValueError:
+                continue
+            if isinstance(d, dict) and isinstance(d.get("timestamp"), str):
+                ts = _parse_ts(d["timestamp"])
+                if ts is not None:
+                    return ts
+    except Exception:  # noqa: BLE001 — an age read must never fail a capture
+        return None
+    return None
+
+
 def _headless_outside_t3(thread: str | None, sid: str, window_ts: float | None = None,
                          now: float | None = None) -> bool:
     """T3's record definitively has no thread for this session, so an SDK-driven
     run is a script's or an orchestrator's, not a person's. No T3 database on
     the machine is that answer too (not every user has T3); one that cannot be
     read is not, and the lines are kept. With T3 present, the answer counts
-    only when the window's first line (``window_ts``) is at least
-    T3_NAMING_GRACE_S old: younger or unknown, T3 may not have named the
-    thread yet, and the lines are kept. Never raises."""
+    only when the session started (``window_ts``: the caller passes the
+    transcript head's first timestamp, else the window's first line's) at
+    least T3_NAMING_GRACE_S ago: younger or unknown, T3 may not have named
+    the thread yet, and the lines are kept. Never raises."""
     if thread:
         return False
     try:
@@ -2995,7 +3026,8 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     (``read_window``'s typed user messages, redacted) becomes each part's
     ``owner_lines``, an empty list when none was typed, except in a job's
     capture, which carries no ``owner_lines`` at all. ``window_ts`` is the
-    window's first line's time (``read_window``'s ``first_line_ts``)."""
+    window's first line's time (``read_window``'s ``first_line_ts``), the
+    fallback for the session's start when the transcript head has none."""
     off_before = int(st.get("offset", 0))
     # W1.2/W1.3: resolve identity from the cwd, not the model. Never
     # raises (identity.resolve_repo_root is itself fail-open); this
@@ -3050,7 +3082,8 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     # Decided once, here: the job label below and the owner-lines skip use it.
     # Nobody types into a job, so its user turns are briefs and relays.
     is_job = bool(job_parent or st.get("origin") == "job" or delegated
-                  or (sdk_run and _headless_outside_t3(thread, sid, window_ts)))
+                  or (sdk_run and _headless_outside_t3(
+                      thread, sid, _session_start_ts(path) or window_ts)))
     owner_lines = [[] for _ in parts] if is_job else _owner_lines_by_part(parts, typed)
     for i, part in enumerate(parts, start=1):
         job = {"harness": harness, "session_id": sid, "cwd": cwd, "event": event,

@@ -656,3 +656,85 @@ def test_a_merge_keeps_each_sides_owner_words():
     assert _owner_match(vb, 'amber reset') and _owner_match(vb, 'lapis hinge') == DESK_TYPED
     assert _owner_match(vb, 'quartz anvil') is None
     assert cur.episodes[1]['raw']['merged_from'][0]['payload']['verbatim'] == incoming['verbatim']
+
+
+# ---- round 3 on #577: the session's age, and a job side in a merge ---------------
+
+def _second_window(tmp_path, rows):
+    """Append ``rows`` to T3_SID's transcript and run a due SessionEnd: the
+    queued job for that window."""
+    for p in session_capture.queued_jobs():
+        p.unlink()
+    path = tmp_path / '.claude' / 'projects' / 'p' / f'{T3_SID}.jsonl'
+    with path.open('a') as f:
+        for r in rows:
+            f.write(json.dumps(r) + '\n')
+    out = session_capture.hook_main(json.dumps({'hook_event_name': 'SessionEnd', 'session_id': T3_SID,
+                                                'cwd': str(tmp_path), 'transcript_path': str(path)}),
+                                    'claude_code')
+    assert out.get('due'), out
+    return json.loads(session_capture.queued_jobs()[0].read_text())
+
+
+def test_a_never_named_sdk_session_thirty_minutes_old_is_a_job_in_every_window(tmp_path, monkeypatch):
+    """Muse's probe: the session started 30 minutes ago and T3 never named it.
+    Window 1 is a job; window 2, whose first line is 2 minutes old, is too:
+    the grace counts from the session's start, not the window's."""
+    _synthetic_t3(tmp_path, monkeypatch, thread=False)
+    _assert_a_job_without_owner_lines(json.loads(_queue(tmp_path, _headless_rows(30)).read_text()))
+    later = 'Next, polish the hematite sprocket and report back.'
+    _assert_a_job_without_owner_lines(_second_window(tmp_path, _headless_rows(2, later)))
+
+
+def test_a_session_whose_head_is_two_minutes_old_keeps_its_lines_in_a_later_window(tmp_path, monkeypatch):
+    _synthetic_t3(tmp_path, monkeypatch, thread=False)
+    job = json.loads(_queue(tmp_path, _headless_rows(2)).read_text())
+    assert 'origin' not in job and job.get('owner_lines') == [HEADLESS_BRIEF]
+    later = 'Then tidy the hematite sprocket notes.'
+    job = _second_window(tmp_path, _headless_rows(1, later))
+    assert 'origin' not in job and job.get('owner_lines') == [later], job
+
+
+def test_the_session_start_is_read_from_the_head_only(tmp_path):
+    import time
+
+    path = _write(tmp_path, 'h.jsonl', _headless_rows(None) + _headless_rows(30) + _headless_rows(1, 'later'))
+    assert 29 * 60 < time.time() - session_capture._session_start_ts(path) < 31 * 60
+    # past the first 50 lines the head has no timestamp: unknown, never a full read
+    deep = _write(tmp_path, 'd.jsonl', _headless_rows(None) * 30 + _headless_rows(30))
+    assert session_capture._session_start_ts(deep) is None
+    assert session_capture._session_start_ts(tmp_path / 'missing.jsonl') is None
+
+
+def _merge(target, incoming):
+    from khipu import capture as cap
+    from tests.test_audit1010_capb import Cursor
+
+    cur = Cursor({1: target})
+    with mock.patch.object(cap, '_reembed_merged_episode'), \
+            mock.patch('khipu.deliverables.insert_deliverables_from_episode', return_value=0), \
+            mock.patch('khipu.topic_graph.persist_capture_graph', return_value={}), \
+            mock.patch('khipu.embed.embed_one', side_effect=RuntimeError('offline')):
+        assert cap._merge_into_episode(cur, 1, incoming, matched_via='jaccard', score=.9)
+    return cur.episodes[1]['verbatim']
+
+
+JOB_BRIEF = 'Read the brief and fix the onyx turbine, then stop.'
+
+
+def test_a_job_merged_into_a_conversation_gives_no_owner_words():
+    from tests.test_audit1010_capb import episode
+
+    typed = 'please keep the amber reset intact'
+    conv = episode(verbatim={'quotes': [typed], 'owner_lines': [typed]})
+    job = episode(ts='2026-10-10T00:01:00Z', session_id='claude_code:job', transcript_range='100:200',
+                  session_origin='job', verbatim={'quotes': [JOB_BRIEF]})
+    vb = _merge(conv, job)
+    assert vb['owner_lines'] == [typed] and JOB_BRIEF in vb['quotes']
+    assert _owner_match(vb, 'onyx turbine') is None
+    # lineage marks a job too, and a row stored before the list keeps its quotes as its owner words
+    old = episode(verbatim={'quotes': [typed]})
+    child = episode(ts='2026-10-10T00:01:00Z', session_id='claude_code:child', transcript_range='100:200',
+                    parent_session_id='claude_code:parent', verbatim={'quotes': [JOB_BRIEF]})
+    vb = _merge(old, child)
+    assert vb['owner_lines'] == [typed] and _owner_match(vb, 'onyx turbine') is None
