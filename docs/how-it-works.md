@@ -373,7 +373,9 @@ stateDiagram-v2
 |---|---|---|
 | `legacy` | Files only | Existing capture scripts only. Full rollback. |
 | `dual` | Files and Khipu | Legacy capture continues and mirrors into PostgreSQL. The default. |
-| `hub` | Khipu only | Khipu owns writes, with the outbox behind it. |
+| `hub` | Khipu only | Khipu owns writes, with the outbox behind it. The old capture script does not run. |
+
+In `hub` mode the session files (`episodes.jsonl`) get their lines from the hub, once a night. The nightly adds one line for each live episode that has none yet (`khipu capture export`, `--dry-run` to count first). It never changes, reorders or deletes a line that is already there, and never writes a forgotten episode. The old script's extra preference pass no longer runs, so new lines carry only the preferences the hub holds. Lines written before this change keep theirs. Episodes no longer flow from the files back into the hub; `khipu reconcile` now syncs topic pages only.
 
 Change it in Settings, Capture & models, or with `khipu config --set-capture-mode`. The app control is locked when `KHIPU_CAPTURE_MODE` is set in the environment.
 
