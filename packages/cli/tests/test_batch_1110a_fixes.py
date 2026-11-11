@@ -28,9 +28,9 @@ def test_search_looks_up_the_new_fields_only_for_rows_that_remain(hub, monkeypat
     asked: list = []
     real = memory_rows.episode_facts
 
-    def recording(cur, wanted):
+    def recording(cur, wanted, **kw):
         asked.extend(str(i) for i in wanted)
-        return real(cur, wanted)
+        return real(cur, wanted, **kw)
 
     monkeypatch.setattr(memory_rows, "episode_facts", recording)
     tombstones.publish_episode_ids({int(ids[0])})
