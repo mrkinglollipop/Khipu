@@ -77,6 +77,61 @@ class PersistentCaptureRetryTest(unittest.TestCase):
             sc._write_retry_state(path, retry)
         return path, job
 
+    def test_job_preferences_are_empty_in_checkpoint_delivery_and_storage_forms(self):
+        from khipu import capture, embed, mirror
+        from tests.test_capture import _EpisodesFakeCursor
+
+        preference = "The brief's synthetic preference must never be stored."
+        for marks in ({"origin": "job"}, {"parent_session_id": "claude_code:parent"},
+                      {"origin": "job", "subagent": True},
+                      {"origin": "job", "subagent": True, "has_owner_turn": True}):
+            for cached in (False, True):
+                with self.subTest(marks=marks, cached=cached):
+                    extracted = {"summary": "Synthetic task finished.", "topics": [],
+                                 "preferences": [preference]}
+                    extra = {"extracted_payload": dict(extracted)} if cached else {}
+                    path, _ = self.enqueue(part="1/1", **marks, **extra)
+                    self.extract.side_effect = None
+                    self.extract.return_value = extracted
+                    self.extract.reset_mock()
+                    self.capture.return_value = 1  # keep the checkpoint for inspection
+                    out = sc.drain()
+                    self.assertEqual(out["failed"], 1)
+                    self.assertEqual(self.extract.call_count, 0 if cached else 1)
+                    checkpoint = json.loads(path.read_text())["extracted_payload"]
+                    payload = self.capture.call_args.args[0]
+                    self.assertEqual(checkpoint["preferences"], [])
+                    self.assertEqual(payload["preferences"], [])
+                    self.assertNotIn(preference, embed.episode_text(payload))
+                    cur = _EpisodesFakeCursor()
+                    self.assertTrue(mirror._upsert_episode(cur, payload))
+                    stored = cur.episodes[1]
+                    self.assertEqual(stored["preferences"], [])
+                    self.assertEqual(stored["raw"]["preferences"], [])
+                    self.assertTrue(capture._merge_into_episode(
+                        cur, 1, {**payload, "ts": "2026-10-23T20:00:22Z"},
+                        matched_via="jaccard", score=0.9))
+                    merged = cur.episodes[1]
+                    self.assertEqual(merged["preferences"], [])
+                    self.assertEqual(merged["raw"]["preferences"], [])
+                    self.assertEqual(merged["raw"]["merged_from"][0]["payload"]["preferences"], [])
+                    sc._write_retry_state(path, {})
+                    self.capture.return_value = 0
+                    self.assertEqual(sc.drain()["captured"], 1)
+                    self.assertEqual(self.capture.call_args.args[0]["preferences"], [])
+                    self.assertEqual(self.extract.call_count, 0 if cached else 1)
+
+    def test_job_with_owner_typing_and_normal_conversation_keep_preferences(self):
+        for marks in ({"origin": "job", "has_owner_turn": True},
+                      {"parent_session_id": "claude_code:parent", "has_owner_turn": True}, {}):
+            with self.subTest(marks=marks):
+                self.enqueue(part="1/1", **marks)
+                self.extract.side_effect = None
+                self.extract.return_value = {"summary": "Synthetic work.", "preferences": ["Keep concise notes."]}
+                self.capture.return_value = 0
+                self.assertEqual(sc.drain()["captured"], 1)
+                self.assertEqual(self.capture.call_args.args[0]["preferences"], ["Keep concise notes."])
+
     def test_failure_is_persistent_backed_off_and_held_until_existing_owner_retry(self):
         from khipu import outbox
 
@@ -1527,3 +1582,97 @@ def test_prompts_nobody_typed_are_not_typed_lines_in_capture():
     assert "[notification: session-start] Task (from the session" in said
     assert "[notification: task-notification] job done" in said
     assert said.rstrip().endswith("pause Codex until tonight")
+
+
+_TASK_ENVELOPE = ("<task-notification><task-id>synthetic-task</task-id><tool-use-id>synthetic-tool</tool-use-id>"
+                  "<status>completed</status><summary>Synthetic check finished.</summary></task-notification>")
+_TASK_MARKS = {"origin": {"kind": "task-notification", "producer": "session-task", "runId": "synthetic-run"},
+               "promptSource": "system", "turnOrigin": "task_notification", "entrypoint": "claude-desktop",
+               "turnPosition": {"promptIndex": 3, "turnIndex": 6}, "userType": "external", "isSidechain": False}
+
+
+@_pytest.mark.parametrize("text,marks", [
+    (_TASK_ENVELOPE, _TASK_MARKS),
+    ("<system-reminder>Injected context.</system-reminder>\n" + _TASK_ENVELOPE, _TASK_MARKS),
+    ("Synthetic task compaction result.", {**_TASK_MARKS, "isCompactSummary": True}),
+    ("Synthetic completion.", {"origin": _TASK_MARKS["origin"]}),
+    ("Synthetic completion.", {"promptSource": "system"}),
+    ("Synthetic completion.", {"turnOrigin": "task_notification"}),
+    (_TASK_ENVELOPE, {}),
+    ("<system-reminder>" + _TASK_ENVELOPE + "</system-reminder>", {}),
+    ("Synthetic completion.", {"origin": _TASK_MARKS["origin"], "turnOrigin": "human"}),
+    ("Synthetic completion.", {"promptSource": "system", "turnOrigin": "human"}),
+])
+def test_desktop_task_notifications_never_supply_owner_lines(tmp_path, text, marks):
+    from khipu import extract, memory_rows
+
+    row = {"type": "user", "promptId": "synthetic-notice", "message": {"role": "user", "content": text}, **marks}
+    path = _write(tmp_path / "notification.jsonl", [row])
+    stats = {}
+    msgs, _, users = sc.read_window(path, 0, stats=stats)
+    assert users == 0 and stats["typed"] == [] and not stats["has_owner_turn"]
+    lines = extract.owner_lines(stats["typed"])
+    assert lines == []
+    verbatim = {**extract.extract_verbatim(sc.render(msgs)), "owner_lines": lines}
+    assert memory_rows.owner_lines_of(verbatim) == []
+    assert memory_rows.owner_line(memory_rows.owner_lines_of(verbatim), "synthetic", ["synthetic"]) is None
+
+    typed = "Keep the next synthetic report concise."
+    _write(path, [row, {"type": "user", "turnOrigin": "human", "promptId": "synthetic-owner",
+                        "message": {"role": "user", "content": typed}}])
+    msgs, _, users = sc.read_window(path, 0, stats=stats)
+    assert users == 1 and stats["typed"] == [typed] and stats["has_owner_turn"]
+    assert extract.owner_lines(stats["typed"]) == [typed]
+    if "<summary>" in text and not text.startswith("<system-reminder><task-notification>"):
+        assert "[notification: task-notification] Synthetic check finished." in sc.render(msgs)
+
+
+def test_human_marked_compact_summary_never_supplies_owner_lines_or_owner_turn(tmp_path):
+    from khipu import extract, memory_rows
+
+    path = _write(tmp_path / "summary.jsonl", [
+        {"type": "user", "isCompactSummary": True, "turnOrigin": "human",
+         "message": {"role": "user", "content": "Keep synthetic summary rules forever."}},
+    ])
+    stats = {}
+    sc.read_window(path, 0, stats=stats)
+    assert stats["typed"] == [] and not stats["has_owner_turn"]
+    lines = extract.owner_lines(stats["typed"])
+    assert lines == [] and memory_rows.owner_lines_of({"owner_lines": lines}) == []
+
+
+@_pytest.mark.parametrize("typed_kind", ["none", "human", "queued-human", "paste-only"])
+def test_job_queue_remembers_explicit_owner_typing_across_windows(tmp_path, monkeypatch, typed_kind):
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
+    monkeypatch.setenv("KHIPU_JOB", "1")
+    monkeypatch.setenv("KHIPU_T3_DB", str(tmp_path / "absent.sqlite"))
+    rows = [{"type": "user", "message": {"role": "user", "content": "Follow this synthetic brief."}},
+            {"type": "assistant", "message": {"role": "assistant", "content": "Synthetic result. " * 30}}]
+    if typed_kind == "queued-human":
+        rows.append({"type": "attachment", "attachment": {"type": "queued_command", "commandMode": "prompt",
+                     "origin": {"kind": "human"}, "prompt": "Keep my synthetic correction."}})
+    elif typed_kind != "none":
+        text = ("<pasted_content>Quoted synthetic rules.</pasted_content>" if typed_kind == "paste-only"
+                else "Keep my synthetic correction.")
+        rows.append({"type": "user", "turnOrigin": "human", "message": {"role": "user", "content": text}})
+    path = _write(tmp_path / "job.jsonl", rows)
+    hook = {"hook_event_name": "SessionEnd", "session_id": "synthetic-job", "cwd": str(tmp_path),
+            "transcript_path": str(path)}
+    assert sc.hook_main(json.dumps(hook), "claude_code")["due"]
+    job = json.loads(sc.queued_jobs()[0].read_text())
+    expected = typed_kind in ("human", "queued-human")
+    assert sc._job_origin(job) == "job" and job.get("has_owner_turn", False) is expected
+    assert "owner_lines" not in job
+    rows.append({"type": "assistant", "message": {"role": "assistant", "content": "Later synthetic work. " * 30}})
+    _write(path, rows)
+    assert sc.hook_main(json.dumps(hook), "claude_code")["due"]
+    jobs = [json.loads(p.read_text()) for p in sc.queued_jobs()]
+    assert len(jobs) == 2 and all(j.get("has_owner_turn", False) is expected for j in jobs)
+    with mock.patch("khipu.extract.extract_memory", side_effect=lambda *a, **kw: {
+            "summary": "Synthetic result.", "preferences": ["Keep concise notes."]}), \
+            mock.patch("khipu.config.capture_mode", return_value="hub"), \
+            mock.patch("khipu.capture.capture", return_value=0) as capture, \
+            mock.patch("khipu.hub_snapshot.sync_decision_changes", return_value={}):
+        assert sc.drain()["captured"] == 2
+    assert all(c.args[0]["preferences"] == (["Keep concise notes."] if expected else [])
+               for c in capture.call_args_list)
