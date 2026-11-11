@@ -2360,54 +2360,60 @@ NOT_IN_THE_APP_YET = {
     # Read once, by phase 1a's import of the standing rules, and never again
     # after it ran: a control for it would do nothing.
     "routing_rules_seed",
-    # Owner-local Mac names (survey rows 8-11): set only through the
-    # owner-gated `khipu config` path; the delivery group is display only.
-    "routing_mac_names",
 }
 
 
-def test_every_routing_setting_is_in_the_app():
-    # Codex review, finding 6: every option is visible and usable on
-    # Settings -> Routing and every limit can be lifted there. The app's
-    # allowlist (lib.rs) and the page are compared with the CLI's whole
-    # list, so a setting added later can't be missed.
+def test_every_routing_setting_can_be_changed_from_the_app_or_by_direction():
+    # Codex review, finding 6, as it stands after the simplified app (#573):
+    # there is no Settings -> Routing page any more. The app's screens change
+    # a few settings themselves, through the allowlist in lib.rs, and every
+    # routing setting is changed by telling an agent (`khipu_owner_act`,
+    # `config.routing_setting`). Both are compared with the CLI's whole list,
+    # so a setting added later can't be missed.
     import re
     from pathlib import Path
 
+    from khipu import owner_act
+
     root = Path(__file__).resolve().parents[3]
     lib = (root / "apps/desktop/src-tauri/src/lib.rs").read_text(encoding="utf-8")
-    page = (root / "apps/desktop/src/RoutingSettings.tsx").read_text(encoding="utf-8")
     allowed = set(re.findall(r'"(routing_[a-z_]+)"', lib[lib.index("const ROUTING_DURATION_KEYS"):
                                                          lib.index("const ROUTING_SOURCES_MAX")]))
-    shown = set(re.findall(r'"(routing_[a-z_]+)"', page))
     everything = set(routing.SETTINGS)
     assert NOT_IN_THE_APP_YET <= everything
     wanted = everything - NOT_IN_THE_APP_YET
     assert sorted(wanted - allowed) == [], "settings the app can't change"
-    assert sorted(wanted - shown) == [], "settings Settings -> Routing doesn't show"
-    assert sorted((allowed | shown) & NOT_IN_THE_APP_YET) == [], "in the app: take it off NOT_IN_THE_APP_YET"
+    assert sorted(allowed & NOT_IN_THE_APP_YET) == [], "in the app: take it off NOT_IN_THE_APP_YET"
     assert sorted(allowed - everything) == [], "the app allows a setting the CLI doesn't have"
+    for key in sorted(everything):
+        head, _ = owner_act.argv("config.routing_setting", {"key": key, "value": "1"})
+        assert head[:3] == ["config", "--set", key], key
 
 
-def test_every_limit_a_refusal_names_can_be_raised_in_the_app():
+def test_every_limit_a_refusal_names_can_be_raised_without_a_terminal():
     # F3 (fix round 1): a refusal that tells the owner which setting raises a
-    # limit names one the app offers: in the app's allowlist (lib.rs) and on
-    # Settings -> Routing. Every limit on the owner's own words is one.
+    # limit names one the owner can raise on the spot: it is in the app's
+    # allowlist (lib.rs) and an agent can set it on the owner's direction
+    # (`config.routing_setting`). Every limit on the owner's own words is one.
+    # The simplified app (#573) has no row per setting, so there is no page
+    # to look for one on.
     import re
     from pathlib import Path
+
+    from khipu import owner_act
 
     root = Path(__file__).resolve().parents[3]
     source = Path(routing.__file__).read_text(encoding="utf-8")
     named = set(re.findall(r"(routing_[a-z_]+) raises", source))
     named |= {"routing_hold_chars", "routing_line_chars"}
     lib = (root / "apps/desktop/src-tauri/src/lib.rs").read_text(encoding="utf-8")
-    page = (root / "apps/desktop/src/RoutingSettings.tsx").read_text(encoding="utf-8")
     allowed = set(re.findall(r'"(routing_[a-z_]+)"', lib[lib.index("const ROUTING_DURATION_KEYS"):
                                                          lib.index("const ROUTING_SWITCH_KEYS")]))
     for key in sorted(named):
         assert key in routing.SETTINGS, key
         assert key in allowed, f"{key} is not in the app's allowlist"
-        assert f'key: "{key}"' in page, f"{key} has no row on Settings -> Routing"
+        head, _ = owner_act.argv("config.routing_setting", {"key": key, "value": "0"})
+        assert head == ["config", "--set", key, "0"], key
 
 
 # ---- fix round 2 of phase 5 -------------------------------------------------------------

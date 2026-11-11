@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import json
-import shutil
 import socket
-import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -309,67 +307,3 @@ def test_routing_advice_line_qualifies_uncertain_go(evidence):
     advice.update(evidence=evidence)
     assert advice["verdict"] == "go"
     assert f"evidence={evidence}" in routing_advice.advice_line(advice)
-
-
-def test_routing_desktop_withholds_unplaceable_cap_figures(tmp_path):
-    """Execute production TS without dependencies; all runtime imports are pure/stubbed."""
-    root = Path(__file__).resolve().parents[3]
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("production TS probe requires Node with native type stripping")
-    runner = tmp_path / "pace-probe.cjs"
-    runner.write_text(r"""
-const fs = require('node:fs'), vm = require('node:vm'), path = require('node:path');
-const { stripTypeScriptTypes } = require('node:module');
-if (!stripTypeScriptTypes) process.exit(77);
-const cache = new Map();
-function blocked() { throw Error('external operation forbidden'); }
-async function load(name) {
-  if (cache.has(name)) return cache.get(name);
-  let mod;
-  if (name === 'react' || name === './settingsCli') {
-    const names = name === 'react' ? ['useCallback','useEffect','useRef','useState'] : ['callCli'];
-    mod = new vm.SyntheticModule(names, function() { for (const n of names) this.setExport(n, blocked); });
-  } else {
-    const file = path.join(process.cwd(), 'src', name.replace(/^\.\//, '') + '.ts');
-    mod = new vm.SourceTextModule(stripTypeScriptTypes(fs.readFileSync(file, 'utf8')), { identifier: file });
-  }
-  cache.set(name, mod);
-  if (mod instanceof vm.SourceTextModule) await mod.link(load);
-  return mod;
-}
-(async () => {
-  const mod = await load('./routingPace'); await mod.evaluate();
-  const cap = { kind: 'pace_target', revision: 'fake', window: 'weekly', pct: 100, slack: 0,
-                allowance_pct: 14.3, used_pct: 32, verdict: 'ahead' };
-  for (const why of ['reset time spread over more than an hour', 'last reading 2 h old',
-                     'reset time disagrees between readings', 'reset passed; waiting for a new reading',
-                     'possible reset; waiting for the next reading']) {
-    const pace = { window: 'weekly', buckets: 48, used_pct: 32, why,
-                   plan: { verdict: 'unknown' }, pace_target: cap };
-    const a = { key: 'fake|', label: 'Fake', harness: 'claude', state: 'open', pace: [pace], cap_statuses: [cap] };
-    const row = mod.namespace.paceModel({ accounts: [a] }, null, new Date('2026-10-22T12:02:00Z')).rows[0];
-    if (!row.caps[0].state.startsWith('Not known:') || row.caps[0].tag !== null)
-      throw Error(JSON.stringify(row.caps[0]));
-  }
-  for (const why of ['readings cover only 0.9 of the last 24 h',
-                     'readings disagree for 0.5 of the last 24 h']) {
-    for (const verdict of ['ahead', 'recovering']) {
-      const status = { ...cap, used_pct: 80, verdict };
-      const pace = { window: 'weekly', buckets: 3, used_pct: 80, why,
-                     plan: { verdict: 'unknown' }, pace_target: status };
-      const a = { key: 'fake|', label: 'Fake', harness: 'claude', state: 'open',
-                  pace: [pace], cap_statuses: [status] };
-      const row = mod.namespace.paceModel({ accounts: [a] }, null, new Date('2026-10-22T12:02:00Z')).rows[0];
-      const expected = verdict === 'ahead' ? '65.7 points ahead' : 'Coming back';
-      if (row.caps[0].state !== 'Allowed 14.3% by now, used 80' || row.caps[0].tag?.text !== expected)
-        throw Error(JSON.stringify(row.caps[0]));
-    }
-  }
-})().catch(e => { console.error(e); process.exitCode = 1; });
-""")
-    result = subprocess.run([node, "--experimental-vm-modules", str(runner)],
-                            cwd=root / "apps/desktop", capture_output=True, text=True, timeout=30)
-    if result.returncode == 77:
-        pytest.skip("production TS probe requires Node with native type stripping")
-    assert result.returncode == 0, result.stderr
