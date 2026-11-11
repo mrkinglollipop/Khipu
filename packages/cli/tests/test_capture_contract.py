@@ -174,6 +174,13 @@ class VerbatimExtractionTest(unittest.TestCase):
     def test_empty_window_returns_empty_dict(self):
         self.assertEqual(extract.extract_verbatim(""), {})
 
+    def test_owner_lines_never_come_from_the_rendered_window(self):
+        # Which turns were typed is decided by read_window on the original
+        # messages; a rendered window cannot tell a relayed body from a typed line.
+        self.assertNotIn("owner_lines", extract.extract_verbatim(self.FIXTURE))
+        self.assertEqual(extract.owner_lines([" typed one ", "typed one", "typed two"]),
+                         ["typed one", "typed two"])
+
 
 class VerbatimRedactionTest(unittest.TestCase):
     def test_a_fake_key_inside_a_verbatim_quote_is_redacted(self):

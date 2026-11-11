@@ -672,6 +672,51 @@ def _verbatim_quotes(user_messages: list[str]) -> list[str]:
     return [q[:VERBATIM_QUOTE_CHARS] for q in picked]
 
 
+# ``owner_lines``: every user message of the window the owner typed, in order,
+# without duplicates. ``quotes`` keeps only three messages, and in a long
+# conversation those three are usually a compaction summary, a scheduled prompt
+# and a task notice, so the owner's own lines were stored nowhere "only my
+# words" could find them. Which messages were typed is decided by
+# ``session_capture.read_window`` on the original message, before capture
+# rewrites machine messages (a relayed cross-session body loses its tag and
+# would read as typed), and rides on the queued job; it is never re-derived
+# from the rendered window. Caps: 1,000 chars a line (a typed line is rarely
+# longer; the search quote is cut to 300 around the match anyway), 40 lines and
+# 16,000 chars a window (a capture window holds a few turns; 16 KB is under 2%
+# of the gateway's 1 MiB body cap). Over a cap, lines are dropped from the
+# middle, so the oldest and the newest stay.
+OWNER_LINE_CHARS = 1_000
+OWNER_LINES_MAX = 40
+OWNER_LINES_TOTAL_CHARS = 16_000
+# Capture-now's stand-in turn (session_capture) when no transcript turn is
+# unread: written by the agent that asked for the capture, not typed.
+_CAPTURE_NOTE_PREFIX = "Capture note: "
+
+
+def owner_lines(typed: list[str]) -> list[str]:
+    """``typed`` (the window's typed user messages, from read_window) as
+    stored: stripped, each clipped to OWNER_LINE_CHARS, deduped, untagged
+    automated openings (``turn_text.is_automated``) dropped too; over
+    OWNER_LINES_MAX or OWNER_LINES_TOTAL_CHARS the middle ones go. Never
+    raises: a failure keeps no owner lines and never fails a capture."""
+    try:
+        from khipu.turn_text import is_automated
+
+        lines = list(dict.fromkeys(
+            msg.strip()[:OWNER_LINE_CHARS] for msg in typed
+            if isinstance(msg, str) and msg.strip()
+            and not (msg.strip().startswith(_CAPTURE_NOTE_PREFIX) or is_automated(msg))))
+        if len(lines) > OWNER_LINES_MAX:
+            head = OWNER_LINES_MAX // 2
+            lines = lines[:head] + lines[len(lines) - (OWNER_LINES_MAX - head):]
+        total = sum(len(x) for x in lines)
+        while len(lines) > 1 and total > OWNER_LINES_TOTAL_CHARS:
+            total -= len(lines.pop(len(lines) // 2))
+        return lines
+    except Exception:  # noqa: BLE001 — an extra index list must never fail a capture
+        return []
+
+
 def extract_verbatim(text: str) -> dict[str, list[str]]:
     """errors / commands / paths / quotes pulled from a rendered capture
     window. Never raises; an empty/unmatched window returns {}."""

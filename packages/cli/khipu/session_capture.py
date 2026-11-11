@@ -693,14 +693,19 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     must still see these messages. ``skip_to`` is the byte offset just past
     the window's leading run of lines that held nothing but already-seen
     copies: a not-due run may move the offset there without losing anything,
-    so a 60 MB re-emission is not re-parsed on every Stop until a real turn."""
+    so a 60 MB re-emission is not re-parsed on every Stop until a real turn.
+
+    ``stats["typed"]`` receives the text of every kept user message the person
+    wrote, decided here on the original message, before a machine message is
+    rewritten (a relayed cross-session body loses its tag below and would read
+    as typed). Capture's ``verbatim.owner_lines`` come only from this list."""
     msgs: list[tuple[str, str]] = []
     users = 0
     known = set(seen) if seen is not None else None
     fresh: list[str] = []
     dropped = dropped_chars = 0
     if stats is not None:
-        stats.update(deduped_msgs=0, deduped_chars=0, fresh=fresh, skip_to=offset)
+        stats.update(deduped_msgs=0, deduped_chars=0, fresh=fresh, skip_to=offset, typed=[])
     try:
         size = path.stat().st_size
     except OSError:
@@ -952,6 +957,8 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             stats.setdefault("carry", []).append((role, text))
         else:
             head_open = False
+        if real and stats is not None and not d.get("isCompactSummary"):
+            stats["typed"].append(text)
         if msgs and msgs[-1][0] == role and (role != "user" or streamed or real == open_real):
             # ACP streams chunks (concatenate); the others emit whole
             # messages (join on a newline).
@@ -2833,6 +2840,14 @@ def _record_drain(harness: str, *, captured: bool, error: str | None = None, emp
             _record_drain_unlocked(harness, captured=captured, error=error, empty=empty)
 
 
+def _redact_typed(stats: dict) -> list[str]:
+    """The person's typed messages from ``read_window``'s ``stats["typed"]``,
+    masked by the same redactor, at the same step, as the window's messages."""
+    from khipu.redact import redact_secrets
+
+    return [redact_secrets(t)[0] for t in stats.get("typed") or []]
+
+
 def _redact_messages(msgs: list[tuple[str, str]], harness: str, sid: str) -> list[tuple[str, str]]:
     from khipu.redact import redact_secrets
 
@@ -2847,12 +2862,71 @@ def _redact_messages(msgs: list[tuple[str, str]], harness: str, sid: str) -> lis
     return redacted_msgs
 
 
+def _t3_child_thread(thread: str | None) -> bool:
+    """T3's record definitively names a parent for this thread: one started
+    as another thread's child (``t3_thread_launch``), so a job. One read under
+    the hook's T3 budget. An unreadable record is not definitive and reads as
+    a conversation, lines kept. Never raises."""
+    if not thread:
+        return False
+    try:
+        delegated, definitive = _t3.delegated_thread_result(thread)
+    except Exception:  # noqa: BLE001 — a lookup must never fail a capture
+        return False
+    return bool(delegated and definitive)
+
+
+def _starts_at_cut(text: str, next_text: str, probe: str) -> bool:
+    """A typed message's opening ``probe`` was cut by the splitter: ``text``
+    ends with its head and ``next_text`` opens with the rest, as the next
+    fragment of the same user block (``_split_messages``)."""
+    prefix = "USER: "
+    if not next_text.startswith(prefix):
+        return False
+    rest = next_text[len(prefix):]
+    return any(text.endswith(probe[:n]) and rest.startswith(probe[n:])
+               for n in range(len(probe) - 1, 0, -1))
+
+
+def _owner_lines_by_part(parts: list[dict[str, Any]], typed: list[str] | None) -> list[list[str]]:
+    """Each part's ``owner_lines``: the typed messages (in order) found in that
+    part's text, through ``extract.owner_lines``. A typed message is looked for
+    from the part the previous one was in, by its opening; one whose opening
+    the split cut is kept once, in the part where it starts. Never raises: a
+    failure gives no owner lines, never a failed capture."""
+    out: list[list[str]] = [[] for _ in parts]
+    try:
+        from khipu.extract import owner_lines
+
+        found: list[list[str]] = [[] for _ in parts]
+        at = 0
+        for t in typed or []:
+            probe = t.strip()[:200]
+            if not probe:
+                continue
+            k = next((j for j in range(at, len(parts)) if probe in parts[j]["text"]), None)
+            if k is None:
+                # The split cut through its opening: it starts in the part
+                # whose end holds the probe's head and whose next part opens
+                # with the rest. Kept there, once.
+                k = next((j for j in range(at, len(parts) - 1)
+                          if _starts_at_cut(parts[j]["text"], parts[j + 1]["text"], probe)), None)
+            if k is not None:
+                found[k].append(t)
+                at = k
+        return [owner_lines(f) for f in found]
+    except Exception:  # noqa: BLE001 — an extra index list must never fail a capture
+        return out
+
+
 def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: str,
                     path: Path, st: dict, msgs: list[tuple[str, str]], new_off: int,
                     turns: int, job_parent: str | None = None, capture_note: str = "",
                     preserve_mtime: bool = False, fresh_seen: list[str] | None = None,
-                    capture_request_id: str = "") -> list[str]:
-    """Queue every part before advancing the shared capture offset."""
+                    capture_request_id: str = "", typed: list[str] | None = None) -> list[str]:
+    """Queue every part before advancing the shared capture offset. ``typed``
+    (``read_window``'s typed user messages, redacted) becomes each part's
+    ``owner_lines``, except in a job's capture, which keeps none."""
     off_before = int(st.get("offset", 0))
     # W1.2/W1.3: resolve identity from the cwd, not the model. Never
     # raises (identity.resolve_repo_root is itself fail-open); this
@@ -2901,7 +2975,13 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     thread = cache_thread(st, sid)
     # A T3 delegated child thread is a job: T3 names it by this prefix, so no
     # read of T3's database is needed (owner_turns treats it the same way).
-    delegated = str(thread or "").startswith(_t3.DELEGATED_THREAD_PREFIX)
+    # A launched child has an ordinary id; T3's record names its parent.
+    delegated = (str(thread or "").startswith(_t3.DELEGATED_THREAD_PREFIX)
+                 or (not (job_parent or st.get("origin") == "job") and _t3_child_thread(thread)))
+    # Decided once, here: the job label below and the owner-lines skip use it.
+    # Nobody types into a job, so its user turns are briefs and relays.
+    is_job = bool(job_parent or st.get("origin") == "job" or delegated)
+    owner_lines = [[] for _ in parts] if is_job else _owner_lines_by_part(parts, typed)
     for i, part in enumerate(parts, start=1):
         job = {"harness": harness, "session_id": sid, "cwd": cwd, "event": event,
                "ts": _mint_ts(), "turns": turns, "transcript": part["text"],
@@ -2911,7 +2991,7 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
                "parent_session_id": job_parent,
                "transcript_range": f"{off_before}:{new_off}",
                "truncated_chars": part["truncated_chars"]}
-        if (st.get("origin") == "job" or delegated) and not job_parent:
+        if is_job and not job_parent:
             # KHIPU_JOB=1 or a T3 delegated thread with no lineage; lineage
             # alone already marks a job.
             job["origin"] = "job"
@@ -2920,6 +3000,8 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
             job["subagent"] = True
         if checkout:
             job["checkout"] = checkout
+        if owner_lines[i - 1]:
+            job["owner_lines"] = owner_lines[i - 1]
         if window_id:
             job["window_id"] = window_id
             job["part"] = f"{i}/{len(parts)}"
@@ -3097,6 +3179,7 @@ def hook_main(raw: str, harness: str | None = None, event: str | None = None) ->
             from khipu.redact import redact_secrets
 
             msgs = _redact_messages(msgs, harness, sid)
+            typed = _redact_typed(dedupe)
             # K3: the full window, unclipped — decide() and the high-value scan see
             # everything; only the job-splitting step below ever bounds it.
             full_text = render(msgs, max_chars=10**9)
@@ -3164,7 +3247,7 @@ def hook_main(raw: str, harness: str | None = None, event: str | None = None) ->
                         harness=harness, sid=track_sid if is_subagent_stop else sid, track_sid=track_sid,
                         cwd=session_cwd(env), event=event, path=path, st=st, msgs=msgs,
                         new_off=new_off, turns=turns, job_parent=st["parent_session_id"],
-                        capture_note=capture_note, fresh_seen=fresh_seen,
+                        capture_note=capture_note, fresh_seen=fresh_seen, typed=typed,
                         capture_request_id=_capture_request_id(capture_now) if capture_now is not None else "",
                     )
                     out["queued"] = queued_names[0] if len(queued_names) == 1 else queued_names
@@ -3329,6 +3412,7 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                         sid = str(st.get("session_id") or track_sid)
                         carried = [tuple(m) for m in st.get("carry") or []]
                         msgs = _redact_messages(carried + msgs, harness, sid)
+                        typed = _redact_typed(dedupe)
                         chars = len(render(msgs, max_chars=10**9))
                         latest = _transcript_stat(path)
                         if (latest.st_mtime_ns, latest.st_size) != (info.st_mtime_ns, info.st_size) \
@@ -3375,7 +3459,7 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                                 harness=harness, sid=sid, track_sid=track_sid, cwd=cwd,
                                 event="idle_sweep", path=path, st=st, msgs=msgs,
                                 new_off=new_off, turns=turns, job_parent=st.get("parent_session_id"),
-                                preserve_mtime=True, fresh_seen=fresh_seen,
+                                preserve_mtime=True, fresh_seen=fresh_seen, typed=typed,
                             )
                             out["jobs"] += len(names)
                             _log(f"sweep {harness}:{sid}: queued {len(names)} part(s) "
@@ -3496,6 +3580,17 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         from khipu.extract import extract_deliverables, extract_verbatim
 
         verbatim = extract_verbatim(job.get("transcript", ""))
+        # The person's typed lines, decided by read_window on the original
+        # messages and queued with the job (none for a job's capture, decided
+        # at enqueue); never re-derived from the rendered window, where a
+        # rewritten machine message reads as typed. A job queued before this
+        # existed has none.
+        if isinstance(job.get("owner_lines"), list):
+            from khipu.extract import owner_lines as _owner_lines
+
+            kept = _owner_lines([t for t in job["owner_lines"] if isinstance(t, str)])
+            if kept:
+                verbatim["owner_lines"] = kept
         # O4: same tier as verbatim above — paths written/created, PR/issue
         # URLs, release tags, never lost to summarisation either.
         deliverables = extract_deliverables(job.get("transcript", ""))

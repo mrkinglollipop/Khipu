@@ -1249,14 +1249,24 @@ _EPISODE_ILIKE_COLUMNS = (
     "COALESCE(people::text, '')",
 )
 
+def _verbatim_without_owner_lines(verbatim: str) -> str:
+    """``verbatim`` minus ``owner_lines`` (the typed lines kept only for "only
+    my words"), so every other search reads exactly what it read before that
+    key existed. A row without the key, or a non-object value, is unchanged."""
+    return (f"(CASE WHEN jsonb_typeof({verbatim}) = 'object' AND {verbatim} ? 'owner_lines' "
+            f"THEN {verbatim} - 'owner_lines' ELSE {verbatim} END)")
+
+
 def _episode_literal_columns(cur):
-    """Search decoded JSON strings, including owner quotes, on existing schema."""
+    """Search decoded JSON strings, including owner quotes, on existing schema.
+    ``owner_lines`` are left out: only "only my words" searches them."""
     verbatim = _episode_verbatim_select(cur)
     if verbatim == "NULL::jsonb":
         return _EPISODE_ILIKE_COLUMNS
     return (*_EPISODE_ILIKE_COLUMNS,
             f"COALESCE((SELECT string_agg(v #>> '{{}}', chr(10)) FROM "
-            f"jsonb_path_query({verbatim}, 'strict $.** ? (@.type() == \"string\")') AS v), '')")
+            f"jsonb_path_query({_verbatim_without_owner_lines(verbatim)}, "
+            f"'strict $.** ? (@.type() == \"string\")') AS v), '')")
 
 
 # fast=True columns for `_literal_candidates` (recall_prompt's budgeted
@@ -1713,6 +1723,11 @@ def _literal_candidates(
                 f"SELECT id::text, summary, topics, decisions, preferences, people, ts, "
                 f"{_episode_verbatim_select(cur)} AS verbatim FROM episodes "
                 f"WHERE {_episode_live_clause(cur)}public.khipu_owner_words(verbatim) LIKE %(words)s ESCAPE '\\' "
+                # The index covers every verbatim string, owner_lines too; this
+                # leg must not match on those, so a row holding the key is
+                # checked again without it (a row without it is not).
+                f"AND (jsonb_typeof(verbatim) IS DISTINCT FROM 'object' OR NOT (verbatim ? 'owner_lines') "
+                f"OR public.khipu_owner_words(verbatim - 'owner_lines') LIKE %(words)s ESCAPE '\\') "
                 f"AND ({ep_filter}) ORDER BY ts DESC NULLS LAST, id DESC LIMIT %(lim)s",
                 {**filter_params, "words": f"%{_escape_like(term.lower())}%", "lim": lim},
             )
