@@ -422,8 +422,12 @@ def test_short_retained_steps_are_not_replayed_after_a_rewrite_and_a_short_repea
     new = [t for t in _job_texts() if "Replaced answer" in t]
     assert len(new) == 1
     assert "Question one" not in new[0] and "short reply" not in new[0]
-    # Step 2 is a kept copy; step 4 is the person asking again.
-    assert new[0].count("keep this short question") == 1
+    # Step 2 is a kept copy; step 4 is the person asking again: once in the
+    # window's text, and once as the typed line kept beside it.
+    import json
+    job = json.loads(new[0])
+    assert job["transcript"].count("keep this short question") == 1
+    assert job.get("owner_lines") == ["keep this short question"]
     writer.close()
 
 
