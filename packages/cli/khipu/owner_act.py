@@ -866,9 +866,15 @@ def _decline(args, *, terminal: bool = False, app: bool = False) -> tuple[bool, 
         from khipu import routing_replication
 
         try:
-            routing_replication.answer_remote(request, None, "decline")
-        except Exception:  # noqa: BLE001 - the no is recorded here; the other Mac's request ends by itself
-            pass
+            sent = routing_replication.answer_remote(request, None, "decline") is True
+        except Exception:  # noqa: BLE001 - said plainly below; the request waits again
+            sent = False
+        if not sent:
+            # Not recorded for the other Mac, so the no was not given: the request waits again.
+            owner_direction.reopen_declined(request["id"], request.get("owner_action"))
+            return False, {"ok": False, "code": "not_sent", "sent": False, "request": request["id"],
+                           "error": "Khipu could not record your no to send to your other Mac. Nothing was "
+                                    "changed, and the request still waits for your answer."}
         return True, {"ok": True, "declined": True, "applied": False, "sent": True, "request": request["id"],
                       "line": "Your no is on its way to the other Mac, which drops the request. Nothing was changed.",
                       "owner_action": request.get("owner_action"), "receipt": request.get("receipt")}

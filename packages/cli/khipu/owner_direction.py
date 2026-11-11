@@ -1122,6 +1122,29 @@ def decline(request_id: str, *, env=None, now: float | None = None, remote: dict
     return request
 
 
+def reopen_declined(request_id: str, line_id: str | None) -> None:
+    """A no to a request another Mac holds that could not be recorded to send
+    there (``owner_act._decline``): the request waits again, and the no's
+    owner-actions line is marked failed, so nothing says it was given. A
+    request answered meanwhile is left as it is."""
+    now = _clock()
+    try:
+        with _requests_locked() as path:
+            state = _load(path)
+            for row in state["requests"]:
+                if row.get("id") == request_id and row.get("state") == "declined" \
+                        and row.get("owner_action") == line_id:
+                    for name in ("owner_action", "receipt", "settled_ts", "settled_at", "declined"):
+                        row.pop(name, None)
+                    row["state"] = "pending"
+                    _save(path, state, now)
+                    break
+        if line_id:
+            _append({"kind": "state", "id": _new_id(), "at": _iso(now), "target": line_id, "state": "failed"})
+    except OSError:
+        pass
+
+
 _ERROR_CODE = re.compile(r"[a-z][a-z0-9_.]{0,63}")
 _SETTLE_ERROR = "The held change was not applied."
 
