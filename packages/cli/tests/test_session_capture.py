@@ -1661,13 +1661,13 @@ def test_job_queue_remembers_explicit_owner_typing_across_windows(tmp_path, monk
     assert sc.hook_main(json.dumps(hook), "claude_code")["due"]
     job = json.loads(sc.queued_jobs()[0].read_text())
     expected = typed_kind in ("human", "queued-human")
-    assert sc._job_origin(job) == "job" and job["has_owner_turn"] is expected
+    assert sc._job_origin(job) == "job" and job.get("has_owner_turn", False) is expected
     assert "owner_lines" not in job
     rows.append({"type": "assistant", "message": {"role": "assistant", "content": "Later synthetic work. " * 30}})
     _write(path, rows)
     assert sc.hook_main(json.dumps(hook), "claude_code")["due"]
     jobs = [json.loads(p.read_text()) for p in sc.queued_jobs()]
-    assert len(jobs) == 2 and all(j["has_owner_turn"] is expected for j in jobs)
+    assert len(jobs) == 2 and all(j.get("has_owner_turn", False) is expected for j in jobs)
     with mock.patch("khipu.extract.extract_memory", side_effect=lambda *a, **kw: {
             "summary": "Synthetic result.", "preferences": ["Keep concise notes."]}), \
             mock.patch("khipu.config.capture_mode", return_value="hub"), \

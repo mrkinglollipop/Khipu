@@ -3111,8 +3111,10 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
             # KHIPU_JOB=1 or a T3 delegated thread with no lineage; lineage
             # alone already marks a job.
             job["origin"] = "job"
-        if is_job:
-            job["has_owner_turn"] = bool(st.get("has_owner_turn"))
+        if is_job and st.get("has_owner_turn"):
+            # Written only when true, so a job record keeps its old shape;
+            # drain reads a missing key as no typed owner turn.
+            job["has_owner_turn"] = True
         if st.get("subagent"):
             # A subagent is a dispatched job of its parent session.
             job["subagent"] = True
