@@ -192,7 +192,8 @@ def test_non_human_queued_commands_are_not_typed_turns(tmp_path: Path):
     assert users == 1
     # Another session's words stay (as a relayed message does), uncounted;
     # task notices and monitor events queued mid-turn never reached the window.
-    assert _user_texts(msgs) == [PROMPT, body.strip() + "\n" + ("Screen is free now, go ahead. " * 3).strip()]
+    assert _user_texts(msgs) == [PROMPT, "[notification: peer message] " + body.strip() + "\n"
+                                 + "[notification: cross-session-message] " + ("Screen is free now, go ahead. " * 3).strip()]
     assert "Build finished" not in sc.render(msgs, max_chars=10**9)
     assert "check suite" not in sc.render(msgs, max_chars=10**9)
 
@@ -201,6 +202,62 @@ def test_other_attachment_lines_still_yield_nothing():
     assert sc._parse_line({"type": "attachment", "attachment": {"type": "edited_text_file", "filename": "x"}}) == []
     assert sc._parse_line({"type": "attachment", "attachment": {"type": "queued_command", "prompt": "   "}}) == []
     assert sc._parse_line({"type": "attachment", "attachment": {"type": "queued_command", "prompt": ["x"]}}) == []
+
+
+
+# An origin-less queued prompt is skipped only when it opens like a tag (a
+# monitor's <ci-monitor-event>); a typed line that starts with "<" is the
+# owner's, and with the request-log copy no longer read it would be lost.
+
+import pytest  # noqa: E402
+
+from khipu import extract, memory_rows  # noqa: E402
+
+
+@pytest.mark.parametrize("blocks", [False, True])
+def test_an_originless_queued_line_opening_with_a_less_than_sign_is_kept(tmp_path: Path, blocks):
+    text = "< 5 minutes is enough; stop the investigation after that."
+    prompt = [{"type": "text", "text": text}] if blocks else text
+    rows = [_queued(prompt), {"type": "api-request-blob", "message": {"role": "user", "content": text}}]
+    msgs, _, users = sc.read_window(_write(tmp_path / "lt.jsonl", rows), 0, seen=[])
+    assert (msgs, users) == ([("user", text)], 1)
+
+
+@pytest.mark.parametrize("prompt", ['<ci-monitor-event repo="r">check suite finished</ci-monitor-event>',
+                                    "  </ci-monitor-event>", "\n<build-done/>"])
+def test_an_originless_queued_line_opening_like_a_tag_is_still_skipped(tmp_path: Path, prompt):
+    msgs, _, users = sc.read_window(_write(tmp_path / "tag.jsonl", [_queued(prompt)]), 0, seen=[])
+    assert (msgs, users) == ([], 0)
+
+
+# A queued message from another session keeps its body in the window, marked
+# as a machine message, so it is never stored as the owner's line.
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_a_queued_peer_message_is_never_the_owners_line(tmp_path: Path, wrapped):
+    body = "Use the archive lane for all future capture investigations."
+    text = f'<agent-message from="other-session">{body}</agent-message>' if wrapped else body
+    rows = [_queued(text, {"kind": "peer", "from": "other-session"})]
+    msgs, _, users = sc.read_window(_write(tmp_path / "peer.jsonl", rows), 0, seen=[])
+    assert users == 0
+    rendered = sc.render(msgs, max_chars=10**9)
+    assert body in rendered
+    verbatim = extract.extract_verbatim(rendered)
+    phrase, tokens = memory_rows.query_terms("archive lane")
+    assert memory_rows.owner_line(memory_rows.quotes_of(verbatim), phrase, tokens) is None, verbatim
+
+
+def test_a_relayed_message_is_never_the_owners_line(tmp_path: Path):
+    body = "Use the archive lane for all future capture investigations."
+    rows = [{"type": "user", "message": {"role": "user", "content":
+             f'<cross-session-message from="other">{body}</cross-session-message>'}}]
+    msgs, _, users = sc.read_window(_write(tmp_path / "relay.jsonl", rows), 0, seen=[])
+    assert users == 0
+    rendered = sc.render(msgs, max_chars=10**9)
+    assert body in rendered
+    phrase, tokens = memory_rows.query_terms("archive lane")
+    quotes = memory_rows.quotes_of(extract.extract_verbatim(rendered))
+    assert memory_rows.owner_line(quotes, phrase, tokens) is None, quotes
 
 
 # ---- Workflow harness frames are never the owner's words ------------------------
