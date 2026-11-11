@@ -146,6 +146,7 @@ def test_session_start_with_an_unreadable_forget_list_pushes_no_memory():
     _corrupt_list()
     start = _session_start()
     assert not [w for w in (*FORGOTTEN_WORDS, "LIVE-EPISODE", "LIVE-TOPIC") if w in start]
+    assert "Nothing is summarised" not in start
 
 
 def _stale_con():

@@ -316,9 +316,10 @@ def _fenced_slice(slice_data: dict) -> dict:
 
 def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
     """W4: repo-scoped first (decisions, episodes, then linked
-    topics), the cwd-token search only as a fallback when nothing repo-scoped
-    resolved or came back empty — same precedence the plan's slice order
-    describes. A PG failure degrades to the local hub_snapshot with a visible
+    topics). The cwd-token search and the global recents are only for a
+    session whose project did not resolve; a resolved project with an empty
+    slice gets a one-line "nothing summarised yet" and no other project's rows.
+    A PG failure degrades to the local hub_snapshot with a visible
     `stale` line and logs the miss via query_log so W6 can count it."""
     from khipu import activity
     from khipu.cli import _literal_candidates
@@ -361,6 +362,10 @@ def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
             # repeat live DB work through the cwd and recents fallbacks.
             _ = exc
             return ""
+        # Whether the hub had anything for this project before the forget
+        # fence ran: a slice the fence emptied (every row forgotten, or the
+        # forget list unreadable) is not a project with no memory.
+        filed = bool(slice_data and any(slice_data.get(k) for k in ("decisions", "topics", "episodes", "pairs")))
         if slice_data:
             slice_data = _fenced_slice(slice_data)
         # Routing directions (slice 19a) never carry the owner's words
@@ -392,6 +397,19 @@ def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
                     lines.extend(note)
                 rendered = "\n".join(lines)
             return rendered
+        if project:
+            # A resolved project never falls back to other projects' rows:
+            # neither the folder-name search (a worktree's own folder name is
+            # a throwaway) nor the global recents. With nothing summarised
+            # under it (a new repo, or a new worktree of one) it says so; when
+            # the forget fence withheld everything, it pushes nothing.
+            if filed:
+                return ""
+            return "\n".join([
+                "## Pushed slice",
+                f"project: `{project}`",
+                "Nothing is summarised under this project yet. `khipu_search` searches every project.",
+            ])
 
     rows: list[dict] = []
     term = cwd_search_term(cwd)
