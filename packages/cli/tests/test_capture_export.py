@@ -102,9 +102,10 @@ def world(pg):
         _line(p[2], preferences=["file-only preference"]),  # differs: left alone
         _line(p[5]),                                        # matched through episode_sources
         _line(p[6]),                                        # matches a forgotten row
+        "{not json",                                        # unparseable (a whole line)
         _line(p[9]),                                        # no hub row at all
-        "{not json",                                        # unparseable
-    ])  # no trailing newline on purpose
+    ])  # no trailing newline on purpose: a whole last line keeps its bytes
+    # (a torn last line is cut: test_a_retry_after_a_torn_append_...)
     current.write_text(current_text, encoding="utf-8")
     rotated.write_text(_line(p[3]) + "\n", encoding="utf-8")  # 3 has its line in a rotated file
     # 4 has no line anywhere: the one episode the export must add.
@@ -358,3 +359,205 @@ def test_the_command_runs_the_export_by_hand(monkeypatch, tmp_path, capsys):
     rc = cli.main(["capture", "export", "--memory-root", str(tmp_path), "--dry-run", "--json"])
     assert rc == 0 and seen == [(tmp_path, True)]
     assert json.loads(capsys.readouterr().out)["would_add"] == 4
+
+
+# ---- review fixes (PR 569, Codex): a database double, no hub needed ----------
+#
+# The double answers the export's own queries from a list of synthetic rows.
+# ``on_close`` runs when a connection closes: a commit made on another Mac
+# after the export's read.
+
+from datetime import datetime, timezone  # noqa: E402
+import os  # noqa: E402
+
+from khipu import capture_identity, db, forget  # noqa: E402
+
+
+def _row(i=1, summary="synthetic review sentinel", **extra):
+    return dict(id=i, ts=datetime(2026, 11, 10, 12, tzinfo=timezone.utc), summary=summary,
+                session_id=f"codex:review-{i}", topics=[], people=[], decisions=[], preferences=[],
+                scope=None, deleted=False, **extra)
+
+
+class _Conn:
+    def __init__(self, rows, sources=(), on_close=None):
+        self.rows, self.sources, self.on_close = rows, sources, on_close
+        self.read_only = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        if self.on_close:
+            self.on_close()
+
+    def cursor(self):
+        return _Cursor(self)
+
+    def rollback(self):
+        pass
+
+
+class _Cursor:
+    def __init__(self, conn):
+        self.conn, self.answer = conn, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def execute(self, sql, params=None):
+        rows = self.conn.rows
+        if sql.startswith("SELECT id, ts, summary"):
+            self.answer = [tuple(r[k] for k in ("id", "ts", "summary", "session_id", "topics", "people",
+                                               "decisions", "preferences", "scope", "deleted"))
+                           for r in rows]
+        elif sql.startswith("SELECT episode_id, ts, summary_md5"):
+            self.answer = list(self.conn.sources)
+        elif sql.startswith("SELECT id, raw"):
+            self.answer = [(r["id"], {**capture_export.line_for(r), "harness": "codex"})
+                           for r in rows if r["id"] in params[0]]
+        elif sql.startswith("SELECT id FROM episodes WHERE id = ANY"):
+            self.answer = [(r["id"],) for r in rows if r["id"] in params[0] and r["deleted"]]
+        else:
+            raise AssertionError(sql)
+
+    def fetchall(self):
+        return self.answer
+
+
+@pytest.fixture
+def doubled(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("KHIPU_OUTBOX", str(tmp_path / "outbox"))
+    monkeypatch.setattr(capture_identity, "sources_ready", lambda cur: True)
+    mem = tmp_path / "memory"
+    mem.mkdir()
+    rows = [_row()]
+    monkeypatch.setattr(db, "connect", lambda **kw: _Conn(rows))
+    return mem, rows
+
+
+def test_a_hub_forget_committed_after_the_read_is_not_appended(doubled, monkeypatch):
+    mem, rows = doubled
+    closed = []
+
+    def remote_commit():
+        closed.append(1)
+        if len(closed) == 1:
+            rows[0]["deleted"] = True  # another Mac's forget, after the export's read
+
+    monkeypatch.setattr(db, "connect", lambda **kw: _Conn(rows, on_close=remote_commit))
+    out = capture_export.export_new_lines(mem)
+    assert out["added"] == 0 and out["dropped_forgotten_since_read"] == 1
+    assert not (mem / "episodes.jsonl").exists() or rows[0]["summary"] not in (
+        mem / "episodes.jsonl").read_text()
+
+
+def _crash_first_write(monkeypatch, cut_at):
+    write, calls = os.write, []
+
+    def torn(fd, data):
+        calls.append(1)
+        if len(calls) == 1:
+            return write(fd, bytes(data)[:cut_at(bytes(data))])
+        raise OSError("synthetic interrupted append")
+
+    return torn
+
+
+def test_a_retry_after_a_torn_append_leaves_no_unforgettable_plaintext(doubled, monkeypatch):
+    mem, rows = doubled
+    path = mem / "episodes.jsonl"
+    prefix = b'{"ts":"2026-01-01T00:00:00Z","summary":"older file-only line"}\n'
+    path.write_bytes(prefix)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "write", _crash_first_write(monkeypatch, lambda d: d.index(b', "topics"')))
+        with pytest.raises(OSError, match="synthetic interrupted"):
+            capture_export.export_new_lines(mem)
+    assert rows[0]["summary"].encode() in path.read_bytes()[len(prefix):]
+    out = capture_export.export_new_lines(mem)
+    assert out["added"] == 1
+    assert path.read_bytes().startswith(prefix)
+    assert capture_export.export_new_lines(mem)["added"] == 0
+    result = forget._rewrite_log(mem, path, capture_export.line_for(rows[0])["ts"],
+                                 capture_export._md5(rows[0]["summary"]))
+    assert result["removed"] == 1 and result["state"] == "removed", result
+    assert rows[0]["summary"] not in path.read_text(encoding="utf-8")
+    assert path.read_bytes() == prefix
+    assert out["repaired_torn_tail"] == 1
+
+
+def test_a_retry_after_a_write_torn_inside_a_character_reads_strictly(doubled, monkeypatch):
+    mem, rows = doubled
+    rows[0]["summary"] = "synthetic café record"
+    path = mem / "episodes.jsonl"
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "write", _crash_first_write(monkeypatch, lambda d: d.index("é".encode()) + 1))
+        with pytest.raises(OSError, match="synthetic interrupted"):
+            capture_export.export_new_lines(mem)
+    out = capture_export.export_new_lines(mem)
+    assert out["added"] == 1
+    text = path.read_text(encoding="utf-8")  # the outside nightly's strict read
+    assert [json.loads(x)["summary"] for x in text.splitlines()] == ["synthetic café record"]
+    assert out["repaired_torn_tail"] == 1
+
+
+def test_a_dry_run_reports_a_torn_tail_and_leaves_it(doubled):
+    mem, rows = doubled
+    path = mem / "episodes.jsonl"
+    data = b'{"ts":"2026-01-01T00:00:00Z","summary":"whole line"}\n{"ts":"2026-01-0'
+    path.write_bytes(data)
+    out = capture_export.export_new_lines(mem, dry_run=True)
+    assert out["torn_tail"] == 1 and out["repaired_torn_tail"] == 0 and out["would_add"] == 1
+    assert path.read_bytes() == data
+
+
+def test_a_whole_last_line_without_its_newline_is_kept(doubled):
+    mem, rows = doubled
+    path = mem / "episodes.jsonl"
+    data = b'{"ts":"2026-01-01T00:00:00Z","summary":"whole line, no newline"}'
+    path.write_bytes(data)
+    out = capture_export.export_new_lines(mem)
+    assert out["added"] == 1 and out["torn_tail"] == 0 and out["repaired_torn_tail"] == 0
+    assert path.read_bytes().startswith(data + b"\n")
+
+
+def test_two_episodes_sharing_one_historical_key_both_count_as_present(doubled, monkeypatch):
+    mem, rows = doubled
+    original = capture_export.line_for(rows[0])
+    rows[0]["summary"] = "first edited summary"
+    rows.append(_row(2, "second edited summary"))
+    sources = [(i, rows[0]["ts"], capture_export._md5(original["summary"])) for i in (1, 2)]
+    monkeypatch.setattr(db, "connect", lambda **kw: _Conn(rows, sources))
+    (mem / "episodes.jsonl").write_text(json.dumps(original) + "\n")
+    out = capture_export.export_new_lines(mem)
+    assert out["added"] == 0 and out["matched_via_sources"] == 1
+
+
+def test_a_dry_run_writes_no_reachability_memo(tmp_path, monkeypatch):
+    import psycopg
+
+    from khipu import hub_reach
+
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("KHIPU_DATABASE_URL", "postgresql://synthetic@127.0.0.1:1/synthetic")
+    mem = tmp_path / "memory"
+    mem.mkdir()
+
+    def refused(*a, **kw):
+        raise psycopg.OperationalError("synthetic hub down")
+
+    monkeypatch.setattr(psycopg, "connect", refused)
+    with pytest.raises(psycopg.OperationalError):
+        capture_export.export_new_lines(mem, dry_run=True)
+    assert not hub_reach.memo_path().exists()
+    # A dry run that reaches the hub leaves an existing memo as it was too.
+    monkeypatch.setattr(capture_identity, "sources_ready", lambda cur: True)
+    monkeypatch.setattr(psycopg, "connect", lambda *a, **kw: _Conn([_row()]))
+    hub_reach.memo_path().parent.mkdir(parents=True, exist_ok=True)
+    hub_reach.memo_path().write_text('{"at": "2026-11-10T00:00:00+00:00"}', encoding="utf-8")
+    assert capture_export.export_new_lines(mem, dry_run=True)["would_add"] == 1
+    assert hub_reach.memo_path().exists()

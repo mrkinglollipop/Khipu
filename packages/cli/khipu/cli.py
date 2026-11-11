@@ -6153,7 +6153,10 @@ def build_parser() -> argparse.ArgumentParser:
              "(append-only; the nightly runs it)",
     )
     cap_export.add_argument("--memory-root", default=_memory_root_default())
-    cap_export.add_argument("--dry-run", action="store_true", help="Count only; write nothing")
+    cap_export.add_argument(
+        "--dry-run", action="store_true",
+        help="Count only: changes nothing in the Memory files or the hub "
+             "(and writes no hub-reachability note)")
     cap_export.add_argument("--json", action="store_true", help="Print the counts as JSON")
     cap_export.set_defaults(func=cmd_capture_export)
     cap.set_defaults(func=cmd_capture)

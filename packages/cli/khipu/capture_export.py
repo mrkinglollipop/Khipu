@@ -31,7 +31,23 @@ All new lines go to the file in one append, after the whole list is built, so
 a run that stops early leaves the file as it was, and a second run adds
 nothing. A real run holds the forget write gate (the per-Mac memory lock,
 shared, and the registry lock) from its reads through its append, so a forget
-never interleaves with it.
+on this Mac never interleaves with it. That gate cannot cover another Mac:
+immediately before the append the run reads the hub's tombstones for the rows
+it is about to write once more and drops any forgotten since its first read
+(no lock across Macs; the window left is that last query to the append).
+
+A run that stopped inside its append can leave a last line with no newline.
+Those bytes are an unfinished write, not a line: before appending, under the
+gate, a real run cuts the file back to just after its last newline
+(``repaired_torn_tail``). The one exception is a last line that is whole JSON
+and whole UTF-8 (the file's last line written without its newline): it is
+kept and given its newline. Complete lines are never changed. Nothing else
+writes this file while the gate is held: capture_v2 (legacy and dual modes)
+holds the same registry lock for its whole run, and a forget's rewrite holds
+the memory lock exclusively.
+
+``--dry-run`` changes neither the Memory files nor the hub, and opens the
+hub without writing this Mac's hub-reachability memo.
 """
 from __future__ import annotations
 
@@ -132,8 +148,11 @@ def _file_lines(memory_root: Path) -> Iterator[tuple[str, dict[str, Any] | None]
             yield path.name, obj if isinstance(obj, dict) else None
 
 
-def _read_hub(cur) -> tuple[list[dict[str, Any]], dict[tuple[str, str], int]]:
-    """Every hub episode (live and tombstoned) and every source key."""
+def _read_hub(cur) -> tuple[list[dict[str, Any]], dict[tuple[str, str], list[int]]]:
+    """Every hub episode (live and tombstoned) and every source key, with
+    every episode that holds it: the schema does not make a historical
+    ``(ts, md5(summary))`` unique, so two edited episodes can share one."""
+    # forget-fence source: _plan fences the rows it writes (tombstones.withhold)
     from khipu.capture_identity import sources_ready
 
     cur.execute(
@@ -146,7 +165,7 @@ def _read_hub(cur) -> tuple[list[dict[str, Any]], dict[tuple[str, str], int]]:
          "scope": r[8], "deleted": bool(r[9])}
         for r in cur.fetchall()
     ]
-    sources: dict[tuple[str, str], int] = {}
+    sources: dict[tuple[str, str], list[int]] = {}
     if sources_ready(cur):
         cur.execute(
             "SELECT episode_id, ts, summary_md5 FROM episode_sources "
@@ -155,11 +174,14 @@ def _read_hub(cur) -> tuple[list[dict[str, Any]], dict[tuple[str, str], int]]:
         for episode_id, ts, md in cur.fetchall():
             key = (_norm_ts(ts), md)
             if key[0] is not None:
-                sources.setdefault(key, int(episode_id))
+                ids = sources.setdefault(key, [])
+                if int(episode_id) not in ids:
+                    ids.append(int(episode_id))
     return rows, sources
 
 
 def _raws(cur, ids: list[int]) -> dict[int, Any]:
+    # forget-fence source: _plan fences the rows it writes (tombstones.withhold)
     out: dict[int, Any] = {}
     for start in range(0, len(ids), 1000):
         cur.execute("SELECT id, raw FROM episodes WHERE id = ANY(%s)", (ids[start:start + 1000],))
@@ -167,8 +189,21 @@ def _raws(cur, ids: list[int]) -> dict[int, Any]:
     return out
 
 
+def _tombstoned(cur, ids: list[int]) -> set[int]:
+    """Which of ``ids`` the hub has tombstoned now."""
+    # forget-fence: returns the ids the export refuses to write; no text
+    out: set[int] = set()
+    for start in range(0, len(ids), 1000):
+        cur.execute("SELECT id FROM episodes WHERE id = ANY(%s) AND deleted_at IS NOT NULL",
+                    (ids[start:start + 1000],))
+        out.update(int(r[0]) for r in cur.fetchall())
+    return out
+
+
 def _plan(memory_root: Path, cur, gate) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """The counts and the hub rows (live, fenced, with no line) to write."""
     from khipu.drift import is_smoke_row
+    from khipu.tombstones import withheld_episode_ids, withhold
 
     rows, sources = _read_hub(cur)
     by_key: dict[tuple[str, str], dict[str, Any]] = {}
@@ -196,19 +231,22 @@ def _plan(memory_root: Path, cur, gate) -> tuple[dict[str, Any], list[dict[str, 
             continue
         key = (_norm_ts(obj["ts"]), _md5(str(obj.get("summary") or "")))
         row = by_key.get(key) if key[0] is not None else None
+        matched = [row] if row is not None else []
         via_source = False
         if row is None and key in sources:
-            row = by_id.get(sources[key])
-            via_source = row is not None
-        if row is None:
+            # A line with a historical key is the line of every episode
+            # that holds that key.
+            matched = [by_id[i] for i in sources[key] if i in by_id]
+            via_source = bool(matched)
+        if not matched:
             counts["file_only"] += 1
             continue
-        has_line.add(row["id"])
-        if row["deleted"]:
+        has_line.update(r["id"] for r in matched)
+        if all(r["deleted"] for r in matched):
             counts["matches_forgotten"] += 1
         elif via_source:
             counts["matched_via_sources"] += 1
-        elif _same_content(obj, row):
+        elif _same_content(obj, matched[0]):
             counts["present_identical"] += 1
         else:
             counts["present_different"] += 1
@@ -228,16 +266,19 @@ def _plan(memory_root: Path, cur, gate) -> tuple[dict[str, Any], list[dict[str, 
             continue
         candidates.append(row)
 
-    hidden = set(gate.episode_ids)
+    # This Mac's forget list and the replica's queued erasures; raises when
+    # either cannot be read, so nothing is written then.
+    hidden = set(gate.episode_ids) | set(withheld_episode_ids())
     raws = _raws(cur, [r["id"] for r in candidates]) if candidates and not gate.empty else {}
-    new: list[dict[str, Any]] = []
-    skipped_here = 0
+    allowed = []
     for row in candidates:
         raw = raws.get(row["id"])
         if row["id"] in hidden or (isinstance(raw, dict) and not gate.allows_stored(raw)):
-            skipped_here += 1
             continue
-        new.append(line_for(row))
+        allowed.append(row)
+    # The one forget fence, as every other output applies it.
+    new = withhold(allowed, episode_key="id")
+    skipped_here = len(candidates) - len(new)
     counts.update(
         hub_live=sum(1 for r in rows if not r["deleted"]),
         would_add=len(new),
@@ -248,19 +289,67 @@ def _plan(memory_root: Path, cur, gate) -> tuple[dict[str, Any], list[dict[str, 
     return counts, new
 
 
-def _append(path: Path, lines: list[dict[str, Any]]) -> int:
-    """Every line in one append. Bytes already in the file are never touched;
-    a file whose last line lacks its newline gets one first, so the new first
-    line is not glued onto it."""
-    blob = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines).encode("utf-8")
+_TAIL_CHUNK = 1 << 16
+
+
+def _tail(path: Path) -> tuple[str, int]:
+    """What the end of ``path`` is: ``("clean", size)`` when empty, missing
+    or ending in a newline; ``("unterminated", size)`` when its last line is
+    whole JSON and whole UTF-8 but lacks the newline; ``("torn", keep)``
+    otherwise, ``keep`` being the length up to and including the last
+    newline (0 when there is none). Reads only."""
     try:
-        with path.open("rb") as fh:
-            if fh.seek(0, os.SEEK_END) > 0:
-                fh.seek(-1, os.SEEK_END)
-                if fh.read(1) != b"\n":
-                    blob = b"\n" + blob
+        fh = path.open("rb")
     except FileNotFoundError:
-        pass
+        return "clean", 0
+    with fh:
+        size = fh.seek(0, os.SEEK_END)
+        if size == 0:
+            return "clean", 0
+        fh.seek(size - 1)
+        if fh.read(1) == b"\n":
+            return "clean", size
+        end, tail = size, b""
+        while end > 0:
+            start = max(0, end - _TAIL_CHUNK)
+            fh.seek(start)
+            tail = fh.read(end - start) + tail
+            end = start
+            cut = tail.rfind(b"\n")
+            if cut >= 0:
+                keep = start + cut + 1
+                last = tail[cut + 1:]
+                break
+        else:
+            keep, last = 0, tail
+    try:
+        obj = json.loads(last.decode("utf-8"))
+    except ValueError:  # UnicodeDecodeError is a ValueError
+        return "torn", keep
+    return ("unterminated", size) if isinstance(obj, dict) else ("torn", keep)
+
+
+def _repair_tail(path: Path, state: tuple[str, int]) -> None:
+    """Cut a torn tail back to just after the last newline. Run under the
+    gate, so no writer this Mac runs is mid-write."""
+    kind, keep = state
+    if kind != "torn":
+        return
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        os.ftruncate(fd, keep)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _append(path: Path, lines: list[dict[str, Any]], unterminated: bool = False) -> int:
+    """Every line in one append. Bytes already in the file are never touched;
+    an ``unterminated`` whole last line gets its newline first, so the new
+    first line is not glued onto it."""
+    blob = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines).encode("utf-8")
+    if unterminated:
+        blob = b"\n" + blob
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
         view = memoryview(blob)
@@ -286,17 +375,44 @@ def export_new_lines(memory_root: Path, *, dry_run: bool = False) -> dict[str, A
         return {"ok": False, "dry_run": dry_run, "error": f"memory root missing: {memory_root}"}
     target = memory_root / CURRENT_FILE
 
+    def hub():
+        # A dry run writes no hub-reachability memo, creates no data
+        # directory and runs no local recovery.
+        conn = connect(record_reachability=False) if dry_run else connect()
+        try:
+            conn.read_only = True
+        except Exception:  # noqa: BLE001 - a driver without the flag still only reads here
+            pass
+        return conn
+
     def run(gate) -> dict[str, Any]:
-        with connect() as conn:
-            try:
-                conn.read_only = True
-            except Exception:  # noqa: BLE001 - a driver without the flag still only reads here
-                pass
+        with hub() as conn:
             with conn.cursor() as cur:
-                counts, new = _plan(memory_root, cur, gate)
+                counts, rows = _plan(memory_root, cur, gate)
             conn.rollback()
-        written = 0 if dry_run or not new else _append(target, new)
-        return {"ok": True, "dry_run": dry_run, "target": CURRENT_FILE, "added": written, **counts}
+        dropped = 0
+        if rows:
+            # Another Mac's forget may have committed since that read: its
+            # tombstones, read again right before the append.
+            with hub() as conn:
+                with conn.cursor() as cur:
+                    gone = _tombstoned(cur, [r["id"] for r in rows])
+                conn.rollback()
+            dropped = sum(1 for r in rows if r["id"] in gone)
+            rows = [r for r in rows if r["id"] not in gone]
+            counts["would_add"] = len(rows)
+        tail = _tail(target)
+        torn = int(tail[0] == "torn")
+        written = repaired = 0
+        if not dry_run:
+            _repair_tail(target, tail)
+            repaired = torn
+            if rows:
+                written = _append(target, [line_for(r) for r in rows],
+                                  unterminated=tail[0] == "unterminated")
+        return {"ok": True, "dry_run": dry_run, "target": CURRENT_FILE, "added": written,
+                **counts, "dropped_forgotten_since_read": dropped,
+                "torn_tail": torn, "repaired_torn_tail": repaired}
 
     if dry_run:
         out = run(tombstones.read_gate())
