@@ -1070,11 +1070,28 @@ def test_a_cold_hook_read_still_unreadable_at_the_check_is_refused(cold_hook, mo
     from khipu import t3
 
     _desktop_say("s-desktop")
-    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: (None, False))
+    reads: list = []
+    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: reads.append(sid) or (None, False))
     _be_with(cold_hook, "s-desktop", monkeypatch, _DESKTOP_ENV)
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check()
     assert err.value.code == "t3_unreadable"
+    # One bounded set of tries, not a second set on the T3 path (review of #570).
+    assert len(reads) == owner_direction._OWNER_T3_ATTEMPTS
+
+
+def test_a_cold_hook_read_still_unreadable_at_a_hold_reads_once(cold_hook, monkeypatch):
+    from khipu import owner_act, t3
+
+    session = "s-terminal"
+    cold_hook.be(session)
+    cold_hook.say("go ahead with that", session=session)
+    assert owner_turns.turns(session)[-1]["entrypoint"] == "t3-unverified"
+    reads: list = []
+    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: reads.append(sid) or (None, False))
+    ok, out = owner_act.act("ledger.purge", {"id": "T-12", "project": "atlas"})
+    assert not ok and "t3_unreadable" in str(out), out
+    assert len(reads) == owner_direction._OWNER_T3_ATTEMPTS
 
 
 def test_a_cold_hook_read_never_lifts_a_job_or_a_machine(cold_hook, monkeypatch):

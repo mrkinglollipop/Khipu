@@ -210,6 +210,10 @@ def check(action: str, *, env=None, now: float | None = None, reading: bool = Fa
         turn = _recent_turn(session, conf, now, recorded)
     except DirectionRefused:
         member = _t3_state(session, recorded)
+        if member == "unreadable":
+            # Already tried under the owner budget; the T3 path would only
+            # repeat the same reads before refusing the same way.
+            raise DirectionRefused("t3_unreadable", _T3_UNREADABLE_WHY) from None
         if member == "t3":
             # A T3 conversation (or one whose hook could not read T3's record in
             # time, which T3's record is asked again here): its hook turns never
@@ -280,14 +284,16 @@ def _t3_state(session: str, turns_: list[dict]) -> str:
 
     - "t3": a turn the hook recorded as T3's, or a turn whose T3 lookup could
       not be read (``t3-unverified``) and T3's record, read now, names a
-      thread for this session or still can't be read (the T3 path, which
-      refuses ``t3_unreadable`` when it can't read it either);
+      thread for this session (the T3 path);
+    - "unreadable": unverified turns, and T3's record still can't be read
+      after the bounded tries. The caller refuses ``t3_unreadable`` without
+      reading it again (the T3 path's own read would repeat these tries);
     - "settled": unverified turns, and T3's record, read now definitively,
       holds no thread for this session; those turns are judged by their
       native entrypoint (``owner_turns.eligible``'s ``t3_settled_none``);
     - "native": no turn needs T3's record, which is not read.
 
-    A failed read is never "settled"."""
+    A failed read is never "settled" or "native"."""
     entries = {t.get("entrypoint") for t in turns_}
     if "t3" in entries:
         return "t3"
@@ -302,14 +308,15 @@ def _t3_state(session: str, turns_: list[dict]) -> str:
             threads, definitive = t3.session_thread_ids_result(session)
             if definitive:
                 return "t3" if threads else "settled"
-    return "t3"
+    return "unreadable"
 
 
 def _t3_conversation(session: str, turns_: list[dict]) -> bool:
     """Whether T3's record proves the owner in this conversation (``_t3_state``
-    is "t3"). An unread turn never counts itself, so one unread lookup only
-    stops poisoning a conversation T3 never ran."""
-    return _t3_state(session, turns_) == "t3"
+    is "t3", or "unreadable", which keeps the T3 path and its refusal). An
+    unread turn never counts itself, so one unread lookup only stops
+    poisoning a conversation T3 never ran."""
+    return _t3_state(session, turns_) in ("t3", "unreadable")
 
 
 def _t3_thread_of(session: str) -> str:
@@ -588,7 +595,9 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
             extra = {}
             if terminal or authorized is not None:
                 pass
-            elif (member := _t3_state(session, turns_)) == "t3":
+            elif (member := _t3_state(session, turns_)) == "unreadable":
+                raise DirectionRefused("t3_unreadable", _T3_UNREADABLE_WHY)
+            elif member == "t3":
                 with t3.owner_read_budget():
                     thread, _ = _t3_bound(environ, session, now)
                     seeded = None if class_c(action, args) else _seed(thread, session, signature(action, args))
@@ -866,7 +875,7 @@ def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
     thread runs ``session`` (``_t3_state``)."""
     recorded = owner_turns.turns(session, now)
     member = _t3_state(session, recorded)
-    if member == "t3":
+    if member in ("t3", "unreadable"):
         raise DirectionRefused("no_recorded_turn", "This conversation's turns were recorded as T3's, but T3's "
                                                    "record no longer shows it, so Khipu can't confirm here.")
     if owner_turns.dispatched_job(environ, session):
