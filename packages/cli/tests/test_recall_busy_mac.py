@@ -230,10 +230,8 @@ class KeepCachesWarmTest(unittest.TestCase):
 class WarmCachesTest(unittest.TestCase):
     def test_it_also_counts_word_rarity(self) -> None:
         with mock.patch("khipu.hub_snapshot.active_snapshot_profile", return_value=None), \
-                mock.patch("khipu.graph_candidates._episode_slug_map") as slugs, \
                 mock.patch("khipu.hub_snapshot.term_document_frequency") as counts:
             recall_daemon._warm_caches()
-        slugs.assert_called_once_with()
         counts.assert_called_once_with()
 
 

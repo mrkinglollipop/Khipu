@@ -10,7 +10,7 @@ from unittest import mock
 from uuid import UUID
 
 import pytest
-from khipu import cli, config, embed, extract, integrations, keychain, models, rerank, synth_cli
+from khipu import cli, config, embed, extract, integrations, keychain, models, synth_cli
 from khipu import session_capture as sc
 from tests.test_cli_recall_quality import _green_doctor_patches
 
@@ -307,15 +307,6 @@ def test_empty_key_file_does_not_count_as_key(tmp_path):
         keychain.resolve_anthropic_key()
 
 
-@pytest.mark.parametrize('provider', ['anthropic', 'openai', 'openrouter'])
-def test_rerank_dispatch_and_missing_key_mapping(provider):
-    models.set_models_merge_role('synth', provider=provider, model_id='m')
-    with mock.patch.object(extract, '_provider_key', return_value='fake'), \
-         mock.patch.object(extract, '_generate', return_value='[0]') as gen:
-        assert rerank._call_model('p', timeout=1) == ('[0]', 'm')
-    gen.assert_called_once_with('p', timeout=1, retries=0, caller='rerank')
-    with pytest.raises(rerank._Unavailable):
-        rerank._call_model('p', timeout=1)
 
 
 def test_provider_grouping_legacy_rows_and_unknown_cost():
@@ -393,14 +384,6 @@ def test_transport_retry_redaction_and_missing_key_no_charge(provider):
     assert embed.budget_status('synth')['calls'] == 2
 
 
-@pytest.mark.parametrize('provider', ['anthropic', 'openai', 'openrouter'])
-def test_rerank_configured_model_reaches_adapter(provider):
-    models.set_models_merge_role('synth', provider=provider, model_id='custom-model')
-    with mock.patch.object(extract, '_provider_key', return_value='fake'), \
-         mock.patch.object(extract, '_generate_' + provider, return_value='[1]') as adapter:
-        assert rerank._call_model('unchanged-prompt', timeout=1.5) == ('[1]', 'custom-model')
-    adapter.assert_called_once_with('unchanged-prompt', model_id='custom-model', timeout=1.5,
-                                   retries=0, caller='rerank')
 
 
 def test_extraction_fixture_prompt_is_byte_identical_across_adapters():
@@ -706,14 +689,6 @@ def test_cli_dispatch_default_timeout_and_missing_usage(provider):
     assert extract.synth_usage_today()['calls'] == 1
 
 
-@pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])
-def test_cli_rerank_refusal_before_key_or_adapter(provider):
-    models.set_models_merge_role('synth', provider=provider, model_id='m')
-    with mock.patch.object(extract, '_provider_key') as key, mock.patch.object(extract, '_generate') as adapter:
-        with pytest.raises(rerank._Unavailable, match='rerank needs an API provider'):
-            rerank._call_model('p', timeout=1)
-    key.assert_not_called()
-    adapter.assert_not_called()
 
 
 @pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])

@@ -44,6 +44,11 @@ NOT_CAPTURE = {
     "session_capture._write_claim_owner": "PID and kernel process birth metadata only; no capture text",
     "hub_snapshot._write_endpoint_file": "the hub endpoint's sha256 fingerprint (host, port, database, role) "
                                          "and its generation counter; no capture text",
+    "macs._write_cache": "this Mac's status row as kept for the timer: check keys and states, counts, free space, "
+                         "version, sign-in labels, and the running jobs as `khipu running` last read them (a job's "
+                         "own one-line task text and last line, clipped and cut of paths and secrets by "
+                         "running_now.project_runners, the same closed list the hub row carries); no transcript, "
+                         "prompt, summary or episode text",
     "usage._log_attempt": "usage-probe attempt log: time, account key, ok flag, error code and milliseconds only; "
                           "no capture text",
     "usage._rotate_attempts": "renames that same attempts log when it grows large; writes no text of its own",
@@ -161,7 +166,6 @@ NOT_CAPTURE = {
                      "routing._save_view", "routing_replay._routing_quiet", "routing_replay._seed",
                      "routing_replay.replay", "conversation_overrides._append", "priority_cleanup._save",
                      "routing_page_file.write"), _ROUTING),
-    "notes.hook_reconcile": "a one-line timestamp that throttles the Stop hook's notes step; no note text",
     **dict.fromkeys(("memory_md.regen_memory_md", "notes._write_state", "organise._backup_index",
                      "organise._write_evidence", "organise.rewrite_index", "organise.split_note"),
                     _NOTES),

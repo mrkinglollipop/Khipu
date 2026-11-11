@@ -162,7 +162,7 @@ def _is_trivial(tokens: list[str]) -> bool:
 # tagged envelope) is not something the user asked. Both are abstentions
 # (outcome no_match), not gates: the prompt was read and needs nothing.
 LONG_PROMPT_CHARS = 800
-_HARNESS_MESSAGE_RE = re.compile(r"\s*<[A-Za-z][\w-]*>")
+from khipu.turn_text import HARNESS_MESSAGE_RE as _HARNESS_MESSAGE_RE  # noqa: E402  one test, shared with owner-words search
 
 
 def _self_contained(prompt: str) -> str | None:
@@ -2070,7 +2070,7 @@ def _relevance_gate(rows: list[dict[str, Any]], tokens: list[str]) -> list[dict[
     try:
         from khipu import relevance
 
-        if not rows or not tokens or not relevance.enabled():
+        if not rows or not tokens:
             return rows
         from khipu.search_text import token_hit_count
 
@@ -2433,7 +2433,7 @@ def _fuse_and_annotate(
     legs: list[str], degraded: str | None, graph: bool = True,
 ) -> dict[str, Any]:
     # forget-fence source: prior_work_for_prompt fences the push
-    """Everything after the legs finish: fusion, graph candidates, the
+    """Everything after the legs finish: fusion, the
     relevance gate, row metadata, project/status ranking, time boost and
     validity. One function for the keyword-only result and the full one, so
     the two cannot drift apart. It rewrites the rows it is given and appends
@@ -2499,64 +2499,9 @@ def _fuse_and_annotate(
 
     fused = fuse_ranked_lists(lists, limit=_REPLICA_DEPTH)
 
-    # Graph candidates (Phase 3, session A): switch-gated, own 150ms
-    # deadline, dropped entirely (never partially) on a miss — named in
-    # `degraded_legs`, not silently absorbed into `degraded` above (that
-    # field is already owned by the lexical/cosine legs' own vocabulary).
-    # Seeds are the top 5 rows of `fused` as fused above, before any of the
-    # metadata/validity passes below touch it.
     degraded_legs: list[str] = []
-    from khipu import features as _features
 
-    if graph and _features.enabled("graph_candidates"):
-        try:
-            from khipu import graph_candidates as _gc
-
-            gc_deadline = time.monotonic() + _gc.REPLICA_LEG_DEADLINE_S
-            # Only the head of the fused list is excluded from candidacy: at
-            # _REPLICA_DEPTH an indirectly linked row usually sits somewhere
-            # in the tail, and excluding it there dropped the graph's vote
-            # for it (and its `via`) entirely.
-            cand_rows, missed = _gc.replica_candidates(
-                con, fused[:_CANDIDATE_LIMIT], deadline=gc_deadline
-            )
-            if missed:
-                degraded_legs.append("graph_candidates")
-            elif cand_rows:
-                # This lane's `via` is the bare seed id (e.g.
-                # "topic:billing-service"), not graph_candidates' own
-                # {seed, relation} dict — the compact per-prompt block has
-                # no room for the relation detail the hub leg keeps.
-                for r in cand_rows:
-                    via = r.get("via")
-                    if isinstance(via, dict):
-                        r["via"] = via.get("seed")
-                cand_rows = hub_snapshot.snapshot_filter_live_sources(con, cand_rows)
-                # A candidate from the tail votes once, as a candidate (as it
-                # did when the fused list was _CANDIDATE_LIMIT long): keeping
-                # its tail vote too let linked notes outrank direct hits.
-                # Its retrieval evidence (cosine, profile, lexical and
-                # prompt-term hits) stays on the candidate row, so the
-                # relevance gate and push ranking still see it; the candidate's
-                # own fields, `via` included, win.
-                tail_by_key = {(r.get("kind"), str(r.get("id"))): r for r in fused}
-                cand_keys = set()
-                for r in cand_rows:
-                    k = (r.get("kind"), str(r.get("id")))
-                    cand_keys.add(k)
-                    orig = tail_by_key.get(k)
-                    if orig:
-                        for f, v in orig.items():
-                            if f not in ("via", "score") and r.get(f) is None:
-                                r[f] = v
-                fused = [r for r in fused if (r.get("kind"), str(r.get("id"))) not in cand_keys]
-                fused = fuse_ranked_lists([fused, cand_rows], limit=_REPLICA_DEPTH)
-                legs.append("graph_candidates")
-        except Exception as exc:  # noqa: BLE001 — a candidate-leg failure must not sink the search
-            degraded_legs.append("graph_candidates")
-            _log(f"snapshot graph-candidates leg skipped: {type(exc).__name__}")
-
-    # Once, after fusion and graph expansion: candidate rows carry no signal,
+    # Once, after fusion: candidate rows carry no signal,
     # so they can never make an otherwise empty list pass.
     fused = hub_snapshot.snapshot_row_metadata(con, fused)
     from khipu.summary_kind import without_verbatim_only
@@ -2572,19 +2517,18 @@ def _fuse_and_annotate(
 
     # Time interpretation (Phase 3, session A): switch-gated. This lane never
     # receives an explicit since/until from its caller (the per-prompt hook
-    # has no such input), so the only gate needed here is the switch itself.
+    # has no such input), so no gate is needed here.
     # A preference (apply_time_boost), never a filter — nothing is excluded.
     interpretation: dict[str, Any] | None = None
-    if _features.enabled("time_interpretation"):
-        try:
-            from khipu import timeparse as _timeparse
+    try:
+        from khipu import timeparse as _timeparse
 
-            interpretation = _timeparse.interpret(prompt, datetime.now(timezone.utc), tz)
-            if interpretation:
-                fused = _timeparse.apply_time_boost(fused, interpretation)
-        except Exception as exc:  # noqa: BLE001 — additive, never a search failure
-            _log(f"snapshot time interpretation skipped: {type(exc).__name__}")
-            interpretation = None
+        interpretation = _timeparse.interpret(prompt, datetime.now(timezone.utc), tz)
+        if interpretation:
+            fused = _timeparse.apply_time_boost(fused, interpretation)
+    except Exception as exc:  # noqa: BLE001 — additive, never a search failure
+        _log(f"snapshot time interpretation skipped: {type(exc).__name__}")
+        interpretation = None
 
     # Validity annotation (Phase 2, session B): ONE indexed sqlite query
     # (decision_counts_snapshot, idx_snapshot_decisions_episode_id), bounded
@@ -4075,11 +4019,14 @@ def prompt_routing_budget_rate(*, now: datetime | None = None, warn_pct: float =
     """The share of recent prompts whose routing read was skipped for lack
     of time (``ROUTING_OUT_OF_TIME``: ``skipped`` in all, and each of them
     apart), over the last ``_ROUTING_RATE_MAX_CALLS`` prompts with the push
-    on in the last 7 days. ``warn`` when more than ``warn_pct`` percent of
-    20 or more did (0: never warn). Missing telemetry reports
+    on in the last 24 hours (the same window as the prompt-recall row, so a
+    quiet Mac does not report last week's failures as current). Fewer than 20
+    such prompts is no rate: ``rate_pct`` stays None and ``message`` says
+    "not enough recent prompts to tell". ``warn`` when more than ``warn_pct``
+    percent of 20 or more did (0: never warn). Missing telemetry reports
     ``available: False``."""
     now = now or datetime.now(timezone.utc)
-    cutoff = now.timestamp() - _OUTCOMES_WINDOW_S
+    cutoff = now.timestamp() - _OUTCOMES_OWNER_WINDOW_S
     out: dict[str, Any] = {"available": False, "count": 0, "skipped": 0, "skipped_budget": 0,
                            "skipped_fold_busy": 0, "skipped_busy": 0, "skipped_starting": 0, "rate_pct": None,
                            "warn_pct": warn_pct, "warn": False}
@@ -4110,7 +4057,11 @@ def prompt_routing_budget_rate(*, now: datetime | None = None, warn_pct: float =
     out.update(available=True, count=len(statuses), skipped=skipped, skipped_budget=each["skipped:budget"],
                skipped_fold_busy=each["skipped:fold-busy"], skipped_busy=each["skipped:busy"],
                skipped_starting=each["skipped:starting"])
-    if statuses:
+    if len(statuses) >= _ROUTING_RATE_MIN_CALLS:
         out["rate_pct"] = round(100.0 * skipped / len(statuses), 2)
+    else:
+        out["insufficient"] = True
+        out["message"] = (f"not enough recent prompts to tell ({len(statuses)} with routing on in the last "
+                          f"{_OUTCOMES_OWNER_WINDOW_S // 3600} hours; {_ROUTING_RATE_MIN_CALLS} are needed)")
     out["warn"] = bool(warn_pct and len(statuses) >= _ROUTING_RATE_MIN_CALLS and out["rate_pct"] > warn_pct)
     return out

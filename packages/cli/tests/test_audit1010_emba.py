@@ -587,38 +587,6 @@ class SearchValidityTest(unittest.TestCase):
         self.assertIn("t.deleted_at IS NULL", cur.sql)
         self.assertIn("e.deleted_at IS NULL", cur.sql)
 
-    def test_deleted_topic_never_reaches_actual_hybrid_reranker(self) -> None:
-        rows = [{"kind": "topic", "id": "live", "rank_text": "needle", "score": 1.0},
-                {"kind": "topic", "id": "gone", "rank_text": "needle", "score": .9}]
-        class Cur:
-            def execute(self, sql, params=None): self.sql = " ".join(sql.split())
-            def fetchall(self):
-                if "FROM topics WHERE deleted_at IS NULL" in self.sql:
-                    return [("live", None, "active", None, None, None)]
-                return []
-            def __enter__(self): return self
-            def __exit__(self, *_): return False
-        class Conn:
-            def cursor(self): return Cur()
-        @contextmanager
-        def hub(): yield Conn()
-        reranked = []
-        def stage(_query, candidates, **_kwargs):
-            reranked.extend(r["id"] for r in candidates)
-            return candidates, {"applied": True}, False
-        with mock.patch("khipu.hub_snapshot.try_hub_connect", hub), \
-                mock.patch("khipu.cli._literal_candidates", return_value=rows), \
-                mock.patch("khipu.topic_graph.enrich_search_results", side_effect=lambda _c, r: r), \
-                mock.patch("khipu.rerank.stage", side_effect=stage), \
-                mock.patch("khipu.recency.apply_project_and_status", side_effect=lambda r, project=None: r), \
-                mock.patch("khipu.recency.apply_recency", side_effect=lambda r: r), \
-                mock.patch.object(embed, "_episode_schema_flags", return_value={
-                    "project": True, "deleted_at": True, "harness": True,
-                    "parent_session_id": True}), \
-                mock.patch("khipu.features.enabled", side_effect=lambda name: name == "rerank"):
-            embed.hybrid_search("needle", mode="literal", limit=2,
-                                include_libraries=False)
-        self.assertEqual(reranked, ["live"])
 
 
 class HybridOrderingTest(unittest.TestCase):

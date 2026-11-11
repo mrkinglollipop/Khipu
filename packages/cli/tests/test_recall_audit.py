@@ -46,36 +46,6 @@ def test_capture_resume_prefers_current_home_with_old_file_present(tmp_path):
         assert not sc._read_beat('claude_code').get('transcript_missing')
 
 
-@pytest.mark.parametrize('semantic', [False, True])
-@pytest.mark.parametrize('filters', [
-    {'kind': 'episode', 'project': 'fake/alpha', 'since': '2026-10-15'},
-    {'kind': 'episode'},
-    {'project': 'fake/alpha'},
-    {'since': '2026-10-15'},
-    {},
-])
-def test_recall_graph_expansion_obeys_requested_filters(monkeypatch, semantic, filters):
-    from khipu import relevance
-
-    con = sqlite3.connect(':memory:')
-    hs._create_schema(con)
-    certify(con)
-    con.execute("INSERT INTO episodes (id,ts,session_id,summary,topics,project,raw) VALUES (1,'2026-10-20T00:00:00+00:00','codex:fake','zebrafish shipment','[\"Shared guide\"]','fake/alpha','{}')")
-    con.execute("INSERT INTO topics (slug,title,body,status,created_at,updated_at) VALUES ('shared-guide','Shared guide','unrelated reference','active','2020-01-01','2020-01-01')")
-    con.commit()
-    monkeypatch.setattr(hs, 'open_snapshot', lambda: con)
-    monkeypatch.setattr(hs, 'stale_fields', lambda: {'stale': True})
-    monkeypatch.setattr(relevance, 'enabled', lambda: False)
-    monkeypatch.setenv('KHIPU_FEATURE_GRAPH_CANDIDATES', '1')
-    if semantic:
-        monkeypatch.setattr(hs, 'semantic_search_snapshot', lambda *a, **k: [
-            {'kind': 'episode', 'id': '1', 'label': 'zebrafish shipment'}])
-    result = hs.search_stale_payload('zebrafish', 12, semantic=semantic, **filters)
-    expected = {('episode', '1')}
-    if not filters:
-        expected.add(('topic', 'shared-guide'))
-    assert {(r['kind'], r['id']) for r in result['results']} == expected
-    con.close()
 
 
 
@@ -133,40 +103,5 @@ def test_topic_event_date_filtered_before_enrichment(hub, monkeypatch):
     assert [r['id'] for r in filtered['results']] == ['zebrafish']
 
 
-@pytest.mark.parametrize('semantic', [False, True])
-@pytest.mark.parametrize('filters,changed', [
-    ({'project': 'fake/alpha'}, {'project': 'fake/beta'}),
-    ({'session_id': 'codex:fake'}, {'session_id': 'codex:other'}),
-    ({'harness': 'codex'}, {'harness': 'claude_code'}),
-    ({'since': '2026-10-15'}, {'ts': '2020-01-01T00:00:00Z'}),
-    ({'until': '2026-10-21'}, {'ts': '2026-10-25T00:00:00Z'}),
-    ({'t3_thread': 'thread-1'}, {'raw': '{"t3_thread_id":"other","via":"t3"}'}),
-    ({'via': 't3'}, {'raw': '{"t3_thread_id":"thread-1","via":"other"}'}),
-])
-def test_recall_graph_neighbors_recheck_each_metadata_filter(monkeypatch, semantic, filters, changed):
-    from khipu import relevance
-
-    con = sqlite3.connect(':memory:')
-    hs._create_schema(con)
-    certify(con)
-    fields = ('id', 'ts', 'session_id', 'harness', 'project', 'summary', 'raw')
-    seed = dict(zip(fields, (1, '2026-10-20T00:00:00Z', 'codex:fake:123', 'codex',
-                            'fake/alpha', 'zebrafish shipment', '{"t3_thread_id":"thread-1","via":"t3"}')))
-    neighbor = dict(seed, id=2, summary='unrelated neighbor', **changed)
-    for row in (seed, neighbor):
-        con.execute(f"INSERT INTO episodes ({','.join(fields)}) VALUES ({','.join('?' for _ in fields)})",
-                    [row[f] for f in fields])
-    con.commit()
-    monkeypatch.setattr(hs, 'open_snapshot', lambda: con)
-    monkeypatch.setattr(hs, 'stale_fields', lambda: {'stale': True})
-    monkeypatch.setattr(relevance, 'enabled', lambda: False)
-    monkeypatch.setattr(hs, '_graph_candidates_snapshot', lambda con, rows: (
-        rows + [{'kind': 'episode', 'id': '2', 'label': 'unrelated neighbor'}], []))
-    if semantic:
-        monkeypatch.setattr(hs, 'semantic_search_snapshot', lambda *a, **k: [
-            {'kind': 'episode', 'id': '1', 'label': 'zebrafish shipment'}])
-    result = hs.search_stale_payload('zebrafish', 12, semantic=semantic, **filters)
-    assert [(r['kind'], r['id']) for r in result['results']] == [('episode', '1')]
-    con.close()
 
 

@@ -306,39 +306,8 @@ class RecallAndForgetGateTest(unittest.TestCase):
                 redirect_stdout(io.StringIO()):
             self.assertEqual(cli.cmd_recall(args), 1)
 
-    def test_relevance_requires_applicable_entries_and_expected_positive_hits(self):
-        args = argparse.Namespace(recall_cmd="eval", golden=None, path="explicit", record=None, compare=None,
-                                  replay=None, allow_changes=False, budget_ms=None, rerank=None, relevance_floor="on")
-        report = {"paths": {"explicit": {"entries": 1, "abstain_total": 0, "abstain_correct": 0,
-                                             "positives": 1, "positives_found": 0, "emptied_positives": []}},
-                  "rows": [{"expect_none": False, "hit_with": False, "got_with": ["unrelated"],
-                            "hit_without": True, "got_without": ["expected"]}]}
-        with mock.patch("khipu.recall_eval.load_golden", return_value=[{"query": "q"}]), \
-                mock.patch("khipu.recall_eval.run_relevance_eval", return_value=report), \
-                redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.cmd_recall(args), 1)
 
-    def test_relevance_rejects_zero_applicable_entries_and_empty_paths(self):
-        args = argparse.Namespace(recall_cmd="eval", golden=None, path="explicit", record=None, compare=None,
-                                  replay=None, allow_changes=False, budget_ms=None, rerank=None, relevance_floor="off")
-        for report in ({"paths": {"explicit": {"entries": 0, "abstain_total": 0, "abstain_correct": 0}}, "rows": []},
-                       {"paths": {}, "rows": []}):
-            with self.subTest(report=report), \
-                    mock.patch("khipu.recall_eval.load_golden", return_value=[{"query": "q"}]), \
-                    mock.patch("khipu.recall_eval.run_relevance_eval", return_value=report), \
-                    redirect_stdout(io.StringIO()):
-                self.assertEqual(cli.cmd_recall(args), 1)
 
-    def test_relevance_keeps_a_baseline_miss_outside_floor_regression(self):
-        args = argparse.Namespace(recall_cmd="eval", golden=None, path="explicit", record=None, compare=None,
-                                  replay=None, allow_changes=False, budget_ms=None, rerank=None, relevance_floor="on")
-        report = {"paths": {"explicit": {"entries": 1, "abstain_total": 0, "abstain_correct": 0,
-                                             "positives": 1, "positives_found": 0, "emptied_positives": []}},
-                  "rows": [{"expect_none": False, "hit_without": False, "hit_with": False}]}
-        with mock.patch("khipu.recall_eval.load_golden", return_value=[{"query": "q"}]), \
-                mock.patch("khipu.recall_eval.run_relevance_eval", return_value=report), \
-                redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.cmd_recall(args), 0)
 
     def test_forget_fails_when_snapshot_cleanup_is_partial(self):
         args = argparse.Namespace(episode_cmd="forget", id=7)

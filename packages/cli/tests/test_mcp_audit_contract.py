@@ -280,12 +280,11 @@ def test_f12_offline_search_exposes_honest_signals(monkeypatch, semantic, rows, 
     monkeypatch.setattr(hs, "search_snapshot", lambda *a, **kw: copy.deepcopy(rows))
     monkeypatch.setattr(hs, "semantic_search_snapshot", lambda *a, **kw: copy.deepcopy(rows))
     monkeypatch.setattr(hs, "merge_outbox_episodes", lambda results, **kw: results)
-    monkeypatch.setattr(hs, "_graph_candidates_snapshot", lambda con, results: (results, []))
     monkeypatch.setattr(hs, "_filter_expanded_snapshot_rows", lambda con, results, **kw: results)
     monkeypatch.setattr(hs, "enrich_search_results_snapshot", lambda con, results: results)
     monkeypatch.setattr(hs, "_annotate_snapshot_validity", lambda con, results: results)
     monkeypatch.setattr(hs, "stale_fields", lambda: {"stale": True})
-    monkeypatch.setattr("khipu.relevance.enabled", lambda: False)
+    monkeypatch.setattr("khipu.relevance.gate", lambda rows, n: (rows, None))
     out = hs.search_stale_payload("orchid", 10, semantic=semantic)
     assert out["confidence"] == confidence and out["stale"]
     for row in out["results"]:

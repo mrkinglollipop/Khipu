@@ -135,7 +135,7 @@ describe("healthRows (pure)", () => {
     );
     const row = rows.find((r) => r.key === "notes_reconcile_ok");
     expect(row?.status).toBe("skipped");
-    expect(row?.label).toBe("Notes reconciled by the nightly");
+    expect(row?.label).toBe("Notes watcher installed");
   });
 
   it("sorts red first, then not-set-up, then green", () => {
@@ -153,7 +153,7 @@ describe("healthRows (pure)", () => {
   it("Phase 6: every new nightly-step / lag / degrade key has a plain-words label", () => {
     const rows = healthRows(fixture());
     const byKey = Object.fromEntries(rows.map((r) => [r.key, r.label]));
-    expect(byKey.notes_reconcile_ok).toBe("Notes reconciled by the nightly");
+    expect(byKey.notes_reconcile_ok).toBe("Notes watcher installed");
     expect(byKey.embed_provider_ok).toBe("Embedding provider reachable");
     expect(byKey.topics_embed_lag_ok).toBe("Search index catching up on time");
     expect(byKey.degraded_rate_ok).toBe("Search rarely falls back to keyword-only");
