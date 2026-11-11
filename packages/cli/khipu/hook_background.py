@@ -21,7 +21,6 @@ import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 
 DRAIN_SLOTS_DEFAULT = 4
 DRAIN_PASSES_MAX = 50
@@ -99,31 +98,23 @@ def _drain(sid: str, harness: str) -> None:
 
 
 def run(mem_root: str, harness: str, sid: str) -> None:
-    """Drain, mirror, replay the outbox, catch up embeddings.
+    """Drain, replay the outbox, catch up embeddings.
     Every step fails open and is logged with the session id.
 
+    ``mem_root`` is accepted for the hook's existing argument list and no
+    longer read: the files → hub tail copy of episodes.jsonl is gone (row 11;
+    the hub writes the files now, through the nightly export).
+
     The promotion gate's own capture (``KHIPU_GATE=1``, khipu.promote) drains
-    its isolated queue and stops there: the mirror, the outbox replay and the
-    embed catch-up all act on live state that is not
-    the gate's."""
+    its isolated queue and stops there: the outbox replay and the embed
+    catch-up both act on live state that is not the gate's."""
     try:
         _drain(sid, harness)
     except Exception as e:  # noqa: BLE001 — fail-open, always
         _say(sid, harness, f"drain skipped: {type(e).__name__}: {e}")
     if os.environ.get("KHIPU_GATE") == "1":
-        _say(sid, harness, "gate run: mirror, outbox drain and embed catch-up skipped")
+        _say(sid, harness, "gate run: outbox drain and embed catch-up skipped")
         return
-    try:
-        from khipu.config import path_setting
-        from khipu.mirror import sync_recent_episodes
-
-        mem = Path(mem_root) if mem_root else path_setting("memory_root")
-        if mem is None:
-            _say(sid, harness, "mirror skipped: memory_root not configured")
-        else:
-            _say(sid, harness, f"mirror {sync_recent_episodes(mem)}")
-    except Exception as e:  # noqa: BLE001
-        _say(sid, harness, f"mirror skipped: {type(e).__name__}: {e}")
     try:
         # Captures whose PG write failed wait in the outbox; replay them the
         # moment PG is reachable again. One listdir when empty.

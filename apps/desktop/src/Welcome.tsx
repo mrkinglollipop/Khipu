@@ -939,7 +939,7 @@ export function Welcome({
           <ul className="welcome-list">
             <li><strong>Database</strong>: join a Khipu you already have, set one up on this Mac, or connect to one you run.</li>
             <li><strong>Model</strong>: cloud Gemini, a local model, or skip for now (recording waits, nothing is lost).</li>
-            <li><strong>Agents</strong>: one click per harness to wire in recording.</li>
+            <li><strong>Agents</strong>: one click per app to wire in recording.</li>
             <li className="new-line"><strong>Accounts</strong>: see how much of each plan is left and tell your agents which accounts have room. Optional.</li>
             <li><strong>Finish</strong>: a health check, and where to get help.</li>
           </ul>
@@ -1270,7 +1270,7 @@ export function Welcome({
               {synthChoice === "cloud" ? (
                 <>
                   <p className="muted">
-                    Paste a Gemini API key (optional now — capture queues without one).
+                    Paste a Gemini API key (optional now — saving queues without one).
                   </p>
                   <div className="toolbar" style={{ width: "100%" }}>
                     <input
@@ -1423,7 +1423,7 @@ export function Welcome({
               ) : null}
               {embedChoice === "cloud" && !presence?.gemini_in_keychain && !presence?.gemini_env ? (
                 <Callout tone="warn" title="No Gemini key yet">
-                  Semantic search stays empty until a key is set; synth capture can still queue.
+                  Semantic search stays empty until a key is set; saving a summary can still queue.
                 </Callout>
               ) : null}
               {embedChoice === "cloud" &&
@@ -1458,7 +1458,7 @@ export function Welcome({
             finding it again.
           </p>
           {harnesses == null ? (
-            <p className="muted">Looking for harnesses…</p>
+            <p className="muted">Looking for apps…</p>
           ) : harnessesError ? (
             <div role="alert">
               <p className="muted">Couldn&apos;t look for harnesses{harnessesError ? `: ${harnessesError}` : "."}</p>
@@ -1467,7 +1467,7 @@ export function Welcome({
               </button>
             </div>
           ) : harnesses.length === 0 ? (
-            <p className="muted">No supported harness was found on this Mac yet.</p>
+            <p className="muted">No supported app was found on this Mac yet.</p>
           ) : (
             <ul className="welcome-list welcome-harness-list">
               {harnesses.map((h) => (
@@ -1488,7 +1488,7 @@ export function Welcome({
           )}
           <div className="toolbar">
             <button type="button" className="primary" onClick={openIntegrations}>
-              Open Harnesses to install and verify
+              Open Apps to install and verify
             </button>
           </div>
         </>

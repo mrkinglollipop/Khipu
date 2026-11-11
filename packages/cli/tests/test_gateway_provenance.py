@@ -584,37 +584,6 @@ class MirrorOriginTest(_ResetIdentityCache):
         self.assertTrue(ok)
         self.assertNotIn("origin", cur.inserts[0])
 
-    def test_sync_recent_episodes_passes_no_origin(self):
-        obj = {"ts": "2026-09-03T00:00:00Z", "session_id": "s1", "summary": "from a file"}
-        key = (obj["ts"], hashlib.md5(obj["summary"].encode()).hexdigest())
-        with tempfile.TemporaryDirectory() as d:
-            (Path(d) / "episodes.jsonl").write_text(json.dumps(obj) + "\n", encoding="utf-8")
-            with mock.patch("khipu.db.connect", return_value=_FakeConn(_OriginFakeCursor())), \
-                 mock.patch("khipu.drift.episodes_missing_in_pg", return_value=[key]), \
-                 mock.patch("khipu.embed.embed_on_capture", return_value=False), \
-                 mock.patch.object(mirror, "_upsert_episode", return_value=True) as up:
-                stats = mirror.sync_recent_episodes(Path(d))
-        self.assertEqual(stats["inserted"], 1)
-        up.assert_called_once()
-        self.assertIsNone(up.call_args.kwargs.get("origin"))
-        self.assertEqual(len(up.call_args.args), 2)  # cursor and payload only
-
-    def test_reconcile_passes_no_origin(self):
-        obj = {"ts": "2026-09-03T00:00:00Z", "session_id": "s1", "summary": "from a file"}
-        key = (obj["ts"], hashlib.md5(obj["summary"].encode()).hexdigest())
-        with tempfile.TemporaryDirectory() as d:
-            ep = Path(d) / "episodes.jsonl"
-            ep.write_text(json.dumps(obj) + "\n", encoding="utf-8")
-            with mock.patch("khipu.db.connect", return_value=_FakeConn(_OriginFakeCursor())), \
-                 mock.patch("khipu.drift.episode_files", return_value=[ep]), \
-                 mock.patch("khipu.drift.episodes_missing_in_pg", return_value=[key]), \
-                 mock.patch.object(mirror, "_upsert_episode", return_value=True) as up:
-                stats = mirror.reconcile_memory_root(Path(d))
-        self.assertEqual(stats["episodes_new"], 1)
-        up.assert_called_once()
-        self.assertIsNone(up.call_args.kwargs.get("origin"))
-        self.assertEqual(len(up.call_args.args), 2)
-
 
 class _MigCursor:
     def __init__(self, log: list):

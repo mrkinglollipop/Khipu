@@ -1,0 +1,243 @@
+/* Accounts › Room right now (slice A4). Khipu's own tokens from App.css;
+   every class starts `ac-`. The list and page frame comes from shell.css. */
+
+/* The panel fills the window under the toolbar so the list and page scroll on their own. */
+.panel.ac-panel:not(.is-hidden) {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.ac-empty {
+  flex: 1;
+  padding: 40px;
+  color: var(--text-2);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+}
+.ac-muted {
+  color: var(--muted);
+  font-size: 13.5px;
+}
+.ac-cap {
+  margin: 0 12px 12px;
+  color: var(--muted);
+  font-size: 14px;
+}
+.ac-foot {
+  margin: 12px 12px 0;
+}
+
+/* ---------- list ---------- */
+.ac-list {
+  display: block;
+}
+.ac-row {
+  height: auto; /* App.css gives every button a fixed height */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "name pace" "bar bar";
+  gap: 6px 12px;
+  align-items: start;
+}
+.ac-row .ac-name { grid-area: name; font-weight: 650; display: flex; flex-direction: column; min-width: 0; }
+.ac-row .ac-name .ac-muted { font-weight: 400; }
+.ac-row .ac-pace { grid-area: pace; }
+.ac-row .ac-bar { grid-area: bar; display: block; }
+.ac-pace {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 14px;
+  white-space: nowrap;
+  color: var(--text-2);
+}
+.ac-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.ac-pace.warn .ac-dot { background: var(--warn); }
+.ac-pace.err .ac-dot { background: var(--err); }
+.ac-pace.none .ac-dot { background: var(--border-strong); }
+.ac-line {
+  display: block;
+  margin-top: 7px;
+  font-size: 14px;
+  color: var(--text-2);
+  text-wrap: pretty;
+}
+.ac-meter {
+  position: relative;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.ac-meter > i { position: absolute; left: 0; top: -1px; bottom: -1px; border-radius: 3px; background: var(--ok); }
+.ac-meter > i.warn { background: var(--warn); }
+.ac-meter > i.err { background: var(--err); }
+/* The part agents leave alone: hatched, with a line where agents stop. */
+.ac-meter > s {
+  position: absolute; left: 0; top: -1px; bottom: -1px; border-radius: 3px 0 0 3px;
+  background: repeating-linear-gradient(135deg, transparent 0 3px, rgba(255, 255, 255, 0.55) 3px 5px);
+}
+.ac-meter > b { position: absolute; top: -5px; bottom: -5px; width: 2px; margin-left: -1px; background: var(--text); }
+
+.ac-ahead { margin: 4px 0 16px; padding: 0 12px; }
+.ac-ahead h2 { font-size: 15px; font-weight: 650; margin: 0 0 4px; }
+
+/* ---------- rows of running-ahead conversations ---------- */
+.ac-ahead-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+.ac-ahead-rows.compact .ac-ahead-row { border-top: 0; padding: 10px 0 0; }
+.ac-row-acts { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+
+/* ---------- buttons, fields, errors ---------- */
+.ac-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.ac-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.ac-btn:focus-visible, .ac-quiet:focus-visible, .ac-back:focus-visible, .ac-field select:focus-visible, .ac-field input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+@media (hover: hover) and (pointer: fine) {
+  .ac-btn:not(:disabled):hover { border-color: var(--text-2); }
+}
+.ac-quiet {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--accent-text);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ac-quiet:disabled { opacity: 0.45; cursor: not-allowed; }
+.ac-dismiss { color: var(--muted); font-weight: 400; }
+.ac-error {
+  margin: 8px 0 0;
+  color: var(--err);
+  font-size: 14px;
+  text-wrap: pretty;
+}
+.ac-field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); min-width: 0; }
+.ac-field select, .ac-field input {
+  height: 40px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  max-width: 100%;
+}
+
+/* ---------- receipts ---------- */
+.ac-receipt {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: var(--ok-soft);
+  color: var(--text);
+  font-size: 14.5px;
+}
+.ac-receipt.block { margin: 0 0 12px; }
+.ac-receipt.inline { margin: 0 0 20px; }
+.ac-receipt svg { color: var(--ok); margin-top: 3px; flex: none; }
+.ac-receipt-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+
+/* ---------- the account's page ---------- */
+.ac-back {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 16px;
+  padding: 6px 4px;
+  border: 0;
+  background: none;
+  color: var(--accent-text);
+  font: inherit;
+  font-size: 15px;
+  cursor: pointer;
+}
+@media (max-width: 899px) {
+  .ac-back { display: inline-flex; min-height: 44px; }
+}
+.ac-dhead { padding-bottom: 16px; }
+.ac-dhead h2 { margin: 0; font-size: 22px; line-height: 1.25; letter-spacing: -0.01em; }
+.ac-dhead p { margin: 2px 0 0; }
+.ac-page h3 { font-size: 15px; font-weight: 650; margin: 0 0 6px; }
+.ac-dgrid > div + div { margin-top: 32px; }
+/* Two columns once the page beside the list is about 900 px wide (a 1620 px window and up). A plain media
+   query: container queries need a newer macOS web view than the app's minimum. */
+@media (min-width: 1620px) {
+  .ac-dgrid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 56px; align-items: start; }
+  .ac-dgrid > div + div { margin-top: 0; }
+}
+.ac-kv { padding: 12px 0; border-top: 1px solid var(--border); }
+.ac-k { font-weight: 650; }
+.ac-v { margin-top: 2px; color: var(--text-2); font-size: 14.5px; text-wrap: pretty; }
+.ac-signin { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.ac-ctl { padding: 16px 0; border-top: 1px solid var(--border); }
+.ac-ctl h4 { margin: 0; font-size: 15px; font-weight: 650; }
+.ac-help { margin: 2px 0 0; color: var(--text-2); font-size: 14px; text-wrap: pretty; }
+.ac-doit { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; align-items: flex-end; }
+.ac-rules { margin: 6px 0 0; padding-left: 20px; color: var(--text-2); font-size: 14px; }
+
+@media (max-width: 639px) {
+  .ac-btn, .ac-quiet, .ac-field select, .ac-field input { min-height: 44px; font-size: 16px; }
+  .ac-doit { align-items: stretch; }
+  .ac-ahead-row { flex-direction: column; align-items: flex-start; }
+}
+
+/* A11: what moved here from the older Accounts screen. */
+.ac-more { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+.ac-more h3 { margin: 0; font-size: 15px; }
+.ac-more-item { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.ac-more-item p, .ac-more-item ul { margin: 0; }
+.ac-more-item ul { padding-left: 18px; }
+.ac-more-confirm { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); }
+.ac-note { color: var(--muted); font-size: var(--t-md); }
+.ac-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.ac-btn.danger { color: var(--err); border-color: var(--err); }
+.ac-finder { display: flex; flex-direction: column; gap: 10px; margin: 24px 12px 12px; padding-top: 16px; border-top: 1px solid var(--border); }
+.ac-finder h2 { margin: 0; font-size: 15px; }
+.ac-finder-more summary { cursor: pointer; color: var(--accent-text); }
+.ac-finder-more[open] summary { margin-bottom: 8px; }
+/* The finder's found rows were drawn for a wide page; in the list pane they stack. */
+.ac-finder .aa-found { grid-template-columns: minmax(0, 1fr); row-gap: 8px; align-items: start; }
+.ac-finder .aa-found .aa-btns { justify-content: flex-start; }

@@ -139,25 +139,27 @@ class RoutingTest(unittest.TestCase):
         cap.capture({"summary": "x"}, mode="dual")
         self.assertEqual(self.calls, [("pg", {}), ("v2", {"suppress": True})])
 
-    def test_hub_pg_first_then_reverse_mirror_to_file(self):
-        # hub = PG is the record; the file is its reverse mirror (plan wording),
-        # so the legacy consumers keep working. Off only via KHIPU_HUB_FILE_MIRROR=0.
-        cap.capture({"summary": "x"}, mode="hub")
-        self.assertEqual(self.calls, [("pg", {}), ("v2", {"suppress": True})])
+    def test_hub_writes_pg_only_and_never_the_file(self):
+        # Row 11: hub = PG is the record; the nightly export writes the file
+        # line (khipu.capture_export), so capture_v2 never runs, either way.
+        self.assertEqual(cap.capture({"summary": "x"}, mode="hub"), 0)
+        self.assertEqual(self.calls, [("pg", {})])
         self.calls.clear()
         with mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "0"}):
             cap.capture({"summary": "x"}, mode="hub")
         self.assertEqual(self.calls, [("pg", {})])
 
     def test_pg_failure_is_queued_file_still_written_and_returns_zero(self):
+        expected = {"dual": [("v2", {"suppress": False})],  # file leg, own mirror ON
+                    "hub": []}                              # row 11: no file leg in hub
         for mode in ("dual", "hub"):
             self.calls.clear()
             self.p_pg.stop()
             with mock.patch.object(cap, "write_pg", side_effect=RuntimeError("pg down")):
                 rc = cap.capture({"summary": "x", "ts": "2026-08-17T18:00:00Z"}, mode=mode)
             self.p_pg.start()
-            self.assertEqual(rc, 0, mode)                                   # durable: outbox + file
-            self.assertEqual(self.calls, [("v2", {"suppress": False})], mode)  # file leg, own mirror ON
+            self.assertEqual(rc, 0, mode)                                   # durable in the outbox
+            self.assertEqual(self.calls, expected[mode], mode)
         self.assertEqual(self._pending(), 1)                                # same identity -> one job
 
     def test_pg_failure_with_unwritable_outbox_is_a_real_exit(self):
@@ -166,8 +168,8 @@ class RoutingTest(unittest.TestCase):
                 mock.patch("khipu.outbox.enqueue", side_effect=OSError("disk full")):
             rc = cap.capture({"summary": "x"}, mode="hub")
         self.p_pg.start()
-        self.assertEqual(rc, cap.EX_SOFTWARE)                               # nowhere durable but the file
-        self.assertEqual(self.calls, [("v2", {"suppress": False})])
+        self.assertEqual(rc, cap.EX_SOFTWARE)                               # nowhere durable: stays queued
+        self.assertEqual(self.calls, [])                                    # row 11: no file leg in hub
 
 
 @unittest.skipUnless(PG_AVAILABLE, "Postgres unreachable; skipping live capture round-trip")
@@ -341,10 +343,10 @@ class VerbatimOnlyFileLegTest(unittest.TestCase):
         self.v2.assert_called_once()
         self.assertEqual(self.v2.call_args.args[0]["decisions"], ["synthetic decision"])
 
-    def test_whitespace_summary_without_verbatim_kind_keeps_the_file_leg_in_hub(self):
+    def test_whitespace_summary_without_verbatim_kind_keeps_the_file_leg_in_dual(self):
         p = self.payload(summary="   ", decisions=["synthetic decision"])
         p.pop("summary_kind")
-        cap._capture(p, mode="hub", result={})
+        cap._capture(p, mode="dual", result={})
         self.v2.assert_called_once()
 
 class _EpisodesFakeCursor:

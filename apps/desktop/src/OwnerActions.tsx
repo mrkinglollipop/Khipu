@@ -42,6 +42,8 @@ export type OwnerAction = {
   binding?: "hook" | "token" | "session";
   via_session?: string;
   state?: string | null;
+  /** The Mac the change was made on ("M5"); null when the line doesn't say. */
+  mac?: string | null;
   runs_at?: string;
   no_undo?: string;
   after?: Record<string, unknown> | null;
@@ -95,7 +97,7 @@ const SETTING_WORDS: Record<string, string> = {
  *  target where it helps; an id missing here still reads as words, never as the
  *  raw dotted id. A test keeps this table equal to the back end's list. */
 export const ACTION_LABELS: Record<string, string> = {
-  "owed.change": "Changed Owed items",
+  "owed.change": "Changed items on your list",
   "route.definition.set": "Changed an account or provider definition",
   "route.pause": "Paused an account",
   "route.lift": "Lifted a pause",
@@ -162,11 +164,11 @@ export const ACTION_LABELS: Record<string, string> = {
   "project.merge": "Merged two projects",
   "project.keep_separate": "Kept two projects separate",
   "project.separate": "Split a project name out again",
-  "forget.send": "Sent this Mac's forgets the hub lacked to the hub",
-  "forget.here": "Forgot a hub episode, already forgotten on this Mac",
-  "forget.not_same": "Marked a hub episode as not the one forgotten on this Mac",
-  "outbox.merge_preferences": "Merged saved notes from held captures into the hub",
-  "outbox.span_covered": "Retired held captures another episode covers",
+  "forget.send": "Sent this Mac's forgets that your saved memory lacked",
+  "forget.here": "Forgot a saved conversation, already forgotten on this Mac",
+  "forget.not_same": "Marked a saved conversation as not the one forgotten on this Mac",
+  "outbox.merge_preferences": "Merged saved notes from held saves into your saved memory",
+  "outbox.span_covered": "Retired held saves that another saved conversation covers",
 };
 
 /** An id with no label above, as words: "foo.bar_baz" reads "Owner change: foo bar baz". */
@@ -306,7 +308,7 @@ export function actionWords(a: OwnerAction, rules?: RouteRule[] | null): string 
       const count = t.split(",").filter(Boolean).length;
       const change = String(a.facts?.change ?? "");
       const verb = change === "close" ? "Closed" : change === "reopen" ? "Reopened" : change === "reassign" ? "Moved" : "Changed";
-      return `${verb} ${count} Owed items`;
+      return `${verb} ${count} items on your list`;
     }
     case "direction.off":
       return "Turned owner direction off";
@@ -315,15 +317,15 @@ export function actionWords(a: OwnerAction, rules?: RouteRule[] | null): string 
     case "direction.acknowledge":
       return "Acknowledged the tamper alarm";
     case "forget.send":
-      return "Sent this Mac's forgets the hub lacked to the hub";
+      return "Sent this Mac's forgets that your saved memory lacked";
     case "forget.here":
-      return `Forgot hub episode ${t}, already forgotten on this Mac`;
+      return `Forgot saved conversation ${t}, already forgotten on this Mac`;
     case "outbox.merge_preferences":
-      return "Merged saved notes from held captures into the hub";
+      return "Merged saved notes from held saves into your saved memory";
     case "outbox.span_covered":
-      return "Retired held captures another episode covers";
+      return "Retired held saves that another saved conversation covers";
     case "forget.not_same":
-      return `Marked hub episode ${t} as not the one forgotten on this Mac`;
+      return `Marked saved conversation ${t} as not the one forgotten on this Mac`;
     case "direction.set": {
       if (t.startsWith("trust ")) return `Trusted ${frontEndWords(t.slice(6))}`;
       if (t.startsWith("untrust ")) return `Stopped trusting ${frontEndWords(t.slice(8))}`;

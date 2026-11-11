@@ -13,41 +13,6 @@ import {
 } from "./postUpdateNotices";
 import "./whatsNew.css";
 
-/** Open and scroll to the Settings group named `group`, if it exists. The
- * element carries `data-settings-group="<group>"`; old folded groups open
- * themselves, while an eight-page routing group selects its page first. Tries
- * for a few frames because the section renders after the tab switches. */
-export function revealSettingsGroup(group: string, frames = 12): void {
-  let left = frames;
-  const selector = `[data-settings-group="${group.replace(/["\\]/g, "\\$&")}"]`;
-  const tick = () => {
-    const el = document.querySelector<HTMLElement>(selector);
-    if (el) {
-      if (el instanceof HTMLButtonElement && el.getAttribute("aria-expanded") === "false") el.click();
-      const page = el.closest<HTMLElement>("[data-routing-page]");
-      const pageKey = page?.dataset.routingPage;
-      if (pageKey && page?.dataset.active !== "true") {
-        document.querySelector<HTMLButtonElement>(`[data-routing-page-select="${pageKey}"]`)?.click();
-        requestAnimationFrame(tick);
-        return;
-      }
-      const folds = [...document.querySelectorAll<HTMLElement>(".route-rare-fold")].filter((fold) => fold.contains(el));
-      const closed = folds.find((fold) => fold.querySelector<HTMLButtonElement>(":scope > button")?.getAttribute("aria-expanded") === "false");
-      if (closed) {
-        closed.querySelector<HTMLButtonElement>(":scope > button")?.click();
-        requestAnimationFrame(tick);
-        return;
-      }
-      el.scrollIntoView?.({ block: "start" });
-      el.focus?.();
-      return;
-    }
-    left -= 1;
-    if (left > 0) requestAnimationFrame(tick);
-  };
-  requestAnimationFrame(tick);
-}
-
 type ShowProps = {
   /** What this build has; defaults to BUILD_CAPABILITIES. */
   caps?: ReadonlySet<Capability>;

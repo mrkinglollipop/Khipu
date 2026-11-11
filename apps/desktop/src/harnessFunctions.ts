@@ -145,7 +145,7 @@ export function antigravityMacRows(
     return [{
       key: "app",
       mark: "off",
-      text: "Khipu isn't installed in Antigravity on this Mac. Install adds capture, recall and memory tools with one click.",
+      text: "Khipu isn't installed in Antigravity on this Mac. Install adds saving, recall and memory tools with one click.",
     }];
   }
   const proof = row.proof ?? {};
@@ -199,7 +199,7 @@ export function antigravityT3Rows(
   };
   const recallLimited = [f.start_block, f.prompt_recall].every((v) => state(v) === "unsupported");
   return [
-    row("capture", "Capture", "from the project's files"),
+    row("capture", "Saving", "from the project's files"),
     row("mcp", "Memory tools (MCP)", "from the project's files"),
     recallLimited
       ? {
@@ -278,7 +278,7 @@ export function providerSummary(p: ProviderLike): {
     const n = p.projects?.installed ?? 0;
     const where = n === 1 ? "1 project" : `${n} projects`;
     const has = state(f.capture) === "installed" || state(f.mcp) === "installed";
-    if (has) line += `, capture and tools in ${where}; recall not possible in T3`;
+    if (has) line += `, saving and tools in ${where}; recall not possible in T3`;
   } else if (FEATURES.some((k) => state(f[k]) === "missing")) {
     line += ", Reinstall adds the rest";
   }

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
+import { openSettingsRow } from "./nav";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
@@ -24,14 +25,12 @@ describe("App — Join advertise", () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "dsn_configured") return true;
       if (cmd === "khipu_db_status") return JSON.stringify({ ok: true, host_kind: "remote" });
-      if (cmd === "liveness_now") return JSON.stringify({ ok: true, harnesses: {} });
       if (cmd === "join_advertise") return JSON.stringify({ ok: true, pin: "123456", timeout_sec: 600 });
       if (cmd === "run_khipu") return JSON.stringify({ ok: true, capture_liveness: { ok: true, harnesses: {} }, claude_homes: { homes: [] }, counts: {}, recent: [] });
       return JSON.stringify({ ok: true });
     });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
-    fireEvent.click(screen.getByRole("tab", { name: "Another Mac" }));
+    await openSettingsRow("Your Macs");
     fireEvent.change(await screen.findByLabelText("Join kit passphrase"), { target: { value: "phrase" } });
     fireEvent.click(await screen.findByRole("button", { name: /Advertise nearby/ }));
     expect(await screen.findByText(/Nearby setup started/)).toBeInTheDocument();
@@ -44,7 +43,6 @@ function mockRemoteHub() {
   invokeMock.mockImplementation(async (cmd: string) => {
     if (cmd === "dsn_configured") return true;
     if (cmd === "khipu_db_status") return JSON.stringify({ ok: true, host_kind: "remote" });
-    if (cmd === "liveness_now") return JSON.stringify({ ok: true, harnesses: {} });
     if (cmd === "join_advertise") return JSON.stringify({ ok: true, pin: "123456", timeout_sec: 600 });
     if (cmd === "join_export") return JSON.stringify({ ok: true, out: "/tmp/k.khipujoin", expected: {} });
     if (cmd === "run_khipu") return JSON.stringify({ ok: true, capture_liveness: { ok: true, harnesses: {} }, claude_homes: { homes: [] }, counts: {}, recent: [] });
@@ -54,8 +52,7 @@ function mockRemoteHub() {
 
 async function openAnotherMac() {
   render(<App />);
-  fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
-  fireEvent.click(screen.getByRole("tab", { name: "Another Mac" }));
+  await openSettingsRow("Your Macs");
   await screen.findByText("Set up another Mac");
   // IntegrationsPanel has its own "Save join kit…" shortcut; scope to this card.
   return within(screen.getByText("Set up another Mac").closest(".section-card") as HTMLElement);

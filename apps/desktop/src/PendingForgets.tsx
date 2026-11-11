@@ -9,7 +9,7 @@
    them. The owner's actions (each `--from-app`, owner actions
    `forget.send`, `forget.here` and `forget.not_same`): "Send to the hub"
    for the listed forgets, and for a forgotten episode number whose hub
-   episode is live, "Forget it here" or "Not the same episode". Shown in
+   episode is live, "Forget it here" or "Not the same conversation". Shown in
    Activity, beside Forget. */
 
 import { useCallback, useEffect, useState } from "react";
@@ -72,7 +72,7 @@ export function PendingForgets({
         if (!out || out.ok !== true) {
           setError(
             out?.hub_unreachable
-              ? "The hub isn't reachable. Try again when it is."
+              ? "Khipu can't reach your saved memory right now. Try again in a moment."
               : `${typeof out?.error === "string" ? out.error : failed}.`,
           );
         }
@@ -94,15 +94,15 @@ export function PendingForgets({
     <div className="callout warn" role="status">
       <div className="txt">
         <b>
-          {forgets(count)} {count === 1 ? "hasn't" : "haven't"} reached the hub
+          {forgets(count)} {count === 1 ? "hasn't" : "haven't"} reached your saved memory
         </b>
         <span>
-          Until they do, this Mac shows no owed items, decisions or deliverables, so nothing you forgot can come
-          back.
+          Until they do, this Mac holds back what it remembers from your conversations, so nothing you forgot can
+          come back.
         </span>
         {ids.map((item) => (
           <span key={item.id}>
-            You forgot episode {item.id} here, but the hub's episode {item.id} is still there
+            You forgot conversation {item.id} on this Mac, but your saved memory still has a conversation {item.id}
             {item.summary ? `: "${item.summary}"` : ""}. Forget it here too if it is the same one.
           </span>
         ))}
@@ -115,10 +115,10 @@ export function PendingForgets({
             className="sm primary"
             disabled={busy !== null}
             aria-busy={busy === "send" || undefined}
-            onClick={() => void act("send", ["--send"], "The hub didn't take every forget")}
+            onClick={() => void act("send", ["--send"], "Not every forget was sent")}
           >
             {busy === "send" ? <Loader2 size={14} className="spin" aria-hidden /> : null}
-            Send {forgets(strings.length)} to the hub
+            Send {forgets(strings.length)} now
           </button>
         ) : null}
         {ids.map((item) => (
@@ -129,11 +129,11 @@ export function PendingForgets({
               disabled={busy !== null}
               aria-busy={busy === `here-${item.id}` || undefined}
               onClick={() =>
-                void act(`here-${item.id}`, ["--forget-here", String(item.id)], `Episode ${item.id} wasn't forgotten`)
+                void act(`here-${item.id}`, ["--forget-here", String(item.id)], `Conversation ${item.id} wasn't forgotten`)
               }
             >
               {busy === `here-${item.id}` ? <Loader2 size={14} className="spin" aria-hidden /> : null}
-              Forget episode {item.id} here
+              Forget conversation {item.id} there too
             </button>
             <button
               type="button"
@@ -141,11 +141,11 @@ export function PendingForgets({
               disabled={busy !== null}
               aria-busy={busy === `same-${item.id}` || undefined}
               onClick={() =>
-                void act(`same-${item.id}`, ["--not-same", String(item.id)], `Episode ${item.id} is still listed`)
+                void act(`same-${item.id}`, ["--not-same", String(item.id)], `Conversation ${item.id} is still listed`)
               }
             >
               {busy === `same-${item.id}` ? <Loader2 size={14} className="spin" aria-hidden /> : null}
-              Not the same episode
+              Not the same conversation
             </button>
           </span>
         ))}

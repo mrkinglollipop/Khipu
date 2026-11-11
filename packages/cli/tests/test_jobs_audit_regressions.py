@@ -93,8 +93,8 @@ def test_driver_failure_keeps_failure_and_runs_independent_steps(tmp_path, monke
     assert jobs.run_nightly() == expected
     assert all(getattr(jobs, name).call_count == 1 for name in MAINTENANCE)
     assert json.loads((tmp_path / 'state/job-nightly.json').read_text())['exit'] == expected
-    step = jobs.nightly_last()['steps'][1]
-    assert step['name'] == 'consolidate_nightly' and step['ok'] is False
+    step = next(s for s in jobs.nightly_last()['steps'] if s['name'] == 'consolidate_nightly')
+    assert step['ok'] is False
     assert step['error']
 
 

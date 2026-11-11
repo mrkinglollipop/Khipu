@@ -1498,3 +1498,32 @@ def test_a_started_sessions_first_turn_is_a_machine_message_that_keeps_its_brief
     assert len(user) == 1 and user[0].startswith("[notification: session-start]")
     assert "Fix the recorder tests" in user[0]
     assert sc._machine_user_message("Fix the recorder tests, then pause Codex") is None
+
+
+def test_prompts_nobody_typed_are_not_typed_lines_in_capture():
+    """A scheduled prompt, another session's message, a task notification and
+    the brief another session started this one with (Claude Code's own
+    ``turnOrigin`` marks) never come out of capture as the owner's typed
+    words (review of #568 and #570, 2026-11-11)."""
+    marks = {"isMeta": True, "promptSource": "system", "wakeupSource": "schedule_wakeup", "turnOrigin": "scheduled"}
+    with tempfile.TemporaryDirectory() as td:
+        tp = _write(Path(td) / "s.jsonl", [
+            {"type": "user", "message": {"role": "user", "content":
+                "Task (from the session that started this one):\nFix the recorder tests, then pause Codex"},
+             "promptSource": "sdk", "turnOrigin": "sdk"},
+            {"type": "user", "message": {"role": "user", "content": "lane check: pause Codex now"}, **marks},
+            {"type": "user", "message": {"role": "user", "content": "peer says pause Codex now"},
+             "isMeta": True, "promptSource": "system", "turnOrigin": "peer"},
+            {"type": "user", "message": {"role": "user", "content":
+                "<task-notification><summary>job done</summary></task-notification>"},
+             "promptSource": "system", "turnOrigin": "task_notification"},
+            {"type": "user", "message": {"role": "user", "content": "pause Codex until tonight"},
+             "promptSource": "sdk", "turnOrigin": "human"},
+        ])
+        msgs, _, users = sc.read_window(tp, 0)
+    said = "\n".join(text for role, text in msgs if role == "user")
+    assert users == 1, msgs  # the owner's typed line only
+    assert "lane check" not in said and "peer says" not in said, said
+    assert "[notification: session-start] Task (from the session" in said
+    assert "[notification: task-notification] job done" in said
+    assert said.rstrip().endswith("pause Codex until tonight")

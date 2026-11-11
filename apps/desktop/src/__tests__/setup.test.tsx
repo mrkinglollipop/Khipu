@@ -10,6 +10,7 @@ import { act, render, screen, fireEvent, waitFor, cleanup, within } from "@testi
 import { Welcome } from "../Welcome";
 import App from "../App";
 import { IntegrationsPanel, verifiedLine } from "../IntegrationsPanel";
+import { openSettingsRow } from "./nav";
 
 const invokeMock = vi.fn();
 
@@ -312,6 +313,7 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
     });
 
     render(<App />);
+    await openSettingsRow("Where memory is kept");
 
     fireEvent.click(screen.getByRole("button", { name: /Move this memory to another database/ }));
     fireEvent.change(screen.getByLabelText("Target connection string"), {
@@ -344,8 +346,7 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
 
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-    fireEvent.click(screen.getByRole("tab", { name: "Another Mac" }));
+    await openSettingsRow("Your Macs");
 
     await waitFor(() =>
       expect(
@@ -365,8 +366,7 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
     invokeMock.mockImplementation(async (cmd: string) => defaultInvoke(cmd));
 
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-    fireEvent.click(screen.getByRole("tab", { name: "Another Mac" }));
+    await openSettingsRow("Your Macs");
 
     await waitFor(() =>
       expect(screen.getByText("Set up another Mac")).toBeInTheDocument(),
@@ -422,7 +422,7 @@ describe("Welcome › Finish step", () => {
       expect(screen.getByText("The newest backup is older than it should be")).toBeInTheDocument(),
     );
     expect(screen.getByText("Some note files no longer match the database")).toBeInTheDocument();
-    expect(screen.getByText("Some captures are still waiting to reach the database")).toBeInTheDocument();
+    expect(screen.getByText("Some saves are still waiting to reach the database")).toBeInTheDocument();
     // The revisions fix reads as a plain instruction here (Finish has no
     // Conflicting-edits view of its own to send the button to).
     expect(screen.getByText(/Conflicting edits — from Home, after you finish/)).toBeInTheDocument();
@@ -496,7 +496,7 @@ describe("Welcome › Finish step", () => {
     expect(screen.queryByText("Everything checked out")).not.toBeInTheDocument();
   });
 
-  it("runs the app probe itself when recall_probe_ok is red and no harness has verified", async () => {
+  it("runs the app probe itself when recall_probe_ok is red and no app has verified", async () => {
     let doctorCalls = 0;
     renderFinishStep(async (args) => {
       if (args[0] === "doctor" && args.includes("--probe")) {
@@ -699,7 +699,7 @@ describe("verifiedLine — live beat vs. no probe", () => {
 // for a successful round trip from the explicit per-harness probe.
 // ---------------------------------------------------------------------------
 
-describe("IntegrationsPanel — harness status after install", () => {
+describe("IntegrationsPanel — app status after install", () => {
   it("does not promote a heartbeat to Verified without a successful probe", async () => {
     // Real timers throughout — the 15 s interval is exercised via the same
     // "on window focus" trigger the panel wires up alongside it, so the test
@@ -757,7 +757,7 @@ describe("IntegrationsPanel — harness status after install", () => {
 
     fireEvent.click(within(card).getByRole("button", { name: /Reinstall/ }));
     await waitFor(() =>
-      expect(within(card).getByText(/select Verify to check capture and recall/)).toBeInTheDocument(),
+      expect(within(card).getByText(/select Verify to check saving and recall/)).toBeInTheDocument(),
     );
     expect(within(card).queryByText("Verified")).not.toBeInTheDocument();
 

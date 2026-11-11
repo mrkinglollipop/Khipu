@@ -205,7 +205,9 @@ def check(action: str, *, env=None, now: float | None = None, reading: bool = Fa
         return dict(confirmed["stamp"])
     from khipu import t3
 
-    recorded = owner_turns.turns(session, now)
+    # Claude Code writes a prompt's transcript line after its hook recorded
+    # the turn: what that line says started it is read here (``with_origins``).
+    recorded = owner_turns.with_origins(owner_turns.turns(session, now))
     try:
         turn = _recent_turn(session, conf, now, recorded)
     except DirectionRefused:
@@ -591,7 +593,7 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
     try:
         erased = _load(requests_path())["erased"]
         with _requests_locked() as path:
-            turns_ = owner_turns.turns(session, now)
+            turns_ = owner_turns.with_origins(owner_turns.turns(session, now))
             extra = {}
             if terminal or authorized is not None:
                 pass
@@ -873,7 +875,7 @@ def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
     """A confirm outside T3. Unverified turns are judged by their native
     entrypoint only when this check's own read of T3's record settles that no
     thread runs ``session`` (``_t3_state``)."""
-    recorded = owner_turns.turns(session, now)
+    recorded = owner_turns.with_origins(owner_turns.turns(session, now))
     member = _t3_state(session, recorded)
     if member in ("t3", "unreadable"):
         raise DirectionRefused("no_recorded_turn", "This conversation's turns were recorded as T3's, but T3's "
@@ -1067,10 +1069,15 @@ DECLINE_ACTION = "direction.decline"
 
 
 def decline(request_id: str, *, env=None, now: float | None = None, remote: dict | None = None,
-            terminal: bool = False, app: bool = False) -> dict:
+            terminal: bool = False, app: bool = False, receipt_after_send: bool = False) -> dict:
     """The owner's no to a held request: it is dropped and nothing changes.
     The proof a confirm needs, so a conversation can't answer for the owner
-    either way; with no reply since the ask it asks again, as a confirm does."""
+    either way; with no reply since the ask it asks again, as a confirm does.
+
+    ``receipt_after_send``: for a request another Mac holds, the routing
+    record's receipt is not written here; the returned row carries
+    ``receipt_due`` (not saved), which ``write_decline_receipt`` writes once
+    the no is recorded to send (``owner_act._decline``)."""
     from khipu import t3
 
     now = _clock() if now is None else now
@@ -1118,8 +1125,53 @@ def decline(request_id: str, *, env=None, now: float | None = None, remote: dict
     except OSError as err:
         raise DirectionRefused("log_unwritable", f"Khipu can't read or write the held requests ({err}), so nothing "
                                                  "was changed.") from None
+    if receipt_after_send and request.get("remote"):
+        return dict(request, receipt_due={"sentence": sentence, "line": line["id"], "harness": stamp.get("harness")})
     _write_receipt(sentence, line, stamp)
     return request
+
+
+def write_decline_receipt(request: dict) -> None:
+    """The routing record's receipt for a no ``decline(receipt_after_send=True)``
+    held back, written once that no is recorded to send to the other Mac."""
+    due = request.get("receipt_due")
+    if isinstance(due, dict):
+        _write_receipt(due["sentence"], {"id": due["line"]}, {"harness": due.get("harness")})
+
+
+def reopen_declined(request_id: str, line_id: str | None) -> dict:
+    """A no to a request another Mac holds that could not be recorded to send
+    there (``owner_act._decline``): the request waits again, and the no's
+    owner-actions line is marked failed, so nothing says it was given. A
+    request answered meanwhile is left as it is. Says what it managed:
+    ``waiting`` (the request is pending again) and ``marked`` (the line is
+    marked failed); a write that fails leaves that one False."""
+    now = _clock()
+    waiting = marked = False
+    try:
+        with _requests_locked() as path:
+            state = _load(path)
+            for row in state["requests"]:
+                if row.get("id") != request_id:
+                    continue
+                if row.get("state") == "declined" and row.get("owner_action") == line_id:
+                    for name in ("owner_action", "receipt", "settled_ts", "settled_at", "declined"):
+                        row.pop(name, None)
+                    row["state"] = "pending"
+                    _save(path, state, now)
+                waiting = row.get("state") == "pending"
+                break
+    except OSError:
+        pass
+    if line_id:
+        try:
+            _append({"kind": "state", "id": _new_id(), "at": _iso(now), "target": line_id, "state": "failed"})
+            marked = True
+        except OSError:
+            pass
+    else:
+        marked = True
+    return {"waiting": waiting, "marked": marked}
 
 
 _ERROR_CODE = re.compile(r"[a-z][a-z0-9_.]{0,63}")
@@ -1510,6 +1562,86 @@ def _merged(rows: list[dict]) -> dict[str, dict]:
 def actions() -> list[dict]:
     """The owner actions in log order, each as it stands now (``_merged``)."""
     return [line for line in _merged(read_log()).values() if line.get("kind") == "action"]
+
+
+# The other Mac's routing changes, as they appear in the owner-actions list: its record's event type -> the action
+# id the list already words (``ACTIONS``).  Only changes the owner made there and that took effect.
+_OTHER_MAC_ACTIONS = {
+    "rule_add": "route.rule.add", "rule_edit": "route.rule.edit", "rule_retire": "route.rule.retire",
+    "rule_restore": "route.rule.restore", "rule_confirm": "route.rule.confirm", "rule_undo": "route.rule.undo",
+    "rule_dismiss": "route.rule.dismiss", "hold": "route.hold.add", "hold_end": "route.hold.end",
+    "cap_set": "route.cap.set", "cap_remove": "route.cap.remove", "priority_set": "route.priority.set",
+    "priority_confirm": "route.priority.confirm", "priority_undo": "route.priority.undo",
+    "priority_clear": "route.priority.clear", "pause": "route.pause", "lift": "route.lift", "clear": "route.clear",
+    "note_set": "route.note.set", "note_end": "route.note.end",
+}
+OTHER_MAC_LINES_MOST = 100
+OTHER_MAC_NO_UNDO = "This was made on another Mac; undo it there."
+
+
+def _other_mac_target(event: dict) -> str:
+    kind = event.get("type")
+    if kind.startswith("priority_"):
+        return "priority"
+    if kind.startswith("note_"):
+        return "note"
+    if kind.startswith("rule_"):
+        # The rule's stable entity, as routing resolves it; the view names it by the number the hub gave it.
+        # A provisional ``n`` an older pending row kept can be another rule's number.
+        from khipu import routing
+
+        entity = routing.event_identity.entity(event)
+        if isinstance(entity, str) and entity:
+            return entity
+    for key in ("n", "entity", "account", "target", "id"):
+        if isinstance(event.get(key), (str, int)) and not isinstance(event.get(key), bool):
+            return str(event[key])
+    return ""
+
+
+def _other_mac_lines() -> list[dict]:
+    """The other Macs' owner changes to the routing record, newest first, as owner-actions lines: read from the
+    copy of their record this Mac already holds (the hub's receipts).  An event from a build that writes no Mac,
+    or none of ours to tell apart, is left out; a replica that can't be read adds nothing."""
+    from khipu import mac_names, routing, routing_replication
+
+    try:
+        mine = routing._local_mac()
+        events = routing_replication.remote_events()
+    except Exception:  # noqa: BLE001 - the other Mac's changes are a nicety; this Mac's list stands
+        return []
+    out = []
+    for event in events:
+        kind, mac, at = event.get("type"), event.get("mac"), event.get("written_at")
+        if (not isinstance(kind, str) or kind not in _OTHER_MAC_ACTIONS or not isinstance(mac, str) or not mac
+                or mac == mine or not isinstance(at, str) or event.get("pending") is True
+                or (event.get("written_by") or {}).get("kind") != "owner" or not isinstance(event.get("id"), str)):
+            continue
+        out.append({"kind": "action", "id": f"other-mac:{event['id']}", "at": at, "action": _OTHER_MAC_ACTIONS[kind],
+                    "target": _other_mac_target(event), "auth": "other_mac", "state": "applied", "undo": None,
+                    "no_undo": OTHER_MAC_NO_UNDO, "mac": mac_names.name_of(mac) or "Your other Mac"})
+    out.sort(key=lambda x: x["at"], reverse=True)
+    return out[:OTHER_MAC_LINES_MOST]
+
+
+def listing() -> list[dict]:
+    """Every owner action newest first, as the app lists them: each line carries ``mac`` (the Mac the change was
+    made on: this one, or the one a "same change as there" line names; ``None`` when a line doesn't say), and the
+    other Mac's routing changes are merged in.  Read only."""
+    from khipu import mac_names
+
+    here = mac_names.this_mac()
+    rows = []
+    for line in reversed(actions()):
+        mac = line.get("mac")
+        if not isinstance(mac, str) or not mac:
+            from_ = (line.get("facts") or {}).get("from") if isinstance(line.get("facts"), dict) else None
+            mac = from_ if line.get("auth") == "other_mac" and isinstance(from_, str) and from_ else \
+                None if line.get("auth") == "other_mac" else here
+        rows.append(dict(line, mac=mac))
+    merged = rows + _other_mac_lines()
+    merged.sort(key=lambda x: str(x.get("at") or ""), reverse=True)  # stable: equal times keep log order
+    return merged
 
 
 def line_state(line_id: str) -> str | None:
@@ -3464,8 +3596,7 @@ def run_cli(args) -> int:
         return 0
     if cmd == "actions":
         run_due()
-        rows = actions()
-        rows.reverse()
+        rows = listing()
         if getattr(args, "json", False):
             _print({"ok": True, "actions": rows})
         else:

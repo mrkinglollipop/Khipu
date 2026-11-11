@@ -9,6 +9,7 @@
     "core:default",
     "core:window:allow-start-dragging",
     "opener:default",
+    "autostart:default",
     "updater:default",
     "process:default",
     "dialog:allow-open",

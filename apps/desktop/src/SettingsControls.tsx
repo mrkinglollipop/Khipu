@@ -175,9 +175,9 @@ async function unsetConfig(key: string, reload: () => Promise<unknown>): Promise
 // ---------------------------------------------------------------------------
 
 const CAPTURE_MODE_OPTIONS: ReadonlyArray<readonly [string, string, string]> = [
-  ["legacy", "Files only", "The older capture script writes session files. Khipu stores nothing."],
-  ["dual", "Files and Khipu", "The capture script writes files and Khipu stores each capture too."],
-  ["hub", "Khipu only", "Khipu stores each capture. The session files are rebuilt from Khipu."],
+  ["legacy", "Files only", "The older saving script writes session files. Khipu stores nothing."],
+  ["dual", "Files and Khipu", "The saving script writes files and Khipu stores each saved conversation too."],
+  ["hub", "Khipu only", "Khipu stores each saved conversation. Each night it adds the new ones to the session files."],
 ];
 
 const SIMILARITY_ENV = {
@@ -186,7 +186,7 @@ const SIMILARITY_ENV = {
 
 /** Owed's limits (`khipu.config.COUNT_SETTINGS`), each liftable with 0. */
 const OWED_LIMIT_ROWS: ReadonlyArray<readonly [string, string, string]> = [
-  ["owed_page_max", "Most items on one page of Owed", "How many items one read of Owed returns. Show more reads the next page."],
+  ["owed_page_max", "Most items on one page of the work list", "How many items one read of the work list returns. Show more reads the next page."],
   ["owed_bulk_max", "Most items changed at once", "How many items one Close… or Move to… changes together."],
 ];
 
@@ -258,13 +258,13 @@ export function CaptureTuningCard({
           ) : null}
           <p className="cm-readonly">
             After {turns} turns or {minutes} minutes, before a conversation is compacted, and when it ends. The same
-            on every harness.
+            on every app.
           </p>
           <p className="set-help">Keys, tokens and passwords are masked before anything is summarised or stored.</p>
           <div className="set-field">
             <div className="set-labelrow">
               <label className="set-label" htmlFor={modeId}>
-                Where captures are written
+                Where saved conversations are written
               </label>
               {modeLocked ? <Tag tone="neutral">Locked</Tag> : null}
             </div>
@@ -306,8 +306,8 @@ export function CaptureTuningCard({
           </div>
           {similarity(
             "dedup_similarity",
-            "Merge near-duplicate captures at",
-            "From 0 to 1; higher merges only closer matches. A word matching rule can also merge close captures.",
+            "Merge near-duplicate saved conversations at",
+            "From 0 to 1; higher merges only closer matches. A word matching rule can also merge close saved conversations.",
           )}
         </div>
       </div>
@@ -316,7 +316,7 @@ export function CaptureTuningCard({
         <div className="section-head">Commitments</div>
         <div className="section-body">
           <p className="set-help">
-            Owed keeps explicitly filed asks and archived commitments. Only a deliberate update changes them.
+            The work list keeps explicitly filed asks and archived commitments. Only a deliberate update changes them.
           </p>
           <SettingField
             label="Your names"
@@ -368,8 +368,8 @@ export function CaptureTuningCard({
 // ---------------------------------------------------------------------------
 
 const OFFLINE_ROWS: ReadonlyArray<readonly [string, string]> = [
-  ["hub_statement_timeout", "Wait on the hub for a read or write (seconds)"],
-  ["hub_dead_connection_after", "Give up on a silent hub connection after (seconds)"],
+  ["hub_statement_timeout", "Wait on your saved memory for a read or write (seconds)"],
+  ["hub_dead_connection_after", "Give up on a silent connection to your saved memory after (seconds)"],
   ["app_cli_timeout", "Wait for an answer in this app (seconds)"],
 ];
 
@@ -378,10 +378,10 @@ export function OfflineWaitsCard({ active }: { active: boolean }) {
   const rows = cfg.data?.offline ?? {};
   return (
     <>
-      <div className="section-head">Waiting on the hub</div>
+      <div className="section-head">Waiting on your saved memory</div>
       <div className="section-body">
         <p className="set-help">
-          How long Khipu waits before it uses this Mac's copy of Owed. 0 means no limit.
+          How long Khipu waits before it uses this Mac's copy of the work list. 0 means no limit.
         </p>
         {cfg.error && !cfg.data ? (
           <p className="set-error" role="alert">
@@ -471,7 +471,7 @@ export function GatewayUrlCard({ active, onSaved }: { active: boolean; onSaved?:
 const PATH_ROWS: ReadonlyArray<readonly [string, string, string]> = [
   ["memory_root", "Session file folder", "Where the older file-based memory keeps its session files."],
   ["memory_repo", "Memory git repository", "The repository that folder is pushed from, usually its parent."],
-  ["capture_v2", "Capture script", "The older capture script that Files and Khipu mode chains to."],
+  ["capture_v2", "Saving script", "The older saving script that Files and Khipu mode chains to."],
   ["gemini_key_file", "Gemini key file", "A last-resort file the Gemini key is read from when nothing else has it."],
 ];
 
@@ -611,11 +611,11 @@ export function ReplicaCopyCard({ active }: { active: boolean }) {
  *  copy answers instead. */
 export function HubAwayCard({ active }: { active: boolean }) {
   return (
-    <section className="section-card" aria-label="When the hub is away">
-      <div className="section-head">When the hub is away</div>
+    <section className="section-card" aria-label="When your saved memory is away">
+      <div className="section-head">When your saved memory is away</div>
       <div className="section-body">
         <p className="set-help">
-          Khipu answers from this Mac's copy of your memory whenever the hub is out of reach, and catches up by
+          Khipu answers from this Mac's copy of your memory whenever your saved memory is out of reach, and catches up by
           itself when it answers again.
         </p>
       </div>
@@ -636,7 +636,7 @@ const JOB_ROWS: ReadonlyArray<readonly [string, string, string]> = [
   [
     "nightly",
     "Nightly upkeep",
-    "Consolidates the day's captures and indexes anything new.",
+    "Consolidates the day's saved conversations and indexes anything new.",
   ],
   ["monthly", "Monthly topic pass", "Runs the monthly topic pass on the first of the month, with its own model."],
   [
@@ -646,8 +646,8 @@ const JOB_ROWS: ReadonlyArray<readonly [string, string, string]> = [
   ],
   [
     "queue_drain",
-    "Queued captures",
-    "Every 5 minutes, saves captures that another harness queued but could not store right away.",
+    "Queued saves",
+    "Every 5 minutes, saves conversations that another app queued but could not store right away.",
   ],
   [
     "replica_refresh",
@@ -787,7 +787,7 @@ export function GatewayTokenCard({ active, onSaved }: { active: boolean; onSaved
   return (
     <div className="section-card">
       <div className="section-head">
-        Gateway key
+        Cloud server key
         <span className="spacer" />
         {s ? (
           s.exists ? (
@@ -813,7 +813,7 @@ export function GatewayTokenCard({ active, onSaved }: { active: boolean; onSaved
           clearOnSave
           help={
             <>
-              Aegis, Grok Bot and the gateway check on this Mac read this key to reach your gateway. Once saved, the key is never shown here again.
+              Aegis, Grok Bot and the cloud server check on this Mac read this key to reach your cloud server. Once saved, the key is never shown here again.
               {s?.path ? (
                 <>
                   {" "}

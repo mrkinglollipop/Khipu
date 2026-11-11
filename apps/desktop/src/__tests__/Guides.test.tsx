@@ -9,9 +9,8 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { invoke } from "@tauri-apps/api/core";
 import { GuidesPage } from "../GuidesPage";
 import { HowThisWorks } from "../HowThisWorks";
-import { SetupHint } from "../SetupHint";
 import { useGuideSignals, gatewayCheckWords, runGatewayCheck } from "../guideSignals";
-import { grokBotProgress, guideStates, hintState, startItems, DEFAULT_PREFS } from "../guidesModel";
+import { grokBotProgress, guideStates, startItems, DEFAULT_PREFS } from "../guidesModel";
 import type { GuideId } from "../guidesModel";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -301,41 +300,3 @@ describe("How this works", () => {
   });
 });
 
-describe("Home hint", () => {
-  const items = startItems({ liveness: null, gatewayCheckOk: false, episodes: 0, accountsRead: 0, agentAsked: false });
-
-  it("names the next step with one action, a link to all steps, and a way to hide it", () => {
-    const onAct = vi.fn();
-    const onSeeAll = vi.fn();
-    const onHide = vi.fn();
-    render(<SetupHint state={hintState(items, DEFAULT_PREFS)} onAct={onAct} onSeeAll={onSeeAll} onHide={onHide} onDismissAllSet={() => {}} />);
-    expect(screen.getByText(/Next: connect your first agent/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Connect an agent" }));
-    expect(onAct).toHaveBeenCalledWith("connect");
-    fireEvent.click(screen.getByRole("button", { name: "See all setup steps" }));
-    expect(onSeeAll).toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Hide this hint" }));
-    expect(onHide).toHaveBeenCalled();
-  });
-
-  it("shows a checking state, not a '2 of 4' count, until the setup evidence is read", () => {
-    render(<SetupHint state={hintState(items, DEFAULT_PREFS, { prefs: true, signals: false })} onAct={() => {}} onSeeAll={() => {}} onHide={() => {}} onDismissAllSet={() => {}} />);
-    expect(screen.getByRole("status")).toHaveTextContent("Checking your setup");
-    expect(screen.queryByText(/setup steps done/)).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Connect an agent" })).not.toBeInTheDocument();
-  });
-
-  it("renders nothing before the saved choices are read", () => {
-    const { container } = render(
-      <SetupHint state={hintState(items, DEFAULT_PREFS, { prefs: false, signals: false })} onAct={() => {}} onSeeAll={() => {}} onHide={() => {}} onDismissAllSet={() => {}} />,
-    );
-    expect(container).toBeEmptyDOMElement();
-  });
-
-  it("renders nothing once hidden", () => {
-    const { container } = render(
-      <SetupHint state={hintState(items, { ...DEFAULT_PREFS, hintHidden: true })} onAct={() => {}} onSeeAll={() => {}} onHide={() => {}} onDismissAllSet={() => {}} />,
-    );
-    expect(container).toBeEmptyDOMElement();
-  });
-});

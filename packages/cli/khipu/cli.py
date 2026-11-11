@@ -2458,7 +2458,19 @@ def cmd_route(args: argparse.Namespace) -> int:
     it never chooses, refuses, launches or reorders work."""
     from khipu import routing
 
+    if getattr(args, "route_cmd", None) == "override" and getattr(args, "action", None) == "candidates":
+        from khipu import conversation_overrides
+
+        return conversation_overrides.candidates_cli(args)
     return routing.run_cli(args)
+
+
+def cmd_route_say(args: argparse.Namespace) -> int:
+    """`khipu route say --from-app --preview WORDS | --apply TOKEN`: say a
+    change to the order or the rules, see it, save it (the app's entry)."""
+    from khipu import routing_say
+
+    return routing_say.run_cli(args)
 
 
 def _needs_item(selector: str) -> tuple[dict, dict, int] | None:
@@ -2515,6 +2527,10 @@ def cmd_needs_you(args: argparse.Namespace) -> int:
     """The local owner list in the same words the app and MCP use."""
     from khipu import needs_you, owner_act, routing
 
+    if getattr(args, "from_app", False) or getattr(args, "answer", None):
+        from khipu import needs_you_app
+
+        return needs_you_app.run_cli(args)
     selector = args.item or args.yes or args.no
     if selector:
         found = _needs_item(selector)
@@ -3337,6 +3353,30 @@ def cmd_capture(args: argparse.Namespace) -> int:
         else sys.stdin.read()
     )
     return capture(load_payload(raw), mode=args.mode)
+
+
+def cmd_capture_export(args: argparse.Namespace) -> int:
+    """``khipu capture export [--dry-run] [--json]``: the nightly's
+    append-only hub → session-file export, run by hand."""
+    from khipu.capture_export import export_new_lines
+
+    mem = _require_memory_root(args)
+    if mem is None:
+        return 2
+    out = export_new_lines(mem, dry_run=bool(args.dry_run))
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+    elif not out.get("ok"):
+        print(f"capture export failed: {out.get('error')}")
+    else:
+        verb = "would add" if out["dry_run"] else "added"
+        n = out["would_add"] if out["dry_run"] else out["added"]
+        print(f"{verb} {n} line(s) to {out['target']}; "
+              f"{out['present_identical']} identical, {out['present_different']} different (left alone), "
+              f"{out['matched_via_sources']} matched through episode_sources, "
+              f"{out['matches_forgotten']} match a forgotten episode (left alone), "
+              f"{out['file_only']} with no hub row")
+    return 0 if out.get("ok") else 1
 
 
 def cmd_capture_now(args: argparse.Namespace) -> int:
@@ -5176,6 +5216,9 @@ def build_parser() -> argparse.ArgumentParser:
     choose.add_argument("--item", metavar="KEY_OR_NUMBER", help="Show one item whole by stable key or list number")
     choose.add_argument("--yes", metavar="KEY_OR_NUMBER", help="Keep the displayed item after a terminal yes")
     choose.add_argument("--no", metavar="KEY_OR_NUMBER", help="Decline or undo the displayed item after a terminal yes")
+    choose.add_argument("--answer", nargs=2, metavar=("KEY", "YES_OR_NO"), help=argparse.SUPPRESS)
+    ny.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    ny.add_argument("--expect", metavar="PIN", help=argparse.SUPPRESS)
     ny.set_defaults(func=cmd_needs_you)
 
     storage_p = sub.add_parser("storage", help="Free disk space and what Khipu holds, as JSON (read-only)")
@@ -5596,7 +5639,7 @@ def build_parser() -> argparse.ArgumentParser:
     rem.set_defaults(func=cmd_sources)
     src.set_defaults(func=cmd_sources)
 
-    rc = sub.add_parser("reconcile", help="Full file→PG episodes/topics sync")
+    rc = sub.add_parser("reconcile", help="Full topics/*.md → PG topic sync (episodes flow hub → files: capture export)")
     rc.add_argument("--memory-root", default=_memory_root_default())
     rc.set_defaults(func=cmd_reconcile)
 
@@ -5762,8 +5805,8 @@ def build_parser() -> argparse.ArgumentParser:
     _owner_flags(hold)
     rover = rt_sub.add_parser("override", help="Owner: let one conversation run ahead of pace on an account "
                               "(grant ACCOUNT --subject JSON --until T | --indefinite), end one early (end ID) "
-                              "or keep one with no end (keep ID); list and walk are the app's reads", parents=[rt_json])
-    rover.add_argument("action", choices=("grant", "end", "keep", "list", "walk"))
+                              "or keep one with no end (keep ID); list, walk and candidates are the app's reads", parents=[rt_json])
+    rover.add_argument("action", choices=("grant", "end", "keep", "list", "walk", "candidates"))
     rover.add_argument("params", nargs="*")
     rover.add_argument("--subject", default=None, metavar="JSON", help="Who it is for, as the ask showed it")
     rover.add_argument("--effect", default="ahead_of_pace")
@@ -5775,6 +5818,7 @@ def build_parser() -> argparse.ArgumentParser:
     rover.add_argument("--reason", default=None)
     rover.add_argument("--ref", default=None)
     rover.add_argument("--request", default=None, help="The owner's words, one line")
+    rover.add_argument("--account", default=None, metavar="A", help="candidates: the account the conversations could run ahead on")
     rover.add_argument("--leave", default=None, metavar="KEY", help="walk: set this item aside")
     rover.add_argument("--keep", default=None, metavar="KEY", help="walk: keep this pair of twins as they are")
     rover.add_argument("--restart", action="store_true", help="walk: forget what was set aside")
@@ -5784,10 +5828,14 @@ def build_parser() -> argparse.ArgumentParser:
                                parents=[rt_json])
     rpause.add_argument("account")
     rpause.add_argument("--until", default=None, metavar="T")
+    rpause.add_argument("--expect", default=None, metavar="PIN",
+                        help="The account's pause as read; refused if it changed since")
     rpause.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rpause)
     rlift = rt_sub.add_parser("lift", help="Owner: lift a pause (asks for a typed confirmation)", parents=[rt_json])
     rlift.add_argument("account")
+    rlift.add_argument("--expect", default=None, metavar="PIN",
+                       help="The account's pause as read; refused if it changed since")
     rlift.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rlift)
     rclear = rt_sub.add_parser("clear", help="Owner: clear an account, or dismiss one report (--report ID)",
@@ -5860,7 +5908,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="A conversation: the owner's request, in one line (rule add or edit; stays unconfirmed)")
     rrule.add_argument("--base", default=None, help="Owner revision read when preparing a rule edit request")
     rrule.add_argument("--expect", default=None, metavar="REVISION",
-                       help="Rule revision shown when confirming; refused if it changed since")
+                       help="Rule revision shown when confirming (add: the rules as read); refused if it changed since")
     rrule.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rrule)
 
@@ -5901,8 +5949,15 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Check allowance: only caller-declared sensitive code")
     rcap.add_argument("--until", default=None, metavar="T",
                       help="set: when the cap stops applying (a time, or 2d, 30h); the cap it replaced applies again")
+    rcap.add_argument("--expect", default=None, metavar="PIN",
+                      help="set: the window's share caps as read; refused if they changed since")
     rcap.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rcap)
+    rsay = rt_sub.add_parser("say", parents=[rt_json], help=argparse.SUPPRESS)
+    rsay.add_argument("--preview", default=None, metavar="WORDS", help="The change, in the owner's words")
+    rsay.add_argument("--apply", default=None, metavar="TOKEN", help="Save the change a preview showed")
+    rsay.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    rsay.set_defaults(func=cmd_route_say)
     radv = rt_sub.add_parser("advise", parents=[rt_json],
                              help="Launch advice per account (advisory only; it never blocks anything)")
     radv.add_argument("account", nargs="?", default=None, help="One account (its label or its id)")
@@ -6138,6 +6193,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Defaults to the most recently active local session's id",
     )
     cap_now.set_defaults(func=cmd_capture_now)
+    cap_export = cap_sub.add_parser(
+        "export",
+        help="Add a session-file line for every live hub episode that has none "
+             "(append-only; the nightly runs it)",
+    )
+    cap_export.add_argument("--memory-root", default=_memory_root_default())
+    cap_export.add_argument(
+        "--dry-run", action="store_true",
+        help="Count only: changes nothing in the Memory files or the hub "
+             "(and writes no hub-reachability note)")
+    cap_export.add_argument("--json", action="store_true", help="Print the counts as JSON")
+    cap_export.set_defaults(func=cmd_capture_export)
     cap.set_defaults(func=cmd_capture)
 
     gt = sub.add_parser(

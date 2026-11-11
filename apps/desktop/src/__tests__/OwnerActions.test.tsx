@@ -212,14 +212,14 @@ describe("Owner actions", () => {
     expect(within(items[6]).getByRole("button", { name: "Undo: Dismissed a report on Codex" })).toBeTruthy();
   });
 
-  it("a close of several Owed items by direction says how many, with an Undo", async () => {
+  it("a close of several items on your list by direction says how many, with an Undo", async () => {
     backend.actions.push({
       id: "o1", at: "2026-10-16T09:00:00Z", action: "owed.change", target: "11,12,13", auth: "direction",
       harness: "claude_code", binding: "hook", state: "applied", facts: { change: "close" },
     });
     render(<OwnerActions active />);
     const items = within(await list()).getAllByRole("listitem");
-    fireEvent.click(within(items[5]).getByRole("button", { name: "Undo: Closed 3 Owed items" }));
+    fireEvent.click(within(items[5]).getByRole("button", { name: "Undo: Closed 3 items on your list" }));
     await waitFor(() => expect(within(items[5]).getByText("Undone")).toBeTruthy());
     expect(calls).toContainEqual(["khipu_owner_direction_undo", { id: "o1" }]);
   });
@@ -309,9 +309,9 @@ describe("actionWords", () => {
     expect(text.length).toBeGreaterThan(10);
   });
 
-  it("has a plain label for retiring held captures", () => {
+  it("has a plain label for retiring held saves", () => {
     const text = actionWords({ id: "1", at: "2026-11-03T00:00:00Z", action: "outbox.span_covered", target: "outbox" });
-    expect(text).toBe("Retired held captures another episode covers");
+    expect(text).toBe("Retired held saves that another saved conversation covers");
   });
 
   it("has a plain label for every action id the back end can log", () => {

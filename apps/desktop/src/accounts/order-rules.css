@@ -1,0 +1,337 @@
+/* Accounts > Order and rules. Tokens from App.css; every class starts "or-".
+   Spacing follows the app's scale (4/8/12/16/24/32). The page is two columns
+   (the rules, then Recent changes beside them) down to 900 px, one column
+   below it, as the shell does. */
+
+.or-page {
+  padding: 32px 40px 56px;
+  font-size: 14.5px;
+  line-height: 1.5;
+}
+.or-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 56px;
+  align-items: start;
+  max-width: 1180px;
+}
+.or-main {
+  min-width: 0;
+  max-width: 720px;
+}
+.or-side {
+  min-width: 0;
+  padding-left: 32px;
+  border-left: 1px solid var(--border);
+}
+.or-page h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+.or-sec {
+  margin-top: 40px;
+}
+.or-sec > h2 {
+  margin-bottom: 12px;
+}
+.or-muted {
+  margin: 0;
+  color: var(--muted);
+}
+.or-hint {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 13.5px;
+}
+
+/* ---- the box ---- */
+.or-say label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 16px;
+  font-weight: 650;
+}
+.or-say-row {
+  display: flex;
+  gap: 12px;
+}
+.or-field {
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  padding: 0 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 15.5px;
+}
+.or-field::placeholder {
+  color: var(--muted);
+}
+.or-field:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--ring);
+  border-color: var(--accent);
+}
+button.or-btn {
+  height: 44px;
+  padding: 0 18px;
+  border-radius: var(--r-md);
+  font-size: 15px;
+  white-space: nowrap;
+}
+
+/* ---- preview, notice, receipt ---- */
+.or-preview,
+.or-notice,
+.or-receipt {
+  margin-top: 16px;
+}
+.or-preview {
+  padding: 16px 24px 24px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+}
+.or-preview h2 {
+  margin-bottom: 8px;
+}
+.or-understood {
+  margin: 0;
+  font-weight: 600;
+}
+.or-fallback {
+  margin: 8px 0 12px;
+  padding: 12px 16px;
+  border-radius: var(--r-md);
+  background: var(--warn-soft);
+  color: var(--text);
+}
+.or-words {
+  display: block;
+  margin-top: 8px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.or-ba {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 8px 12px;
+  margin: 12px 0 16px;
+}
+.or-ba dt {
+  color: var(--muted);
+}
+.or-ba dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.or-ba dd.after {
+  font-weight: 650;
+}
+.or-btnrow {
+  display: flex;
+  gap: 12px;
+}
+.or-notice {
+  padding: 12px 16px;
+  border-radius: var(--r-md);
+  background: var(--warn-soft);
+}
+.or-notice p {
+  margin: 0;
+}
+.or-notice p + p {
+  margin-top: 4px;
+}
+.or-error {
+  margin-top: 4px;
+  color: var(--err);
+  font-size: 13.5px;
+}
+.or-receipt {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: var(--r-md);
+  background: var(--ok-soft);
+  color: var(--text);
+}
+.or-receipt > svg {
+  flex: none;
+  margin-top: 3px;
+  color: var(--ok);
+}
+.or-receipt.plain {
+  background: var(--surface-2);
+}
+.or-receipt.plain > svg {
+  color: var(--text-2);
+}
+.or-receipt-body {
+  flex: 1;
+  min-width: 0;
+}
+.or-receipt-body .or-hint {
+  margin-top: 0;
+}
+
+/* ---- Undo ---- */
+button.or-quiet {
+  flex: none;
+  height: 36px;
+  padding: 0 12px;
+  border: 0;
+  background: none;
+  color: var(--accent-text);
+  font-size: 14.5px;
+  font-weight: 650;
+}
+button.or-quiet:hover {
+  background: var(--accent-soft);
+  border: 0;
+}
+button.or-link {
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-text);
+  font-size: 14px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+button.or-link:hover {
+  background: none;
+  border: 0;
+}
+
+/* ---- order, rules, recent ---- */
+.or-order {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.or-order li {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 14px 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--surface);
+}
+.or-order li b {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  font-size: 12.5px;
+}
+.or-rules {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.or-rules li {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+.or-rules li:last-child {
+  border-bottom: 1px solid var(--border);
+}
+.or-until {
+  flex: none;
+  color: var(--muted);
+  font-size: 13.5px;
+  white-space: nowrap;
+}
+.or-sechead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.or-change {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.or-change.undone {
+  color: var(--muted);
+}
+.or-who {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 13.5px;
+}
+
+@media (max-width: 1180px) {
+  .or-cols {
+    grid-template-columns: minmax(0, 1fr) 300px;
+    gap: 40px;
+  }
+  .or-side {
+    padding-left: 24px;
+  }
+}
+@media (max-width: 899px) {
+  .or-page {
+    padding: 24px 24px 56px;
+  }
+  .or-cols {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 40px;
+  }
+  .or-side {
+    padding-left: 0;
+    border-left: 0;
+  }
+}
+@media (max-width: 639px) {
+  button.or-quiet,
+  button.or-link {
+    min-height: 44px;
+  }
+  .or-page {
+    padding: 24px 16px 96px;
+  }
+  .or-say-row {
+    flex-direction: column;
+  }
+  .or-field {
+    flex: none;
+    width: 100%;
+    font-size: 16px;
+  }
+  button.or-btn {
+    align-self: flex-start;
+  }
+  .or-ba {
+    grid-template-columns: 60px minmax(0, 1fr);
+  }
+  .or-rules li {
+    flex-direction: column;
+    gap: 2px;
+  }
+}
