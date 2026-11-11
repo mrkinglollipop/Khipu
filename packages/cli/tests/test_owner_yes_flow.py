@@ -316,3 +316,45 @@ def test_a_terminal_no_to_another_macs_request_that_could_not_be_recorded_is_not
     monkeypatch.setattr(routing_replication, "answer_remote", lambda *a: True)
     ok, out = owner_act._decline({"request": ident}, terminal=True)
     assert ok and out["sent"] is True, out
+
+
+def _held_on_another_mac(world):
+    from tests.test_owner_needs_you import _held_pause
+
+    ident = _held_pause(world)
+    path = owner_direction.requests_path()
+    state = json.loads(path.read_text())
+    next(r for r in state["requests"] if r["id"] == ident)["remote"] = {"mac": "m1-id", "request": "req-remote",
+                                                                      "sig": "s" * 16}
+    path.write_text(json.dumps(state))
+    return ident
+
+
+def _receipts_for(line_id):
+    return [r for r in routing.recent_receipts(routing.read_view(), routing._now()) if r["id"] == line_id]
+
+
+@pytest.mark.parametrize("sent", [True, False])
+def test_a_terminal_no_to_another_macs_request_has_a_receipt_only_once_sent(world, monkeypatch, sent):
+    """``owner_act._decline``: the routing record's "Declined the request..." is
+    written after the no is recorded to send, once, and never for a no not sent."""
+    from khipu import routing_replication
+
+    ident = _held_on_another_mac(world)
+    monkeypatch.setattr(routing_replication, "answer_remote", lambda *a: sent)
+    ok, out = owner_act._decline({"request": ident}, terminal=True)
+    assert ok is sent, out
+    lines = [a for a in owner_direction.actions() if a.get("action") == owner_direction.DECLINE_ACTION]
+    assert len(lines) == 1
+    assert len(_receipts_for(lines[0]["id"])) == (1 if sent else 0)
+    assert "receipt_due" not in next(r for r in owner_direction._read_requests(owner_direction.requests_path())
+                                     if r["id"] == ident)
+
+
+def test_a_direct_decline_of_another_macs_request_keeps_its_receipt(world):
+    """Callers of ``owner_direction.decline`` other than ``owner_act._decline``
+    (the old ``owner-direction decline --from-app`` command) write the receipt as before."""
+    ident = _held_on_another_mac(world)
+    request = owner_direction.decline(ident, app=True)
+    assert "receipt_due" not in request
+    assert len(_receipts_for(request["owner_action"])) == 1

@@ -557,3 +557,90 @@ def test_a_no_to_another_macs_request_that_could_not_be_recorded_is_not_sent(wor
     assert not [a for a in owner_direction.actions()
                 if a.get("action") == owner_direction.DECLINE_ACTION and a.get("state") != "failed"]
     assert needs_you_app.last_answer() is None
+
+
+def _held_on_another_mac(world) -> str:
+    """A held request this Mac only mirrors: the M1 holds it (fictional)."""
+    ident = _held_pause(world)
+    path = owner_direction.requests_path()
+    state = json.loads(path.read_text())
+    next(r for r in state["requests"] if r["id"] == ident)["remote"] = {
+        "mac": "m1-id", "request": "req-remote", "sig": "s" * 16}
+    path.write_text(json.dumps(state))
+    from khipu import routing_replication
+
+    world["mp"].setattr(routing_replication, "mac_label", lambda mac: "M1")
+    return ident
+
+
+def _decline_receipts(line_ids) -> list[dict]:
+    return [r for r in routing.recent_receipts(routing.read_view(), routing._now()) if r["id"] in line_ids]
+
+
+def test_a_no_that_was_not_sent_leaves_no_receipt_in_the_routing_record(world, khipu_app, capsys, monkeypatch):
+    from khipu import routing_replication
+
+    ident = _held_on_another_mac(world)
+    monkeypatch.setattr(routing_replication, "answer_remote", lambda *a: False)
+    _app(world, khipu_app)
+    code, out = _answer(capsys, "held:" + ident, "no")
+    assert code == 2 and out["code"] == "not_sent", out
+    assert _request(ident)["state"] == "pending"
+    lines = {a["id"] for a in owner_direction.actions() if a.get("action") == owner_direction.DECLINE_ACTION}
+    assert lines and not _decline_receipts(lines)
+
+
+def test_a_no_to_another_macs_request_that_is_sent_writes_its_receipt_once(world, khipu_app, capsys, monkeypatch):
+    from khipu import routing_replication
+
+    ident = _held_on_another_mac(world)
+    sent = []
+    monkeypatch.setattr(routing_replication, "answer_remote", lambda request, stamp, answer: sent.append(answer) or True)
+    _app(world, khipu_app)
+    code, out = _answer(capsys, "held:" + ident, "no")
+    assert code == 0 and sent == ["decline"] and out["sent"] is True, out
+    lines = {a["id"] for a in owner_direction.actions() if a.get("action") == owner_direction.DECLINE_ACTION}
+    receipts = _decline_receipts(lines)
+    assert len(lines) == 1 and len(receipts) == 1 and receipts[0]["text"].startswith("Declined the request")
+
+
+@pytest.mark.parametrize("broken", ["request_save", "failed_mark"])
+def test_a_failed_no_whose_recovery_also_failed_says_so(world, khipu_app, capsys, monkeypatch, broken):
+    """The no was not recorded to send, and then putting the request back (or
+    marking the no's line failed) could not be written either (fictional disk)."""
+    from khipu import routing_replication
+
+    ident = _held_on_another_mac(world)
+    original_save, original_append = owner_direction._save, owner_direction._append
+
+    def cannot_save(*a, **kw):
+        raise OSError("fictional disk full while putting the request back")
+
+    def cannot_mark(line):
+        if line.get("kind") == "state" and line.get("state") == "failed":
+            raise OSError("fictional disk full while marking the no failed")
+        return original_append(line)
+
+    def fail_delivery(*a):
+        if broken == "request_save":
+            monkeypatch.setattr(owner_direction, "_save", cannot_save)
+        else:
+            monkeypatch.setattr(owner_direction, "_append", cannot_mark)
+        raise OSError("fictional disk full while recording the answer")
+
+    monkeypatch.setattr(routing_replication, "answer_remote", fail_delivery)
+    _app(world, khipu_app)
+    code, out = _answer(capsys, "held:" + ident, "no")
+    monkeypatch.setattr(owner_direction, "_save", original_save)
+    monkeypatch.setattr(owner_direction, "_append", original_append)
+    assert code == 2 and out["ok"] is False and out["code"] == "not_sent" and out["sent"] is False, out
+    assert "not sent" in out["error"]
+    states = [a.get("state") for a in owner_direction.actions() if a.get("target") == ident]
+    if broken == "request_save":
+        assert _request(ident)["state"] == "declined"
+        assert "could not put the request back" in out["error"] and "other Mac" in out["error"]
+        assert "still waits" not in out["error"]
+    else:
+        assert _request(ident)["state"] == "pending"
+        assert "still waits for your answer" in out["error"] and "could not put" not in out["error"]
+        assert states == ["applied"]
