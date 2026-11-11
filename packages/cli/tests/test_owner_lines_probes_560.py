@@ -345,3 +345,396 @@ def test_every_typed_line_among_peer_messages_stays_the_owners(tmp_path, monkeyp
     for words in ('cobalt lane', 'archive lane'):
         phrase, tokens = memory_rows.query_terms(words)
         assert memory_rows.owner_line(lines, phrase, tokens) is None, lines
+
+
+# ---- a headless run outside T3, and a desktop conversation's start brief -----------
+
+SDK = {'entrypoint': 'sdk-ts', 'turnOrigin': 'sdk', 'promptSource': 'sdk'}
+HEADLESS_BRIEF = 'Do the work yourself and repair the magnolia gearbox, then stop.'
+
+
+def _iso_minutes_ago(minutes):
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat().replace('+00:00', 'Z')
+
+
+def _headless_rows(minutes=11, brief=HEADLESS_BRIEF):
+    """A headless SDK window whose lines were written ``minutes`` ago (None:
+    lines with no timestamp)."""
+    stamp = {} if minutes is None else {'timestamp': _iso_minutes_ago(minutes)}
+    return [_user_row(brief, **SDK, **stamp), {**_assistant_row('Working. ' + 'x' * 350), **stamp}]
+
+
+HEADLESS_ROWS = _headless_rows()
+
+
+def _synthetic_t3(tmp_path, monkeypatch, *, thread=True):
+    """A synthetic T3 database: it names an ordinary thread for ``T3_SID`` when
+    ``thread``, and only for some other session otherwise."""
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setattr(session_capture, 'ancestor_pids', lambda: [])
+    path = tmp_path / 'synthetic-t3-headless.sqlite'
+    db = T3(path)
+    if thread:
+        db.thread('ordinary-thread-561', T3_SID)
+    monkeypatch.setenv('KHIPU_T3_DB', str(path))
+    return db
+
+
+def _assert_a_job_without_owner_lines(job):
+    assert job.get('origin') == 'job' and 'owner_lines' not in job, job
+    assert session_capture._job_origin(job) == 'job'
+
+
+def test_a_headless_sdk_run_with_no_t3_database_keeps_no_owner_lines(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'no-t3-here.sqlite'))
+    job_path = _queue(tmp_path, HEADLESS_ROWS)
+    _assert_a_job_without_owner_lines(json.loads(job_path.read_text()))
+    payload, _ = _drain_job(job_path)
+    assert not payload['verbatim'].get('owner_lines')
+
+
+def test_a_headless_sdk_run_t3_has_no_thread_for_keeps_no_owner_lines(tmp_path, monkeypatch):
+    _synthetic_t3(tmp_path, monkeypatch, thread=False)
+    _assert_a_job_without_owner_lines(json.loads(_queue(tmp_path, HEADLESS_ROWS).read_text()))
+
+
+def test_the_same_lines_in_a_thread_t3_names_are_the_owners(tmp_path, monkeypatch):
+    _synthetic_t3(tmp_path, monkeypatch, thread=True)
+    job = json.loads(_queue(tmp_path, HEADLESS_ROWS).read_text())
+    assert job.get('t3_thread_id') == 'ordinary-thread-561' and 'origin' not in job
+    assert job.get('owner_lines') == [HEADLESS_BRIEF]
+
+
+def test_an_unreadable_t3_database_keeps_a_headless_looking_runs_lines(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    broken = tmp_path / 'broken-t3.sqlite'
+    broken.write_bytes(b'this is not a sqlite database' * 50)
+    monkeypatch.setenv('KHIPU_T3_DB', str(broken))
+    assert _t3.session_thread_ids_result(T3_SID) == (None, False)
+    job = json.loads(_queue(tmp_path, HEADLESS_ROWS).read_text())
+    assert 'origin' not in job and job.get('owner_lines') == [HEADLESS_BRIEF]
+
+
+def test_a_headless_run_swept_while_idle_keeps_no_owner_lines(tmp_path, monkeypatch):
+    import os
+    import time
+
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'no-t3-here.sqlite'))
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('KHIPU_PARENT_SESSION', '')
+    monkeypatch.setattr('khipu.identity.resolve_repo_root',
+                        lambda cwd: {'repo_root': '/repo', 'project': 'acme/project', 'is_worktree': False})
+    sid = 'aaaaaaaa-2222-3333-4444-555555555555'
+    path = tmp_path / '.claude' / 'projects' / 'p' / f'{sid}.jsonl'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(''.join(json.dumps(r) + '\n' for r in HEADLESS_ROWS))
+    old = time.time() - session_capture.MIN_MINUTES * 60 - 60
+    os.utime(path, (old, old))
+    session_capture.save_state('claude_code', sid, {
+        'offset': 0, 'last_ts': old - 100, 'captures': 0, 'seen_ts': old,
+        'seen_end': path.stat().st_size, 'transcript_path': str(path), 'cwd': str(tmp_path)})
+    out = session_capture.sweep_idle(now=time.time())
+    assert out['jobs'] == 1, out
+    job = json.loads(session_capture.queued_jobs()[0].read_text())
+    assert job['event'] == 'idle_sweep'
+    _assert_a_job_without_owner_lines(job)
+
+
+def test_in_a_desktop_conversation_only_the_humans_line_is_an_owner_line(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'no-t3-here.sqlite'))
+    desk = {'entrypoint': 'claude-desktop'}
+    start = 'You are a dispatched agent on the quartz repo. Do the work yourself.'
+    typed = 'Now also check the lapis hinge before you stop.'
+    rows = [_user_row(start, turnOrigin='sdk', **desk), _assistant_row(REPLY),
+            _user_row(typed, turnOrigin='human', **desk), _assistant_row('Checked.')]
+    assert _typed(_write(tmp_path, 'desk.jsonl', rows)) == [typed]
+    job = json.loads(_queue(tmp_path, rows).read_text())
+    assert job.get('owner_lines') == [typed], job.get('owner_lines')
+
+
+def test_lines_with_no_origin_fields_are_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'no-t3-here.sqlite'))
+    rows = [_user_row('Check the walnut valve for me.'), _assistant_row(REPLY)]
+    job = json.loads(_queue(tmp_path, rows).read_text())
+    assert 'origin' not in job and job.get('owner_lines') == ['Check the walnut valve for me.']
+
+
+# ---- round 2 on #577: a "no thread" answer read before T3 could name the thread --
+
+def test_a_young_sdk_window_t3_has_not_named_yet_keeps_its_lines(tmp_path, monkeypatch):
+    """T3 present, no thread for the session yet, the window two minutes old:
+    T3 may still write the row, so the lines stay and it is not a job."""
+    _synthetic_t3(tmp_path, monkeypatch, thread=False)
+    job = json.loads(_queue(tmp_path, _headless_rows(2)).read_text())
+    assert 'origin' not in job and session_capture._job_origin(job) == 'conversation', job
+    assert job.get('owner_lines') == [HEADLESS_BRIEF]
+
+
+def test_the_same_window_eleven_minutes_old_is_a_job(tmp_path, monkeypatch):
+    _synthetic_t3(tmp_path, monkeypatch, thread=False)
+    _assert_a_job_without_owner_lines(json.loads(_queue(tmp_path, _headless_rows(11)).read_text()))
+
+
+def test_a_window_of_unknown_age_keeps_its_lines_when_t3_is_installed(tmp_path, monkeypatch):
+    _synthetic_t3(tmp_path, monkeypatch, thread=False)
+    job = json.loads(_queue(tmp_path, _headless_rows(None)).read_text())
+    assert 'origin' not in job and job.get('owner_lines') == [HEADLESS_BRIEF]
+
+
+def test_with_no_t3_installed_age_does_not_matter(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'no-t3-here.sqlite'))
+    for n, minutes in enumerate((2, None)):
+        sid = f'bbbbbbbb-2222-3333-4444-55555555555{n}'
+        _assert_a_job_without_owner_lines(json.loads(_queue(tmp_path, _headless_rows(minutes), sid=sid).read_text()))
+        for p in session_capture.queued_jobs():
+            p.unlink()
+
+
+def test_a_new_t3_thread_named_after_its_first_capture_keeps_both_windows(tmp_path, monkeypatch):
+    """The first due capture runs before T3 names the thread; the next runs
+    after. Both windows are the owner's."""
+    db = _synthetic_t3(tmp_path, monkeypatch, thread=False)
+    first = 'Start on the garnet ledger for me, please.'
+    job = json.loads(_queue(tmp_path, _headless_rows(1, first)).read_text())
+    assert 'origin' not in job and job.get('owner_lines') == [first]
+    for p in session_capture.queued_jobs():
+        p.unlink()
+    db.thread('late-thread-577', T3_SID)
+    session_capture.save_state('claude_code', T3_SID, {
+        **session_capture.load_state('claude_code', T3_SID), 't3_lookup_at': 0})  # past the negative cache
+    second = 'Then check the garnet ledger totals too.'
+    path = tmp_path / '.claude' / 'projects' / 'p' / f'{T3_SID}.jsonl'
+    with path.open('a') as f:
+        for r in _headless_rows(11, second):   # old enough that only the named thread keeps it
+            f.write(json.dumps(r) + '\n')
+    out = session_capture.hook_main(json.dumps({'hook_event_name': 'SessionEnd', 'session_id': T3_SID,
+                                                'cwd': str(tmp_path), 'transcript_path': str(path)}),
+                                    'claude_code')
+    assert out.get('due'), out
+    job = json.loads(session_capture.queued_jobs()[0].read_text())
+    assert 'origin' not in job and job.get('owner_lines') == [second], job
+
+
+def test_the_age_rule_reads_the_windows_first_line(tmp_path):
+    path = _write(tmp_path, 'w.jsonl', _headless_rows(30) + _headless_rows(1, 'a later line'))
+    stats = {}
+    session_capture.read_window(path, 0, seen=(), stats=stats)
+    import time
+    assert 29 * 60 < time.time() - stats['first_line_ts'] < 31 * 60
+    session_capture.read_window(_write(tmp_path, 'n.jsonl', _headless_rows(None)), 0, seen=(), stats=stats)
+    assert 'first_line_ts' not in stats
+
+
+# ---- round 2 on #577: quotes are not the owner's words when the row has the list --
+
+from khipu import memory_rows  # noqa: E402
+
+DESK = {'entrypoint': 'claude-desktop'}
+DESK_START = 'You are a dispatched agent on the quartz anvil repo. Do the work yourself.'
+DESK_TYPED = 'Now also check the lapis hinge before you stop.'
+DESK_ROWS = [_user_row(DESK_START, turnOrigin='sdk', **DESK), _assistant_row(REPLY),
+             _user_row(DESK_TYPED, turnOrigin='human', **DESK), _assistant_row('Checked.')]
+
+
+def _owner_match(verbatim, words):
+    phrase, tokens = memory_rows.query_terms(words)
+    return memory_rows.owner_line(memory_rows.owner_lines_of(verbatim), phrase, tokens)
+
+
+def test_a_desktop_start_brief_in_quotes_is_not_the_owners_words(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'no-t3-here.sqlite'))
+    payload, _ = _drain_job(_queue(tmp_path, DESK_ROWS))
+    vb = payload['verbatim']
+    assert DESK_START in vb['quotes'] and vb['owner_lines'] == [DESK_TYPED]
+    assert _owner_match(vb, 'quartz anvil') is None
+    assert _owner_match(vb, 'lapis hinge') == DESK_TYPED
+
+
+def test_a_conversation_with_nothing_typed_stores_an_empty_list(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'no-t3-here.sqlite'))
+    rows = [_user_row(DESK_START, turnOrigin='sdk', **DESK), _assistant_row(REPLY)]
+    job_path = _queue(tmp_path, rows)
+    assert json.loads(job_path.read_text())['owner_lines'] == []
+    payload, _ = _drain_job(job_path)
+    assert payload['verbatim']['owner_lines'] == [] and DESK_START in payload['verbatim']['quotes']
+    assert _owner_match(payload['verbatim'], 'quartz anvil') is None
+
+
+def test_owner_lines_of_reads_the_list_when_the_row_has_it():
+    typed_looking = 'please keep the violet reset intact'
+    assert memory_rows.owner_lines_of({'quotes': [typed_looking], 'owner_lines': []}) == []
+    assert _owner_match({'quotes': [typed_looking], 'owner_lines': []}, 'violet reset') is None
+    # a row without the key: today's rule, its quotes
+    assert _owner_match({'quotes': [typed_looking]}, 'violet reset') == typed_looking
+    assert _owner_match(json.dumps({'quotes': [typed_looking]}), 'violet reset') == typed_looking
+
+
+def _plant(hub, verbatim, *, parent=None, raw=None, session='claude_code:cccccccc-0000-0000-0000-000000000001'):
+    conn = hub.connect()
+    conn.execute("INSERT INTO episodes (ts,summary,raw,session_id,project,harness,parent_session_id,verbatim) "
+                 "VALUES (now(),'Work.',%s::jsonb,%s,'khipu','claude_code',%s,%s::jsonb)",
+                 (json.dumps(raw or {}), session, parent, json.dumps(verbatim)))
+    conn.commit()
+    return str(conn.execute('SELECT max(id) FROM episodes').fetchone()[0])
+
+
+def _owner_hits(monkeypatch, ids, words):
+    """``hybrid_search(owner_words_only=True)`` ids in both modes: literal (the
+    owner-words SQL leg) and hybrid, where every row is a cosine candidate too
+    (so the check after fusion, ``keep_owner_matches``, sees each)."""
+    cos = [dict(kind='episode', id=i, score=.9, rank_text='x', label='x', snippet='x') for i in ids]
+    monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: kw['timing'].update(
+        embed_ms=0.0, cosine_ms=0.0) or list(cos))
+    return {mode: [r['id'] for r in embed.hybrid_search(words, mode=mode, owner_words_only=True)['results']]
+            for mode in ('literal', 'hybrid')}
+
+
+def test_only_my_words_on_the_hub_finds_the_typed_line_not_the_start_brief(at_the_key, monkeypatch, tmp_path):
+    configure_hub(monkeypatch, at_the_key)
+    monkeypatch.setenv('KHIPU_CAPTURE_HOME', str(tmp_path / 'cap'))
+    monkeypatch.setenv('KHIPU_T3_DB', str(tmp_path / 'no-t3-here.sqlite'))
+    desk = _land(_drain_job(_queue(tmp_path, DESK_ROWS))[0])
+    assert _owner_hits(monkeypatch, [desk], 'quartz anvil') == {'literal': [], 'hybrid': []}
+    assert _owner_hits(monkeypatch, [desk], 'lapis hinge') == {'literal': [desk], 'hybrid': [desk]}
+
+
+def _plant(hub, verbatim, n, *, parent=None, raw=None):
+    conn = hub.connect()
+    conn.execute("INSERT INTO episodes (ts,summary,raw,session_id,project,harness,parent_session_id,verbatim) "
+                 "VALUES (now(),'Work.',%s::jsonb,%s,'khipu','claude_code',%s,%s::jsonb)",
+                 (json.dumps(raw or {}), f'claude_code:cccccccc-0000-0000-0000-00000000000{n}', parent,
+                  json.dumps(verbatim)))
+    conn.commit()
+    return str(conn.execute('SELECT max(id) FROM episodes').fetchone()[0])
+
+
+def test_only_my_words_on_the_hub_reads_the_list_and_never_a_job(hub, monkeypatch, tmp_path):
+    from tests.test_search_indexed_words import install_words
+
+    configure_hub(monkeypatch, hub)
+    install_words(hub, tmp_path)
+    empty = _plant(hub, {'quotes': ['please keep the cobalt reset intact'], 'owner_lines': []}, 1)
+    old = _plant(hub, {'quotes': ['please keep the amber reset intact']}, 2)
+    child = _plant(hub, {'quotes': ['please keep the onyx reset intact']}, 3,
+                   parent='claude_code:cccccccc-0000-0000-0000-000000000099')
+    marked = _plant(hub, {'quotes': ['please keep the jade reset intact']}, 4, raw={'session_origin': 'job'})
+    ids = [empty, old, child, marked]
+    with hub.connect() as conn, conn.cursor() as cur:
+        facts = memory_rows.episode_facts(cur, ids, owner_lines=True)
+    assert {i: facts[i]['owner_lines'] for i in (empty, child, marked)} == {empty: [], child: [], marked: []}
+    for words, want in (('cobalt reset', []), ('onyx reset', []), ('jade reset', []), ('amber reset', [old])):
+        assert _owner_hits(monkeypatch, ids, words) == {'literal': want, 'hybrid': want}, words
+
+
+def test_a_merge_keeps_each_sides_owner_words():
+    """A row captured before the list was stored, merged with one that has it:
+    the old side's owner words (its quotes) join the list, the new side's
+    brief in quotes does not."""
+    from khipu import capture as cap
+    from tests.test_audit1010_capb import Cursor, episode
+
+    old = episode(verbatim={'quotes': ['please keep the amber reset intact']})
+    cur = Cursor({1: old})
+    incoming = episode(ts='2026-10-10T00:01:00Z', session_id='codex:two', transcript_range='100:200',
+                       verbatim={'quotes': [DESK_START, DESK_TYPED], 'owner_lines': [DESK_TYPED]})
+    with mock.patch.object(cap, '_reembed_merged_episode'), \
+            mock.patch('khipu.deliverables.insert_deliverables_from_episode', return_value=0), \
+            mock.patch('khipu.topic_graph.persist_capture_graph', return_value={}), \
+            mock.patch('khipu.embed.embed_one', side_effect=RuntimeError('offline')):
+        assert cap._merge_into_episode(cur, 1, incoming, matched_via='jaccard', score=.9)
+    vb = cur.episodes[1]['verbatim']
+    assert vb['owner_lines'] == ['please keep the amber reset intact', DESK_TYPED]
+    assert _owner_match(vb, 'amber reset') and _owner_match(vb, 'lapis hinge') == DESK_TYPED
+    assert _owner_match(vb, 'quartz anvil') is None
+    assert cur.episodes[1]['raw']['merged_from'][0]['payload']['verbatim'] == incoming['verbatim']
+
+
+# ---- round 3 on #577: the session's age, and a job side in a merge ---------------
+
+def _second_window(tmp_path, rows):
+    """Append ``rows`` to T3_SID's transcript and run a due SessionEnd: the
+    queued job for that window."""
+    for p in session_capture.queued_jobs():
+        p.unlink()
+    path = tmp_path / '.claude' / 'projects' / 'p' / f'{T3_SID}.jsonl'
+    with path.open('a') as f:
+        for r in rows:
+            f.write(json.dumps(r) + '\n')
+    out = session_capture.hook_main(json.dumps({'hook_event_name': 'SessionEnd', 'session_id': T3_SID,
+                                                'cwd': str(tmp_path), 'transcript_path': str(path)}),
+                                    'claude_code')
+    assert out.get('due'), out
+    return json.loads(session_capture.queued_jobs()[0].read_text())
+
+
+def test_a_never_named_sdk_session_thirty_minutes_old_is_a_job_in_every_window(tmp_path, monkeypatch):
+    """Muse's probe: the session started 30 minutes ago and T3 never named it.
+    Window 1 is a job; window 2, whose first line is 2 minutes old, is too:
+    the grace counts from the session's start, not the window's."""
+    _synthetic_t3(tmp_path, monkeypatch, thread=False)
+    _assert_a_job_without_owner_lines(json.loads(_queue(tmp_path, _headless_rows(30)).read_text()))
+    later = 'Next, polish the hematite sprocket and report back.'
+    _assert_a_job_without_owner_lines(_second_window(tmp_path, _headless_rows(2, later)))
+
+
+def test_a_session_whose_head_is_two_minutes_old_keeps_its_lines_in_a_later_window(tmp_path, monkeypatch):
+    _synthetic_t3(tmp_path, monkeypatch, thread=False)
+    job = json.loads(_queue(tmp_path, _headless_rows(2)).read_text())
+    assert 'origin' not in job and job.get('owner_lines') == [HEADLESS_BRIEF]
+    later = 'Then tidy the hematite sprocket notes.'
+    job = _second_window(tmp_path, _headless_rows(1, later))
+    assert 'origin' not in job and job.get('owner_lines') == [later], job
+
+
+def test_the_session_start_is_read_from_the_head_only(tmp_path):
+    import time
+
+    path = _write(tmp_path, 'h.jsonl', _headless_rows(None) + _headless_rows(30) + _headless_rows(1, 'later'))
+    assert 29 * 60 < time.time() - session_capture._session_start_ts(path) < 31 * 60
+    # past the first 50 lines the head has no timestamp: unknown, never a full read
+    deep = _write(tmp_path, 'd.jsonl', _headless_rows(None) * 30 + _headless_rows(30))
+    assert session_capture._session_start_ts(deep) is None
+    assert session_capture._session_start_ts(tmp_path / 'missing.jsonl') is None
+
+
+def _merge(target, incoming):
+    from khipu import capture as cap
+    from tests.test_audit1010_capb import Cursor
+
+    cur = Cursor({1: target})
+    with mock.patch.object(cap, '_reembed_merged_episode'), \
+            mock.patch('khipu.deliverables.insert_deliverables_from_episode', return_value=0), \
+            mock.patch('khipu.topic_graph.persist_capture_graph', return_value={}), \
+            mock.patch('khipu.embed.embed_one', side_effect=RuntimeError('offline')):
+        assert cap._merge_into_episode(cur, 1, incoming, matched_via='jaccard', score=.9)
+    return cur.episodes[1]['verbatim']
+
+
+JOB_BRIEF = 'Read the brief and fix the onyx turbine, then stop.'
+
+
+def test_a_job_merged_into_a_conversation_gives_no_owner_words():
+    from tests.test_audit1010_capb import episode
+
+    typed = 'please keep the amber reset intact'
+    conv = episode(verbatim={'quotes': [typed], 'owner_lines': [typed]})
+    job = episode(ts='2026-10-10T00:01:00Z', session_id='claude_code:job', transcript_range='100:200',
+                  session_origin='job', verbatim={'quotes': [JOB_BRIEF]})
+    vb = _merge(conv, job)
+    assert vb['owner_lines'] == [typed] and JOB_BRIEF in vb['quotes']
+    assert _owner_match(vb, 'onyx turbine') is None
+    # lineage marks a job too, and a row stored before the list keeps its quotes as its owner words
+    old = episode(verbatim={'quotes': [typed]})
+    child = episode(ts='2026-10-10T00:01:00Z', session_id='claude_code:child', transcript_range='100:200',
+                    parent_session_id='claude_code:parent', verbatim={'quotes': [JOB_BRIEF]})
+    vb = _merge(old, child)
+    assert vb['owner_lines'] == [typed] and _owner_match(vb, 'onyx turbine') is None

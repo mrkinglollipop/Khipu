@@ -399,9 +399,10 @@ def test_each_rewritten_machine_message_alone_gives_no_owner_lines(tmp_path, mon
             rows = [rows[0], _assistant_row('reply ' + 'y' * 300)]
         job_path = _queue(home, rows, sid=f'00000000-0000-0000-0000-0000000010{n:02d}')
         job = json.loads(job_path.read_text())
-        assert 'owner_lines' not in job, (kind, job.get('owner_lines'))
+        # a conversation's window always carries the list: empty, nothing typed
+        assert job.get('owner_lines') == [], (kind, job.get('owner_lines'))
         payload, _ = _drain_job(job_path)
-        assert 'owner_lines' not in (payload.get('verbatim') or {}), kind
+        assert (payload.get('verbatim') or {}).get('owner_lines') == [], kind
 
 
 def test_idle_sweep_window_carries_owner_lines_too(tmp_path, monkeypatch):
