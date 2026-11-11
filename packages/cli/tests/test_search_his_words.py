@@ -360,9 +360,10 @@ def test_orchestrator_window_keeps_typed_lines_only_and_finds_each(at_the_key, m
     monkeypatch.setattr(embed, '_cosine_candidates', lambda q, **kw: [])
     job, payload = _captured(tmp_path)
     window = job['transcript']
-    # the window text is as before: the relayed body is kept, tag stripped
-    assert RELAYED in window and 'cross-session-message' not in window
-    assert f'USER: {TYPED_THREE}\n{RELAYED_TWO}' in window      # merged into one rendered block
+    # the window text: the relayed body is kept behind its stand-in label, and a
+    # typed line never shares a rendered block with the stand-in after it
+    assert f'USER: [notification: cross-session-message] {RELAYED}' in window
+    assert f'USER: {TYPED_THREE}\n\nUSER: [notification: cross-session-message] {RELAYED_TWO}' in window
     vb = payload['verbatim']
     # quotes are exactly what they were: first, longest, last
     assert vb['quotes'] == extract._verbatim_quotes(extract._verbatim_user_messages(window))
