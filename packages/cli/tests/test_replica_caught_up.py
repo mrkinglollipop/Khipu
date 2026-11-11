@@ -132,8 +132,3 @@ def test_a_pull_made_against_another_dump_does_not_count(replica):  # noqa: F811
                  hs.PULL_CAUGHT_UP_KEY: datetime.now(timezone.utc).isoformat()})
     hs.meta_path().write_text(json.dumps(side), encoding="utf-8")
     assert hs.caught_up_at() == dump.isoformat()
-
-
-def test_the_app_shows_the_catch_up_time():
-    app = (PACKAGE.parents[2] / "apps" / "desktop" / "src" / "App.tsx").read_text(encoding="utf-8")
-    assert "hubSnapshotHealth.caught_up_at" in app

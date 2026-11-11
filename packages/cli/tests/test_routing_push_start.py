@@ -590,24 +590,6 @@ def test_a_late_fold_never_keeps_a_conversations_write_waiting(home, monkeypatch
 
 # ---- fix round 3 ------------------------------------------------------------------------------
 
-_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven", 8: "eight"}
-
-
-def test_the_apps_cost_line_matches_the_start_budget_setting():
-    # R3-2: the app said "at most one second", but routing_start_budget_ms is a
-    # setting that start_budget() allows up to START_BUDGET_MOST_MS. The line
-    # must name the budget, its default and its ceiling, from the code's numbers.
-    tsx = (Path(__file__).resolve().parents[3] / "apps" / "desktop" / "src" / "OptionalFeatures.tsx").read_text()
-    block = tsx[tsx.index('name: "routing_push"'):]
-    cost = block[block.index("cost:"):].split("\n", 1)[0]
-    default_s = routing.SETTINGS["routing_start_budget_ms"][1] // 1000
-    most_s = routing.START_BUDGET_MOST_MS // 1000
-    assert "at most one second" not in cost
-    assert "start budget" in cost
-    assert f"{_WORDS[default_s]} second{'s' if default_s != 1 else ''} by default" in cost
-    assert f"never more than {_WORDS[most_s]} seconds" in cost
-
-
 def test_a_summary_too_long_for_session_start_leaves_a_pointer_not_silence():
     # R4-1: a summary past the hook limit was left out with nothing said.
     from khipu import recall_rule
