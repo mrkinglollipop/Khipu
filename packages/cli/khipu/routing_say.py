@@ -321,27 +321,29 @@ def _priority_state(view: dict) -> tuple[dict | None, list[dict]]:
     return held, list((held or {}).get("entries") or [])
 
 
-def pin_value(spec: dict, now: datetime) -> object:
-    """What a change is pinned to, read now from the record (JSON-able)."""
-    view = routing.read_view(now)
+def pin_value(spec: dict, now: datetime, view: dict | None = None) -> object:
+    """What a change is pinned to (JSON-able), read from ``view`` or now
+    from the record. The pins with no command of their own are the
+    record's (``routing.pause_pin`` and the rest), which the command
+    compares again under its lock (``--expect``)."""
+    view = routing.read_view(now) if view is None else view
     kind = spec["type"]
     if kind == "priority":
         return view.get("priority_version") or "p0"
     if kind == "rules":
-        return sorted([r.get("entity"), r.get("revision")] for r in view.get("rules") or [])
+        return routing.rules_pin(view)
     if kind == "rule":
         rule = next((r for r in view.get("rules") or [] if str(r.get("n")) == str(spec["n"])), None)
         return rule.get("revision") if rule else None
-    entry = next((a for a in view.get("accounts") or [] if a.get("key") == spec.get("key")), None)
-    if entry is None:
-        return None
     if kind == "paused":
-        return [entry.get("state") == routing.PAUSED, entry.get("until") if entry.get("state") == routing.PAUSED else None]
+        return routing.pause_pin(view, spec.get("key"))
     if kind == "caps":
-        return sorted([c.get("pct"), c.get("until")] for c in entry.get("caps") or []
-                      if c.get("kind") == "share" and c.get("window") == spec["window"]
-                      and c.get("purpose", "job") == "job")
+        return routing.cap_pin(view, spec.get("key"), spec["window"])
     return None
+
+
+def _expect(value) -> str:
+    return "--expect=" + routing.pin_text(value)
 
 
 def _keep_holds(event: dict, now: datetime) -> dict | None:
@@ -393,7 +395,7 @@ def _priority_first(key: str, label: str, end_spec: str | None, now: datetime) -
     if keys[0] == key:
         raise NotUnderstood(f"{label} is already first. Nothing to change.")
     pin = {"type": "priority"}
-    version = pin_value(pin, now)
+    version = pin_value(pin, now, view)  # the same read as the entries shown
     if end is None:
         moved = [label] + [x for x in labels if x != label]
         stored = (view.get("priority_stored") or {}).get("entries") or []
@@ -440,13 +442,15 @@ def _pause(key: str, label: str, end_spec: str | None, now: datetime) -> dict:
                             f"example \"pause {label} until Monday\" or \"pause {label} for 2 hours\".")
     end = resolve_time(end_spec, now)
     pin = {"type": "paused", "key": key}
-    current = pin_value(pin, now)
-    entry = next(a for a in routing.read_view(now)["accounts"] if a["key"] == key)
+    view = routing.read_view(now)
+    current = pin_value(pin, now, view)
+    entry = next(a for a in view["accounts"] if a["key"] == key)
     was = (f"Paused until {when_words(routing._parse(entry['until']))}" if current[0] and entry.get("until")
            else "Paused until you resume it" if current[0] else "Open to agents")
     return _plan("pause", understood=f"Pause {label} until {when_words(end)}", now_words=was,
                  after_words=f"Paused until {when_words(end)}. It opens again on its own.",
-                 argv=["route", "pause", key, "--from-app", "--until=" + _iso(end)], pin=dict(pin, value=current),
+                 argv=["route", "pause", key, "--from-app", "--until=" + _iso(end), _expect(current)],
+                 pin=dict(pin, value=current),
                  receipt=f"Paused {label} until {when_words(end)}.", account=label, ends=end)
 
 
@@ -455,12 +459,31 @@ def _resume(key: str, label: str, end_spec: str | None, now: datetime) -> dict:
         raise NotUnderstood(f"Resuming happens now, with no time. To stop {label} for a while, say \"pause "
                             f"{label} until …\".")
     pin = {"type": "paused", "key": key}
-    current = pin_value(pin, now)
+    view = routing.read_view(now)
+    current = pin_value(pin, now, view)
     if not current or not current[0]:
         raise NotUnderstood(f"{label} isn't paused, so there is nothing to resume.")
+    under = (routing._account_entry(view, key) or {}).get("underlying") or {}
+    after = "The pause ends." + (" " + state_words(under) if under.get("state") else "")
     return _plan("resume", understood=f"Resume {label}", now_words="Paused by you",
-                 after_words="Open to agents again.", argv=["route", "lift", key, "--from-app"],
-                 pin=dict(pin, value=current), receipt=f"{label} is open to agents again.", account=label)
+                 after_words=after, argv=["route", "lift", key, "--from-app", _expect(current)],
+                 pin=dict(pin, value=current), receipt=f"Lifted the pause on {label}.", account=label)
+
+
+def state_words(entry: dict) -> str:
+    """What an account is, in a sentence: "open to agents" only when it is."""
+    state, until = entry.get("state"), routing._parse(entry.get("until")) if entry.get("until") else None
+    if state == routing.OPEN:
+        return "It is open to agents again."
+    if state == routing.LIMITED:
+        return f"It is still limited until {when_words(until)}." if until else "It is still limited."
+    if state == routing.PAUSED:
+        return f"It is still paused until {when_words(until)}." if until else "It is still paused."
+    if state == routing.PROBABLY_OPEN:
+        return "Its limit's time has passed, so it is probably open; Khipu hasn't read it open yet."
+    if state == routing.DOWN:
+        return "It is down."
+    return "Khipu doesn't know yet whether it is open."
 
 
 def _stop_at(key: str, label: str, main: str, end_spec: str | None, pct_match, now: datetime) -> dict:
@@ -476,7 +499,8 @@ def _stop_at(key: str, label: str, main: str, end_spec: str | None, pct_match, n
     base = [c for c in current or [] if c[1] is None] or current or []
     was = (f"Agents stop at {_pct_words(base[-1][0])}% of {span}" if base and base[-1][0] is not None
            else "No stop level set by you")
-    argv = ["route", "cap", "set", key, "--from-app", "--kind=share", f"--window={window}", f"--pct={pct_out}"]
+    argv = ["route", "cap", "set", key, "--from-app", "--kind=share", f"--window={window}", f"--pct={pct_out}",
+            _expect(current)]
     after = f"Agents stop at {pct_out}% of {span}"
     receipt = f"Agents stop at {pct_out}% of {span} on {label}."
     if end is not None:
@@ -533,9 +557,9 @@ def _add_rule(text: str, now: datetime) -> dict:
     if text.startswith("-"):
         raise NotUnderstood("Start a rule with a word, not a dash.")
     pin = {"type": "rules"}
-    value = pin_value(pin, now)
+    value = pin_value(pin, now, view)
     count = len(rules)
-    argv = ["route", "rule", "add", text, "--from-app"]
+    argv = ["route", "rule", "add", text, "--from-app", _expect(value)]
     kept = _keep_holds({"type": "rule_add", "text": text}, now)
     if kept:
         argv.append("--holds=" + json.dumps(kept, sort_keys=True))
@@ -716,13 +740,19 @@ def apply(token: str, now: datetime | None = None) -> dict:
     result = owner_act._parsed(out.getvalue())
     if rc != 0 or result.get("ok") is False:
         code = result.get("code") or result.get("reason") or "refused"
-        if code in ("version_moved", "crossed", "entry_moved") or str(result.get("error") or "").startswith(
-                "say end or keep in holds"):
+        error = str(result.get("error") or "")
+        if code in ("version_moved", "crossed", "entry_moved") or error.startswith(
+                ("say end or keep in holds", "the rule changed after it was read")):
             raise Refusal("changed", CHANGED)
         raise Refusal(code, result.get("error") or err.getvalue().strip() or "The change was refused.")
     action_id = result.get("owner_action")
+    receipt = plan["receipt"]
+    if plan["kind"] == "resume":
+        # What the account is once the pause is gone, read from the record.
+        entry = routing._account_entry(routing.read_view(now),result.get("account") or pin.get("key")) or {}
+        receipt = f"{receipt} {state_words(entry)}"
     return {"ok": True, "applied": True, "kind": plan["kind"], "action_id": action_id,
-            "receipt": {"text": plan["receipt"], "action_id": action_id, "undoable": bool(action_id),
+            "receipt": {"text": receipt, "action_id": action_id, "undoable": bool(action_id),
                         "saved_on": [_this_mac()], "not_reached": []}}
 
 
