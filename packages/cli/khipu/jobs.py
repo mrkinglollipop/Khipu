@@ -740,13 +740,13 @@ def _drain_sessions() -> dict[str, Any]:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def _wiki_update(*, force: bool = False, max_pages: int = 60) -> dict[str, Any]:
+def _wiki_update(*, force: bool = False, max_pages: int = 60, since: int = 8, allow_open: bool = True) -> dict[str, Any]:
     """Isolate wiki failures; the outside consolidation must always run."""
     try:
         from khipu import wiki_nightly
         if not force and not wiki_nightly.enabled():
             return {"ok": True, "skipped": "wiki_nightly is off"}
-        result = wiki_nightly.run(max_pages=max_pages)
+        result = wiki_nightly.run(max_pages=max_pages, since=since, allow_open=allow_open)
     except Exception as exc:
         result = {"ok": False, "error": type(exc).__name__}
     try:
@@ -771,7 +771,7 @@ def _write_wiki_last(result: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def run_wiki(*, max_pages: int = 60, undo: dict | None = None, periodic: bool = False) -> dict[str, Any]:
+def run_wiki(*, max_pages: int = 60, since: int = 8, undo: dict | None = None, periodic: bool = False) -> dict[str, Any]:
     """Hand/timer entrypoint: same lock as the whole nightly, no git sync."""
     from khipu import wiki_nightly
     from khipu.config import minute_setting
@@ -786,7 +786,7 @@ def run_wiki(*, max_pages: int = 60, undo: dict | None = None, periodic: bool = 
                 return {"ok": True, "skipped": "wiki interval is not due"}
         if undo is not None:
             return wiki_nightly.undo(**undo)
-        result = _wiki_update(force=True, max_pages=max_pages)
+        result = _wiki_update(force=True, max_pages=max_pages, since=since, allow_open=not periodic)
         if not result.get("skipped"):
             # Preserve all other step receipts for the doctor/app readers.
             previous = nightly_last() or {}

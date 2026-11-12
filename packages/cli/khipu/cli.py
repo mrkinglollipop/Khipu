@@ -4939,7 +4939,7 @@ def cmd_wiki(args: argparse.Namespace) -> int:
     if args.wiki_cmd in {"run", "undo"}:
         from khipu import jobs
         try:
-            result = (jobs.run_wiki(max_pages=args.max) if args.wiki_cmd == "run" else
+            result = (jobs.run_wiki(max_pages=args.max, since=args.since) if args.wiki_cmd == "run" else
                       jobs.run_wiki(undo={"slug": args.slug, "night": args.night, "run_id": args.run}))
         except ValueError as exc:
             result = {"ok": False, "error": str(exc)}
@@ -4957,6 +4957,7 @@ def cmd_wiki(args: argparse.Namespace) -> int:
                 print(f"Wiki: {result.get('pages_revised', 0)} revised, {result.get('pages_opened', 0)} opened; "
                       f"{result.get('episodes_absorbed', 0)} episodes absorbed; {result.get('queue_remaining', 0)} queued; "
                       f"oldest {result.get('queue_oldest_age_days')} days; {result.get('rewrites_refused', 0)} refused; "
+                      f"{result.get('delegated_excluded', 0)} delegated excluded; "
                       f"{result.get('calls_used', 0)} calls; cap {'hit' if result.get('cap_hit') else 'not hit'}; "
                       f"run {result.get('run_id', 'unavailable')}")
             if result.get("error") or isinstance(result.get("skipped"), str):
@@ -4966,22 +4967,21 @@ def cmd_wiki(args: argparse.Namespace) -> int:
         result = wiki_nightly.plan(since=args.since)
     else:
         result = wiki_nightly.draft(sample=args.sample, model_id=args.model,
-                                    out=Path(args.out) if args.out else None)
+                                    out=Path(args.out) if args.out else None, since=args.since)
     if getattr(args, "json", False) or args.wiki_cmd == "draft":
         print(json.dumps(result, indent=2))
     else:
-        print(f"Read-only wiki plan: {result['planned_calls']} calls; "
-              f"{result['no_vector_count']}/{result['episode_count']} episodes lack vectors")
-        print("Provisional cosine distance <= 0.15; sample calibration required")
-        if result["blocked"]:
-            print("BLOCKED: " + result["block_reason"])
+        print(f"Read-only wiki plan: {result['planned_calls']} calls; {result['episode_count']} episodes; "
+              f"{result['delegated_excluded']} delegated episodes excluded")
         for page in result["pages"]:
             print(page["slug"] + f" ({page['episode_count']} episodes)" + (" (open)" if page["open"] else ""))
             for row in page["episodes"]:
-                print(f"  {row['episode_id']}: {row['reason']}; distance={row['distance']}")
+                print(f"  {row['episode_id']}: {row['reason']}")
         print("Proposed opens: " + ", ".join(p["slug"] for p in result["opens"]))
+        print("Would ask: " + ", ".join(c["slug"] for c in result["slug_candidates"]))
+        print("Stored slug decisions: " + json.dumps(result["slug_decisions"], sort_keys=True))
         print("Unmatched: " + ", ".join(result["unmatched"]))
-    return 2 if result.get("blocked", result.get("plan", {}).get("blocked", False)) else 0
+    return 0
 
 
 def cmd_models(args: argparse.Namespace) -> int:
@@ -5684,16 +5684,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     wk = sub.add_parser("wiki", help="Wiki assignments, drafts, live update and exact undo")
     wk_sub = wk.add_subparsers(dest="wiki_cmd", required=True)
-    wk_plan = wk_sub.add_parser("plan", help="Read-only assignments, cap and vector coverage")
+    wk_plan = wk_sub.add_parser("plan", help="Read-only assignments, cap and slug candidates")
     wk_plan.add_argument("--json", action="store_true")
-    wk_plan.add_argument("--since", type=int, default=30, metavar="DAYS")
+    wk_plan.add_argument("--since", type=int, default=8, metavar="DAYS")
     wk_plan.set_defaults(func=cmd_wiki)
     wk_draft = wk_sub.add_parser("draft", help="Draft artifacts outside memory; no wiki writes")
     wk_draft.add_argument("--sample", type=int, required=True)
+    wk_draft.add_argument("--since", type=int, default=8, metavar="DAYS")
     wk_draft.add_argument("--model", default=None, metavar="ID")
     wk_draft.add_argument("--out", default=None, metavar="DIR")
     wk_draft.set_defaults(func=cmd_wiki)
     wk_run = wk_sub.add_parser("run", help="Run only the wiki step, even when wiki_nightly is off")
+    wk_run.add_argument("--since", type=int, default=8, metavar="DAYS")
     wk_run.add_argument("--max", type=int, default=60, metavar="N")
     wk_run.add_argument("--json", action="store_true")
     wk_run.set_defaults(func=cmd_wiki)

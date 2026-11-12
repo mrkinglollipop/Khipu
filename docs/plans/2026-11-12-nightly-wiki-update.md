@@ -84,7 +84,7 @@ Test command for every slice: `cd packages/cli && HOME=$(mktemp -d) KHIPU_KEYCHA
 1. **Queue and matching, read-only.** Migration for `wiki_queue`; `assign()`; `khipu wiki plan` prints tonight's pages and why. (As built it also matched by vector; that was measured and removed, see section 1.)
 2. **Writer, drafts only.** The `wiki` model role, the `wiki` ceiling scope, the prompt, the checks in code and `khipu wiki draft --sample N` writing to the jobs folder. Stop if adding the role breaks the app's reading of `models`. That fix becomes its own slice.
 3. **Sample run (no code).** 30 pages, Haiku and Sonnet, the Codex Sol check and Matt's 3 diffs; report in the jobs folder. Stop after two failed rounds and hand the diffs back.
-4. **Live step behind the switch.** The `wiki_update` nightly step, file write plus `_upsert_topic`, baseline revisions, carry-over, the 30-day catch-up, and `khipu wiki undo` (page and night). Never run the real nightly to test it: tests use a temp home.
+4. **Live step behind the switch.** The `wiki_update` nightly step, file write plus `_upsert_topic`, baseline revisions, carry-over, the 8-day catch-up, and `khipu wiki undo` (page and night). Never run the real nightly to test it: tests use a temp home.
 5. **Morning report (1c).** The step counts and the search page-age figures, plus a doctor line.
 6. **Wiki row in Settings,** built with the approved regrouped Models page. Until then an agent sets it on Matt's word.
 7. **Flip on by default** after 7 clean nights.

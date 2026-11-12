@@ -116,7 +116,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | `library` | Folders of `.txt` and `.md` files indexed as a search space. |
 | `embed-backfill` | Job-mode alias for `embed backfill --job`. |
 | `library-backfill NAME` | Job-mode alias for `library backfill NAME --job`. |
-| `wiki` | Read-only `plan --json --since DAYS` (default 30) and `draft --sample N [--model ID] [--out DIR]`; live `run [--max N] [--json]`; exact undo `undo <slug>` or `undo --night YYYY-MM-DD [--run ID]` (also `undo --run ID`). |
+| `wiki` | Read-only `plan --json --since DAYS` (default 8) and `draft --sample N [--since DAYS] [--model ID] [--out DIR]`; live `run [--since DAYS] [--max N] [--json]`; exact undo `undo <slug>` or `undo --night YYYY-MM-DD [--run ID]` (also `undo --run ID`). |
 | `models` | Per-role model settings: `show`, `set`, `welcome`. |
 | `sources` | Memory sources: `list`, `enable`, `disable`, `remove`. |
 
@@ -288,19 +288,30 @@ Owner actions that scan or change batches return “Started; it will finish on i
 
 ### wiki
 
-`wiki plan` reads episodes, existing active-profile vectors, topics and the queue
-(if migrated). It never creates tables, embeds, queues work, reconciles files or
-writes wiki pages. `--since DAYS` defaults to a 30-day catch-up proposal. Exact
-slug and supersession redirects precede nearest vector matching (at most two
-pages per episode). The provisional maximum cosine distance is 0.15; sample
-calibration is required before live use. More than 20% missing episode vectors on any day
-blocks drafting and returns a blocked plan with the count. Episodes without a
-vector wait two UTC nights, then use exact matches only.
+`wiki plan` reads recent top-level, nondeleted episodes, topics, the queue and
+stored slug decisions (if migrated). Every already queued episode remains loaded,
+including delegated or deleted history. Reports count delegated recent episodes
+excluded from the input. Planning never calls a provider, creates tables, queues
+work, reconciles files or writes decisions/pages. `--since DAYS` defaults to an
+8-day catch-up for plan, draft and run. Assignments use only named page slugs,
+supersession redirects and stored aliases, at most two pages per episode.
 
-`wiki draft --sample N` uses the first planned batch for up to N distinct pages (1–60); additional batches remain undrafted. It it writes
+Unknown valid slugs in at least 3 episodes from at least 2 sessions in 7 days are
+candidates, ordered by distinct sessions descending, episodes descending, then
+slug. Names of any existing page, including retired/superseded pages, stay reserved.
+The nightly and a hand run ask the Wiki writer once about the first 30 undecided
+candidates: page (a named thing or standing decision), tag (a generic activity or
+word), or alias (plainly the same thing or a small part of an eligible page).
+The call includes counts, two most recent episode summaries/decisions/preferences
+and eligible page slugs/titles. Checked decisions are kept in `wiki_slugs` and are
+never asked again. Invalid replies or provider failures leave slugs undecided.
+Only approved page slugs may open under the nomination rule; tags stay unmatched.
+`plan` shows would-ask candidates and stored decisions without asking the model.
+
+`wiki draft --sample N` uses the first planned batch for up to N distinct pages (1–60); additional batches remain undrafted. It writes
 old.md, episodes.jsonl (summary/decisions/preferences only), draft.md,
-checks.json and summary.json below the jobs folder or an empty `--out` directory
-outside memory_root. These are unreviewed artifacts. Mechanical checks preserve
+checks.json and summary.json, plus slug-decisions.json with the sample gate reply, below the jobs folder or an empty `--out` directory
+outside memory_root. Draft may call the gate but saves its decisions only in that output folder. These are unreviewed artifacts. Mechanical checks preserve
 frontmatter (except today's last_updated and seed → active), at least 70% of old
 length, old lines carrying numbers/dates/paths/links verbatim or named verbatim
 in a dated Was line, and the supplied Sources ids. They cannot establish factual
@@ -316,9 +327,10 @@ Login exhaustion never selects a paid fallback. `wiki_daily_pages` defaults to
 refuses with exit 75 while that lock is held. A page is reconciled from its
 file before the provider sees it; a missing matching revision gets a baseline.
 The accepted file and a `nightly-wiki` revision are saved before its queue
-entries are marked done. Failed checks or calls leave those entries waiting.
-At most 60 writes run per invocation and 10 new pages open per UTC day; all invocations share
-the separate daily wiki call budget, including failed calls and draft calls.
+entries are marked done. Episodes within a page run oldest timestamp first, then
+numeric id; a refused batch defers later batches for that page until a future run. Failed checks or calls leave those entries waiting.
+At most 60 writes run per invocation and 10 new pages open per invocation; all invocations share
+the separate daily wiki call budget, including the single gate call, failed calls and draft calls.
 `--max N` further limits one invocation. Reports count unique episode IDs
 absorbed in that run, even when an episode updates two pages.
 
@@ -328,7 +340,7 @@ configured nightly sync host with its memory folder mounted. Its failure does
 not stop later nightly steps. `config --set wiki_every_minutes N` sets the
 periodic interval (default 60, 0 means nightly only). The existing
 `replica_refresh` timer runs it when due; it also requires `wiki_nightly` and
-quietly skips a held nightly lock. No extra launchd job or daytime git sync
+quietly skips a held nightly lock. Hourly runs update existing pages only; they never call the gate or open pages, including pending openings. No extra launchd job or daytime git sync
 is installed. A wiki run failure does not change the replica timer's outcome.
 
 `wiki undo <slug>` restores the exact bytes before its latest wiki write.
@@ -336,7 +348,7 @@ is installed. A wiki run failure does not change the replica timer's outcome.
 `--run ID` selects one recorded run. These commands use the same nightly lock.
 They record `wiki-undo`, requeue the absorbed episodes and hold each affected
 page for seven days; the hold expires automatically. An opened page moves to
-`topics/_retired/` and is tombstoned, never deleted. Pages changed since their
+`topics/_retired/` and is tombstoned, never deleted; its slug decision remains. Pages changed since their
 selected write are skipped and listed. Undo refuses when exact source bytes
 are unavailable; the older body-only revision history cannot restore them.
 
@@ -351,5 +363,4 @@ the latest run wrote no pages while episodes remain queued.
 Migrations `0053_wiki_queue` and `0054_wiki_writes` are prerequisites for live
 runs. The latter retains exact before bytes separately from redacted revision
 bodies. Neither planning nor running applies migrations automatically. The
-assignment distance remains provisional and the switch stays off until the
-scope's sample and owner review pass.
+switch stays off until the scope's sample and owner review pass.
