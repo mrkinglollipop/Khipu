@@ -59,7 +59,7 @@ The first time Khipu sees a transcript it starts a clock and reads from near the
 
 The hook inside the session only writes a job file. It calls no model and no database. A detached drainer then picks up the jobs, runs the summariser, writes to PostgreSQL, mirrors, replays the outbox and catches up embeddings. Up to four drainers run at once by default.
 
-A queue-drain job also runs every five minutes, so a job whose drainer was interrupted still finishes.
+A queue-drain job also runs every minute, so a job whose drainer was interrupted still finishes.
 
 ### Long windows are split, not cut
 

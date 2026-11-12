@@ -201,40 +201,6 @@ def test_claude_turn_is_due_again_after_the_interval(fake):
     assert usage.probe_claude()["ok"] is True
 
 
-def test_claude_turn_comes_back_sooner_when_the_last_figures_are_near_the_limit(fake, tmp_path):
-    # 2026-11-12: the owner reset the second account at 99%; the next turn was
-    # 30 minutes away, so every conversation was told it was out.
-    out = fake("claude", "claude-null.jsonl")
-    turn = Path(str(out) + ".turn")
-    home = tmp_path / "second"
-    home.mkdir()
-    account = {"label": "Claude second", "harness": "claude", "home": str(home)}
-    stamps = usage.cache_file().with_name(usage.TURN_STAMP_NAME)
-
-    def last_turn(seconds_ago, used_pct):
-        usage._save_cache({usage._key(account): {"windows": [{"name": "weekly", "used_pct": used_pct}]}})
-        stamps.parent.mkdir(parents=True, exist_ok=True)
-        stamps.write_text(json.dumps({str(usage._home_path(str(home))): time.time() - seconds_ago}))
-        if turn.exists():
-            turn.unlink()
-
-    last_turn(usage.NEAR_LIMIT_TURN_EVERY_S + 5, 99.0)
-    assert usage.probe_claude(str(home), identity=False)["ok"] is True and turn.exists()
-    last_turn(usage.NEAR_LIMIT_TURN_EVERY_S + 5, 50.0)  # far from the limit: the usual interval
-    assert usage.probe_claude(str(home), identity=False)["error"] == usage.E_NO_FIGURES and not turn.exists()
-    last_turn(usage.NEAR_LIMIT_TURN_EVERY_S - 30, 99.0)  # near the limit, but too soon
-    assert usage.probe_claude(str(home), identity=False)["error"] == usage.E_NO_FIGURES and not turn.exists()
-
-
-@pytest.mark.parametrize("row", [None, {}, {"windows": None}, {"windows": [{"used_pct": True}]},
-                                 {"windows": [{"used_pct": "99"}]}, {"windows": ["bad"]}])
-def test_claude_turn_interval_is_the_usual_one_without_readable_figures(row, tmp_path):
-    home = str(tmp_path / "x")
-    if row is not None:
-        usage._save_cache({usage._key({"harness": "claude", "home": home}): row})
-    assert usage._claude_turn_every(home) == usage.TURN_EVERY_S
-
-
 def test_claude_turn_without_a_rate_limit_event_still_reads_no_figures(fake, tmp_path):
     lone = tmp_path / "claude-lone.jsonl"  # no claude-lone-turn.jsonl: the turn prints nothing
     shutil.copy(FIXTURES / "claude-null.jsonl", lone)

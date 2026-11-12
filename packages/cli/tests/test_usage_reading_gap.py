@@ -76,35 +76,37 @@ def test_attempt_log_rotates_when_over_cap(isolated, monkeypatch):
 
 
 def test_grok_due_sooner_after_failure_or_near_weekly_reset():
+    # Grok's own shortening, measured against the older 5- and 10-minute ages.
+    FIVE_MIN, TEN_MIN = 300, 600
     failed = {"last_attempt_at": iso(NOW - timedelta(seconds=100)), "last_error": usage.E_CLI, "ok": False}
-    assert usage._due([GROK], {"grok|": failed}, NOW, usage.PERIODIC_MAX_AGE_S) == [GROK]
+    assert usage._due([GROK], {"grok|": failed}, NOW, FIVE_MIN) == [GROK]
     fresh_fail = {"last_attempt_at": iso(NOW - timedelta(seconds=30)), "last_error": usage.E_TIMEOUT, "ok": False}
-    assert usage._due([GROK], {"grok|": fresh_fail}, NOW, usage.PERIODIC_MAX_AGE_S) == []
+    assert usage._due([GROK], {"grok|": fresh_fail}, NOW, FIVE_MIN) == []
 
     near = {"last_attempt_at": iso(NOW - timedelta(seconds=100)), "ok": True,
             "windows": [_week(90, NOW + timedelta(minutes=10))]}
-    assert usage._due([GROK], {"grok|": near}, NOW, usage.PERIODIC_MAX_AGE_S) == [GROK]
+    assert usage._due([GROK], {"grok|": near}, NOW, FIVE_MIN) == [GROK]
     hour = {"last_attempt_at": iso(NOW - timedelta(seconds=100)), "ok": True,
             "windows": [_week(90, NOW + timedelta(minutes=45))]}
-    assert usage._due([GROK], {"grok|": hour}, NOW, usage.PERIODIC_MAX_AGE_S) == []
+    assert usage._due([GROK], {"grok|": hour}, NOW, FIVE_MIN) == []
     # A reading that passed but carries a transient last_error still retries sooner.
     gap = {"last_attempt_at": iso(NOW - timedelta(seconds=100)), "ok": True, "last_error": usage.E_TIMEOUT}
-    assert usage._due([GROK], {"grok|": gap}, NOW, usage.PERIODIC_MAX_AGE_S) == [GROK]
+    assert usage._due([GROK], {"grok|": gap}, NOW, FIVE_MIN) == [GROK]
     # Errors that never recover on their own keep the five-minute age.
     for code in (usage.E_SIGNIN, usage.E_NOT_INSTALLED):
         stuck = {"last_attempt_at": iso(NOW - timedelta(seconds=100)), "last_error": code, "error": code, "ok": False}
-        assert usage._due([GROK], {"grok|": stuck}, NOW, usage.PERIODIC_MAX_AGE_S) == []
+        assert usage._due([GROK], {"grok|": stuck}, NOW, FIVE_MIN) == []
     # A prompt kick (600 s age) uses the same per-account limit, so it cannot
     # start a Grok probe more often than that limit allows.
     young = {"last_attempt_at": iso(NOW - timedelta(seconds=60)), "last_error": usage.E_TIMEOUT, "ok": False}
-    assert usage._due([GROK], {"grok|": young}, NOW, usage.PROMPT_MAX_AGE_S) == []
+    assert usage._due([GROK], {"grok|": young}, NOW, TEN_MIN) == []
     far = {"last_attempt_at": iso(NOW - timedelta(seconds=100)), "ok": True,
            "windows": [_week(10, NOW + timedelta(days=3))]}
-    assert usage._due([GROK], {"grok|": far}, NOW, usage.PERIODIC_MAX_AGE_S) == []
+    assert usage._due([GROK], {"grok|": far}, NOW, FIVE_MIN) == []
     # Codex keeps the five-minute age even near a reset.
     codex_near = {"last_attempt_at": iso(NOW - timedelta(seconds=100)), "ok": True,
                   "windows": [_week(90, NOW + timedelta(minutes=10))]}
-    assert usage._due([CODEX], {"codex|": codex_near}, NOW, usage.PERIODIC_MAX_AGE_S) == []
+    assert usage._due([CODEX], {"codex|": codex_near}, NOW, FIVE_MIN) == []
 
 
 def test_merge_keeps_prev_used_pct_when_weekly_window_rolls():
