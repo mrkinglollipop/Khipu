@@ -501,6 +501,7 @@ def _prepare_body(slug: str, old: str, body: str, ids: list[str], today: str, *,
     if not body.strip():
         raise ValueError("empty reply")
     header, old_body, closed = split_header(old)
+    body = _strip_episode_echo(old_body, body)
     used = _used_ids(old_body, body, ids)
     skipped = [str(i) for i in ids if str(i) not in used]
     if not used and not old_body.strip() and all(line.lstrip().startswith("#") for line in body.splitlines() if line.strip()):
@@ -573,6 +574,19 @@ def _strip_reply_fence(text: str) -> str:
         raise ValueError("provider page must be text")
     match = re.fullmatch(r"\s*(`{3,}|~{3,})[^\r\n]*\r?\n(.*?)\r?\n\1[ \t]*\s*", text, re.S)
     return match.group(2) if match else text
+
+
+_EPISODE_RECORD = re.compile(r'\s*\{"date": "\d{4}-\d{2}-\d{2}", "episode_id": "\d+", "summary": ')
+
+
+def _strip_episode_echo(old_body: str, body: str) -> str:
+    """Drop input records the writer copied into its reply (seen 2026-11-12 on
+    the largest page). They are the prompt's own lines, never page text; a page
+    that already holds such a line keeps it."""
+    kept = {line.strip() for line in old_body.splitlines()}
+    lines = body.splitlines(keepends=True)
+    out = [line for line in lines if not _EPISODE_RECORD.match(line) or line.strip() in kept]
+    return "".join(out) if len(out) != len(lines) else body
 
 
 def _gate_json(text: str) -> dict:
@@ -1011,7 +1025,7 @@ Episodes
 2. Say exactly what the episode says happened and no more. Work the episode calls in progress, proposed, planned, drafted, queued, blocked, held or waiting is written that way, with the episode's date. Never write that something was merged, shipped, installed, chosen, decided or finished unless the episode says so itself.
 3. Never join what the episode keeps apart. If the episode does not say which project, product or person a fact belongs to, do not give it to this page's subject: leave that fact out.
 4. Episodes come oldest first. Where two disagree, the later one is current. Where the page already says something dated later than an episode, the page stands.
-5. Add nothing that is in neither the page nor an episode. No notes about this rewrite, about the page's condition, or about missing text. Nothing before or after the page text.
+5. Add nothing that is in neither the page nor an episode. No notes about this rewrite, about the page's condition, or about missing text. Nothing before or after the page text. Never copy an episode record into your reply.
 
 The existing page
 6. Keep every statement on the page. Copy kept lines exactly, character for character, even a line that looks unfinished.

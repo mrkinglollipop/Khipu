@@ -1181,7 +1181,10 @@ def generate_wiki(prompt: str, *, model_id: str | None = None, timeout: int | No
     settings = wiki_settings()
     if model_id:
         settings["model_id"] = model_id
-    floor = 24000 if settings["provider"] in {"claude-cli", "codex-cli"} else 8192
+    # The logins count thinking against the allowance: the largest page used
+    # 15,700 to 16,600 on a plain reply and 33,000 on one that echoed its input
+    # (measured 2026-11-12), and a reply cut at 24,000 lost its beginning.
+    floor = 48000 if settings["provider"] in {"claude-cli", "codex-cli"} else 8192
     max_output_tokens = max(floor, max_output_tokens or 0)
     token = _CALL_SCOPE.set("wiki")
     try:

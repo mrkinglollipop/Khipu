@@ -857,3 +857,17 @@ def test_heading_only_reply_on_a_page_with_no_text_is_all_skipped():
     # Prose with no episode id is not a skip: it stays refused, so the rows are retried.
     _,checks=wiki._prepare_body('memory-management',old,'# Memory Management\n\nSome fact with no source.\n',['19'],TODAY)
     assert not checks['passed'] and 'changed without a source' in checks['errors']
+
+
+def test_episode_records_copied_into_the_reply_are_dropped_before_ids_are_counted():
+    old='# Routing\n\nKeep 60 pages.\n\nSources: episodes 3\n'
+    echo='{"date": "2026-11-05", "episode_id": "20", "summary": "Other work.", "decisions": [], "preferences": []}'
+    reply='# Routing\n\nKeep 60 pages.\n'+echo+'\n\n- **2026-11-05 (19):** Muse is canceled, ending 11-13.\n\nSources: episodes 3\n'
+    joined,checks=wiki._prepare_body('routing',old,reply,['19','20'],TODAY)
+    assert checks['passed'],checks
+    assert '"episode_id"' not in joined and 'Muse is canceled' in joined
+    assert checks['used_episode_ids']==['19'] and checks['skipped_episode_ids']==['20']
+
+
+def test_writer_prompt_forbids_copying_episode_records():
+    assert 'Never copy an episode record into your reply.' in wiki._rewrite_prompt('x','','','2026-11-12')

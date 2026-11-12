@@ -1066,7 +1066,7 @@ def test_wiki_claude_system_timeout_output_cap_and_summary_default(monkeypatch):
     assert extract.generate_wiki('page',timeout=180,system_prompt='wiki instructions',max_output_tokens=7000)=='# Complete page'
     argv,kwargs=seen[0]
     assert argv[argv.index('--system-prompt')+1]=='wiki instructions'
-    assert kwargs['env']['CLAUDE_CODE_MAX_OUTPUT_TOKENS']=='24000' and kwargs['timeout']==180
+    assert kwargs['env']['CLAUDE_CODE_MAX_OUTPUT_TOKENS']=='48000' and kwargs['timeout']==180
     extract._generate_claude_cli('summary',model_id='haiku',retries=0)
     argv,kwargs=seen[1]
     assert argv[argv.index('--system-prompt')+1]==extract.CLAUDE_CLI_SYSTEM_PROMPT
@@ -1078,7 +1078,7 @@ def test_wiki_default_call_keeps_existing_adapter_timeout_and_prompt(monkeypatch
     seen=[]
     monkeypatch.setattr(extract,'_generate_claude_cli',lambda p,**kw:(seen.append(kw) or 'result'))
     assert extract.generate_wiki('page')=='result'
-    assert seen[0]['timeout']==60 and 'system_prompt' not in seen[0] and seen[0]['max_output_tokens']==24000
+    assert seen[0]['timeout']==60 and 'system_prompt' not in seen[0] and seen[0]['max_output_tokens']==48000
 
 
 @pytest.mark.parametrize('provider', ['claude-cli','codex-cli'])
@@ -1088,7 +1088,7 @@ def test_wiki_login_minimum_allowance_leaves_summaries_unchanged(monkeypatch,pro
     seen=[]
     monkeypatch.setattr(extract,'_generate_'+provider.replace('-','_'),lambda p,**kw:(seen.append(kw) or 'page'))
     assert extract.generate_wiki('page',max_output_tokens=allowance)=='page'
-    assert seen[0]['max_output_tokens']==max(24000,allowance or 0)
+    assert seen[0]['max_output_tokens']==max(48000,allowance or 0)
     extract._generate('summary',settings={'provider':provider,'model_id':'fixture'},retries=0)
     assert 'max_output_tokens' not in seen[1]
 
@@ -1110,7 +1110,7 @@ def test_wiki_claude_login_output_limit_errors_are_truncated_with_one_call(monke
     monkeypatch.setattr(synth_cli,'environment',lambda:{'PATH':'/usr/bin'})
     with pytest.raises(extract.ProviderTruncated,match='truncated'):
         extract.generate_wiki('private page',max_output_tokens=4096)
-    assert len(calls)==1 and calls[0]['env']['CLAUDE_CODE_MAX_OUTPUT_TOKENS']=='24000'
+    assert len(calls)==1 and calls[0]['env']['CLAUDE_CODE_MAX_OUTPUT_TOKENS']=='48000'
 
 
 def test_successful_wiki_may_describe_a_previous_output_limit_error(monkeypatch):
