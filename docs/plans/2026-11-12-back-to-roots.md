@@ -127,4 +127,6 @@ This replaces item 8's reminders and is how item 4 stays true over time.
 
 ## Questions for Matt
 
-None open in this plan. The two scope docs carry their own.
+- **Usage on Today** (Matt, 2026-11-12: "on the today screen, there should be helpful information ... usage limits ... at a glance for the different accounts it is tracking"). Proposed mock: `docs/plans/mocks/2026-11-12-today-usage.html`. One tile per account Khipu reads, under the status sentence and above Needs you: what is left of the account's tightest limit as a bar, the reset day, the pace word the Accounts place already uses, a second limit on one small line, and when the reading is old, its age. Choosing a tile opens that account. It reads what the Accounts place already reads, so nothing new is stored. Waiting on Matt: approve the mock, or say what to change.
+
+The two scope docs carry their own questions.
