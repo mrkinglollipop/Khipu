@@ -1176,6 +1176,12 @@ def reopen_declined(request_id: str, line_id: str | None) -> dict:
 
 _ERROR_CODE = re.compile(r"[a-z][a-z0-9_.]{0,63}")
 _SETTLE_ERROR = "The held change was not applied."
+# A fixed message per code a settle may keep (never the command's own text).
+_SETTLE_ERRORS = {
+    "holds_needed": ("The held change was not applied: it touches an account with a pause or a hold that needs "
+                     "an end-or-keep answer. A paused account shows as paused in Accounts; ask for the change "
+                     "again with holds naming end or keep for it."),
+}
 
 
 def result_counts(result: dict | None) -> dict:
@@ -1204,8 +1210,8 @@ def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float 
                        result=result_counts(result))
             if not ok:
                 code = result.get("code") if isinstance(result, dict) else None
-                row.update(error_code=code if isinstance(code, str) and _ERROR_CODE.fullmatch(code) else "failed",
-                           error=_SETTLE_ERROR)
+                code = code if isinstance(code, str) and _ERROR_CODE.fullmatch(code) else "failed"
+                row.update(error_code=code, error=_SETTLE_ERRORS.get(code, _SETTLE_ERROR))
         _save(path, state, now)
 
 

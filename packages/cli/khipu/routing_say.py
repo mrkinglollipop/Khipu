@@ -354,11 +354,8 @@ def _keep_holds(event: dict, now: datetime) -> dict | None:
     record's own check is run on the event and its refusal is read."""
     try:
         routing._require_hold_choices(dict(event, written_by=routing.OWNER), now)
-    except routing.RouteError as err:
-        found = re.fullmatch(r"say end or keep in holds for: (.+)", str(err))
-        if not found:
-            raise
-        return {i.strip(): "keep" for i in found.group(1).split(",") if i.strip()}
+    except routing.HoldsNeeded as err:
+        return {i: "keep" for i in err.ids}
     return None
 
 

@@ -141,6 +141,21 @@ class RuleCapError(RouteError):
         self.code = code
 
 
+class HoldsNeeded(RouteError):
+    """An owner write that touches an account with a pause or a hold, given
+    no end-or-keep choice for it. ``ids`` are the ones missing; the text
+    names each (a pause is an account's state, not a row of the holds list,
+    so its id alone is found nowhere the owner looks)."""
+
+    code = "holds_needed"
+
+    def __init__(self, ids: list[str], what: dict[str, str] | None = None):
+        what = what or {}
+        named = "; ".join(f"{i} is {what[i]}" for i in ids if what.get(i))
+        super().__init__("say end or keep in holds for: " + ", ".join(ids) + (f" ({named})" if named else ""))
+        self.ids = list(ids)
+
+
 class _AccountNotConfigured(RouteError):
     """The pre-probe lookup found no configured account."""
 
@@ -7410,7 +7425,49 @@ def _require_hold_choices(event: dict, now: datetime) -> None:
         raise RouteError('holds must name each hold or pause id with "end" or "keep"')
     missing = sorted(required - set(choices))
     if missing:
-        raise RouteError('say end or keep in holds for: ' + ", ".join(missing))
+        raise HoldsNeeded(missing, _hold_choice_words(view, missing))
+
+
+def _hold_choice_words(view: dict, ids) -> dict[str, str]:
+    """What each hold or pause id an owner write must answer is, in words:
+    "the pause on Grok (no end set)", "the hold on Codex: ..."."""
+    out: dict[str, str] = {}
+    labels = {a["key"]: a["label"] for a in view.get("accounts") or []}
+    for hold in view.get("holds") or []:
+        if hold["id"] in ids:
+            scope = hold.get("scope") or {}
+            on = labels.get(scope.get("account")) if scope.get("kind") == "account" else None
+            words = _word_clip(str(hold.get("text") or ""), 80)
+            out[hold["id"]] = (f"the hold on {on}" if on else "a hold on every account") + (f": {words}" if words else "")
+    for account in view.get("accounts") or []:
+        wid = (account.get("witness") or {}).get("id")
+        if account.get("state") == PAUSED and wid in ids:
+            until = account.get("until")
+            out[wid] = f"the pause on {account['label']} ({'until ' + until if until else 'no end set'}; lift it or answer keep)"
+    return out
+
+
+def _amend_keeps(view: dict, key: str, words: str, holds: dict | None) -> dict | None:
+    """An amend changes one account's entry: a pause or hold on any other
+    account in the priority is kept as it is, unless the amendment's own
+    words name that account or the owner answered for it. A hold on every
+    account, and one on the amended account, still need the owner's answer
+    (``_require_hold_choices``)."""
+    touched = {key}
+    named = _named_account_labels(words, view)
+    for account in view.get("accounts") or []:
+        if account["label"] in named or re.search(r"(?<![\w-])" + re.escape(account_id(account["key"]))
+                                                  + r"(?![\w-])", words, re.I):
+            touched.add(account["key"])
+    choices = dict(holds or {})
+    for hold in view.get("holds") or []:
+        scope = hold.get("scope") or {}
+        if scope.get("kind") == "account" and scope.get("account") not in touched:
+            choices.setdefault(hold["id"], "keep")
+    for account in view.get("accounts") or []:
+        if account["key"] not in touched and account.get("state") == PAUSED:
+            choices.setdefault(account["witness"]["id"], "keep")
+    return choices or holds
 
 
 def _rule_words(entity: str | None) -> str:
@@ -8954,10 +9011,15 @@ def amend_priority(account, *, append=None, role=None, until=None, exception=Non
         if done.get("duplicate") and confirm_pending is None:
             return {"ok": True, "duplicate": True, "entries": [e["label"] for e in rows], **done}
         # ``holds``: end or keep for each hold on an account it names, as a
-        # set takes them (``_require_hold_choices``).
+        # set takes them (``_require_hold_choices``). Every other account's
+        # pause or hold stays as it is (``_amend_keeps``): changing Claude's
+        # words never asks about a pause on Grok.
+        kept = _amend_keeps(current, _resolve_account_key(account, accounts()),
+                            " ".join(str(x) for x in (append, role, exception) if x is not None), holds)
         choices = {"holds": holds} if holds is not None else {}
+        amended = {"holds": kept} if kept is not None else {}
         if confirm_pending is None:
-            out = _owner_write({"type": "priority_set", "entries": rows, "until": whole, **choices}, via)
+            out = _owner_write({"type": "priority_set", "entries": rows, "until": whole, **amended}, via)
             return dict(out, entries=[e["label"] for e in rows], **done)
         view = read_view(now)
         proposal = next(p["id"] for p in view["proposals"].values()
@@ -8965,7 +9027,7 @@ def amend_priority(account, *, append=None, role=None, until=None, exception=Non
         stored = view.get("priority_stored") or {}
         confirm = {"type": "priority_confirm", "entries": [dict(e) for e in stored.get("entries") or []],
                    "confirm_proposal": proposal, **choices}
-        amend = {"type": "priority_set", "entries": rows, "until": whole, **choices}
+        amend = {"type": "priority_set", "entries": rows, "until": whole, **amended}
         written, view = _write_batch(owner_lines([confirm, amend], via), target=f"priority:{str(expect).strip()}")
         out = _done(written[-1], view)
     return dict(out, entries=[e["label"] for e in rows], confirmed_request=True, **done)
