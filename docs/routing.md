@@ -425,7 +425,9 @@ codes. The cache is `state/usage.json`.
 
 Usage reads normally use the CLI's usage protocol. Claude may use a tiny Haiku
 turn when its usage reply omits figures, and Muse may use a tiny turn to refresh
-stale observations, each at most once per 30 minutes per login. `khipu_usage`
+stale observations, each at most once per 30 minutes per login. Claude's turn
+comes every 5 minutes while its last figures are at 90% or more, so a reset the
+owner presses at the limit shows within minutes. `khipu_usage`
 replies from cache immediately; its background refresh can use these fallbacks.
 From Muse 1.4.13, `muse usage --json` gives the figures with no turn; older Muse
 keeps the turn.

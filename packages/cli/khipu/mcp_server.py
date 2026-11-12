@@ -694,7 +694,7 @@ TOOLS: list[dict] = [
             "account (Claude, Codex, Grok, Muse, GLM): plan, windows (name, "
             "used_pct, resets_at), credits, probed_at, ok/error, stale. Read "
             "from each CLI with the login it already holds; a refresh may spend "
-            "one tiny model turn per login per 30 minutes. Answers at once from the cache and refreshes in "
+            "one tiny model turn per login per 30 minutes (5 near its limit). Answers at once from the cache and refreshes in "
             "the background (refreshing: true) when a row is older than "
             "max_age seconds (default 120) or fresh: true; ask again a few "
             "seconds later for the new figures. An account never probed reads "

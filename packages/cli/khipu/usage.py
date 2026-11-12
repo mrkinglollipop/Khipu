@@ -769,7 +769,7 @@ def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S, t
         data = parse_claude(frames)
     except ProbeError as exc:
         data = {"ok": False, "error": exc.code}
-        if exc.code == E_NO_FIGURES and turn and _turn_due(config_dir):
+        if exc.code == E_NO_FIGURES and turn and _turn_due(config_dir, every=_claude_turn_every(config_dir)):
             # The figures turn keeps its existing budget; optional identity
             # below still stops at the caller's original deadline.
             observed = _claude_turn(binary, env, deadline + OVERALL_GRACE_S - 0.25)
@@ -821,6 +821,13 @@ def _claude_identity(binary: str, home: str | None, deadline: float) -> str | Li
 # a one-line system prompt) at most once per TURN_EVERY_S for each login, and
 # reads the figures from the turn's rate_limit_event.
 TURN_EVERY_S = 1800
+# Near the limit the figures matter most and change fastest: the owner presses
+# a reset only when an account is out, and a 30-minute-old 99% kept every
+# conversation away from an account that had just been reset (2026-11-12).
+# So a login whose last figures are at or above NEAR_LIMIT_PCT gets its turn
+# every NEAR_LIMIT_TURN_EVERY_S instead.
+NEAR_LIMIT_PCT = 90
+NEAR_LIMIT_TURN_EVERY_S = 300
 TURN_STAMP_NAME = "usage.turn.json"
 TURN_LOCK_NAME = "usage.turn.lock"
 _CLAUDE_TURN_ARGS = ("-p", "Reply with OK.", "--output-format", "stream-json", "--verbose",
@@ -864,6 +871,18 @@ def _turn_due(config_dir: str | None, *, key: str | None = None, every: float = 
         return True
     finally:
         _release(fd)
+
+
+def _claude_turn_every(config_dir: str | None) -> float:
+    """The turn interval for this login: short while its last kept figures
+    are near the limit, else the usual one. Unreadable figures mean usual."""
+    try:
+        row = _load_cache().get(_key({"harness": "claude", "home": config_dir}))
+        used = [w.get("used_pct") for w in (row or {}).get("windows") or [] if isinstance(w, dict)]
+    except Exception:  # noqa: BLE001 — the interval never makes the probe fail
+        return TURN_EVERY_S
+    near = any(isinstance(u, (int, float)) and not isinstance(u, bool) and u >= NEAR_LIMIT_PCT for u in used)
+    return NEAR_LIMIT_TURN_EVERY_S if near else TURN_EVERY_S
 
 
 def _claude_turn_frame(frame: dict) -> bool:

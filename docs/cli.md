@@ -161,7 +161,7 @@ Discovery can automatically track eligible logins a conversation used. `usage_au
 
 For the app's separate-login workflow, `--sign-in-offers` lists available choices; `--sign-in-folder --harness H --name N` makes a login folder. `--sign-in-new --harness H --folder F` starts login and returns an attempt id immediately; `--again` first ends a running attempt. Use `--sign-in-status ID` and `--sign-in-cancel [ID]`, optionally `--remove-folder` with the harness/folder after login ends to remove an empty folder Khipu made. `--sign-in-reap` ends a leftover attempt.
 
-Usage normally reads the CLI's usage protocol. Claude may use a tiny Haiku turn if its reply omits figures, and Muse may use a tiny turn to refresh stale observations, each at most once per 30 minutes per login. Claude reset checks can use the same fallback.
+Usage normally reads the CLI's usage protocol. Claude may use a tiny Haiku turn if its reply omits figures, and Muse may use a tiny turn to refresh stale observations, each at most once per 30 minutes per login (Claude every 5 minutes while its last figures are at 90% or more, so a reset shows quickly). Claude reset checks can use the same fallback.
 
 `accounts status` supplies the list version for `--expect` on `track`, `rename`, `stop`, `move`, and `request confirm|undo`. `track` takes `--entries JSON`; `stop` offers choices for retained priority, pause, lane mappings, and stopping the last account. Run the subcommand's help for those choices.
 
