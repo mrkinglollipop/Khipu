@@ -4541,6 +4541,10 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
                 out["mac_status"] = dict(macs.publish(), running=running)
         except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
             out["mac_status"] = timer_error(exc)
+        try:
+            out["wiki_update"] = jobs.run_wiki(periodic=True)
+        except Exception as exc:  # noqa: BLE001 — wiki cannot change the timer's outcome
+            out["wiki_update"] = timer_error(exc)
         print(json.dumps(out, indent=2))
         return rc
     if args.snapshot_cmd == "status":
@@ -4932,6 +4936,32 @@ def cmd_monthly(args: argparse.Namespace) -> int:
 
 def cmd_wiki(args: argparse.Namespace) -> int:
     from khipu import wiki_nightly
+    if args.wiki_cmd in {"run", "undo"}:
+        from khipu import jobs
+        try:
+            result = (jobs.run_wiki(max_pages=args.max) if args.wiki_cmd == "run" else
+                      jobs.run_wiki(undo={"slug": args.slug, "night": args.night, "run_id": args.run}))
+        except ValueError as exc:
+            result = {"ok": False, "error": str(exc)}
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            for page in result.get("written", []):
+                print(f"{page['slug']}: {'opened' if page['opened'] else 'written'} ({len(page['episode_ids'])} episodes)")
+            skipped = result.get("skipped", [])
+            for page in result.get("failures", []) + (skipped if isinstance(skipped, list) else []):
+                print(f"{page['slug']}: refused: {page['reason']}" + (" (" + ", ".join(page["checks"]) + ")" if page.get("checks") else ""))
+            for page in result.get("pages", []):
+                print(f"{page['slug']}: {'retired' if page['retired'] else 'restored'} ({page['episodes_requeued']} episodes requeued)")
+            if args.wiki_cmd == "run":
+                print(f"Wiki: {result.get('pages_revised', 0)} revised, {result.get('pages_opened', 0)} opened; "
+                      f"{result.get('episodes_absorbed', 0)} episodes absorbed; {result.get('queue_remaining', 0)} queued; "
+                      f"oldest {result.get('queue_oldest_age_days')} days; {result.get('rewrites_refused', 0)} refused; "
+                      f"{result.get('calls_used', 0)} calls; cap {'hit' if result.get('cap_hit') else 'not hit'}; "
+                      f"run {result.get('run_id', 'unavailable')}")
+            if result.get("error") or isinstance(result.get("skipped"), str):
+                print(result.get("error") or result["skipped"])
+        return result.get("exit_code", 0 if result.get("ok") else 2)
     if args.wiki_cmd == "plan":
         result = wiki_nightly.plan(since=args.since)
     else:
@@ -5652,7 +5682,7 @@ def build_parser() -> argparse.ArgumentParser:
     lbj.add_argument("--limit", type=int, default=None, help="Cap chunks this run")
     lbj.set_defaults(func=cmd_library_backfill_job)
 
-    wk = sub.add_parser("wiki", help="Read-only nightly wiki plan and draft artifacts")
+    wk = sub.add_parser("wiki", help="Wiki assignments, drafts, live update and exact undo")
     wk_sub = wk.add_subparsers(dest="wiki_cmd", required=True)
     wk_plan = wk_sub.add_parser("plan", help="Read-only assignments, cap and vector coverage")
     wk_plan.add_argument("--json", action="store_true")
@@ -5663,6 +5693,16 @@ def build_parser() -> argparse.ArgumentParser:
     wk_draft.add_argument("--model", default=None, metavar="ID")
     wk_draft.add_argument("--out", default=None, metavar="DIR")
     wk_draft.set_defaults(func=cmd_wiki)
+    wk_run = wk_sub.add_parser("run", help="Run only the wiki step, even when wiki_nightly is off")
+    wk_run.add_argument("--max", type=int, default=60, metavar="N")
+    wk_run.add_argument("--json", action="store_true")
+    wk_run.set_defaults(func=cmd_wiki)
+    wk_undo = wk_sub.add_parser("undo", help="Restore exact source bytes and hold the page for seven days")
+    wk_undo.add_argument("slug", nargs="?")
+    wk_undo.add_argument("--night", metavar="DATE")
+    wk_undo.add_argument("--run", metavar="ID")
+    wk_undo.add_argument("--json", action="store_true")
+    wk_undo.set_defaults(func=cmd_wiki)
 
     md = sub.add_parser(
         "models",

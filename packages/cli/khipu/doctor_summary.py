@@ -158,4 +158,8 @@ def health_summary(report: dict) -> list[str]:
         here = [(what, fix) for a, what, fix in bad if a == i]
         lines.append(f"{area}: fine." if not here else f"{area}: " + " ".join(
             f"{what[:1].upper() + what[1:]}. Fix: {fix}." for what, fix in here))
+    from khipu.jobs import wiki_stall
+    stalled = wiki_stall()
+    if stalled:
+        lines.append(f"Wiki: no pages revised on the last run; {stalled['queue_remaining']} queued. Run `khipu wiki run --json` for details.")
     return lines

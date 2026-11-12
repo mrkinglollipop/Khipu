@@ -116,7 +116,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | `library` | Folders of `.txt` and `.md` files indexed as a search space. |
 | `embed-backfill` | Job-mode alias for `embed backfill --job`. |
 | `library-backfill NAME` | Job-mode alias for `library backfill NAME --job`. |
-| `wiki` | Read-only nightly assignments: `plan --json --since DAYS` (default 30); draft artifacts: `draft --sample N [--model ID] [--out DIR]` (last 30 days). |
+| `wiki` | Read-only `plan --json --since DAYS` (default 30) and `draft --sample N [--model ID] [--out DIR]`; live `run [--max N] [--json]`; exact undo `undo <slug>` or `undo --night YYYY-MM-DD [--run ID]` (also `undo --run ID`). |
 | `models` | Per-role model settings: `show`, `set`, `welcome`. |
 | `sources` | Memory sources: `list`, `enable`, `disable`, `remove`. |
 
@@ -311,4 +311,45 @@ set with `models set --role wiki`; `--model ID` overrides the draft model only.
 Login exhaustion never selects a paid fallback. `wiki_daily_pages` defaults to
 60, independently of summaries; lift with `budget lift wiki --cap N` or
 `config --set wiki_daily_pages N`. Draft calls consume this separate budget.
-There is no live nightly step or undo command in this draft-only slice.
+`wiki run [--max N] [--json]` runs only the wiki update, even with
+`wiki_nightly` off. It uses the same lock as the complete nightly: a hand run
+refuses with exit 75 while that lock is held. A page is reconciled from its
+file before the provider sees it; a missing matching revision gets a baseline.
+The accepted file and a `nightly-wiki` revision are saved before its queue
+entries are marked done. Failed checks or calls leave those entries waiting.
+At most 60 writes run per invocation and 10 new pages open per UTC day; all invocations share
+the separate daily wiki call budget, including failed calls and draft calls.
+`--max N` further limits one invocation. Reports count unique episode IDs
+absorbed in that run, even when an episode updates two pages.
+
+`config --set wiki_nightly true` enables the scheduled step (default false).
+It runs after `capture_export`, before the outside consolidation, only on the
+configured nightly sync host with its memory folder mounted. Its failure does
+not stop later nightly steps. `config --set wiki_every_minutes N` sets the
+periodic interval (default 60, 0 means nightly only). The existing
+`replica_refresh` timer runs it when due; it also requires `wiki_nightly` and
+quietly skips a held nightly lock. No extra launchd job or daytime git sync
+is installed. A wiki run failure does not change the replica timer's outcome.
+
+`wiki undo <slug>` restores the exact bytes before its latest wiki write.
+`wiki undo --night YYYY-MM-DD` restores all writes on that UTC date, and
+`--run ID` selects one recorded run. These commands use the same nightly lock.
+They record `wiki-undo`, requeue the absorbed episodes and hold each affected
+page for seven days; the hold expires automatically. An opened page moves to
+`topics/_retired/` and is tombstoned, never deleted. Pages changed since their
+selected write are skipped and listed. Undo refuses when exact source bytes
+are unavailable; the older body-only revision history cannot restore them.
+
+The `wiki_update` entry in `nightly-last.json` and `wiki-last.json` retain the
+run ID, pages revised/opened, unique episodes absorbed, waiting queue count
+and oldest age in days, refusals, calls and cap status, plus the median and
+90th percentile age of topic pages returned by searches in the past 24 hours.
+Hand runs and periodic runs update the same step receipt, keeping other
+nightly receipts. Doctor adds one wiki line only when the switch is on and
+the latest run wrote no pages while episodes remain queued.
+
+Migrations `0053_wiki_queue` and `0054_wiki_writes` are prerequisites for live
+runs. The latter retains exact before bytes separately from redacted revision
+bodies. Neither planning nor running applies migrations automatically. The
+assignment distance remains provisional and the switch stays off until the
+scope's sample and owner review pass.
