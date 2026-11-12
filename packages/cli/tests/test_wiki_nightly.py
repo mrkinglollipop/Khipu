@@ -872,3 +872,14 @@ def test_episode_records_copied_into_the_reply_are_dropped_before_ids_are_counte
 
 def test_writer_prompt_forbids_copying_episode_records():
     assert 'Never copy an episode record into your reply.' in wiki._rewrite_prompt('x','','','2026-11-12')
+
+
+def test_title_line_added_above_a_body_without_one_is_dropped():
+    old='---\ntitle: capture-v2\nstatus: active\nlinks:\n  - gateway\n\n## Overview\n\nKeep 60 pages.\n'
+    reply='# capture-v2\n\n## Overview\n\nKeep 60 pages.\n\n- **2026-11-10 (19):** A new fact.\n'
+    joined,checks=wiki._prepare_body('capture-v2',old,reply,['19'],TODAY)
+    assert checks['passed'],checks
+    assert '# capture-v2' not in joined and '## Overview' in joined and 'A new fact.' in joined
+    # A different first line is still refused.
+    _,checks=wiki._prepare_body('capture-v2',old,'# capture-v2\n\n## Summary\n\nKeep 60 pages.\n- (19) x\n',['19'],TODAY)
+    assert not checks['passed'] and 'reply does not start like the page' in checks['errors']

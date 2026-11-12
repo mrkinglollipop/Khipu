@@ -502,6 +502,7 @@ def _prepare_body(slug: str, old: str, body: str, ids: list[str], today: str, *,
         raise ValueError("empty reply")
     header, old_body, closed = split_header(old)
     body = _strip_episode_echo(old_body, body)
+    body = _drop_added_title(old_body, body)
     used = _used_ids(old_body, body, ids)
     skipped = [str(i) for i in ids if str(i) not in used]
     if not used and not old_body.strip() and all(line.lstrip().startswith("#") for line in body.splitlines() if line.strip()):
@@ -587,6 +588,19 @@ def _strip_episode_echo(old_body: str, body: str) -> str:
     lines = body.splitlines(keepends=True)
     out = [line for line in lines if not _EPISODE_RECORD.match(line) or line.strip() in kept]
     return "".join(out) if len(out) != len(lines) else body
+
+
+def _drop_added_title(old_body: str, body: str) -> str:
+    """A writer may put a "# Title" line above a body that has none (seen
+    2026-11-12). The title lives in the header: drop the added line, so the
+    reply starts like the page."""
+    first = next((line.strip() for line in old_body.splitlines() if line.strip()), None)
+    lines = body.splitlines(keepends=True)
+    text = [i for i, line in enumerate(lines) if line.strip()]
+    if (first and len(text) >= 2 and lines[text[0]].startswith("# ")
+            and lines[text[0]].strip() != first and lines[text[1]].strip() == first):
+        return "".join(lines[text[1]:])
+    return body
 
 
 def _gate_json(text: str) -> dict:
