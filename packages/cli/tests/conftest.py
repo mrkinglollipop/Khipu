@@ -61,22 +61,43 @@ import pytest
 # several tests bind sockets under temporary folders.
 # A run killed outright (a timeout's SIGTERM skips atexit, a SIGKILL or a
 # crash skips everything) left its root behind: about 29 of them, 6 GB, by
-# 2026-11-12. SIGTERM now removes the root before the run dies, and each run
-# removes roots another run left more than a day ago (no run lasts that long).
+# 2026-11-12. SIGTERM now removes the root before the run dies (only in the
+# process that made it: a forked child a test terminates inherits the
+# handler), and each run removes the roots of runs that are gone: a root
+# names its run's pid in ``.pid`` and goes once that process is dead and the
+# root is a day old; a root with no ``.pid`` (made before this) goes at a week.
 _STALE_ROOT_S = 86400
+_UNOWNED_ROOT_S = 7 * 86400
+_OWNER_PID = os.getpid()
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # it exists and is not ours to signal
+    return True
 
 
 def _sweep_stale_roots() -> None:
     import time
 
-    base = Path(tempfile.gettempdir())
     try:
-        entries = list(base.glob("kt-*"))
+        entries = list(Path(tempfile.gettempdir()).glob("kt-*"))
     except OSError:
         return
     for entry in entries:
         try:
-            if entry.is_dir() and not entry.is_symlink() and time.time() - entry.stat().st_mtime > _STALE_ROOT_S:
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            age = time.time() - entry.stat().st_mtime
+            try:
+                pid = int((entry / ".pid").read_text().strip())
+            except (OSError, ValueError):
+                pid = None
+            if (age > _UNOWNED_ROOT_S) if pid is None else (age > _STALE_ROOT_S and not _alive(pid)):
                 shutil.rmtree(entry, ignore_errors=True)
         except OSError:
             continue
@@ -84,14 +105,23 @@ def _sweep_stale_roots() -> None:
 
 _sweep_stale_roots()
 TEMP_ROOT = tempfile.mkdtemp(prefix="kt-")
-atexit.register(shutil.rmtree, TEMP_ROOT, ignore_errors=True)
+(Path(TEMP_ROOT) / ".pid").write_text(str(_OWNER_PID))
 
 
-def _remove_on_term(signum, _frame):
+def _remove_own_roots() -> None:
+    if os.getpid() != _OWNER_PID:
+        return
     shutil.rmtree(TEMP_ROOT, ignore_errors=True)
     home = globals().get("_HERMETIC_HOME")
     if home:
         shutil.rmtree(home, ignore_errors=True)
+
+
+atexit.register(_remove_own_roots)
+
+
+def _remove_on_term(signum, _frame):
+    _remove_own_roots()
     signal.signal(signum, signal.SIG_DFL)
     os.kill(os.getpid(), signum)
 
