@@ -145,3 +145,13 @@ def test_an_old_false_row_is_unmarked_by_a_later_window(t3_world, monkeypatch):
     say("hello")
     routing_directions.capture_scan(SESSION, ["hello"])  # a window without the wake
     assert routing_directions.owed_items() == []
+
+
+def test_a_scheduled_repeat_the_transcript_dropped_leaves_his_reminder(world):
+    """Native Claude: he types it, a scheduled prompt repeats it; the
+    transcript's own origin mark already drops the scheduled copy."""
+    say(GLM)
+    owner_turns.record({"session_id": SESSION, "prompt": GLM, "cwd": "/work"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts"}, now=time.time())  # not his
+    (row,) = routing_directions.capture_scan(SESSION, [GLM])
+    assert row["occurrence"] == 1 and row["typed"] is True

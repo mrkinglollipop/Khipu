@@ -871,10 +871,12 @@ def _capture_scan_locked(session, turns, *, now, actions):
         # A late copy of one Antigravity typing shares its occurrence: one typing.
         occs = sorted(set(recorded_occs.get(sha) or []))
         every = sorted(every_occs.get(sha) or ())
-        if len(every) >= total and len(every) > len(occs):
-            # The record numbers every copy in this window and some are not
-            # his (a T3 wake-up repeating his words): copies line up with the
-            # record in order, and only his open anything.
+        if len(occs) < total <= len(every):
+            # More copies here than his recorded typings, and the record
+            # numbers them all: some are not his (a T3 wake-up repeating his
+            # words). Copies line up with the record in order, and only his
+            # open anything. (A transcript that already dropped a machine's
+            # copy has no more copies than his typings: the branch below.)
             assigned[sha] = [o if o in occs else None for o in every[-total:]]
         else:
             assigned[sha] = occs[-total:] if len(occs) >= total else list(range(1, total + 1))
