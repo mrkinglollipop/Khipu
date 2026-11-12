@@ -33,7 +33,7 @@ describe("planLaunch", () => {
   it("lists every item from all skipped versions, newest first (0.4.4 to 0.4.8)", () => {
     const plan = planLaunch("0.4.4", "0.4.8", null);
     expect(plan.dialog?.items.map((i) => i.title)).toEqual([
-      "Embeddings has its own screen in Settings",
+      "Search models are in Settings › Models",
       "Optional features now have switches in Settings",
       "Recall tells current decisions from reversed ones",
     ]);

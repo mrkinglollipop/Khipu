@@ -39,7 +39,7 @@ export function UpdatesPage({ appVersion, thisMac, whatsNew }: { appVersion: str
       <div className="st-actions">
         <button type="button" className="primary" disabled={busy} onClick={() => void checkNow()}>
           {busy ? <Loader2 size={14} className="spin" aria-hidden /> : null}
-          {busy ? "Checking…" : "Check now"}
+          {busy ? "Checking…" : "Check for updates"}
         </button>
       </div>
       {msg ? <p className="st-muted" role="status">{msg}</p> : null}

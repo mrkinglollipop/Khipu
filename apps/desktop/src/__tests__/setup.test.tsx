@@ -313,7 +313,7 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
     });
 
     render(<App />);
-    await openSettingsRow("Where memory is kept");
+    await openSettingsRow("Storage");
 
     fireEvent.click(screen.getByRole("button", { name: /Move this memory to another database/ }));
     fireEvent.change(screen.getByLabelText("Target connection string"), {
@@ -346,7 +346,7 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
 
     render(<App />);
 
-    await openSettingsRow("Your Macs");
+    await openSettingsRow("Connections");
 
     await waitFor(() =>
       expect(
@@ -366,7 +366,7 @@ describe("Settings › Database — Move dialog and Another Mac gate", () => {
     invokeMock.mockImplementation(async (cmd: string) => defaultInvoke(cmd));
 
     render(<App />);
-    await openSettingsRow("Your Macs");
+    await openSettingsRow("Connections");
 
     await waitFor(() =>
       expect(screen.getByText("Set up another Mac")).toBeInTheDocument(),

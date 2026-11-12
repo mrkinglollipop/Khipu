@@ -30,7 +30,7 @@ describe("App — Join advertise", () => {
       return JSON.stringify({ ok: true });
     });
     render(<App />);
-    await openSettingsRow("Your Macs");
+    await openSettingsRow("Connections");
     fireEvent.change(await screen.findByLabelText("Join kit passphrase"), { target: { value: "phrase" } });
     fireEvent.click(await screen.findByRole("button", { name: /Advertise nearby/ }));
     expect(await screen.findByText(/Nearby setup started/)).toBeInTheDocument();
@@ -52,7 +52,7 @@ function mockRemoteHub() {
 
 async function openAnotherMac() {
   render(<App />);
-  await openSettingsRow("Your Macs");
+  await openSettingsRow("Connections");
   await screen.findByText("Set up another Mac");
   // IntegrationsPanel has its own "Save join kit…" shortcut; scope to this card.
   return within(screen.getByText("Set up another Mac").closest(".section-card") as HTMLElement);

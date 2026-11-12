@@ -72,7 +72,7 @@ export function synthModelError(provider: string, modelId: string): string | nul
   const info = synthProviderInfo(provider);
   if (!info || info.route === "local" || info.defaultModel) return null;
   if (modelId.trim()) return null;
-  return `${info.label} needs a model id, for example ${info.exampleModel}.`;
+  return `${info.id === "codex-cli" || info.id === "openai" ? "GPT" : info.id === "openrouter" ? "OpenRouter" : info.name} needs a model id, for example ${info.exampleModel}.`;
 }
 
 export type SynthSecretsPresence = Partial<Record<string, boolean>>;
@@ -177,7 +177,7 @@ export function SynthAccess({
           {checked && doctorSynth?.binary ? <span className="meta mono">{doctorSynth.binary}</span> : null}
         </div>
         <p className="set-help">
-          Runs the <code>{info.binary}</code> you are already signed into; no key is stored. Counts
+          Uses your existing subscription; no key is stored. Counts
           against that plan's limits.
         </p>
         {!checked ? (
@@ -282,7 +282,7 @@ type TagView = { tone: "neutral" | "ok" | "warn" | "err"; dot: boolean; text: st
 /** The status words on a provider row. Key routes follow the key's status
  *  in Keys below; login routes follow the health report; local follows the
  *  endpoint check. */
-function providerTag(
+export function providerTag(
   info: SynthProviderInfo,
   presence: SynthSecretsPresence | null,
   verifyResult: ModelVerifyResult | null,
@@ -331,7 +331,7 @@ function KeyLine({
     return (
       <p className="choice-key">
         <span>
-          Runs the <code>{info.binary}</code> you are already signed into; no key is stored.
+          Uses your existing subscription; no key is stored.
           {checked ? "" : " Save models, then the health report checks it is on this Mac."}
         </span>
       </p>
@@ -377,7 +377,7 @@ function KeyLine({
   );
 }
 
-function ChoiceBody({
+export function ChoiceBody({
   info,
   providerId,
   row,
@@ -386,7 +386,9 @@ function ChoiceBody({
   verifyResult,
   doctorSynth,
   runError,
+  modelLabel = "Model id",
 }: {
+  modelLabel?: string;
   info: SynthProviderInfo | undefined;
   providerId: string;
   row: SynthRow;
@@ -431,7 +433,7 @@ function ChoiceBody({
       <div className="set-field">
         <div className="set-labelrow">
           <label className="set-label" htmlFor={modelId}>
-            Model id
+            {modelLabel}
           </label>
         </div>
         <div className="toolbar">

@@ -1565,7 +1565,7 @@ export function Welcome({
           </p>
           <p className="muted">
             Need help? Email <a href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</a>.
-            You can reopen this tutorial any time from Settings → Advanced → Run
+            You can reopen this tutorial any time from Settings → Storage → Run
             setup again.
           </p>
         </>

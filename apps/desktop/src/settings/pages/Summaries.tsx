@@ -1,50 +1,35 @@
-import { SummariserCalls, SynthFallbackField, SynthProviderChoices } from "../../SynthProvider";
+import { SummariserCalls, SynthFallbackField } from "../../SynthProvider";
 import { KeysCard } from "../../KeysCard";
 import { Callout } from "../../ui";
 import type { SettingsCtx } from "../context";
+import { ModelChoices } from "./ModelChoices";
+import { SearchByMeaningPage } from "./SearchByMeaning";
 
-/** The old "Session summaries" card and the keys card, with the same calls.
- *  Keys are only ever shown as set or not set. */
 export function SummariesPage({ ctx, active }: { ctx: SettingsCtx; active: boolean }) {
-  return (
-    <>
-      <p className="st-muted" id="synth-help">Which model writes the short summary of each conversation, its model id, and the API keys Khipu uses. Keys are further down this page.</p>
-      {ctx.modelsError ? (
-        <Callout tone="err" title="The stored models setting could not be read">
+  return <>
+    <section className="st-regroup" aria-label="Summaries"><h2>Summaries</h2>
+      <p className="st-muted" id="synth-help">Writes the short summary of each conversation.</p>
+      <div className="st-card">
+        {ctx.modelsError ? <Callout tone="err" title="The stored models setting could not be read">
           {ctx.modelsError}. Showing defaults; saving is blocked until it is fixed or cleared.
-        </Callout>
-      ) : null}
-      <SynthProviderChoices
-        row={ctx.synth}
-        onChange={ctx.onSynthChange}
-        presence={ctx.secretsPresence}
-        verifyResult={ctx.modelCheck.result}
-        runError={ctx.modelCheck.runError}
-        doctorSynth={ctx.doctorSynth}
-      />
-      <div className="st-actions">
-        <button type="button" className="primary" disabled={ctx.modelsSaving || ctx.modelsError != null} onClick={() => void ctx.onSaveModels()}>
-          {ctx.modelsSaving ? "Saving…" : "Save models"}
-        </button>
-      </div>
-      {ctx.modelsMsg ? <p className="st-muted" role="status">{ctx.modelsMsg}</p> : null}
-      <SynthFallbackField
-        provider={ctx.synth.provider}
-        doctorSynth={ctx.doctorSynth}
-        presence={ctx.secretsPresence}
-        verifyResult={ctx.modelCheck.result}
-        onSaved={ctx.onKeySaved}
-      />
-      <KeysCard
-        active={active}
-        presence={ctx.secretsPresence}
-        presenceError={ctx.secretsPresenceMsg}
-        verify={ctx.modelCheck}
-        onKeySaved={ctx.onKeySaved}
-      />
-      <section className="st-group" aria-label="Summaries written today">
+        </Callout> : null}
+        <ModelChoices ctx={ctx} />
+        <SynthFallbackField provider={ctx.synth.provider} doctorSynth={ctx.doctorSynth} presence={ctx.secretsPresence}
+          verifyResult={ctx.modelCheck.result} onSaved={ctx.onKeySaved} />
         <SummariserCalls active={active} />
-      </section>
-    </>
-  );
+      </div>
+    </section>
+    <section className="st-regroup" aria-label="Search by meaning"><h2>Search by meaning</h2>
+      <p className="st-muted">Matches what you meant, not only the words you typed.</p>
+      <div className="st-card"><SearchByMeaningPage active={active} modelDetails /></div>
+    </section>
+    <section className="st-regroup" aria-label="API keys"><h2>API keys</h2>
+      <KeysCard active={active} presence={ctx.secretsPresence} presenceError={ctx.secretsPresenceMsg}
+        verify={ctx.modelCheck} onKeySaved={ctx.onKeySaved} />
+    </section>
+    <div className="st-actions st-save-models"><button type="button" className="primary" disabled={ctx.modelsSaving || ctx.modelsError != null} onClick={() => void ctx.onSaveModels()}>
+      {ctx.modelsSaving ? "Saving…" : "Save models"}
+    </button></div>
+    {ctx.modelsMsg ? <p className="st-muted" role="status">{ctx.modelsMsg}</p> : null}
+  </>;
 }

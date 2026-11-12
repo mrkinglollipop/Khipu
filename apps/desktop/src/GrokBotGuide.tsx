@@ -230,7 +230,7 @@ export function GrokBotGuide({
             <Success done={grok.steps[0].done}>
               {grok.steps[0].done ? (
                 <>
-                  <b>An https address is saved.</b> It's the same setting as Settings → Another Mac → Gateway address.
+                  <b>An https address is saved.</b> It's the same setting as Settings → Connections → Macs → Add another Mac → Cloud address.
                   {liveCheck?.ok ? ` The gateway answered this Mac ${checkedAgo}.` : " Step 5 checks that it answers."}
                 </>
               ) : (

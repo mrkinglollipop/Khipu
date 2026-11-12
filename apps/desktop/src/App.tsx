@@ -426,9 +426,9 @@ export default function App() {
     if (section === "routing") { setAcctView("room"); setTab("routing"); return; }
     if (section === "projects") { setTab("memory"); return; }
     const row: Record<string, string> = {
-      database: "where", capture: "summaries", index: "meaning", features: "meaning", data: "backups",
-      "another-mac": "macs", components: "where", updates: "updates", look: "look", advanced: "agent",
-      owner: "apps", work: "macs",
+      database: "storage", capture: "models", index: "models", features: "general", data: "storage",
+      "another-mac": "connections", components: "storage", updates: "general", look: "general", advanced: "help",
+      owner: "connections", work: "connections",
     };
     openSettingsRow(row[section] ?? "macs");
   }, [openSettingsRow]);
@@ -893,7 +893,7 @@ export default function App() {
     placeItem("routing", <Gauge size={18} aria-hidden />, "Which AI has room, and who gets what work"),
     placeItem("memory", <Search size={18} aria-hidden />, "Find what you said"),
   ];
-  const settingsItem = placeItem("settings", <SlidersHorizontal size={18} aria-hidden />, "Your Macs, sign-ins, updates and help");
+  const settingsItem = placeItem("settings", <SlidersHorizontal size={18} aria-hidden />, "General, models, storage, connections and help");
   const toolbarTitle = PLACE_TITLES[tab];
   // Settings › Your Macs › Add another Mac: the older Settings' Another Mac section, unchanged.
   const anotherMacSection = (

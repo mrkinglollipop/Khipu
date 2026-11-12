@@ -14,7 +14,7 @@ describe("PostUpdateNoticeDialog", () => {
     expect(screen.getByRole("heading", { name: "What's new since 0.4.15" })).toBeInTheDocument();
     expect(screen.getByText(/Khipu is now version 0\.4\.16\. This list also stays on Home/)).toBeInTheDocument();
     expect(within(screen.getByRole("list")).getAllByRole("listitem")).toHaveLength(5);
-    expect(screen.getByText("And 3 more in Settings → Updates.")).toBeInTheDocument();
+    expect(screen.getByText("And 3 more in Settings → General → Updates.")).toBeInTheDocument();
   });
 
   it("has no more line when everything fits", () => {
@@ -87,7 +87,7 @@ describe("WhatsNewCard", () => {
       <WhatsNewCard caps={ALL_CAPABILITIES} appVersion="0.4.16" card={{ since: "0.4.15", version: "0.4.16" }} needsRoutingSetup={false} onShow={onShow} onClose={onClose} onSeeAll={onSeeAll} />,
     );
     fireEvent.click(screen.getByRole("button", { name: "Close the What's new card" }));
-    fireEvent.click(screen.getByRole("button", { name: "See all in Settings → Updates" }));
+    fireEvent.click(screen.getByRole("button", { name: "See all in Settings → General → Updates" }));
     fireEvent.click(screen.getByRole("button", { name: "Show me: Priority and pace" }));
     expect(onClose).toHaveBeenCalled();
     expect(onSeeAll).toHaveBeenCalled();

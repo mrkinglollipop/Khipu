@@ -111,7 +111,7 @@ const doctorCalls = () =>
 
 async function openHarnessesCard(): Promise<HTMLElement> {
   render(<App />);
-  await openSettingsRow("Apps that use Khipu");
+  await openSettingsRow("Connections");
   const findCard = () =>
     Array.from(document.querySelectorAll<HTMLElement>(".hcard")).find((c) => within(c).queryByText("Claude Code"));
   await waitFor(() => expect(findCard()).toBeTruthy());

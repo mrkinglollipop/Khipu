@@ -43,7 +43,7 @@ afterEach(() => {
 describe("Look", () => {
   it("starts on follow-the-Mac with no override and no stored value", () => {
     render(<LookPage />);
-    expect(screen.getByRole("radio", { name: "Follow this Mac" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("radio", { name: "Follows this Mac" })).toHaveAttribute("aria-checked", "true");
     expect(document.documentElement.hasAttribute("data-theme")).toBe(false);
   });
 
@@ -52,7 +52,7 @@ describe("Look", () => {
     fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
     expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
     expect(window.localStorage.getItem(LOOK_KEY)).toBe("dark");
-    fireEvent.click(screen.getByRole("radio", { name: "Follow this Mac" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Follows this Mac" }));
     expect(document.documentElement.hasAttribute("data-theme")).toBe(false);
     expect(window.localStorage.getItem(LOOK_KEY)).toBeNull();
   });

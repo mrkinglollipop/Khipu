@@ -9,7 +9,7 @@ import type { Look } from "../lookModel";
 const OPTIONS = [
   { value: "light", label: "Light" },
   { value: "dark", label: "Dark" },
-  { value: "system", label: "Follow this Mac" },
+  { value: "system", label: "Follows this Mac" },
 ] as const;
 
 /** `part` lets Settings show each card as its own row (Look; Open at login). */
@@ -55,7 +55,7 @@ export function LookPage({ macName = null, part = "both" }: { macName?: string |
   return (
     <div className="look-page">
       {part !== "opening" ? <div className="section-card">
-        <div className="section-head">Look</div>
+        <div className="section-head">Look <small>Only on {mac}</small></div>
         <div className="section-body">
           <Segmented ariaLabel="Colours" options={OPTIONS} value={look} onChange={choose} />
           <p className="muted" aria-live="polite">
@@ -66,7 +66,7 @@ export function LookPage({ macName = null, part = "both" }: { macName?: string |
         </div>
       </div> : null}
       {part !== "look" ? <div className="section-card">
-        <div className="section-head">Opening</div>
+
         <div className="section-body">
           <div className="opt-row">
             <input

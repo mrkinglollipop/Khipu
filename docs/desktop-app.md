@@ -199,8 +199,8 @@ The tooltip starts as "Khipu · starting…". It then shows the doctor result (O
 
 The app checks GitHub Releases once at launch. The check only looks. It never downloads, installs or restarts. If a newer version exists, the tray tooltip reads "Khipu · update vX available".
 
-To install, open **Settings > Updates** and click **Check for updates**. The app downloads the build, checks its signature, installs it and relaunches. Nothing installs unless you click.
+To install, open **Settings > General > Updates** and click **Check for updates**. The app downloads the build, checks its signature, installs it and relaunches. Nothing installs unless you click.
 
-After upgrades, **What's new** presents changes since the last seen version in a Home card and a dialog, with permanent history under **Settings > Updates**.
+After upgrades, **What's new** presents changes since the last seen version in a Home card and a dialog, with permanent history under **Settings > General > Updates**.
 
 Captures carry server-stamped local or gateway provenance when the schema supports it. Gateway forget still uses the session-prefix boundary described in [MCP tools](mcp-tools.md).

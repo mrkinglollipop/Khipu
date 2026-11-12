@@ -4,13 +4,21 @@ import type { ProfileRow } from "../searchTypes";
 /** Read-only. The old Embeddings screen has no on/off control: it only picks
  *  which model is active and how much is covered. So this page says what is true
  *  and has no switch that would do nothing. */
-export function SearchByMeaningPage({ active }: { active: boolean }) {
+export function SearchByMeaningPage({ active, modelDetails = false }: { active: boolean; modelDetails?: boolean }) {
   const st = useCliState<{ profiles: ProfileRow[] }>("khipu_embed_profiles_list", active);
   if (st.loading && !st.data) return <p className="st-muted" role="status">Reading…</p>;
   if (!st.data) return <p className="st-muted" role="status">Khipu could not read this just now{st.error ? `: ${st.error}` : "."}</p>;
+  if (!Array.isArray(st.data.profiles)) return <p className="st-muted" role="status">Khipu could not read the search model just now.</p>;
   const on = st.data.profiles.find((p) => p.is_active);
   if (!on) return <p>Search by meaning is off because no search model is set up yet, so Khipu matches only the words you type.</p>;
   const mem = on.coverage?.memory;
+  if (modelDetails) return <>
+    <div className="st-choice-row"><span>Model</span><span>{on.model}</span></div>
+    <div className="st-choice-row"><span>Source</span><span>{on.provider === "cloud" || on.provider === "gemini" ? "Google API key" : on.provider === "local" ? "This Mac or my network" : on.provider}</span></div>
+    {on.endpoint ? <div className="st-choice-row"><span>Address</span><span className="st-model-address">{on.endpoint}</span></div> : null}
+    <p className="st-muted">This is the active search model. To change it, run setup again in Storage.</p>
+    {mem ? <div className="st-choice-row"><span>Covered</span><span>{Math.round(mem.pct)}% of your memory ({mem.missing.toLocaleString()} still to do)</span></div> : null}
+  </>;
   return (
     <>
       <p>Search by meaning is on, using {on.model}, so Khipu finds a conversation by what it was about and not only by its exact words. It stays on as long as a search model is set, so there is nothing to switch here.</p>
