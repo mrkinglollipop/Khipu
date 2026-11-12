@@ -591,7 +591,7 @@ Agents do not have to ask. When the `routing_push` feature is on, Khipu puts rou
 What the agent sees:
 
 Every reader gets the same text: the routing page (`khipu route --page`), at most
-4,500 characters, headed "ROUTING HH:MMZ".
+5,500 characters (`routing_page.LIMIT`), headed "ROUTING HH:MMZ".
 
 - **Session start**: the page, whole, every time. It has a time budget of 1 second by default.
 - **Each prompt**: the page again only when its signature changed (a status word, the owner's order or the owner's words; a percentage moving on its own does not count). Read from `page.txt`, never folded on the prompt.

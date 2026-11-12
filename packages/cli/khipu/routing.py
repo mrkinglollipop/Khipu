@@ -5166,7 +5166,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         odd.append(("note", note["via"]))
     if priority_out is not None and not priority_out["pending"] and priority_out["via"] not in _OWNERS_OWN:
         odd.append(("priority", priority_out["via"]))
-    odd += [(f"rule {r['n']}", r["via"]) for r in active_rules
+    odd += [(f"rule {r['n']}" if r.get("n") is not None else "new rule (number pending)", r["via"])
+            for r in active_rules
             if r["written_by"].get("kind") == "owner" and r["via"] not in _OWNERS_OWN]
     odd += [(f"pause of {e['label']}", owner["pauses"][e["key"]]["via"]) for e in entries
             if e["state"] == PAUSED and (owner["pauses"][e["key"]]["via"] not in _OWNERS_OWN)]
@@ -12659,7 +12660,8 @@ def _print_view(view: dict, now: datetime, account: str | None) -> None:
             if rule.get("pending"):
                 print(f"  {rule_line(rule)}")
                 continue
-            print(f"  {rule['n']}. {rule['text']}{mark}")
+            number = rule["n"] if rule["n"] is not None else "new"
+            print(f"  {number}. {rule['text']}{mark}")
     if view.get("note"):
         print(note_line(view["note"], now))
     facts = plan_facts(view, now)

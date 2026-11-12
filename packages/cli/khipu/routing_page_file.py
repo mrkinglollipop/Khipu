@@ -29,7 +29,7 @@ from pathlib import Path
 
 PAGE_NAME = "page.txt"
 HEADER = "khipu-routing-page 1 "
-# Read no more than this: the page is at most 4,500 characters and its header
+# Read no more than this: the page is bounded by routing_page.LIMIT and its header
 # a few hundred bytes. A larger file is not one Khipu wrote.
 READ_MOST = 64 * 1024
 # A page older than this is sent with its age, and the child that read it

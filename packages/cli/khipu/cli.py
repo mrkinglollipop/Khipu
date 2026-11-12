@@ -5153,6 +5153,8 @@ class _VersionAction(argparse.Action):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from khipu.routing_page import LIMIT as routing_page_limit
+
     p = _Parser(prog="khipu", description="Khipu memory hub CLI")
     p.add_argument("--version", action=_VersionAction, help="Show the version and the commit this build is")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -5755,7 +5757,7 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("--summary", action="store_true", help="The routing page (as --page): what a conversation gets at its start")
     rt.add_argument("--brief", action="store_true", help="The routing page (as --page), to paste into a brief")
     rt.add_argument("--page", action="store_true",
-                    help="The routing page: the accounts in the owner's order, then the owner's rules (at most 4,500 characters)")
+                    help=f"The routing page: the accounts in the owner's order, then the owner's rules (at most {routing_page_limit:,} characters)")
     rt.add_argument("--full", action="store_true",
                     help="The full record (plain `khipu route` prints the routing page; --json is always the full record)")
     rt.add_argument("--account", dest="view_account", default=None, metavar="A", help="One account only")

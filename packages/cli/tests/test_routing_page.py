@@ -134,10 +134,9 @@ def _page(view=None, **kw):
 # ---- the limit ------------------------------------------------------------------------------
 
 
-def test_the_realistic_page_is_under_4500_characters_with_all_eight_accounts():
+def test_the_realistic_page_is_under_the_limit_with_all_eight_accounts():
     text = _page()
-    assert 1500 < len(text) <= 4500, len(text)
-    assert routing_page.LIMIT == 4500
+    assert 1500 < len(text) <= routing_page.LIMIT, len(text)
     for label in ("Codex", "Grok", "Claude", "Claude second", "Muse", "Kimi", "GLM", "DeepSeek"):
         _line(text, label)
     assert routing.page(_view(), NOW) == text  # the same function through routing.page
@@ -150,7 +149,7 @@ def test_a_record_with_todays_long_roles_and_rules_still_fits_and_keeps_every_ac
     roles["muse|"] = "Blind second opinions on the riskiest work. " + long_role
     rules = [f"Rule {i}: " + "A standing rule of the owner, in full sentences, that runs on. " * 9 for i in range(18)]
     text = _page(_view(roles=roles, rules=rules))
-    assert len(text) <= 4500
+    assert len(text) <= routing_page.LIMIT
     # Facts survive whatever is trimmed: every status word, cap, the hold, the 90%.
     assert "HOLD BACK" in _line(text, "Codex") and "ceiling 95%" in _line(text, "Codex")
     assert "NO JOBS until" in _line(text, "Grok") and "up to 90%" in _line(text, "Grok")
@@ -162,7 +161,7 @@ def test_the_limit_holds_even_when_the_accounts_alone_would_not_fit():
     view = _view()
     for entry in view["accounts"]:
         entry["caps"] = entry["caps"] * 12
-    assert len(_page(view)) <= 4500
+    assert len(_page(view)) <= routing_page.LIMIT
 
 
 # ---- standing rules outrank exceptions for space ----------------------------------------------
@@ -197,6 +196,23 @@ def _with_exceptions(view, counts):
 
 def _rules_of(view):
     return [text for _head, text in routing_page._rules(view)]
+
+
+def test_twelve_standing_rules_fit_with_eight_long_account_roles():
+    rules = [f"{head}: Rule {i}: " + "Keep the owner words intact and route by the current account record. " * 4
+             for i, head in enumerate(("WHICH MODEL", "NEVER", "CHECKS", "MACS") * 3)]
+    view = _view(rules=rules)
+    for entry in view["priority"]["entries"]:
+        entry["role"] = "Keep this account for the work it fits; use even pace and review the result. " * 8
+    assert 3200 < sum(len(t) for t in _rules_of(view)) < 3500
+    text = _page(view)
+    assert len(text) <= routing_page.LIMIT
+    for rule in _rules_of(view):
+        assert rule in text
+    for account in view["accounts"]:
+        _line(text, account["label"])
+    assert "more rule lines" not in text
+    assert routing_page.left_out(view, NOW) == []
 
 
 def test_six_exceptions_on_one_account_never_cost_the_page_a_rule_line():
@@ -494,7 +510,7 @@ def test_khipu_route_page_prints_the_page_from_the_record(replay, capsys):
                          expect=routing.priority_version())
     assert cli.main(["route", "--page"]) == 0
     out = capsys.readouterr().out
-    assert out.startswith("ROUTING ") and "1. Muse: " in out and len(out) <= 4500
+    assert out.startswith("ROUTING ") and "1. Muse: " in out and len(out) <= routing_page.LIMIT
     assert "Blind second opinions." in out
     assert cli.main(["route", "--page", "--json"]) == 0
     assert '"chars"' in capsys.readouterr().out
@@ -517,3 +533,13 @@ def test_second_opinions_only_comes_from_the_provider_fact_not_the_role_words():
     assert "SECOND OPINIONS ONLY" not in _line(text, "Muse")
     view["definitions"]["providers"]["muse"] = {"id": "muse", "use": "second_opinion"}
     assert "SECOND OPINIONS ONLY" in _line(routing_page.page(view, now), "Muse")
+
+
+def test_a_new_page_limit_resends_the_page_once(monkeypatch):
+    # Raising the limit puts back rule lines a running conversation was never
+    # sent; the signature must move so the page goes out again.
+    view = _view()
+    sig = routing_page.signature(view, NOW)
+    monkeypatch.setattr(routing_page, "LIMIT", routing_page.LIMIT + 1000)
+    assert routing_page.signature(view, NOW) != sig
+    assert routing_page.signature(copy.deepcopy(view), NOW) == routing_page.signature(view, NOW)
