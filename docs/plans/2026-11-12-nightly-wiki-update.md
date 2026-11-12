@@ -32,12 +32,23 @@ The first version of this plan matched an episode to the nearest page by vector 
 
 ## 2. What the writer does to a page
 
-Input: the current page, plus one line per waiting episode (date, episode id, summary, decisions, preferences). Output: the whole page.
+Input: the page's title and body, plus one line per waiting episode (date, episode id, summary, decisions, preferences), oldest first. Output: the body, as plain text.
 
-- **Must:** keep every fact that is still true; when a newer episode contradicts an old fact, replace it and leave a dated line ("Was X until 2026-11-12"); keep the frontmatter, set `last_updated`, and move `status: seed` to `active`; list the episode ids it used in a short Sources line. Plain short prose.
-- **Must never:** invent; drop a fact that is still true; merge, retire, rename or split pages (those stay monthly); touch a `note:` page or a protected file.
-- **Checks in code, before writing:** the slug and frontmatter are intact; the page did not shrink below 70% of its old length; every old line containing a date, number, path or link is still present or named in a "Was" line. A rewrite that fails a check is not written. The page stays queued, is retried the next night, and after that is listed in the morning report.
+- **The code owns the header.** A page is split into header and body before the call. The header is the closed `---` block (with any lines above it), or, on the 221 pages that have no closed block, the opening run of `key: value` lines and their list items. The writer never sees it. The code puts it back byte for byte with two changes of its own: `last_updated` becomes today, and an exact `status: seed` becomes `status: active`. A reply that begins with a header is refused.
+- **Must:** keep every statement on the page, copied exactly; say only what an episode says happened (work it calls in progress, proposed or waiting is written that way); when an episode plainly contradicts a line, write the new statement and below it a dated "Was <old line> until <date>"; list the ids of the episodes it used on a Sources line.
+- **May:** skip an episode that is not about the page's subject, by leaving its id off the Sources line. Its queue row closes as skipped. A page never changes without a source: if every episode was skipped, the page must be unchanged, and nothing is written.
+- **Must never:** invent; give a fact to the page's subject when the episode does not name it; write notes about the rewrite; drop a statement; merge, retire, rename or split pages (those stay monthly); touch a `note:` page, an archived page or a protected file.
+- **Checks in code, before writing:** the page did not shrink below 70% of its old length; every old line containing a date, number, path or link is still present or named in a "Was" line (compared without surrounding whitespace; a "Was" line may leave off the list marker); every old Sources id is kept and no id appears that was not given. A line the writer only tidied (at least 90% the same, the same digits in the same order) is put back as it was before the checks decide. A rewrite that fails is not written; the page is held for 24 hours (2 hours after a failed call) and listed in the run's report, so one bad page costs one call a day and never crowds out the others.
+- **Forgotten episodes** are never loaded, and a writing run closes their queue rows.
 - **Write path:** if the file changed since the hub last saw it (an Obsidian edit), reconcile it first. Then write the file and call `_upsert_topic` with source `nightly-wiki`, so the revision is recorded at once. Before the first nightly write to any page that has no revision row matching its current text, write a baseline revision so there is always something to roll back to.
+
+### What the first drafts showed (2026-11-12, 28 pages drafted, none written)
+
+- **The checks, as first built, refused half the pages.** 14 of 28 drafts were refused, nearly all over header lines: 203 of 597 pages have no fenced header, 18 never close it, and the writer kept "fixing" them or changing `stub`, `seedling` or `archived` to `active`. Hence the code owns the header.
+- **A page inside a JSON string is fragile** (2 of 28 replies did not parse), and the largest page needs 46 to 50 seconds against a 60-second limit. Hence a plain-text reply and 180 seconds.
+- **Haiku rounds up.** A Codex Sol check of the drafts against their sources found no old fact lost, but four pages where unfinished work was written as finished ("is being installed" became "installed on both Macs"), one fact given to the wrong product, and notes about the rewrite itself. Hence the rules on saying only what the episode says.
+- **Tags are loose.** 25 of 176 episodes did not belong on the page they reached (`memory-management` is used for a Mac's RAM as well as for Khipu's memory). Hence the writer may skip an episode.
+- **The gate held.** The check would reverse none of its 30 decisions.
 
 ## 3. Which model writes
 
