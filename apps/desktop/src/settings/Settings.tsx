@@ -50,13 +50,15 @@ export function Settings({ ctx, active }: { ctx: SettingsCtx; active: boolean })
   const lastBackup = health.data?.last_backup_at ?? thisMacRow(macs.data)?.health?.last_backup_at ?? null;
   const look = readLook();
   const synthName = synthProviderInfo(ctx.synth.provider)?.name ?? ctx.synth.provider;
+  // The row says which model is in use, so the choice can be found from the list.
+  const synthModel = ctx.synth.model_id.trim() || synthProviderInfo(ctx.synth.provider)?.defaultModel || "";
 
   const rows: Array<{ id: RowId; label: string; note?: string; value: string; warn?: boolean }> = [
     { id: "macs", label: "Your Macs", value: macsSummary(macs.data), warn: Boolean(macs.data?.macs.some((m) => m.stale)) },
     { id: "updates", label: "Updates", value: `Khipu ${ctx.appVersion}` },
     { id: "signins", label: "Sign-ins", value: signinsSummary(macs.data), warn: signinsSummary(macs.data).includes("needs") || signinsSummary(macs.data).includes("need ") },
     { id: "apps", label: "Apps that use Khipu", value: "" },
-    { id: "summaries", label: "Who writes the summaries", value: synthName },
+    { id: "summaries", label: "Models and API keys", value: synthModel ? `${synthName} · ${synthModel}` : synthName },
     { id: "meaning", label: "Search by meaning", value: "" },
     { id: "books", label: "Include your books in search", value: "" },
     { id: "backups", label: "Backups", value: lastBackup ? `Last ${fmtAgoSince(lastBackup) ?? "recorded"}` : health.refreshing ? "Checking…" : "None recorded" },

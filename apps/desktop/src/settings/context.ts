@@ -21,7 +21,7 @@ export type SettingsCtx = {
   refreshHealth: () => Promise<string | null | void> | void;
   onSearchT3Captures: () => void;
   onOpenGuide: (id: GuideId) => void;
-  // Who writes the summaries (App's models state and its save)
+  // Models and API keys (App's models state and its save)
   synth: SynthRow;
   modelsError: string | null;
   modelsSaving: boolean;
