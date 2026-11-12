@@ -54,6 +54,8 @@ NOT_CAPTURE = {
     "usage._log_attempt": "usage-probe attempt log: time, account key, ok flag, error code and milliseconds only; "
                           "no capture text",
     "usage._rotate_attempts": "renames that same attempts log when it grows large; writes no text of its own",
+    "usage._forget_turn": "rewrites usage.turn.json after removing one login's last-turn stamp; "
+                          "login folder keys and attempt times only, no capture text",
     "recall_eval_nightly._write_history": "the nightly recall check's figures (rates, counts, golden file size and "
                                           "mtime); never a query or an id",
     "session_capture._write_retry_state":"attempt count, backoff time, held flag and an error kind only; no capture text",

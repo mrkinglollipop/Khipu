@@ -131,7 +131,7 @@ def test_a_batch_where_every_id_fails_is_not_ok(pg, action, extra):
 
 
 def test_a_batch_reassign_of_a_missing_id_is_not_ok(pg):
-    out = srv._tool_owed_update({"ids": [987654, 987655], "action": "reassign", "owner": "agent", "reason": "r"})
+    out = srv._tool_owed_update({"ids": [987654, 987655], "action": "reassign", "owner": "user", "reason": "r"})
     assert out["ok"] is False and out["changed"] == 0
 
 

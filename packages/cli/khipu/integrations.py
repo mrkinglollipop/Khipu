@@ -159,8 +159,8 @@ def _hook_identity(command: Any) -> tuple[str, str | None, bool]:
     """
     if not isinstance(command, str):
         return "non-command hook", None, False
-    # A bare launcher path is ours even when it has a space in it (a checkout on
-    # "/Volumes/Cloud Storage"): match the whole command before splitting it.
+    # A bare launcher path is ours even when its checkout folder has spaces:
+    # match the whole command before splitting it.
     # Only a bare path qualifies: no assignment, quote or second word that starts
     # an option or another path, so a foreign command that merely ends in a
     # launcher's name is never ours and never comes back whole.
