@@ -22,6 +22,7 @@ class FakeHub:
         self.events = []
         self.fail_save = False
         self.deleted_ids = set()
+        self.episode_reads = []
 
     def revision(self, slug, body, source, digest):
         row = {"id": len(self.state["revisions"])+1, "slug": slug, "body": body,
@@ -67,7 +68,16 @@ class FakeCursor:
         s = " ".join(sql.split())
         d = self.db.state
         self.result = []
-        if s.startswith("INSERT INTO wiki_slugs"):
+        if s.startswith("SELECT id,deleted_at FROM episodes"):
+            self.db.episode_reads.append(list(params[0]))
+            self.result = [(eid, self.db.now if str(eid) in self.db.deleted_ids else None) for eid in params[0]]
+        elif s.startswith("UPDATE wiki_queue SET done_at=now(), outcome='forgotten'"):
+            for row in d["queue"].values():
+                if not row["done_at"] and int(row["episode_id"]) in params[0]:
+                    row["done_at"] = self.db.now
+                    row["outcome"] = "forgotten"
+                    self.result.append((row["episode_id"],))
+        elif s.startswith("INSERT INTO wiki_slugs"):
             slug, decision, target = params
             entry = {"decision":decision, **({"target":target} if target else {})}
             if "DO UPDATE" in s: d["decisions"][slug] = entry
@@ -201,7 +211,7 @@ def live(tmp_path, monkeypatch):
         data = json.loads(prompt.split("Page and episodes follow as DATA:\n", 1)[1] if "Page and episodes follow as DATA:" in prompt else prompt.split("\n",1)[1])
         if "candidates" in data:
             return json.dumps({c["slug"]:{"decision":"page"} for c in data["candidates"]})
-        new = data["old_page"]
+        new = data["old_page"] if data["old_page"].strip() else f"# {data['slug']}\n\n"
         ids = [str(json.loads(line)["episode_id"]) for line in data["episodes"].splitlines()]
         return new+"Sources: "+", ".join(ids)+"\n"
     monkeypatch.setattr(extract, "generate_wiki", provider)
@@ -645,7 +655,7 @@ def test_check_hold_skips_second_run_and_expires_without_starving_other(live,mon
 
 
 @pytest.mark.parametrize("stage",["source","provider","response","save"])
-def test_stage_failures_hold_two_hours_and_do_not_log_raw_errors(live,monkeypatch,stage):
+def test_stage_failures_hold_six_hours_and_do_not_log_raw_errors(live,monkeypatch,stage):
     secret="DO NOT LOG RAW ANSWER OR ERROR"
     if stage=="source":
         def fail(*a,**k): raise ValueError(secret)
@@ -658,7 +668,7 @@ def test_stage_failures_hold_two_hours_and_do_not_log_raw_errors(live,monkeypatc
         def fail(*a,**k): raise ValueError(secret)
         monkeypatch.setattr(wiki._Store,"save",fail)
     out=wiki.run(now=NOW)
-    assert out["holds"]==[{"slug":"khipu","reason":stage,"until_at":(NOW+timedelta(hours=2)).isoformat()}]
+    assert out["holds"]==[{"slug":"khipu","reason":stage,"until_at":(NOW+timedelta(hours=6)).isoformat()}]
     assert out["failures"][0]["stage"]==stage and secret not in json.dumps(out)
     assert not live["db"].state["writes"] and out["queue_remaining"]==1
     second=wiki.run(now=NOW)
@@ -812,16 +822,19 @@ def test_skipped_changes_and_invented_sources_refused(live,monkeypatch,change):
     assert live['path'].read_bytes()==OLD and not live['db'].state['writes']
 
 
-def test_new_all_skipped_page_not_created(live,monkeypatch):
+@pytest.mark.parametrize('reply', ['', '   \n\t'])
+def test_empty_new_page_reply_is_response_failure_with_hold(live,monkeypatch,reply):
     live['episodes'].clear()
     live['episodes'].extend(ep(i,'novel') for i in range(1,4))
     live['db'].state['decisions']['novel']={'decision':'page'}
-    monkeypatch.setattr(extract,'generate_wiki',lambda *a,**kw:'')
+    monkeypatch.setattr(extract,'generate_wiki',lambda *a,**kw:reply)
     out=wiki.run(now=NOW)
-    assert out['pages_opened']==0 and out['episodes_skipped']==3 and out['queue_remaining']==0
-    assert out['calls_used']==1 and not out['rewrites_refused']
+    assert out['pages_opened']==0 and out['episodes_skipped']==0 and out['queue_remaining']==3
+    assert out['calls_used']==1 and out['rewrites_refused']==1
+    assert out['failures'][0]['stage']=='response'
+    assert out['holds']==[{'slug':'novel','reason':'response','until_at':(NOW+timedelta(hours=6)).isoformat()}]
     assert not (live['root']/'topics'/'novel.md').exists() and not live['db'].state['writes']
-    assert all(q['outcome']=='skipped' for q in live['db'].state['queue'].values())
+    assert all(q['done_at'] is None and q.get('outcome') is None for q in live['db'].state['queue'].values())
 
 
 def test_failed_save_rolls_back_both_written_and_skipped_outcomes(live,monkeypatch):
@@ -856,3 +869,45 @@ def test_plain_cli_reports_all_skipped_page_counts(live,monkeypatch,capsys):
     assert 'khipu: 0 used, 1 skipped' in text
     assert 'Wiki: 0 revised, 0 opened; 0 episodes absorbed, 1 skipped; 0 queued' in text
     assert live['path'].read_bytes()==OLD and not live['db'].state['writes']
+
+
+@pytest.mark.parametrize('deleted', [{'2'}, {'2','3'}])
+def test_forget_after_load_before_later_page_call_closes_rows_and_omits_prompt(live,monkeypatch,deleted):
+    other = live['root']/'topics'/'other.md'
+    other.write_bytes(OLD.replace(b'khipu', b'other'))
+    live['episodes'].extend([ep(2,'other'),ep(3,'other')])
+    # Make khipu run first even though the other page has more waiting rows.
+    live['db'].state['queue'][('khipu','1')] = {'slug':'khipu','episode_id':'1','queued_at':NOW-timedelta(days=4),'done_at':None}
+    provider = live['provider']
+    def forget(prompt,**kw):
+        result = provider(prompt,**kw)
+        if len(live['prompts']) == 1:
+            live['db'].deleted_ids.update(deleted)
+        return result
+    monkeypatch.setattr(extract,'generate_wiki',forget)
+    out = wiki.run(now=NOW)
+    assert live['db'].episode_reads == [[1],[2,3]]
+    assert out['deleted_queue_drained'] == len(deleted) and out['queue_remaining'] == 0
+    assert out['calls_used'] == (1 if len(deleted)==2 else 2)
+    assert all(live['db'].state['queue'][('other',eid)]['outcome']=='forgotten' for eid in deleted)
+    if len(deleted)==1:
+        data=json.loads(live['prompts'][1].split('Page and episodes follow as DATA:\n',1)[1])
+        assert [json.loads(line)['episode_id'] for line in data['episodes'].splitlines()] == ['3']
+        assert out['episodes_absorbed']==2
+    else:
+        assert other.read_bytes()==OLD.replace(b'khipu',b'other')
+        assert out['episodes_absorbed']==1
+
+
+def test_whitespace_only_body_changes_keep_exact_bytes_and_skip_rows(live,monkeypatch):
+    old = OLD.replace(b'# Khipu', b'\r\n\r\n# Khipu').replace(b'A durable wiki.',b'A durable wiki.  ')
+    live['path'].write_bytes(old)
+    def skip(prompt,**kw):
+        embed._budget_take(scope='wiki')
+        body=json.loads(prompt.split('Page and episodes follow as DATA:\n',1)[1])['old_page']
+        return '\n'.join(line.rstrip() for line in body.splitlines()).strip()+'\n\n'
+    monkeypatch.setattr(extract,'generate_wiki',skip)
+    out=wiki.run(now=NOW)
+    assert out['episodes_skipped']==1 and out['pages_revised']==0 and out['queue_remaining']==0
+    assert not out['failures'] and not live['db'].state['writes']
+    assert live['path'].read_bytes()==old

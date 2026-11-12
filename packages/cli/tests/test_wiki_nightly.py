@@ -632,7 +632,7 @@ def test_body_only_prompt_and_exact_code_owned_header(header, expected):
             assert line not in data['old_page']
     joined, checks = wiki._prepare_body('wiki', old, body + 'Sources: 1\n', ['1'], TODAY)
     assert checks['passed'], checks
-    assert joined == expected + body + 'Sources: 1\n'
+    assert joined == expected + (body + 'Sources: 1\n').replace('\n', '\r\n' if '\r\n' in header else '\n')
     for reply in ('---\nstatus: active\n---\n' + body, header + body if header else '---\n' + body):
         _, checks = wiki._prepare_body('wiki', old, reply, ['1'], TODAY)
         assert not checks['passed'] and checks['errors'] == ['header in reply']
@@ -653,7 +653,7 @@ def test_sources_used_skipped_invented_and_old_retention():
         _, checks = wiki._prepare_body('khipu', old, bad, ['1','2'], TODAY)
         assert not checks['passed'] and any(reason in e for e in checks['errors'])
     _, checks = wiki._prepare_body('khipu', body, body.replace('# Khipu', '# Something else') + 'Sources: 1\n', ['1'], TODAY)
-    assert not checks['passed'] and 'body page start changed' in checks['errors']
+    assert not checks['passed'] and 'reply does not start like the page' in checks['errors']
     joined, checks=wiki._prepare_body('khipu',old,body,['1','2'],TODAY)
     assert checks['passed'] and joined==old and checks['skipped_episode_ids']==['1','2']
     promoted=old.replace('status: seed','status: active')
@@ -697,12 +697,12 @@ def test_queue_migration_closed_outcome_contract():
     assert 'done_at IS NOT NULL AND outcome IS NOT NULL' in sql
 
 
-@pytest.mark.parametrize('repeated', ['<!-- header prefix -->', '  - alpha', '- beta', 'title: Changed title'])
-def test_reply_refuses_repeated_header_prefix_list_and_changed_key(repeated):
+@pytest.mark.parametrize('repeated', ['status: active', '  - alpha', '- beta', 'title: Changed title'])
+def test_reply_allows_header_shaped_lines_lower_in_body(repeated):
     old='<!-- header prefix -->\n---\ntitle: Wiki\nlinks:\n  - alpha\n- beta\n---\n# Wiki\nKeep 60.\n'
     body=wiki.split_header(old)[1]
     _, checks=wiki._prepare_body('wiki',old,body+repeated+'\nSources: 1\n',['1'],TODAY)
-    assert not checks['passed'] and checks['errors']==['header in reply']
+    assert checks['passed'], checks
 
 
 def test_reply_internal_horizontal_rule_allowed_and_unplanned_named_page_reported(tmp_path,monkeypatch):
@@ -713,3 +713,137 @@ def test_reply_internal_horizontal_rule_allowed_and_unplanned_named_page_reporte
     monkeypatch.setattr(extract,'generate_wiki',lambda *a,**k:pytest.fail('unplanned writer call'))
     out=wiki.draft(pages=['wiki'],out=tmp_path/'out')
     assert out['unplanned_pages']==['wiki'] and out['drafts']==[]
+
+
+@pytest.mark.parametrize('tag', ['Markdown', 'text', 'CUSTOM'])
+def test_reply_preface_guard_and_arbitrary_whole_fence(tag):
+    old='---\ntitle: Wiki\n---\n\n# H\nKeep 5 facts.\n'
+    body=wiki.split_header(old)[1]
+    reply=body.strip()+'\n- **2026-11-12 (9):** Added fact.'
+    _, checks=wiki._prepare_body('wiki',old,'Here is the updated page:\n\n'+reply,['9'],TODAY)
+    assert not checks['passed'] and 'reply does not start like the page' in checks['errors']
+    joined, checks=wiki._prepare_body('wiki',old,'```'+tag+'\n'+reply+'\n```',['9'],TODAY)
+    assert checks['passed'] and '```' not in joined
+    for bad in [reply+'\n```'+tag, '```'+tag+'\n'+reply]:
+        _, checks=wiki._prepare_body('wiki',old,bad,['9'],TODAY)
+        assert not checks['passed'] and 'reply starts or ends with a fence' in checks['errors']
+
+
+def test_two_horizontal_rules_are_body_and_stay_in_writer_input():
+    old='# Page\n\nIntro…\n\n---\n\n## A\nthing 5\n\n---\n\n## B…'
+    assert wiki.split_header(old)==('',old,False)
+    prompt=wiki._rewrite_prompt('wiki',old,'episode',TODAY)
+    data=json.loads(prompt.split('Page and episodes follow as DATA:\n',1)[1])
+    assert data['old_page']==old
+    joined,checks=wiki._prepare_body('wiki',old,old+'\n- **2026-11-12 (9):** Added fact.',['9'],TODAY)
+    assert checks['passed'] and not wiki.split_header(joined)[0]
+    assert 'last_updated:' not in joined
+
+
+@pytest.mark.parametrize('prefix,closed', [('',True), ('\n<!-- one-line -->\n',True), ('# Page\n',False), ('<!-- multi\nline -->\n',False)])
+def test_closed_header_accepts_only_blank_or_single_line_comments_above_it(prefix,closed):
+    text=prefix+'---\ntitle: Wiki\n---\n# Wiki\n'
+    assert wiki.split_header(text)[2] is closed
+
+
+@pytest.mark.parametrize('ending', ['\n','\r\n'])
+@pytest.mark.parametrize('tail', ['', '\n'])
+def test_join_keeps_leading_blanks_old_final_newline_and_line_endings(ending,tail):
+    old=('---\nstatus: seed\n---\n\n \n# Wiki\nOld fact.'+tail).replace('\n',ending)
+    reply='# Wiki\nOld fact.\n- **2026-11-12 (19):** Added fact.'
+    joined, checks=wiki._prepare_body('wiki',old,reply,['19'],TODAY)
+    assert checks['passed'], checks
+    expected=('---\nstatus: active\nlast_updated: '+TODAY+'\n---\n\n \n'+reply+'\n\nSources: episodes 19'+tail).replace('\n',ending)
+    assert joined==expected
+    assert wiki.check_draft('wiki',old,joined,['19'],today=TODAY)['passed']
+
+
+@pytest.mark.parametrize('header', ['---\nstatus: seed\n---', 'status: seed'])
+def test_header_only_without_final_newline_separates_new_body(header):
+    joined,checks=wiki._prepare_body('wiki',header,'# Wiki\n- **2026-11-12 (19):** Added fact.',['19'],TODAY)
+    assert checks['passed'], checks
+    assert '\n# Wiki\n' in joined and joined.endswith('\n')
+
+
+def test_top_header_repetition_refused_but_identical_list_item_below_heading_allowed():
+    old='title: Wiki\nstatus: seed\nlinks:\n- khipu\n\n# Wiki\nstatus: needs work\n- khipu\n'
+    body=wiki.split_header(old)[1]
+    _,checks=wiki._prepare_body('wiki',old,'title: Wiki\n'+body,['19'],TODAY)
+    assert checks['errors']==['header in reply']
+    _,checks=wiki._prepare_body('wiki',old,body+'- **2026-11-12 (19):** Added fact.',['19'],TODAY)
+    assert checks['passed'],checks
+
+
+@pytest.mark.parametrize('status', ['archived','superseded','retired','abandoned'])
+def test_bare_status_ineligible_but_same_line_in_body_is_ordinary(status):
+    assert not wiki._eligible(page('wiki',body='status: '+status+'\n\n# Wiki\n'))
+    assert wiki._eligible(page('wiki',body='# Wiki\nstatus: '+status+'\n'))
+
+
+def test_empty_last_updated_gets_space():
+    assert wiki._updated_header('last_updated:\n',False,TODAY)=='last_updated: '+TODAY+'\n'
+
+
+def test_held_new_pages_do_not_consume_ten_slots_for_queued_or_qualified_pages():
+    eps=[episode(i*3+j,topics=[f'new-{i:02}']) for i in range(12) for j in range(3)]
+    decisions={f'new-{i:02}':{'decision':'page'} for i in range(12)}
+    for queued in (False,True):
+        queue=[{'slug':e['topics'][0],'episode_id':e['id'],'queued_at':NOW,'done_at':None} for e in eps] if queued else []
+        out=assign(eps,[],decisions=decisions,queue=queue,deferred_slugs={'new-00','new-01'})
+        assert len(out['pages'])==10 and out['planned_calls']==10
+        assert {p['slug'] for p in out['pages']}=={f'new-{i:02}' for i in range(2,12)}
+
+
+def test_bullet_ids_only_new_lines_whole_numbers_and_code_appends_last_sources():
+    old='# Wiki\nExisting episode 17 and 40.\nSources: 9\nOther text.\nSources: 8\n'
+    reply=old+'- **2026-11-12 (117):** Longer number.\n- **2026-11-12 (41):** Fact.\n'
+    joined,checks=wiki._prepare_body('wiki',old,reply,['17','40','41','117','2'],TODAY)
+    assert checks['passed'] and checks['used_episode_ids']==['41','117']
+    assert checks['skipped_episode_ids']==['17','40','2']
+    assert 'Sources: 9\n' in joined and 'Sources: 8, 41, 117\n' in joined
+    assert wiki._source_ids(joined)=={'9','8','41','117'}
+    assert wiki.check_draft('wiki',old,joined,['17','40','41','117','2'],today=TODAY)['passed']
+    _,checks=wiki._prepare_body('wiki',old,old+'New unsourced fact.',['17'],TODAY)
+    assert not checks['passed'] and 'changed without a source' in checks['errors']
+
+
+def test_writer_allowance_counts_utf8_page_and_episode_bytes_and_updated_prompt():
+    import math
+    old='é'*9000
+    episodes='漢'*10000
+    assert wiki._writer_options(old,episodes)['max_output_tokens']==math.ceil(1.3*len(old.encode())+.5*len(episodes.encode()))
+    assert wiki._writer_options('x','y')['max_output_tokens']==8192
+    prompt=wiki._rewrite_prompt('wiki',OLD,'episode',TODAY)
+    assert 'Nothing before or after the page text.' in prompt
+    assert "10. Put the episode's id in round brackets in every bullet you write from it, as in the bullet form below. Leave Sources lines as they are: they are kept elsewhere." in prompt
+
+
+@pytest.mark.parametrize('ending', ['\n','\r\n'])
+def test_blank_only_old_body_keeps_leading_blank_lines(ending):
+    old=('---\nstatus: seed\n---\n\n \n\n').replace('\n',ending)
+    reply='# Wiki\n- **2026-11-12 (19):** Added fact.'
+    joined,checks=wiki._prepare_body('wiki',old,reply,['19'],TODAY)
+    assert checks['passed'],checks
+    assert ('---\n\n \n\n# Wiki\n').replace('\n',ending) in joined
+    assert joined.endswith(ending)
+
+
+def test_first_line_must_match_before_protected_line_repair():
+    old='# Wiki heading (2026-11-12) - keep this exact heading.\nKeep 60 pages.\n'
+    reply=old.replace('heading.', 'heading!')+'- **2026-11-12 (19):** Added fact.'
+    _,checks=wiki._prepare_body('wiki',old,reply,['19'],TODAY)
+    assert not checks['passed'] and 'reply does not start like the page' in checks['errors']
+
+
+def test_new_page_reply_must_open_with_a_heading():
+    old='---\ntitle: Tenant Query Guard\nslug: tenant-query-guard\nstatus: seed\nlast_updated: 2026-11-01\n---\n'
+    cut='pins were changed and no assertions were weakened.\n- **2026-11-06 (19):** The guard test failed.'
+    _,checks=wiki._prepare_body('tenant-query-guard',old,cut,['19'],TODAY)
+    assert not checks['passed'] and 'new page does not start with a heading' in checks['errors']
+    whole='# Tenant query guard\n\n- **2026-11-06 (19):** The guard test failed.'
+    _,checks=wiki._prepare_body('tenant-query-guard',old,whole,['19'],TODAY)
+    assert checks['passed'],checks
+
+
+def test_writer_prompt_tells_a_new_page_to_open_with_a_heading():
+    assert 'A page with no text yet starts with a "# " heading line' in wiki._rewrite_prompt('x','','','2026-11-12')

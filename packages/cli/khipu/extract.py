@@ -464,11 +464,20 @@ def _generate_claude_cli(prompt: str, *, model_id: str, timeout: int = 60, retri
             result = subprocess.run(argv, input=prompt, text=True, capture_output=True,
                                     cwd=cwd, env=env, timeout=timeout, check=False)
             data = json.loads(result.stdout)
+            if _CALL_SCOPE.get() == "wiki" and (data.get("stop_reason") == "max_tokens"
+                    or data.get("subtype") == "error_max_output_tokens"
+                    or ((data.get("is_error") or result.returncode or data.get("error"))
+                        and re.search(r"exceeded\b.*?\boutput token maximum\b", json.dumps(data), re.I | re.S))):
+                raise ProviderTruncated("truncated")
+            # Measured 2026-11-12: a reply that passes the output allowance is
+            # continued in a further turn and "result" holds only the last
+            # part, with exit 0 and stop_reason end_turn. A whole reply is one turn.
+            turns = data.get("num_turns")
+            if _CALL_SCOPE.get() == "wiki" and isinstance(turns, int) and turns > 1:
+                raise ProviderTruncated("truncated")
             text = data.get("result")
             if not isinstance(text, str):
                 raise ValueError("missing result")
-            if _CALL_SCOPE.get() == "wiki" and (data.get("stop_reason") == "max_tokens" or data.get("subtype") == "error_max_output_tokens"):
-                raise ProviderTruncated("truncated")
             failed = data.get("is_error") or result.returncode or _cli_failure(text)
             if not failed:
                 _record_usage(data, provider="claude-cli", model_id=model_id, caller=caller)
@@ -1172,6 +1181,8 @@ def generate_wiki(prompt: str, *, model_id: str | None = None, timeout: int | No
     settings = wiki_settings()
     if model_id:
         settings["model_id"] = model_id
+    floor = 24000 if settings["provider"] in {"claude-cli", "codex-cli"} else 8192
+    max_output_tokens = max(floor, max_output_tokens or 0)
     token = _CALL_SCOPE.set("wiki")
     try:
         if settings["provider"] == "local":
