@@ -18,6 +18,12 @@ from tests.test_routing_s19a_directions import CLAUDE_ENV, GLM, SESSION, world  
 THREAD = "thread-1"
 
 
+def _iso(ts):
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def _t3_db(path, messages):
     with sqlite3.connect(path) as con:
         con.execute("CREATE TABLE orchestration_v2_projection_provider_threads (thread_id TEXT, payload_json TEXT)")
@@ -27,7 +33,7 @@ def _t3_db(path, messages):
                     "created_at TEXT, payload_json TEXT)")
         for i, (by, source, text) in enumerate(messages):
             con.execute("INSERT INTO orchestration_v2_projection_messages VALUES (?, ?, 'user', ?, ?)",
-                        (f"m{i}", THREAD, f"2026-11-12T00:00:0{i}Z",
+                        (f"m{i}", THREAD, _iso(time.time() - 60 + i),
                          json.dumps({"createdBy": by, "creationSource": source, "text": text, "threadId": THREAD})))
 
 
@@ -76,7 +82,8 @@ def test_a_row_marked_his_before_the_check_stops_being_listed(t3_world, monkeypa
     _t3_db(t3_world, [("agent", "mcp", WAKE)])
     say(WAKE)
     sha = owner_turns.turns(SESSION)[-1]["prompt_sha256"]
-    monkeypatch.setattr(routing_directions, "t3_owner_hashes", lambda session: {sha})  # the old blanket rule
+    monkeypatch.setattr(routing_directions, "t3_owner_messages",
+                        lambda session: [(time.time(), {sha})])  # the old blanket rule
     (row,) = routing_directions.capture_scan(SESSION, [WAKE])
     assert row["typed"] is True
     monkeypatch.undo()
@@ -97,3 +104,44 @@ def test_the_same_words_said_again_are_one_reminder_and_one_dismissal(world):
     routing_directions.dismiss(item["id"])
     assert routing_directions.owed_items() == []
     assert all(r["status"] == "dismissed" for r in routing_directions.directions())
+
+
+def test_an_ultrathink_prompt_he_typed_in_t3_still_opens_one(t3_world):
+    _t3_db(t3_world, [("user", "web", GLM)])
+    say(f"Ultrathink:\n{GLM}")  # T3 sends it so at "ultrathink" effort; its record keeps his words
+    (row,) = routing_directions.capture_scan(SESSION, [f"Ultrathink:\n{GLM}"])
+    assert row["typed"] is True
+
+
+def test_a_wake_repeating_his_earlier_words_is_not_his(t3_world):
+    _t3_db(t3_world, [("user", "web", GLM), ("agent", "mcp", GLM)])
+    say(GLM)
+    say(GLM)  # the wake-up, same words
+    rows = routing_directions.capture_scan(SESSION, [GLM, GLM])
+    assert len(rows) == 1 and rows[0]["occurrence"] == 1 and rows[0]["typed"] is True
+
+
+def test_a_message_from_days_before_vouches_for_nothing(t3_world):
+    import sqlite3 as _sq
+
+    _t3_db(t3_world, [("user", "web", GLM)])
+    with _sq.connect(t3_world) as con:
+        con.execute("UPDATE orchestration_v2_projection_messages SET created_at = ?", (_iso(time.time() - 3 * 86400),))
+    say(GLM)
+    assert all(not r.get("typed") for r in routing_directions.capture_scan(SESSION, [GLM]))
+
+
+def test_an_old_false_row_is_unmarked_by_a_later_window(t3_world, monkeypatch):
+    _t3_db(t3_world, [("agent", "mcp", WAKE)])
+    say(WAKE)
+    sha = owner_turns.turns(SESSION)[-1]["prompt_sha256"]
+    monkeypatch.setattr(routing_directions, "t3_owner_messages", lambda session: [(time.time(), {sha})])
+    (row,) = routing_directions.capture_scan(SESSION, [WAKE])
+    assert row["typed"] is True
+    monkeypatch.undo()
+    monkeypatch.setattr(owner_turns, "entrypoint_of", lambda *a, **k: "t3")
+    monkeypatch.setattr(owner_turns, "dispatched_job", lambda *a, **k: None)
+    monkeypatch.setenv("KHIPU_T3_DB", str(t3_world))
+    say("hello")
+    routing_directions.capture_scan(SESSION, ["hello"])  # a window without the wake
+    assert routing_directions.owed_items() == []

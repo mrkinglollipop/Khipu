@@ -452,22 +452,28 @@ def owner_reply_read(thread_id: str, seen, since) -> tuple[dict | None, bool]:
     return _read_messages(thread_id, read)
 
 
-def owner_texts_result(thread_id: str) -> tuple[list[str] | None, bool]:
-    """``(texts, definitive)``: the text of every message the owner typed in
-    ``thread_id`` (``is_owner_message``), from one read-only bounded read, for
-    hashing only. T3 writes its scheduled wake-ups, relayed messages and
-    delegated briefs into a thread under another sender, so these are the
-    prompts a person typed. A failed read is ``(None, False)``."""
+def owner_messages_result(thread_id: str) -> tuple[list[dict] | None, bool]:
+    """``(messages, definitive)``: every message the owner typed in
+    ``thread_id`` (``is_owner_message``) as ``{ts, text}`` (T3's epoch
+    seconds; the text is for hashing only), from one read-only bounded read.
+    T3 writes its scheduled wake-ups, relayed messages and delegated briefs
+    into a thread under another sender, so these are the prompts a person
+    typed. A failed read, or a row whose time can't be read, is
+    ``(None, False)``."""
 
     def read(con):
-        texts = []
-        for (payload_json,) in con.execute(
-                "SELECT payload_json FROM orchestration_v2_projection_messages "
+        out = []
+        for created_at, payload_json in con.execute(
+                "SELECT created_at, payload_json FROM orchestration_v2_projection_messages "
                 f"WHERE thread_id = :thread AND {_owner_rows_sql()}", {"thread": thread_id}):
             payload = _owner_payload(payload_json, thread_id)
-            if payload is not None:
-                texts.append(payload["text"])
-        return texts
+            if payload is None:
+                continue
+            ts = _epoch(created_at)
+            if ts is None:
+                raise ValueError("unreadable message time")
+            out.append({"ts": ts, "text": payload["text"]})
+        return out
 
     return _read_messages(thread_id, read)
 
