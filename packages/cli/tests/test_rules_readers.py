@@ -330,6 +330,6 @@ def test_a_command_that_only_ends_in_a_launcher_is_not_khipus(command):
 
 
 def test_a_bare_launcher_path_with_a_space_is_khipus():
-    command = "/Volumes/Cloud Storage/Code/Khipu/packages/cli/bin/khipu-stop-hook"
+    command = "/Volumes/Shared Work/Code/Khipu/packages/cli/bin/khipu-stop-hook"
     assert integ._hook_identity(command) == ("khipu-stop-hook", command, True)
 

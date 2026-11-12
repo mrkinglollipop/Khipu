@@ -59,7 +59,11 @@ function AccountRow({ row, selected, onSelect }: { row: RowModel; selected: bool
   );
 }
 
-export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp, running }: {
+export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp, running, initialAccountKey, onInitialAccountUsed }: {
+  /** A Today tile opens this account; ordinary Accounts visits keep their default. */
+  initialAccountKey?: string | null;
+  /** Called once the key has opened its page, so a later visit starts at the list. */
+  onInitialAccountUsed?: () => void;
   routing: RoutingState;
   plans: UsageReport | null | undefined;
   thisMac: string | null;
@@ -134,8 +138,10 @@ export function Accounts({ routing, plans, thisMac, onReloadPlans, now: nowProp,
 
   const view = routing.data;
   const accounts = useMemo(() => orderedAccounts(view), [view]);
-  const [picked, setPicked] = useState<string | null>(null);
-  const [detailOpen, setDetailOpen] = useState(false);
+  const [picked, setPicked] = useState<string | null>(initialAccountKey ?? null);
+  const [detailOpen, setDetailOpen] = useState(Boolean(initialAccountKey));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { if (initialAccountKey) onInitialAccountUsed?.(); }, []);
   const selectedKey = accounts.some((a) => a.key === picked) ? picked : accounts[0]?.key ?? null;
   const selected = accounts.find((a) => a.key === selectedKey) ?? null;
   const rows = useMemo(

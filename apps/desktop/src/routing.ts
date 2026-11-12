@@ -60,6 +60,8 @@ export type RouteAccount = {
    *  Settings -> Models while limited): no reset check and no Check now. */
   configured?: boolean;
   usage_setup?: string;
+  /** Plan terms already carried by route --json. */
+  terms?: { ends?: string | null };
   witness?: RouteWitness | null;
   disagreement?: RouteReport | null;
   last_seen?: RouteReport | null;
