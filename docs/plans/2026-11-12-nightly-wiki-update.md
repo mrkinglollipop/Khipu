@@ -58,9 +58,18 @@ Input: the page's title and body, plus one line per waiting episode (date, episo
 - **"Skipped everything" was refused over a trimmed blank line.** Hence "unchanged" is judged after normalising whitespace, and an unchanged page keeps its exact bytes.
 - **A cross-family review found three ways a wrong file could be written** (a chatty or fenced reply under a header, any two `---` rules read as a header, an empty reply read as "all skipped"). All three are closed, each with the review's own input as a test.
 
+### What the third and fourth samples showed (2026-11-12, 11 pages each, none written)
+
+- **Haiku, third sample:** the cut replies were gone, but an instruction ("drop it afterward") was written as done, and on the largest page (model-routing, 10.6 KB plus 27 KB of episodes) one reply in three copied the episode records into the page and lost old text. The checks refused that reply; the page would have been held a day at a time. Hence the rule that decisions are not events, the strip of copied records, and the model below.
+- **Sonnet, fourth sample:** 10 of 11 drafts passed the checks (the eleventh added a title line above a body that has none, which the code now drops). On the largest page it took 32 seconds against Haiku's 57 to 112. A Codex Sol read against the sources: no old text lost, the instruction fault fixed, the Muse, GLM and Kimi cancellations stated correctly with their end dates on model-routing (with the aliases of section 1 in place). Two faults in about 130 new bullets: one bullet wrote "is being rebuilt" as "was rebuilt" (church-harness, episode 117836), and model-routing's three-month-old "on-subscription only" block stayed in place above newer, dated statements that replace it.
+- **What that means in use.** Every new bullet carries its episode id, so a doubtful line can be checked against its source, and `khipu wiki undo` takes back a page or a whole run. The writer adds and preserves; it does not restructure a page whose old text has gone stale. That stays with the monthly pass.
+- **Known limits, not fixed here:** a loose tag still brings off-subject episodes to a page with the same name (`memory-management` receives a Mac's RAM as well as the memory system), and the writer sometimes skips an episode that belongs.
+
 ## 3. Which model writes
 
 **Recommendation: Claude Haiku via the Claude login**, the same route and model the summaries use today, unless the sample in section 6 shows it dropping facts. Then Sonnet via the login.
+
+**As built (2026-11-12): Sonnet via the Claude login.** The samples above showed Haiku rounding up and copying its input; Sonnet did neither on the same pages and was faster on the largest one. Unset, the Wiki row follows the summaries' provider, and through the Claude login it uses Sonnet; an explicit Wiki setting wins. Sonnet draws more of the plan per call than the estimate below, which was made for Haiku: on the largest page it used about 6,300 output tokens.
 
 - Why: page writing is merge-and-preserve work over short inputs, close to what Haiku already does well for summaries. Through the login it costs no cash, and at 02:05 the accounts are idle.
 - **Cost per night** at a cap of 60 writes, each about 8,000 tokens in and 1,500 out: about 0.5 million tokens in and 0.1 million out. Through the login that is $0 cash, and about a tenth on top of what the summaries already draw from the plan each day (about 1,400 calls of up to 14,000 characters each). If billed through an Anthropic API key at the repo's own price table (`models.py`, Haiku $0.10 in and $0.50 out per million tokens, as of 2026-10-13), it is about $0.10 a night, or $3 a month. Not checked: Sonnet's current price. It is to be read from Anthropic's page before the sample run.
