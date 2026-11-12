@@ -35,7 +35,7 @@ More detail: [Desktop app](desktop-app.md) and [`apps/desktop/README.md`](../app
 
 ## The Database step
 
-The Database step offers three choices. Each one makes the schema current and schedules five background upkeep jobs: nightly (02:05), monthly (the 1st, 09:00), a notes watcher, a capture-queue drain every five minutes, and replica_refresh every five minutes. The warm recall service is the sixth job and is opt-in. Details are in [Operations](operations.md).
+The Database step offers three choices. Each one makes the schema current and schedules five background upkeep jobs: nightly (02:05), monthly (the 1st, 09:00), a notes watcher, a capture-queue drain every minute, and replica_refresh every five minutes. The warm recall service is the sixth job and is opt-in. Details are in [Operations](operations.md).
 
 The last stage is a memory round trip: write a test memory, find it by search, and show the time it took. The round trip is skipped if capture mode is "Files only" or no embedding key is set.
 

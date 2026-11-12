@@ -166,7 +166,7 @@ Usage for Claude, Codex, Grok, Muse and GLM, provider-defined HTTP quota adapter
 | `fresh` | Start a refresh now even if the cache is young. |
 | `max_age` | Cache age limit in seconds. Default 120. |
 
-It answers from the cache at once and refreshes in the background. A background refresh may use a tiny Haiku turn when Claude’s usage reply omits figures, or a tiny Muse turn to refresh stale observations, each at most once per 30 minutes per login (Claude every 5 minutes while its last figures are at 90% or more). Ask again a few seconds later for new figures. Errors are short codes such as `timeout` or `not_signed_in`. A window a CLI does not report is absent, not zero.
+It answers from the cache at once and refreshes in the background. A background refresh may use a tiny Haiku turn when Claude’s usage reply omits figures, or a tiny Muse turn to refresh stale observations, Claude's at most every 2 minutes and Muse's every 30 minutes per login. Every account is read each minute. Ask again a few seconds later for new figures. Errors are short codes such as `timeout` or `not_signed_in`. A window a CLI does not report is absent, not zero.
 
 ### khipu_route
 

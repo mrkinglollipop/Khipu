@@ -43,12 +43,12 @@ def test_recall_daemon_is_the_only_job_exempt_from_launchd_throttling():
         assert "ProcessType" not in plistlib.loads(launchd_gen.render_plist(job)), job
 
 
-def test_queue_drain_plist_runs_sessions_drain_every_5_min():
+def test_queue_drain_plist_runs_sessions_drain_every_minute():
     """K10: the Aegis capture queue had no drainer of its own."""
     data = plistlib.loads(launchd_gen.render_plist("queue_drain"))
     assert data["Label"] == "com.khipu.queue-drain"
     assert data["ProgramArguments"][-2:] == ["sessions", "drain"]
-    assert data["StartInterval"] == 300
+    assert data["StartInterval"] == 60
     assert data["RunAtLoad"] is False
 
 

@@ -67,7 +67,7 @@ def test_generator_emits_inline_wrapper_and_keeps_bytecode_outside_bundle(monkey
     args = data["ProgramArguments"]
     assert args == launchd_gen._queue_drain_arguments("/example/python")
     assert args[-2:] == ["sessions", "drain"]
-    assert data["StartInterval"] == 300
+    assert data["StartInterval"] == 60
     assert "Caches/Khipu/pycache" in data["EnvironmentVariables"]["PYTHONPYCACHEPREFIX"]
 
 

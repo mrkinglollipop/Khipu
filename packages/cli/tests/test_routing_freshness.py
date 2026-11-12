@@ -150,9 +150,11 @@ def test_the_periodic_job_refreshes_a_stale_cache_once_under_concurrency(cache, 
     assert len(calls) == 1
 
 
-def test_the_periodic_refresh_reads_only_what_is_older_than_five_minutes(cache, monkeypatch):
-    rows = _probed(3)
-    rows["codex|"]["last_attempt_at"] = usage._iso(time.time() - 6 * 60)
+def test_the_periodic_refresh_reads_only_what_is_older_than_its_age(cache, monkeypatch):
+    # Every minute since 2026-11-12: the job runs each 60 s and reads what is
+    # over PERIODIC_MAX_AGE_S (30 s) old.
+    rows = _probed(0.25)
+    rows["codex|"]["last_attempt_at"] = usage._iso(time.time() - 70)
     usage._save_cache(rows)
     calls = []
     monkeypatch.setattr(usage, "probe_all", lambda accounts, *, timeout: calls.append(
@@ -197,19 +199,19 @@ def test_the_drain_job_runs_the_refresh(cache, monkeypatch, capsys):
 
 
 def test_the_prompt_kick_starts_one_detached_refresh_and_never_waits(cache, monkeypatch):
-    usage._save_cache(_probed(11))
+    usage._save_cache(_probed(2))
     started = []
     assert usage.kick_refresh(spawn=started.append) is True
-    assert started == [[sys.executable, "-m", "khipu", "usage", "--refresh-due", "600", "--json"]]
+    assert started == [[sys.executable, "-m", "khipu", "usage", "--refresh-due", "60", "--json"]]
     # Within a minute of the last kick: nothing more, however many prompts.
     assert usage.kick_refresh(spawn=started.append) is False and len(started) == 1
 
 
 def test_the_prompt_kick_does_nothing_on_a_fresh_cache_or_beside_a_running_refresh(cache, monkeypatch):
     started = []
-    usage._save_cache(_probed(9))
+    usage._save_cache(_probed(0.5))
     assert usage.kick_refresh(spawn=started.append) is False
-    usage._save_cache(_probed(11))
+    usage._save_cache(_probed(2))
     fd = usage._try_refresh_lock()
     try:
         assert usage.kick_refresh(spawn=started.append) is False
