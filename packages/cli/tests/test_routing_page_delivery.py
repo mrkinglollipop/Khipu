@@ -498,7 +498,7 @@ def test_doctor_names_the_headings_the_page_left_out_and_not_the_old_summary_as_
     _long_rules()
     block = routing.doctor_block()
     page_words = [w for w in block["warnings"] if w.startswith("The routing page left out")]
-    assert len(page_words) == 1 and "RULES" in page_words[0] and "4,500" in page_words[0]
+    assert len(page_words) == 1 and "RULES" in page_words[0] and f"{routing_page.LIMIT:,}" in page_words[0]
     assert not any("at the start of a conversation shows only part" in w for w in block["warnings"])
     assert not any(w.startswith("The summary had to leave out") for w in block["warnings"])
     # One text for every reader: no warning about a second summary for subagents.
@@ -510,3 +510,39 @@ def test_doctor_says_nothing_about_the_page_when_every_rule_fits_on_it(home):
     _record()
     routing.add_rule("NEVER: a short rule.", via="app")
     assert not any("routing page" in w for w in routing.doctor_block()["warnings"])
+
+
+def test_full_record_labels_a_confirmed_unnumbered_rule_as_new(capsys):
+    view = _view(rules=["Keep the owner words."])
+    view["rules"][0]["n"] = None
+    routing._print_view(view, NOW, None)
+    text = capsys.readouterr().out
+    assert "  new. Keep the owner words." in text
+    assert "None." not in text
+
+
+@pytest.mark.parametrize("harness,shape", [("claude_code", "claude"), ("codex", "claude"), ("cursor", "cursor")])
+def test_limit_sized_page_fits_start_and_prompt_delivery(home, monkeypatch, harness, shape):
+    from khipu import hook_shape
+
+    monkeypatch.setenv("KHIPU_HARNESS", harness)
+    page = "ROUTING " + "x" * (routing_page.LIMIT - 8)
+    cfg = routing.settings()
+    out = dict(page=page, text=page, sig="a" * 16, version=1, epoch="test", kind="full")
+    plan = routing_delivery.page_plan(out, T0, cfg, restate=True)
+    plan["delivery_plan"]["max_chars"] = min(9000, hook_shape.budget(shape) -
+        recall_rule._utf16_len(recall_rule.RULE_MD.strip()) - 2)
+    start = routing_delivery.offer(plan)
+    assert start["text"] == page
+    context, included = recall_rule.fit_start_context(recall_rule.RULE_MD.strip(), start["text"],
+                                                     budget=hook_shape.budget(shape))
+    assert included and context.endswith(page)
+    assert hook_shape.utf16_len(context) <= hook_shape.budget(shape)
+    native = hook_shape.render(shape, "SessionStart", context)
+    assert (native["additional_context"] if shape == "cursor" else
+            native["hookSpecificOutput"]["additionalContext"]) == context
+    # A fresh prompt component receives the same whole page within its own budget.
+    prompt = routing_delivery.offer(routing_delivery.page_plan(out, T0, cfg),
+                                     session=f"limit-{harness}", deferred=True)
+    assert prompt["text"] == page
+    assert hook_shape.utf16_len(prompt["text"]) <= hook_shape.budget(shape)

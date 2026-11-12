@@ -395,7 +395,8 @@ def plan(out, view, now, cfg, *, session=None, project=None):
                  or entity.startswith("priority-exception:"))
         if rule:
             line = r.rule_line(rule, view=view, facts=facts)
-            label = f"Standing rule {rule['n']}"
+            label = (f"Standing rule {rule['n']}" if rule.get("n") is not None
+                     else "New standing rule (number pending)")
             names = r._named_account_labels(rule.get("text"), view)
             if names:
                 label += " for " + ", ".join(names)
@@ -1857,7 +1858,10 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
         if not due:
             return None, _delivery_summary(data, component, state, None, now, counting_component)
         plan_data = out["delivery_plan"]
-        page_limit = _capped(plan_data.get("page_limit") or plan_data.get("limit"), 4000)
+        from khipu import routing_page
+
+        default_limit = routing_page.LIMIT + 500 if plan_data.get("page_only") else 4000
+        page_limit = _capped(plan_data.get("page_limit") or plan_data.get("limit"), default_limit)
         items, progress = [], {}
         for entry in due:
             start, value = entry.get("offset", 0), entry["text"]

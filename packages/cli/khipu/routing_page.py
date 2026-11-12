@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-LIMIT = 4500  # characters, the whole page
+LIMIT = 5500  # characters, the whole page
 NEARLY_OUT_PCT = 10.0
 # Role, exception and hold widths tried, widest first, before any rule line is
 # dropped. An exception width of 0 is the shortest form: no quote, only a
@@ -516,7 +516,9 @@ def facts(view: dict, now: datetime) -> dict:
                          "role": (item or {}).get("role"), "exceptions": exceptions,
                          "caps": entry.get("caps") or [], "terms": entry.get("terms") or {},
                          "provider": {k: provider.get(k) for k in ("use", "models_allowed")}})
-    return {"record": True, "accounts": accounts, "rules": [list(x) for x in _rules(view)],
+    # The limit is part of what a conversation was sent: a new limit puts back
+    # (or cuts) rule lines, so it resends the page once.
+    return {"record": True, "limit": LIMIT, "accounts": accounts, "rules": [list(x) for x in _rules(view)],
             "holds": [{k: h.get(k) for k in ("id", "text", "until", "scope")} for h in holds]}
 
 
