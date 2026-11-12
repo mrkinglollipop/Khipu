@@ -172,7 +172,7 @@ It answers from the cache at once and refreshes in the background. A background 
 
 The routing record: which accounts are open, limited (with the end time and whether it is the CLI's own or a guess), paused, down or unknown; the owner's standing rules and note; holds; and job-runner lanes not matched to an account. Read-only.
 
-Locally, a call with none of `full`, `view`, `summary`, `since`, `account` or `ack` answers the routing page: `{page, chars, version, epoch, full_record}`, the accounts in the owner's order with their status words, then his rules (at most 5,500 characters, `routing_page.LIMIT`). It records no read receipt and reserves nothing, so a conversation that proposes a change reads `full: true` first.
+Locally, a call with none of `full`, `view`, `summary`, `since`, `account` or `ack` answers the routing page: `{page, chars, version, epoch, full_record}`, the accounts in the owner's order with their status words, then his rules (at most 6,000 characters, `routing_page.LIMIT`). It records no read receipt and reserves nothing, so a conversation that proposes a change reads `full: true` first.
 
 | Parameter | Meaning |
 | --- | --- |

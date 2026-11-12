@@ -13,17 +13,18 @@ words of the rules are other slices.
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-LIMIT = 5500  # characters, the whole page
+LIMIT = 6000  # characters, the whole page
 NEARLY_OUT_PCT = 10.0
-# Role, exception and hold widths tried, widest first, before any rule line is
-# dropped. An exception width of 0 is the shortest form: no quote, only a
-# count. The owner's standing rules outrank exceptions for space, so the
-# exception text gives way first (the second number shrinks before a rule line
-# is touched). A hold's words say why an account takes no jobs, so they keep
-# their width until the very last step (the third number).
+# Role, exception and hold widths tried before dropping whole rule lines.
+# Older exceptions yield to counts; the newest fresh exception per account
+# keeps FRESH_FLOOR even at exception width 0, outranking standing rule lines.
+# Only the final all-zero last resort removes that floor. Hold words keep
+# their width until that step too.
 _WIDTHS = ((220, 140, 140), (140, 100, 100), (90, 60, 60), (90, 30, 60), (90, 0, 60), (0, 0, 0))
+FRESH_HOURS = 48
+FRESH_FLOOR = 110
 # Newest exceptions shown on an account's line; older ones collapse to a count.
 EXCEPTIONS_SHOWN = 2
 # A rule that opens with one of these names (``WHICH MODEL: Opus: ...``) goes
@@ -31,6 +32,12 @@ EXCEPTIONS_SHOWN = 2
 SECTIONS = ("WHICH MODEL", "NEVER", "CHECKS", "MACS")
 _HEAD = re.compile(r"^\s*(WHICH MODEL|NEVER|CHECKS|MACS)\s*:\s*", re.IGNORECASE)
 _DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}")
+# Only the "Matt <date> [time]" stamp is shortened, to "(MM-DD)". Whatever
+# follows it (a place label, a scope such as "Codex:", a condition such as
+# "until the build is out:") is kept word for word: no pattern can tell a place
+# from a direction, so none is guessed at.
+_ATTRIBUTION = re.compile(
+    r"^(?:Reaffirmed by )?Matt (?P<date>\d{4}-\d{2}-\d{2})(?: ~?\d{1,2}:\d{2}(?::\d{2})?Z?)?[,:]\s+", re.IGNORECASE)
 _WINDOW_WORDS = {"five_hour": "of its 5 h window", "monthly": "of the month", "daily": "of the day"}
 _WINDOW_NAMES = {"five_hour": "5 h window", "weekly": "week", "monthly": "month", "daily": "day"}
 
@@ -54,6 +61,13 @@ def _cut(text: str, width: int) -> str:
     cut = text[: max(1, width - 1)]
     cut = cut[: cut.rindex(" ")] if " " in cut else cut
     return cut.rstrip(" ,;:.-(") + "…"
+
+
+def _page_words(text: str) -> str:
+    """Shorten leading owner attribution on the page only, keeping its day."""
+    words = _one_line(text)
+    match = _ATTRIBUTION.match(words)
+    return f"({match['date'][5:]}) {words[match.end():]}" if match else words
 
 
 def _sentence(text: str) -> str:
@@ -224,6 +238,12 @@ def _live_exceptions(item: dict | None, now: datetime, r) -> list[dict]:
     return [x for _i, x in ranked]
 
 
+def _fresh_exception(live: list[dict], now: datetime, r) -> dict | None:
+    """The newest exception actually written within the past 48 hours."""
+    return next((x for x in live if (at := r._parse(x.get("at"))) is not None
+                 and now - timedelta(hours=FRESH_HOURS) <= at <= now), None)
+
+
 def _account_text(label: str, entry: dict, item: dict | None, *, number, holds: list[dict], last: bool,
                   providers: dict, override: dict | None, readings: dict, widths, now: datetime, r) -> str:
     windows = _windows(entry, now, r)
@@ -278,16 +298,23 @@ def _account_text(label: str, entry: dict, item: dict | None, *, number, holds: 
     if terms.get("ends"):
         parts.append(f"Ends {_term_day(terms['ends'], now, r)}")
     live = _live_exceptions(item, now, r)
-    if live and widths[1] > 0:
-        for x in live[:EXCEPTIONS_SHOWN]:
+    fresh = _fresh_exception(live, now, r) if widths != (0, 0, 0) else None
+    if live and (widths[1] > 0 or fresh is not None):
+        shown = live[:EXCEPTIONS_SHOWN] if widths[1] > 0 else [fresh]
+        # Future-dated rows are not fresh and must not crowd out the floor.
+        if fresh is not None and not any(x is fresh for x in shown):
+            shown = [*shown[:EXCEPTIONS_SHOWN - 1], fresh]
+        for x in shown:
             ends = r._parse(x.get("until"))
+            width = max(widths[1], FRESH_FLOOR) if x is fresh else widths[1]
             parts.append("Exception" + (f" until {r._clock(ends, now)}" if ends else "") +
-                         f": “{_cut(x.get('text'), widths[1])}”")
-        if len(live) > EXCEPTIONS_SHOWN:
-            parts.append(f"+{len(live) - EXCEPTIONS_SHOWN} older: khipu route --full")
+                         f": “{_cut(_page_words(x.get('text')), width)}”")
+        if len(live) > len(shown):
+            kind = "more" if widths[1] == 0 else "older"
+            parts.append(f"+{len(live) - len(shown)} {kind}: khipu route --full")
     elif live:  # the shortest form: the count alone
         parts.append(f"{len(live)} exception{'s' if len(live) != 1 else ''}: khipu route --full")
-    role = _cut((item or {}).get("role"), widths[0])
+    role = _cut(_page_words((item or {}).get("role")), widths[0])
     if role:
         parts.append(role)
     lead = f"{number}. " if number else "- "
@@ -379,7 +406,8 @@ def _render(view: dict, now: datetime, conversation: dict, readings: dict, rules
             overridden.append(label)
         text = _account_text(label, entry, item, number=number, holds=mine, last=last, providers=providers,
                              override=override, readings=readings, widths=widths, now=now, r=r)
-        return _cut(text, account_width) if account_width else text
+        protected = widths != (0, 0, 0) and _fresh_exception(_live_exceptions(item, now, r), now, r) is not None
+        return _cut(text, account_width) if account_width and not protected else text
 
     for n, (entry, item) in enumerate(ordered, 1):
         lines.append(line(entry, item, n, n == len(ordered) and not extra))
@@ -418,11 +446,13 @@ def page(view: dict, now: datetime, conversation: dict | None = None, readings: 
     account key and cap kind, for a caller that already read them; absent, a
     cap prints as set. Both are inputs because this function reads nothing.
 
-    To fit, the exceptions then the roles are shortened in steps (an exception
-    ends as a bare count), and only then are whole rule lines dropped from the
-    bottom, with a count and the headings that lost lines; accounts, status
-    words and caps are never dropped. At most the two newest exceptions of an
-    account print; older ones collapse to a count."""
+    Leading owner attribution on roles and exceptions becomes (MM-DD) before
+    cutting, without changing the record. To fit, exceptions and roles shrink
+    in steps. The newest exception written in the past 48 hours per account
+    keeps at least 110 characters of width, including at exception width zero;
+    others collapse to a count. Only then do whole rule lines drop from the
+    bottom, with a count and headings. The final all-zero last resort may drop
+    fresh text too. Normally at most two exceptions per account print."""
     from khipu import agent_view, routing as r
 
     now = now.astimezone(timezone.utc)
@@ -457,8 +487,9 @@ def _fitted(view: dict, now: datetime, conversation: dict, readings: dict, r) ->
     rules = _rules(view)
     text = ""
     # Exceptions, then roles, shorten first (all rules kept), then whole rule
-    # lines go from the bottom, then roles and exceptions go, then the
-    # account lines themselves tighten.
+    # lines go from the bottom with fresh exceptions at their floor. Only the
+    # all-zero last resort drops fresh words; account tightening also respects
+    # the floor on every other step.
     tries = ([(len(rules), w) for w in _WIDTHS[:-1]]
              + [(k, _WIDTHS[-2]) for k in range(len(rules) - 1, -1, -1)] + [(0, _WIDTHS[-1])])
     for account_width in (0, 400, 280, 200, 140):
@@ -493,7 +524,8 @@ def facts(view: dict, now: datetime) -> dict:
     keys, in the owner's order then the rest), each account's status word,
     the owner's confirmed rules whole, and the owner's words and settings
     on each account (role, exceptions, holds, caps as set, plan terms,
-    provider facts). Readings are not in it."""
+    provider facts), plus which exception currently has the fresh floor.
+    Readings are not in it."""
     from khipu import routing as r
 
     now = now.astimezone(timezone.utc)
@@ -511,9 +543,11 @@ def facts(view: dict, now: datetime) -> dict:
         status = _status(entry, provider, _windows(entry, now, r), mine, last, (0, 0, 0), now, r)
         exceptions = [{k: x.get(k) for k in ("id", "text", "until")} for x in (item or {}).get("exceptions") or []
                       if (r._parse(x.get("until")) or now) > now]
+        fresh = _fresh_exception(_live_exceptions(item, now, r), now, r)
         accounts.append({"key": entry["key"], "ordered": item is not None, "word": _word(status),
                          "same_as": sorted(entry.get("_same_account_peers") or []),
                          "role": (item or {}).get("role"), "exceptions": exceptions,
+                         "fresh_exception": fresh.get("id") if fresh else None,
                          "caps": entry.get("caps") or [], "terms": entry.get("terms") or {},
                          "provider": {k: provider.get(k) for k in ("use", "models_allowed")}})
     # The limit is part of what a conversation was sent: a new limit puts back
