@@ -6,6 +6,8 @@ import os
 import time
 from pathlib import Path
 
+from khipu.storage import _purgeable_free as _REAL_PURGEABLE  # before the autouse stub
+
 import pytest
 
 from khipu import hub_snapshot as hs
@@ -326,6 +328,28 @@ def test_a_percent_threshold_counts_on_a_small_disk(data_dir, monkeypatch):
     monkeypatch.setattr(storage.shutil, "disk_usage", _usage(15, total_gb=1000))
 
     assert storage.disk_space()["level"] == "red"
+
+
+def test_purgeable_space_counts_as_free(data_dir, monkeypatch):
+    """macOS keeps snapshots and caches as purgeable: 40 GB plainly free on a
+    1.8 TB disk is 2.2%, yet 460 GB is there for a write (2026-11-12)."""
+    from khipu import storage
+
+    monkeypatch.setattr(storage.shutil, "disk_usage", _usage(30, total_gb=1800))
+    assert storage.disk_space()["level"] == "red"
+    monkeypatch.setattr(storage, "_purgeable_free", lambda path: int(460e9))
+    out = storage.disk_space()
+    assert out["level"] == "ok" and out["volumes"][0]["free_bytes"] == int(460e9)
+
+
+def test_the_purgeable_reader_answers_on_this_mac_or_stays_out():
+    import sys
+
+    from khipu.storage import _purgeable_free as stubbed  # the autouse stub
+
+    assert stubbed(Path("/")) is None
+    real = _REAL_PURGEABLE(Path("/"))
+    assert (real is None) if sys.platform != "darwin" else (real is None or real > 0)
 
 
 
