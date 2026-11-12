@@ -13,7 +13,7 @@ python3 -m khipu <command>
 
 Most commands need the Python dependencies on `PYTHONPATH` first; [packages/cli/README.md](../packages/cli/README.md) shows the one-time setup. To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
 
-There are 59 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
+There are 60 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
 
 ## Health and status
 
@@ -22,6 +22,7 @@ There are 59 top-level commands; the reference below includes storage, ledger, w
 | `storage` | Free disk space and the locations and sizes of Khipu's local stores, as JSON. |
 | `status` | Row counts in Postgres. `--sample N` (default 0, which skips the file walk), `--drift` adds drift samples. |
 | `doctor` | The single health command. Exits 0 only when `ok` is true, otherwise 2. |
+| `rules show` | For each app Khipu knows: the rule files it reads (path, size, whether a Khipu block is in it), the hooks it has wired and whether each is Khipu's, and its size cap where it has one. Read-only; `--json` for the same as data. |
 | `activity` | Recent capture episodes. `--limit`, `--show ID`. |
 | `health` | The five checks the app shows (saving, finding, routing, database, jobs) as plain rows, with a line each for what Khipu is doing and what you do. A view over `doctor`; `--json` is the only form, and it exits 0 whatever the checks say. Also shares this Mac's status row through the hub. |
 | `macs` | One status row per Mac, shared through the hub: this Mac live, every other Mac as last reported (marked stale after 15 minutes). A Mac on an older build, a hub that is down or a missing table gives this Mac only, with a note. `--json` is the only form. |

@@ -313,3 +313,23 @@ def test_missing_files_never_raise_a_doctor_warning(home):
 def test_malformed_large_marker_version_is_reported(home):
     put(home, ".codex/AGENTS.md", "<!-- khipu: rules v" + "1" * 5000 + ", edit in Khipu -->\n<!-- khipu: end -->")
     assert integ.rules_status("codex")["files"][0]["reason"] == "malformed Khipu rules block"
+
+
+@pytest.mark.parametrize("command", [
+    "TOKEN=abc123 /tmp/x/packages/cli/bin/khipu-stop-hook",
+    "curl -H 'Authorization: Bearer SECRET' https://x /tmp/x/packages/cli/bin/khipu-stop-hook",
+    "rm -rf /tmp/x/packages/cli/bin/khipu-stop-hook",
+    "/bin/rm /tmp/x/packages/cli/bin/khipu-stop-hook",
+    "/usr/bin/curl -d @/etc/passwd /tmp/x/packages/cli/bin/khipu-stop-hook",
+])
+def test_a_command_that_only_ends_in_a_launcher_is_not_khipus(command):
+    name, path, ours = integ._hook_identity(command)
+    assert not ours
+    assert "abc123" not in f"{name} {path}" and "SECRET" not in f"{name} {path}"
+    assert path != command
+
+
+def test_a_bare_launcher_path_with_a_space_is_khipus():
+    command = "/Volumes/Cloud Storage/Code/Khipu/packages/cli/bin/khipu-stop-hook"
+    assert integ._hook_identity(command) == ("khipu-stop-hook", command, True)
+

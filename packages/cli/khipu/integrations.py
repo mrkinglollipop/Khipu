@@ -161,8 +161,12 @@ def _hook_identity(command: Any) -> tuple[str, str | None, bool]:
         return "non-command hook", None, False
     # A bare launcher path is ours even when it has a space in it (a checkout on
     # "/Volumes/Cloud Storage"): match the whole command before splitting it.
+    # Only a bare path qualifies: no assignment, quote or second word that starts
+    # an option or another path, so a foreign command that merely ends in a
+    # launcher's name is never ours and never comes back whole.
     whole = command.strip()
-    if any(_launcher_path_is_legacy(whole, launcher) for launcher in _RULE_LAUNCHERS):
+    bare = (whole.startswith(("/", "~/")) and "=" not in whole and not re.search(r"""['"`$;|&<>\n]|\s[-/~]""", whole))
+    if bare and any(_launcher_path_is_legacy(whole, launcher) for launcher in _RULE_LAUNCHERS):
         return Path(whole).name, whole, True
     try:
         argv = shlex.split(command)
