@@ -2999,6 +2999,38 @@ TOOL_FUNCS = {
 _LOCAL_ONLY = frozenset({"khipu_owner_act", "khipu_needs_you"})
 
 
+def _gateway_allowed_tools() -> frozenset[str] | None:
+    """Current label's callable tools; None preserves an unconfigured client.
+
+    Read at each message, so listing never grants a later call authority.
+    Malformed policy denies all gateway tools, without echoing configuration.
+    """
+    from khipu.request_context import gateway_label
+
+    raw = os.environ.get("KHIPU_GATEWAY_TOOLS", "").strip()
+    if not raw:
+        return None
+    policy: dict[str, set[str]] = {}
+    for entry in raw.split(";"):
+        label, sep, names = entry.strip().partition(":")
+        label = label.strip()
+        tools = {name.strip() for name in names.split("|")} if names.strip() else set()
+        if (not sep or not re.fullmatch(r"[^:;|,\s]+", label) or label in policy
+                or ("*" in tools and tools != {"*"})
+                or any(name != "*" and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+                       for name in tools)):
+            return frozenset()
+        policy[label] = tools
+    label = gateway_label()
+    if label is None:
+        return frozenset()
+    if label not in policy:
+        return None
+    allowed = policy[label]
+    return frozenset(t["name"] for t in TOOLS if t["name"] not in _LOCAL_ONLY
+                     and ("*" in allowed or t["name"] in allowed))
+
+
 def _result(req_id, payload: dict) -> dict:
     return {"jsonrpc": "2.0", "id": req_id, "result": payload}
 
@@ -3208,11 +3240,22 @@ def _dispatch_message(msg: dict) -> dict | None:
         return _result(req_id, {})
     if method == "tools/list":
         if _via_https_gateway():
-            return _result(req_id, {"tools": [t for t in TOOLS if t["name"] not in _LOCAL_ONLY]})
+            allowed = _gateway_allowed_tools()
+            return _result(req_id, {"tools": [t for t in TOOLS if t["name"] not in _LOCAL_ONLY
+                                             and (allowed is None or t["name"] in allowed)]})
         return _result(req_id, {"tools": TOOLS})
     if method == "tools/call":
         params = msg.get("params") or {}
         name = params.get("name")
+        if _via_https_gateway():
+            allowed = _gateway_allowed_tools()
+            if allowed is not None and name not in allowed:
+                from khipu.request_context import gateway_label
+
+                print("[khipu-gateway] tool_refused label=" + json.dumps(gateway_label())
+                      + " tool=" + json.dumps(name), file=sys.stderr, flush=True)
+                return _result(req_id, _tool_text({"error": "Tool is not available through this gateway."},
+                                                 is_error=True))
         func = TOOL_FUNCS.get(name)
         if func is None:
             return _error(req_id, -32602, f"unknown tool: {name}")

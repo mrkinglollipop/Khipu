@@ -90,6 +90,20 @@ What it is:
 - A small Python server (standard library `ThreadingHTTPServer`). MCP Streamable HTTP is `POST /mcp`. `GET /healthz` is unauthenticated and answers only `{"ok": true}` to the public. Callers on loopback and bearer-token holders also get the server version and build stamp.
 - It binds `127.0.0.1:8787` by default (`KHIPU_GATEWAY_BIND` or `--bind`). Put a TLS-terminating reverse proxy (Caddy or nginx, with a real certificate) in front of it.
 - It refuses to start unless `KHIPU_GATEWAY_TOKEN` is set and at least 24 characters. Extra labelled tokens: `KHIPU_GATEWAY_TOKENS=label:token,...`.
+- Optional per-label tool scope: `KHIPU_GATEWAY_TOOLS='grokbot:khipu_search|khipu_get|khipu_capture;default:*'`.
+  This uses semicolons between labels and pipes between tool names, unlike
+  the comma-separated tokens setting. The primary token's label is `default`.
+  A configured label can list and call only its named tools; `label:` denies
+  all tools, and `label:*` allows the existing gateway tools. Local-only tools
+  remain unavailable, even when named explicitly or covered by `*`. Unknown
+  tool names grant nothing. Labels omitted from this setting, or all labels
+  when it is unset or empty, retain their existing behavior. Labels are exact
+  and cannot contain whitespace, colons, semicolons, pipes or commas.
+  Duplicate labels or malformed entries deny every gateway tool until the
+  setting is corrected. Each list and call reads the setting again; calls
+  do not gain authority from an earlier list. Refusals use fixed error text
+  and log only the label and requested tool name, never arguments or tokens.
+  Local stdio is unaffected.
 - Limits: 1 MiB request body, 120 requests a minute per IP, 240 a minute per token, 10 failed auths a minute, 32 calls per JSON-RPC batch (`KHIPU_GATEWAY_MAX_BATCH`). Browser requests with an `Origin` are refused unless listed in `KHIPU_GATEWAY_ALLOWED_ORIGINS`.
 - It advertises 20 tools; the local-only `khipu_owner_act` is omitted. `khipu_usage` and routing write/advice tools (`khipu_route_advise`, `khipu_route_report`, `khipu_route_rule`, `khipu_route_priority`) answer `available: false` through it. `khipu_route` serves the owner-enabled published cloud routing copy, with a hub timestamp, stale status and persistent pull receipts. `khipu_forget` refuses an episode unless the calling token captured it itself: an episode with no known owner, one captured on a Mac, and one captured by another gateway token are all refused. (A hub without the origin column falls back to refusing session ids that start with a local harness name: `claude_code`, `cursor`, `codex`, `aegis` or `grok_build`.) Capture is accepted only in `hub` mode. See [mcp-tools.md](mcp-tools.md).
 - For library search the gateway host also needs the embedding key of every enabled library profile. A missing key drops that library's meaning leg and reports `degraded_legs`. It does not fail the search.
