@@ -197,6 +197,8 @@ class Cursor:
         assert sql.lstrip().upper().startswith(("SELECT","SET TRANSACTION READ ONLY"))
         self.sql=sql
     def fetchone(self):
+        if "wiki_holds" in self.sql:
+            return ("wiki_holds",) if self.migrated else (None,)
         if "to_regclass" in self.sql:
             return ("wiki_queue", "wiki_slugs") if self.migrated else (None, None)
         return (0,)
@@ -240,7 +242,7 @@ def test_draft_artifacts_exact_old_no_transcript_no_page_or_queue_writes(tmp_pat
     seen=[]
     def provider(prompt,**kwargs):
         seen.append(prompt)
-        return json.dumps({"page":NEW.replace(TODAY,datetime.now(timezone.utc).date().isoformat())})
+        return NEW.replace(TODAY,datetime.now(timezone.utc).date().isoformat())
     monkeypatch.setattr(extract,"generate_wiki",provider)
     before=snapshot(memory)
     out=wiki.draft(sample=1,model_id="fake",out=tmp_path/"output")
@@ -309,9 +311,10 @@ def test_draft_reports_missing_source_and_continues(tmp_path,monkeypatch):
     source=tmp_path/"other.md"
     source.write_text(OLD.replace("khipu","other"))
     monkeypatch.setattr(wiki,"load_inputs",lambda **k:(eps,[page(),page("other",source_path=str(source))],{},[],0))
-    monkeypatch.setattr(extract,"generate_wiki",lambda *a,**k:json.dumps({"page":NEW.replace("khipu","other").replace("Sources: 1","Sources: 2").replace(TODAY,datetime.now(timezone.utc).date().isoformat())}))
+    monkeypatch.setattr(extract,"generate_wiki",lambda *a,**k:NEW.replace("khipu","other").replace("Sources: 1","Sources: 2").replace(TODAY,datetime.now(timezone.utc).date().isoformat()))
     out=wiki.draft(sample=2,out=tmp_path/"output")
-    assert out["drafts"][0]["reason"] == "source file unavailable; cannot validate frontmatter"
+    assert out["drafts"][0]["reason"] == "source"
+    assert out["drafts"][0]["error"] == "ValueError"
     assert len(out["drafts"]) == 2 and out["drafts"][1]["passed"]
 
 
@@ -411,6 +414,7 @@ def test_plan_shows_would_ask_and_stored_decisions_without_provider_or_writes(mo
     eps=[episode(i,topics=["novel","known"]) for i in range(1,4)]
     decisions={"known":{"decision":"tag"}}
     monkeypatch.setattr(wiki,"load_inputs",lambda **k:(eps,[],decisions,[],4))
+    monkeypatch.setattr(wiki,"_hold_rows",lambda **k:[])
     monkeypatch.setattr(extract,"generate_wiki",lambda *a,**k:pytest.fail("plan provider"))
     out=wiki.plan()
     assert [c["slug"] for c in out["slug_candidates"]]==["novel"]
@@ -440,7 +444,7 @@ def test_input_query_excludes_recent_delegated_deleted_but_keeps_waiting_queued(
     # 7 still waits and is loaded whatever its age; 8 is written and is not pulled back in
     assert params==(8,[7])
     assert "AND e.parent_session_id IS NULL AND e.deleted_at IS NULL)" in sql
-    assert "OR e.id = ANY(%s)" in sql
+    assert "OR (e.id = ANY(%s) AND e.deleted_at IS NULL)" in sql
     assert all("embedding" not in s and "has_vector" not in s for s,p in cur.statements)
 
 
@@ -458,6 +462,7 @@ def test_plain_plan_has_candidates_decisions_counts_without_vector_fields(monkey
     eps=[episode(i,topics=["novel","alias"]) for i in range(1,4)]
     decisions={"alias":{"decision":"alias","target":"khipu"}}
     monkeypatch.setattr(wiki,"load_inputs",lambda **k:(eps,[page()],decisions,[],9))
+    monkeypatch.setattr(wiki,"_hold_rows",lambda **k:[])
     assert cli.main(["wiki","plan"])==0
     text=capsys.readouterr().out
     assert "9 delegated episodes excluded" in text and "Would ask: novel" in text
@@ -487,3 +492,115 @@ def test_a_page_gets_one_write_a_run_oldest_first_and_the_rest_waits(monkeypatch
     assert out["calls_waiting"] == 4
     # every pair is still assigned, so the caller queues what was not written
     assert sum(r["slug"] == "khipu" for r in out["assignments"]) == 5
+
+
+@pytest.mark.parametrize("old,new", [
+    ("# Khipu\nKeep /tmp/wiki 60.\n", "# Khipu\nKeep /tmp/wiki 60.\nSources: 1\n"),
+    ("---\nstatus: seed\n# Khipu\nKeep 60.\n", "---\nstatus: seed\n# Khipu\nKeep 60.\nSources: 1\n"),
+    ("status: stub\nlast_updated: 2020-01-01\n# Khipu\nKeep 60.\n", "status: stub\nlast_updated: 2026-11-12\n# Khipu\nKeep 60.\nSources: 1\n"),
+    ("status: seedling\nlast_updated: 2020-01-01\n# Khipu\nKeep 60.\n", "status: seedling\nlast_updated: 2020-01-01\n# Khipu\nKeep 60.\nSources: 1\n"),
+    (OLD.replace("last_updated: 2026-10-01",'last_updated: "2026-10-01"'), NEW.replace(f"last_updated: {TODAY}",f'last_updated: "{TODAY}"')),
+    (OLD.replace("last_updated: 2026-10-01\n", ""), NEW),
+    ("<!-- prefix -->\n"+OLD, "<!-- prefix -->\n"+NEW),
+    (OLD.replace("status: seed", "status: seedling"), NEW.replace("status: active", "status: seedling")),
+    (OLD.replace("status: seed", "status: stub"), NEW.replace("status: active", "status: stub")),
+    (OLD.replace("status: seed", "status: seed  "), NEW.replace("status: active", "status: seed  ")),
+    (OLD.replace("pages.", "pages.  "), NEW),
+    (OLD+"Sources: 7, 8\n", NEW.replace("Sources: 1", "Sources: 1, 7, 8")),
+    (OLD+"- Keep 123 apples.\n", NEW+"Was Keep 123 apples. until 2026-11-12\n"),
+    (OLD+"1. Keep 123 apples.\n", NEW+"Was Keep 123 apples. until 2026-11-12\n"),
+    ("# Khipu\nKeep /tmp/wiki 60.\n", "# Khipu\nKeep /tmp/wiki 60.\nNew: useful prose.\nSources: 1\n"),
+])
+def test_permitted_legacy_shapes(old,new):
+    checks=wiki.check_draft("khipu",old,new,["1"],today=TODAY)
+    assert checks["passed"], checks
+    assert not wiki.check_draft("khipu",old,new.replace("60", "61"),["1"],today=TODAY)["passed"]
+
+
+@pytest.mark.parametrize("old,new", [
+    ("# Khipu\nKeep 60.\n", "---\nlast_updated: 2026-11-12\n---\n# Khipu\nKeep 60.\nSources: 1\n"),
+    ("# Khipu\nKeep 60.\n", "last_updated: 2026-11-12\n# Khipu\nKeep 60.\nSources: 1\n"),
+    ("---\nstatus: seed\n# Khipu\nKeep 60.\n", "---\nstatus: seed\n---\n# Khipu\nKeep 60.\nSources: 1\n"),
+    ("status: seed\n# Khipu\nKeep 60.\n", "status: active\n# Khipu\nKeep 60.\nSources: 1\n"),
+    ("status: stub\n# Khipu\nKeep 60.\n", "status: active\n# Khipu\nKeep 60.\nSources: 1\n"),
+    ("status: seedling\n# Khipu\nKeep 60.\n", "status: active\n# Khipu\nKeep 60.\nSources: 1\n"),
+    ("last_updated: 2020-01-01\nlast_updated: 2021-01-01\n# Khipu\nKeep 60.\n", "last_updated: 2026-11-12\nlast_updated: 2021-01-01\n# Khipu\nKeep 60.\nSources: 1\n"),
+    ("# Khipu\nlast_updated: 2020-01-01\nKeep 60.\n", "# Khipu\nlast_updated: 2026-11-12\nKeep 60.\nSources: 1\n"),
+    ("<!-- prefix -->\n"+OLD, NEW),
+    (OLD.replace("status: seed", "status: archived"), NEW),
+    (OLD+"Sources: 77\n", NEW+"77 appears elsewhere.\n"),
+    (OLD, NEW.replace("Lives at /tmp/khipu with 60 pages.","Lives at /tmp/khipu with 61 pages.")),
+    (OLD, NEW.replace("Lives at /tmp/khipu with 60 pages.","")),
+    (OLD, "# Changed first line\n"+NEW),
+    (OLD, NEW.replace(f"last_updated: {TODAY}", f"last_updated: {TODAY}\nlast_updated: {TODAY}")),
+])
+def test_refused_legacy_shapes(old,new):
+    assert not wiki.check_draft("khipu",old,new,["1"],today=TODAY)["passed"]
+
+
+def test_archived_prefix_shape_ineligible_even_with_active_catalog_status():
+    archived="<!-- prefix -->\n"+OLD.replace("status: seed","status: archived")
+    assert not assign([episode()],[page(body=archived,status="active")])["pages"]
+    assert not assign([episode()],[page(status="archived")])["pages"]
+
+
+@pytest.mark.parametrize("wrapper", [lambda s:s, lambda s:"```json\n"+s+"\n```", lambda s:"Classification follows.\n"+s+"\nDone."])
+def test_gate_accepts_one_object_wrapped_or_bare(wrapper):
+    candidates=[{"slug":"novel"}]
+    assert wiki.decide_slugs(candidates,[],generate=lambda p:wrapper('{"novel":{"decision":"tag"}}')) == {"novel":{"decision":"tag"}}
+    assert wiki.decide_slugs(candidates,[],generate=lambda p:'{"novel":{"decision":"tag"}} {}') == {}
+
+
+def test_reply_fence_strips_only_whole_reply_and_keeps_internal_fences():
+    inner="# Khipu\n```python\nanswer = 60\n```\nSources: 1"
+    assert wiki._strip_reply_fence("```markdown\n"+inner+"\n```")==inner
+    assert wiki._strip_reply_fence(inner)==inner
+    assert wiki._strip_reply_fence("Comment\n```markdown\n"+inner+"\n```").startswith("Comment")
+
+
+def test_narrow_line_repair_preserves_digits_and_rechecks_every_check():
+    old=OLD+"The nightly wiki call budget is 60 pages every day.\n"
+    good=NEW+"The nightly wiki call budget is 60 pages each day.\n"
+    repaired,count=wiki.repair_draft(old,good)
+    assert count==1 and old.splitlines()[-1] in repaired.splitlines()
+    assert wiki.check_draft("khipu",old,repaired,["1"],today=TODAY)["passed"]
+    for bad in (good.replace("60 pages each", "61 pages each"), NEW+"A completely different 60 fact.\n", NEW):
+        repaired,count=wiki.repair_draft(old,bad)
+        assert count==0 and not wiki.check_draft("khipu",old,repaired,["1"],today=TODAY)["passed"]
+    bad=good.replace("Sources: 1", "Sources: 9")
+    repaired,count=wiki.repair_draft(old,bad)
+    assert count==1 and not wiki.check_draft("khipu",old,repaired,["1"],today=TODAY)["passed"]
+
+
+def test_best_repair_match_with_changed_number_never_uses_second_choice():
+    line="The nightly wiki call budget is 60 pages every day."
+    old=OLD+line+"\n"
+    draft=NEW+line.replace("60", "61")+"\n"+line.replace("every day", "each day")+"\n"
+    assert wiki.repair_draft(old,draft)==(draft,0)
+
+
+def test_writer_prompt_contract_budget_and_seed_title():
+    prompt=wiki._rewrite_prompt("khipu",OLD,"episode",TODAY)
+    assert "whole Markdown" in prompt and "without JSON" in prompt
+    assert "dated and arrive oldest first" in prompt and "Earlier episodes do not override" in prompt
+    assert "body-only" in prompt and "all other bare metadata exactly" in prompt
+    assert '"old_page"' in prompt and '"episodes"' in prompt
+    assert "title: New Wiki Page\nslug: new-wiki-page\nstatus: seed\nlast_updated:" in wiki._seed("new-wiki-page",TODAY)
+    assert wiki._writer_options(OLD)["max_output_tokens"]>=4096
+    assert wiki._writer_options("a"*20000)["max_output_tokens"]>=6500
+    assert wiki._writer_options(OLD)["timeout"]==180
+
+
+def test_plan_reports_holds_without_queue_or_provider_writes(monkeypatch):
+    monkeypatch.setattr(wiki,"load_inputs",lambda **k:([episode()],[page()],{},[],0))
+    holds=[{"slug":"khipu","reason":"checks","until_at":(NOW+timedelta(days=1)).isoformat()}]
+    monkeypatch.setattr(wiki,"_hold_rows",lambda **k:holds)
+    out=wiki.plan()
+    assert out["holds"]==holds and not out["pages"] and out["planned_calls"]==0
+
+
+def test_deleted_assignment_never_drains_and_unqueued_delegated_excluded():
+    queue=[{"slug":"khipu","episode_id":"1","queued_at":NOW,"done_at":None}]
+    assert not assign([episode(deleted_at=NOW)],queue=queue)["pages"]
+    assert not assign([episode(parent_session_id="parent")])["pages"]
+    assert assign([episode(parent_session_id="parent")],queue=queue)["pages"]

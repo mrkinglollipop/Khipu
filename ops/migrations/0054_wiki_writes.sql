@@ -15,7 +15,8 @@ CREATE INDEX IF NOT EXISTS idx_wiki_writes_slug ON wiki_writes (slug, id DESC);
 CREATE INDEX IF NOT EXISTS idx_wiki_writes_run ON wiki_writes (run_id);
 CREATE TABLE IF NOT EXISTS wiki_holds (
     slug TEXT PRIMARY KEY,
-    until_at TIMESTAMPTZ NOT NULL
+    until_at TIMESTAMPTZ NOT NULL,
+    reason TEXT
 );
 INSERT INTO schema_migrations (version, note)
 VALUES ('0054_wiki_writes', 'Exact nightly wiki undo provenance and expiring holds')

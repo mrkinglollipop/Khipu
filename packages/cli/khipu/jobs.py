@@ -740,13 +740,14 @@ def _drain_sessions() -> dict[str, Any]:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def _wiki_update(*, force: bool = False, max_pages: int = 60, since: int = 8, allow_open: bool = True) -> dict[str, Any]:
+def _wiki_update(*, force: bool = False, max_pages: int = 60, since: int = 8, allow_open: bool = True, time_budget_s: float | None = None) -> dict[str, Any]:
     """Isolate wiki failures; the outside consolidation must always run."""
     try:
         from khipu import wiki_nightly
         if not force and not wiki_nightly.enabled():
             return {"ok": True, "skipped": "wiki_nightly is off"}
-        result = wiki_nightly.run(max_pages=max_pages, since=since, allow_open=allow_open)
+        result = wiki_nightly.run(max_pages=max_pages, since=since, allow_open=allow_open,
+                                  **({"time_budget_s": time_budget_s} if time_budget_s is not None else {}))
     except Exception as exc:
         result = {"ok": False, "error": type(exc).__name__}
     try:
@@ -786,7 +787,9 @@ def run_wiki(*, max_pages: int = 60, since: int = 8, undo: dict | None = None, p
                 return {"ok": True, "skipped": "wiki interval is not due"}
         if undo is not None:
             return wiki_nightly.undo(**undo)
-        result = _wiki_update(force=True, max_pages=max_pages, since=since, allow_open=not periodic)
+        result = _wiki_update(force=True, max_pages=min(max_pages, 6) if periodic else max_pages,
+                              since=since, allow_open=not periodic,
+                              **({"time_budget_s": 180} if periodic else {}))
         if not result.get("skipped"):
             # Preserve all other step receipts for the doctor/app readers.
             previous = nightly_last() or {}

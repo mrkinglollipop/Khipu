@@ -17,10 +17,11 @@ OLD = b'---\r\nslug: khipu\r\nstatus: seed\r\nlast_updated: 2026-10-01\r\ncustom
 
 class FakeHub:
     def __init__(self):
-        self.state = {"queue": {}, "topics": {}, "revisions": [], "writes": [], "holds": {}, "decisions": {}}
+        self.state = {"queue": {}, "topics": {}, "revisions": [], "writes": [], "holds": {}, "hold_reasons": {}, "decisions": {}}
         self.now = NOW
         self.events = []
         self.fail_save = False
+        self.deleted_ids = set()
 
     def revision(self, slug, body, source, digest):
         row = {"id": len(self.state["revisions"])+1, "slug": slug, "body": body,
@@ -68,17 +69,23 @@ class FakeCursor:
         self.result = []
         if s.startswith("INSERT INTO wiki_slugs"):
             slug, decision, target = params
-            d["decisions"].setdefault(slug, {"decision":decision, **({"target":target} if target else {})})
+            entry = {"decision":decision, **({"target":target} if target else {})}
+            if "DO UPDATE" in s: d["decisions"][slug] = entry
+            else: d["decisions"].setdefault(slug, entry)
+        elif s.startswith("DELETE FROM wiki_slugs"):
+            d["decisions"].pop(params[0], None)
         elif s.startswith("INSERT INTO wiki_queue"):
-            slug, eid = params
+            slug, eid, *done = params
             key = (slug, str(eid))
             if key not in d["queue"]:
-                d["queue"][key] = {"slug": slug, "episode_id": str(eid), "queued_at": self.db.now, "done_at": None}
+                d["queue"][key] = {"slug": slug, "episode_id": str(eid), "queued_at": self.db.now, "done_at": done[0] if done else None}
             elif "DO UPDATE" in s:
-                d["queue"][key]["done_at"] = None
+                d["queue"][key]["done_at"] = done[0] if done else None
         elif s.startswith("SELECT 1 FROM wiki_holds"):
             if d["holds"].get(params[0], NOW-timedelta(days=1)) > self.db.now:
                 self.result = [(1,)]
+        elif s.startswith("SELECT slug,until_at,reason FROM wiki_holds"):
+            self.result = [(slug, until, d["hold_reasons"].get(slug)) for slug, until in d["holds"].items() if until > self.db.now]
         elif s.startswith("SELECT slug FROM wiki_holds"):
             self.result = [(slug,) for slug,until in d["holds"].items() if until > self.db.now]
         elif s.startswith("SELECT 1 FROM topic_revisions"):
@@ -96,6 +103,14 @@ class FakeCursor:
                 raise RuntimeError("fake persistence failed")
             keys = ("run_id", "slug", "before_bytes", "after_hash", "revision_id", "episode_ids")
             d["writes"].append({"id": len(d["writes"])+1, "at": self.db.now, "undone": False, **dict(zip(keys,params))})
+        elif s.startswith("UPDATE wiki_queue q SET done_at=now() FROM episodes"):
+            for row in d["queue"].values():
+                if not row["done_at"] and str(row["episode_id"]) in self.db.deleted_ids:
+                    row["done_at"] = self.db.now
+                    self.result.append((row["episode_id"],))
+        elif s.startswith("UPDATE wiki_queue SET done_at=now() WHERE slug=%s AND done_at IS NULL"):
+            for row in d["queue"].values():
+                if row["slug"] == params[0] and not row["done_at"]: row["done_at"] = self.db.now
         elif s.startswith("UPDATE wiki_queue"):
             slug, ids = params
             for eid in ids:
@@ -131,7 +146,13 @@ class FakeCursor:
                 if row["id"] in params[0]:
                     row["undone"] = True
         elif s.startswith("INSERT INTO wiki_holds"):
-            d["holds"][params[0]] = self.db.now+timedelta(days=7)
+            slug = params[0]
+            until = params[1] if len(params) > 1 else self.db.now+timedelta(days=7)
+            reason = params[2] if len(params) > 1 else "undo"
+            if until > d["holds"].get(slug, self.db.now-timedelta(days=1)):
+                d["holds"][slug] = until
+                d["hold_reasons"][slug] = reason
+            self.result = [(d["holds"][slug], d["hold_reasons"][slug])]
         else:
             raise AssertionError("unhandled SQL: " + s)
 
@@ -165,7 +186,7 @@ def live(tmp_path, monkeypatch):
             db.upsert(None, mirror.parse_topic_file(p), str(p), source="reconcile", note="fake reconcile")
     monkeypatch.setattr(mirror, "reconcile_memory_root", reconcile)
     def inputs(**kwargs):
-        return episodes, list(db.state["topics"].values()), dict(db.state["decisions"]), list(db.state["queue"].values()), 0
+        return [e for e in episodes if not e.get("deleted_at")], list(db.state["topics"].values()), dict(db.state["decisions"]), list(db.state["queue"].values()), 0
     monkeypatch.setattr(wiki, "load_inputs", inputs)
     prompts = []
     def provider(prompt, **kwargs):
@@ -180,7 +201,7 @@ def live(tmp_path, monkeypatch):
         import re
         new = re.sub(r"last_updated: \d{4}-\d{2}-\d{2}", "last_updated: "+__import__("re").search(r"except last_updated: (\d{4}-\d{2}-\d{2})", prompt).group(1), new)
         ids = [str(json.loads(line)["episode_id"]) for line in data["episodes"].splitlines()]
-        return json.dumps({"page": new+"Sources: "+", ".join(ids)+"\n"})
+        return new+"Sources: "+", ".join(ids)+"\n"
     monkeypatch.setattr(extract, "generate_wiki", provider)
     return {"db": db, "root": root, "path": path, "episodes": episodes, "prompts": prompts, "provider": provider}
 
@@ -212,7 +233,7 @@ def test_obsidian_edit_is_reconciled_and_used_as_source(live):
 
 
 def test_failed_checks_leave_exact_file_and_waiting_queue(live, monkeypatch):
-    monkeypatch.setattr(extract, "generate_wiki", lambda *a,**k: json.dumps({"page":"bad"}))
+    monkeypatch.setattr(extract, "generate_wiki", lambda *a,**k: "bad")
     out = wiki.run(now=NOW)
     assert live["path"].read_bytes() == OLD
     assert out["rewrites_refused"] == 1 and out["queue_remaining"] == 1
@@ -239,7 +260,7 @@ def test_provider_edit_race_refuses_save(live, monkeypatch):
     monkeypatch.setattr(extract,"generate_wiki",race)
     out = wiki.run(now=NOW)
     assert live["path"].read_bytes() == edited and out["queue_remaining"] == 1
-    assert out["failures"][0]["reason"] == "page edited during provider call"
+    assert out["failures"][0]["reason"] == "save"
 
 
 def test_manual_and_scheduled_calls_share_daily_ceiling(live, capsys):
@@ -322,7 +343,7 @@ def test_new_pages_open_at_most_ten_then_undo_moves_not_deletes(live):
     opened = live["root"]/"topics"/"new-0.md"
     exact = opened.read_bytes()
     result = wiki.undo(run_id=out["run_id"])
-    assert result["ok"] and result["pages_retired"] == 10 and result["episodes_requeued"] == 30
+    assert result["ok"] and result["pages_retired"] == 10 and result["episodes_requeued"] == 0
     assert not opened.exists()
     assert next((live["root"]/"topics"/"_retired").glob("new-0-*.md")).read_bytes() == exact
     assert live["db"].state["topics"]["new-0"]["deleted_at"] == NOW
@@ -463,7 +484,7 @@ def test_provider_failure_keeps_page_and_queue_then_continues_next_page(live, mo
     assert out["rewrites_refused"] == 1 and out["calls_used"] == 2
     assert out["queue_remaining"] == 1 and live["path"].read_bytes() == OLD
     assert live["db"].state["queue"][("khipu","1")]["done_at"] is None
-    assert out["failures"] == [{"slug":"khipu","stage":"provider","reason":"RuntimeError"}]
+    assert out["failures"] == [{"slug":"khipu","stage":"provider","reason":"provider","error":"RuntimeError"}]
 
 
 def test_opening_limit_is_per_run_with_shared_daily_call_ceiling(live):
@@ -493,6 +514,7 @@ def test_pending_new_page_survives_original_opening_window(live):
 def test_migration_exact_source_provenance_is_additive_and_not_applied():
     from khipu.migrate import available
     sql = dict(available())["0054_wiki_writes"].read_text()
+    assert "reason TEXT" in sql
     assert "before_bytes BYTEA" in sql and "episode_ids BIGINT[]" in sql
     assert "REFERENCES topic_revisions(id)" in sql and "wiki_holds" in sql
     assert "lock_timeout = '5s'" in sql
@@ -561,7 +583,7 @@ def test_failed_oldest_batch_defers_later_batches_for_page_but_continues_other(l
     def generate(prompt,**kw):
         data=json.loads(prompt.split("\n",1)[1])
         seen.append((data["slug"],[json.loads(l)["episode_id"] for l in data["episodes"].splitlines()]))
-        if data["slug"]=="khipu": return '{"page":"bad"}'
+        if data["slug"]=="khipu": return "bad"
         return provider(prompt,**kw)
     monkeypatch.setattr(extract,"generate_wiki",generate)
     out=wiki.run(now=NOW)
@@ -583,10 +605,157 @@ def test_gate_failure_is_abstention_and_existing_page_still_writes(live,monkeypa
     assert not live["db"].state["decisions"] and not out["failures"]
 
 
-def test_queued_delegated_deleted_history_still_drains_and_alias_queue_completes(live):
-    live["episodes"][0].update(parent_session_id="parent",deleted_at=NOW,topics=["old-name"],ts=NOW-timedelta(days=20))
+def test_nondeleted_queued_delegated_history_still_drains_and_alias_queue_completes(live):
+    live["episodes"][0].update(parent_session_id="parent",topics=["old-name"],ts=NOW-timedelta(days=20))
     live["db"].state["decisions"]["old-name"]={"decision":"alias","target":"khipu"}
     live["db"].state["queue"][("old-name","1")]={"slug":"old-name","episode_id":"1","queued_at":NOW-timedelta(days=9),"done_at":None}
     out=wiki.run(now=NOW)
     assert out["ok"] and out["pages_revised"]==1 and out["episodes_absorbed"]==1
     assert out["queue_remaining"]==0 and live["db"].state["queue"][("old-name","1")]["done_at"]==NOW
+
+
+def test_deleted_waiting_queue_drained_without_provider_or_page_write(live):
+    live["episodes"][0]["deleted_at"]=NOW
+    live["db"].deleted_ids.add("1")
+    live["db"].state["queue"][("khipu","1")]={"slug":"khipu","episode_id":"1","queued_at":NOW,"done_at":None}
+    out=wiki.run(now=NOW)
+    assert out["deleted_queue_drained"]==1 and out["queue_remaining"]==0
+    assert out["calls_used"]==0 and not live["prompts"] and live["path"].read_bytes()==OLD
+    assert not live["db"].state["writes"]
+
+
+def test_check_hold_skips_second_run_and_expires_without_starving_other(live,monkeypatch):
+    provider=live["provider"]
+    monkeypatch.setattr(extract,"generate_wiki",lambda *a,**k:"bad")
+    first=wiki.run(now=NOW)
+    assert first["holds"]==[{"slug":"khipu","reason":"checks","until_at":(NOW+timedelta(hours=24)).isoformat()}]
+    monkeypatch.setattr(extract,"generate_wiki",provider)
+    other=live["root"]/"topics"/"other.md"
+    other.write_bytes(OLD.replace(b"khipu",b"other"))
+    live["episodes"].append(ep(2,"other"))
+    second=wiki.run(now=NOW,max_pages=1)
+    assert second["held_pages"]==1 and second["written"][0]["slug"]=="other"
+    live["db"].now=NOW+timedelta(hours=24,seconds=1)
+    third=wiki.run(now=live["db"].now)
+    assert third["pages_revised"]==1 and third["written"][0]["slug"]=="khipu"
+
+
+@pytest.mark.parametrize("stage",["source","provider","response","save"])
+def test_stage_failures_hold_two_hours_and_do_not_log_raw_errors(live,monkeypatch,stage):
+    secret="DO NOT LOG RAW ANSWER OR ERROR"
+    if stage=="source":
+        def fail(*a,**k): raise ValueError(secret)
+        monkeypatch.setattr(wiki._Store,"baseline",fail)
+    elif stage=="provider":
+        def fail(*a,**k): raise RuntimeError(secret)
+        monkeypatch.setattr(extract,"generate_wiki",fail)
+    elif stage=="response": monkeypatch.setattr(extract,"generate_wiki",lambda *a,**k:{"page":secret})
+    else:
+        def fail(*a,**k): raise ValueError(secret)
+        monkeypatch.setattr(wiki._Store,"save",fail)
+    out=wiki.run(now=NOW)
+    assert out["holds"]==[{"slug":"khipu","reason":stage,"until_at":(NOW+timedelta(hours=2)).isoformat()}]
+    assert out["failures"][0]["stage"]==stage and secret not in json.dumps(out)
+    assert not live["db"].state["writes"] and out["queue_remaining"]==1
+    second=wiki.run(now=NOW)
+    assert second["held_pages"]==1 and second["calls_used"]==0
+
+
+def test_holds_never_shorten_existing_undo_or_refusal(live):
+    store=wiki._Store()
+    first=store.hold("khipu","undo",168,NOW)
+    assert store.hold("khipu","checks",24,NOW)==first
+    assert store.hold("khipu","provider",2,NOW)==first
+    assert live["db"].state["hold_reasons"]["khipu"]=="undo"
+
+
+def test_truncation_leaves_bytes_queue_and_reports_reason(live,monkeypatch):
+    def truncated(*a,**k): raise extract.ProviderTruncated("secret answer")
+    monkeypatch.setattr(extract,"generate_wiki",truncated)
+    out=wiki.run(now=NOW)
+    assert out["failures"][0]["reason"]=="truncated" and out["holds"][0]["reason"]=="truncated"
+    assert out["queue_remaining"]==1 and live["path"].read_bytes()==OLD
+    assert "secret answer" not in json.dumps(out)
+
+
+def test_live_repairs_exact_line_and_reports_count_before_save(live,monkeypatch):
+    provider=live["provider"]
+    def changed(*a,**k): return provider(*a,**k).replace("Keep /tmp/wiki and 60 pages.","Keep /tmp/wiki and 60 pages!")
+    monkeypatch.setattr(extract,"generate_wiki",changed)
+    out=wiki.run(now=NOW)
+    assert out["pages_revised"]==1 and out["repaired_protected_lines"]==1
+    assert "Keep /tmp/wiki and 60 pages." in live["path"].read_text()
+
+
+def test_periodic_limits_six_and_180_seconds_and_finishes_inflight(live,monkeypatch):
+    config.set_choice_setting("wiki_nightly","true")
+    for n in range(2,10):
+        (live["root"]/"topics"/f"page-{n}.md").write_bytes(OLD.replace(b"khipu",f"page-{n}".encode()))
+        live["episodes"].append(ep(n,f"page-{n}"))
+    out=jobs.run_wiki(periodic=True,max_pages=40)
+    assert out["pages_revised"]==6 and len(live["prompts"])==6
+    # Fresh run: only one provider finishes, crossing the elapsed-time bound.
+    for q in live["db"].state["queue"].values(): q["done_at"]=None
+    elapsed=[0]
+    monkeypatch.setattr(wiki.time,"monotonic",lambda:elapsed[0])
+    provider=live["provider"]
+    def slow(*a,**k):
+        response=provider(*a,**k)
+        elapsed[0]=181
+        return response
+    monkeypatch.setattr(extract,"generate_wiki",slow)
+    bounded=wiki.run(now=NOW,max_pages=6,allow_open=False,time_budget_s=180)
+    assert bounded["pages_revised"]==1 and bounded["time_budget_exhausted"]
+    assert bounded["queue_remaining"]==8
+
+
+def test_undo_opened_page_completes_even_unabsorbed_pending_rows(live):
+    live["episodes"].extend(ep(i,"novel") for i in range(2,5))
+    out=wiki.run(now=NOW)
+    live["db"].state["queue"][("novel","999")]={"slug":"novel","episode_id":"999","queued_at":NOW,"done_at":None}
+    result=wiki.undo(slug="novel")
+    assert result["pages_retired"]==1 and result["episodes_requeued"]==0
+    assert all(q["done_at"] for q in live["db"].state["queue"].values())
+    assert live["db"].state["hold_reasons"]["novel"]=="undo"
+    assert wiki.run(now=NOW)["queue_remaining"]==0
+
+
+def test_slug_cli_read_set_alias_tag_page_clear_and_target_validation(live,capsys):
+    assert cli.main(["wiki","slug","unknown","--json"])==0
+    assert json.loads(capsys.readouterr().out)["decision"] is None
+    for choice in ("page","tag"):
+        assert cli.main(["wiki","slug","unknown","--set",choice,"--json"])==0
+        assert json.loads(capsys.readouterr().out)["decision"]=={"decision":choice}
+    assert cli.main(["wiki","slug","unknown","--set","alias","--target","khipu","--json"])==2 # not reconciled yet
+    capsys.readouterr()
+    wiki.run(now=NOW)
+    for target in ("missing","note:foo"):
+        assert cli.main(["wiki","slug","unknown","--set","alias","--target",target,"--json"])==2
+        capsys.readouterr()
+    live["db"].state["topics"]["archived"]={"slug":"archived","body":"","status":"archived"}
+    assert cli.main(["wiki","slug","unknown","--set","alias","--target","archived","--json"])==2
+    capsys.readouterr()
+    assert cli.main(["wiki","slug","unknown","--set","alias","--target","khipu","--json"])==0
+    assert json.loads(capsys.readouterr().out)["decision"]=={"decision":"alias","target":"khipu"}
+    assert cli.main(["wiki","slug","unknown","--set","alias","--json"])==2
+    capsys.readouterr()
+    assert cli.main(["wiki","slug","unknown","--clear","--json"])==0
+    assert json.loads(capsys.readouterr().out)["decision"] is None
+    assert "unknown" not in live["db"].state["decisions"]
+    assert cli.main(["wiki","slug","note:foo","--json"])==2
+    capsys.readouterr()
+
+
+def test_run_reports_gate_decisions_stored_in_that_run(live,capsys):
+    live["episodes"].extend(ep(i,"novel") for i in range(2,5))
+    live["db"].state["decisions"]["existing-tag"]={"decision":"tag"}
+    assert cli.main(["wiki","run"])==0
+    text=capsys.readouterr().out
+    assert 'Stored slug decisions: {"novel": {"decision": "page"}}' in text
+    assert wiki.run(now=NOW)["slug_decisions"]=={}
+
+
+def test_archived_prefixed_source_never_reaches_provider(live):
+    live["path"].write_bytes(b"<!-- prefix -->\n"+OLD.replace(b"status: seed",b"status: archived"))
+    out=wiki.run(now=NOW)
+    assert out["calls_used"]==0 and not live["prompts"] and not out["written"]

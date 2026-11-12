@@ -4936,6 +4936,13 @@ def cmd_monthly(args: argparse.Namespace) -> int:
 
 def cmd_wiki(args: argparse.Namespace) -> int:
     from khipu import wiki_nightly
+    if args.wiki_cmd == "slug":
+        try:
+            result = wiki_nightly.slug_decision(args.slug, decision=args.set, target=args.target, clear=args.clear)
+        except ValueError as exc:
+            result = {"ok": False, "error": str(exc)}
+        print(json.dumps(result, indent=2) if args.json else result.get("error") or f"{args.slug}: " + json.dumps(result["decision"], sort_keys=True))
+        return 0 if result["ok"] else 2
     if args.wiki_cmd in {"run", "undo"}:
         from khipu import jobs
         try:
@@ -4948,6 +4955,10 @@ def cmd_wiki(args: argparse.Namespace) -> int:
         else:
             for page in result.get("written", []):
                 print(f"{page['slug']}: {'opened' if page['opened'] else 'written'} ({len(page['episode_ids'])} episodes)")
+            for hold in result.get("holds", []):
+                print(f"{hold['slug']}: held until {hold['until_at']} ({hold['reason']})")
+            if args.wiki_cmd == "run":
+                print("Stored slug decisions: " + json.dumps(result.get("slug_decisions", {}), sort_keys=True))
             skipped = result.get("skipped", [])
             for page in result.get("failures", []) + (skipped if isinstance(skipped, list) else []):
                 print(f"{page['slug']}: refused: {page['reason']}" + (" (" + ", ".join(page["checks"]) + ")" if page.get("checks") else ""))
@@ -4977,6 +4988,8 @@ def cmd_wiki(args: argparse.Namespace) -> int:
             print(page["slug"] + f" ({page['episode_count']} episodes)" + (" (open)" if page["open"] else ""))
             for row in page["episodes"]:
                 print(f"  {row['episode_id']}: {row['reason']}")
+        for hold in result.get("holds", []):
+            print(f"{hold['slug']}: held until {hold['until_at']} ({hold['reason']})")
         print("Proposed opens: " + ", ".join(p["slug"] for p in result["opens"]))
         print("Would ask: " + ", ".join(c["slug"] for c in result["slug_candidates"]))
         print("Stored slug decisions: " + json.dumps(result["slug_decisions"], sort_keys=True))
@@ -5684,6 +5697,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     wk = sub.add_parser("wiki", help="Wiki assignments, drafts, live update and exact undo")
     wk_sub = wk.add_subparsers(dest="wiki_cmd", required=True)
+    wk_slug = wk_sub.add_parser("slug", help="Read, replace or clear a stored slug decision")
+    wk_slug.add_argument("slug")
+    wk_slug_mode = wk_slug.add_mutually_exclusive_group()
+    wk_slug_mode.add_argument("--set", choices=("page", "tag", "alias"))
+    wk_slug_mode.add_argument("--clear", action="store_true")
+    wk_slug.add_argument("--target", metavar="SLUG")
+    wk_slug.add_argument("--json", action="store_true")
+    wk_slug.set_defaults(func=cmd_wiki)
     wk_plan = wk_sub.add_parser("plan", help="Read-only assignments, cap and slug candidates")
     wk_plan.add_argument("--json", action="store_true")
     wk_plan.add_argument("--since", type=int, default=8, metavar="DAYS")

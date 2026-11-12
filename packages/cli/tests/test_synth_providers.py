@@ -1012,3 +1012,70 @@ def test_cli_child_path_carries_the_cli_folder_under_a_bare_path(provider, tmp_p
     assert seen['argv0'] == str(fake)
     assert str(folder) in seen['path'].split(':')
     assert seen['path'].split(':')[:4] == ['/usr/bin', '/bin', '/usr/sbin', '/sbin']
+
+
+@pytest.mark.parametrize('provider', ['gemini','anthropic','openai','openrouter','local'])
+def test_wiki_optional_controls_and_truncation_keep_summary_defaults(provider):
+    data = ({'candidates':[{'finishReason':'MAX_TOKENS','content':{'parts':[{'text':'partial'}]}}]}
+            if provider=='gemini' else {'stop_reason':'max_tokens','content':[{'text':'partial'}]}
+            if provider=='anthropic' else {'choices':[{'finish_reason':'length','message':{'content':'partial'}}]})
+    settings={'provider':provider,'model_id':'fixture'}
+    if provider=='local': settings['endpoint']='http://127.0.0.1:8000'
+    models.set_models_merge_role('wiki',**settings)
+    reply=Reply(data)
+    reply.status=200
+    with mock.patch.object(extract,'_provider_key',return_value='fake'), \
+         mock.patch.object(extract,'_key',return_value='fake'), \
+         mock.patch.object(extract.urllib.request,'urlopen',return_value=reply) as post:
+        with pytest.raises(extract.ProviderTruncated,match='truncated'):
+            extract.generate_wiki('page',timeout=180,system_prompt='wiki instructions',max_output_tokens=7000)
+        assert post.call_count==1
+        body=json.loads(post.call_args.args[0].data)
+        assert post.call_args.kwargs['timeout']==180
+        if provider=='gemini':
+            assert body['generationConfig']['maxOutputTokens']==7000
+            assert 'responseMimeType' not in body['generationConfig']
+            assert body['systemInstruction']['parts'][0]['text']=='wiki instructions'
+        elif provider=='anthropic':
+            assert body['max_tokens']==7000 and body['system']=='wiki instructions'
+        else:
+            assert body['max_tokens']==7000 and body['messages'][0]=={'role':'system','content':'wiki instructions'}
+            assert 'response_format' not in body
+        # The ordinary summary route keeps its original timeout and partial-response behavior.
+        assert extract._generate('summary',settings=settings,retries=0)=='partial'
+        assert post.call_args.kwargs['timeout']==45
+        summary=json.loads(post.call_args.args[0].data)
+        if provider=='gemini':
+            assert summary['generationConfig']['maxOutputTokens']==4096
+            assert summary['generationConfig']['responseMimeType']=='application/json'
+        elif provider=='local':
+            assert 'max_tokens' not in summary and summary['response_format']=={'type':'json_object'}
+        else:
+            assert summary['max_tokens']==4096 and summary['messages']==[{'role':'user','content':'summary'}]
+
+
+def test_wiki_claude_system_timeout_output_cap_and_summary_default(monkeypatch):
+    models.set_models_merge_role('wiki',provider='claude-cli',model_id='haiku')
+    seen=[]
+    def call(argv,**kwargs):
+        seen.append((argv,kwargs))
+        return subprocess.CompletedProcess(argv,0,json.dumps({'result':'# Complete page','is_error':False}),'')
+    monkeypatch.setattr(extract.subprocess,'run',call)
+    monkeypatch.setattr(synth_cli,'binary',lambda _:None)
+    monkeypatch.setattr(synth_cli,'environment',lambda:{'PATH':'/usr/bin'})
+    assert extract.generate_wiki('page',timeout=180,system_prompt='wiki instructions',max_output_tokens=7000)=='# Complete page'
+    argv,kwargs=seen[0]
+    assert argv[argv.index('--system-prompt')+1]=='wiki instructions'
+    assert kwargs['env']['CLAUDE_CODE_MAX_OUTPUT_TOKENS']=='7000' and kwargs['timeout']==180
+    extract._generate_claude_cli('summary',model_id='haiku',retries=0)
+    argv,kwargs=seen[1]
+    assert argv[argv.index('--system-prompt')+1]==extract.CLAUDE_CLI_SYSTEM_PROMPT
+    assert kwargs['timeout']==60 and 'CLAUDE_CODE_MAX_OUTPUT_TOKENS' not in kwargs['env']
+
+
+def test_wiki_default_call_keeps_existing_adapter_timeout_and_prompt(monkeypatch):
+    models.set_models_merge_role('wiki',provider='claude-cli',model_id='haiku')
+    seen=[]
+    monkeypatch.setattr(extract,'_generate_claude_cli',lambda p,**kw:(seen.append(kw) or 'result'))
+    assert extract.generate_wiki('page')=='result'
+    assert seen[0]['timeout']==60 and 'system_prompt' not in seen[0] and 'max_output_tokens' not in seen[0]
