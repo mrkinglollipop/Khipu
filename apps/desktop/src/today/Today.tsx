@@ -2,6 +2,9 @@
 // checks and All changes open docked at the right, one at a time.
 import { useEffect, useState } from "react";
 import { Body } from "../shell";
+import { Usage } from "./Usage";
+import type { RouteView } from "../routing";
+import type { UsageReport } from "../PlansCard";
 import { HealthLine } from "./HealthLine";
 import { HealthPanel } from "./HealthPanel";
 import { ChangesPanel } from "./ChangesPanel";
@@ -11,8 +14,8 @@ import type { NeedsHook } from "./needs";
 import "./today.css";
 
 export function Today({
-  active, needs, onOpen,
-}: { active: boolean; needs: NeedsHook; onOpen: (link: string) => void }) {
+  active, needs, onOpen, view, plans, onOpenAccount, routingError,
+}: { active: boolean; needs: NeedsHook; onOpen: (link: string) => void; view?: RouteView | null; plans?: UsageReport | null; onOpenAccount?: (key: string) => void; routingError?: string | null }) {
   const hook = useHealth(active);
   const [panel, setPanel] = useState<"health" | "changes" | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -30,6 +33,7 @@ export function Today({
             sentence={sentence} hook={hook} now={now} panelOpen={panel === "health"}
             onTogglePanel={() => setPanel((p) => (p === "health" ? null : "health"))}
           />
+          <Usage view={view} plans={plans} now={new Date(now)} onOpenAccount={onOpenAccount} error={routingError} />
           <NeedsCards needs={needs} onAllChanges={() => setPanel("changes")} />
         </div>
       </div>

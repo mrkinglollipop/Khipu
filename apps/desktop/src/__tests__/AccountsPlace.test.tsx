@@ -163,6 +163,17 @@ async function open(name = "Claude") {
 }
 
 describe("reading changes nothing", () => {
+  it("opens the account requested by a Today tile without changing routing", async () => {
+    function FromToday() {
+      const routing = useRouting(true);
+      return <Accounts routing={routing} plans={null} thisMac="M5" now={NOW} initialAccountKey="grok|" />;
+    }
+    const { container } = render(<FromToday />);
+    await screen.findByRole("article", { name: "Grok" });
+    expect(screen.getByRole("button", { name: /^Grok/ }).getAttribute("aria-current")).toBe("true");
+    expect(container.querySelector(".sh-split")?.getAttribute("data-detail")).toBe("open");
+    expect(writes()).toEqual([]);
+  });
   it("opening the place, selecting accounts and reading the conversation list make no write", async () => {
     await open("Claude");
     fireEvent.click(screen.getByRole("button", { name: /^Grok/ }));
