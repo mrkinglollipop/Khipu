@@ -572,7 +572,7 @@ def test_nightly_receipt_lists_every_step_its_code_knows(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, "_nightly_last_path", lambda: tmp_path / "nightly-last.json")
     jobs._record_nightly_step([], "embed_backfill", ok=True)
     doc = json.loads((tmp_path / "nightly-last.json").read_text())
-    assert set(doc["known_steps"]) == {step for step, _fix in jobs._NIGHTLY_STEP_CHECKS.values()}
+    assert set(doc["known_steps"]) == {step for step, _fix in jobs._NIGHTLY_STEP_CHECKS.values()} | {"wiki_update"}
 
 
 def test_memory_lock_busy_refresh_is_busy_not_a_failure(monkeypatch):

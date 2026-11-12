@@ -402,7 +402,7 @@ def _step_result(result: Any) -> dict[str, Any]:
 def _known_nightly_steps() -> list[str]:
     """Every step this code's nightly records, so doctor can tell a step that
     a run skipped from one that run's code did not have yet."""
-    return sorted({step for step, _fix in _NIGHTLY_STEP_CHECKS.values()})
+    return sorted({step for step, _fix in _NIGHTLY_STEP_CHECKS.values()} | {"wiki_update"})
 
 
 # Last completed night's receipts, kept beside tonight's partial run. A nightly
@@ -417,6 +417,8 @@ _CARRIED_STEPS: list[dict[str, Any]] = []
 
 def _slim_receipt(entry: dict[str, Any]) -> dict[str, Any]:
     out = {k: entry.get(k) for k in ("name", "ok", "error", "ts") if k in entry}
+    if entry.get("name") == "wiki_update":
+        out["counts"] = entry.get("counts")
     if isinstance(entry.get("deferred"), str):
         out["deferred"] = entry["deferred"]
     return out
@@ -497,6 +499,7 @@ def _run_nightly_locked() -> int:
     # Before the outside consolidate script, so its git sync carries tonight's
     # new lines offsite tonight. A failure is recorded and the night goes on.
     _record_nightly_step(steps, "capture_export", **_step_result(_capture_export()))
+    _record_nightly_step(steps, "wiki_update", **_step_result(_wiki_update()))
     driver_error = None
     try:
         rc = _run_script(
@@ -735,6 +738,76 @@ def _drain_sessions() -> dict[str, Any]:
         return {"ok": out["failed"] == 0 and not out.get("time_budget_exhausted"), **out}
     except Exception as exc:  # noqa: BLE001 — capture failure cannot block consolidation
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _wiki_update(*, force: bool = False, max_pages: int = 60, since: int = 8, allow_open: bool = True, time_budget_s: float | None = None) -> dict[str, Any]:
+    """Isolate wiki failures; the outside consolidation must always run."""
+    try:
+        from khipu import wiki_nightly
+        if not force and not wiki_nightly.enabled():
+            return {"ok": True, "skipped": "wiki_nightly is off"}
+        result = wiki_nightly.run(max_pages=max_pages, since=since, allow_open=allow_open,
+                                  **({"time_budget_s": time_budget_s} if time_budget_s is not None else {}))
+    except Exception as exc:
+        result = {"ok": False, "error": type(exc).__name__}
+    try:
+        _write_wiki_last(result)
+    except OSError:
+        pass
+    return result
+
+
+def _wiki_last() -> dict[str, Any] | None:
+    try:
+        row = json.loads((ensure_data_dir() / "wiki-last.json").read_text(encoding="utf-8"))
+        return row if isinstance(row, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_wiki_last(result: dict[str, Any]) -> None:
+    path = ensure_data_dir() / "wiki-last.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "counts": result}, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def run_wiki(*, max_pages: int = 60, since: int = 8, undo: dict | None = None, periodic: bool = False) -> dict[str, Any]:
+    """Hand/timer entrypoint: same lock as the whole nightly, no git sync."""
+    from khipu import wiki_nightly
+    from khipu.config import minute_setting
+    if periodic and (not wiki_nightly.enabled() or minute_setting("wiki_every_minutes") == 0):
+        return {"ok": True, "skipped": "periodic wiki is off"}
+    with _job_lock("nightly") as acquired:
+        if not acquired:
+            return {"ok": periodic, "skipped": "nightly job is already running", "exit_code": 0 if periodic else 75}
+        if periodic:
+            last = _wiki_last()
+            if last and _hours_since(last.get("ts")) is not None and _hours_since(last["ts"]) * 60 < minute_setting("wiki_every_minutes"):
+                return {"ok": True, "skipped": "wiki interval is not due"}
+        if undo is not None:
+            return wiki_nightly.undo(**undo)
+        result = _wiki_update(force=True, max_pages=min(max_pages, 6) if periodic else max_pages,
+                              since=since, allow_open=not periodic,
+                              **({"time_budget_s": 180} if periodic else {}))
+        if not result.get("skipped"):
+            # Preserve all other step receipts for the doctor/app readers.
+            previous = nightly_last() or {}
+            steps = [s for s in previous.get("steps", []) if s.get("name") != "wiki_update"]
+            _capture_previous_receipts()
+            _record_nightly_step(steps, "wiki_update", **_step_result(result))
+        return result
+
+
+def wiki_stall() -> dict[str, Any] | None:
+    """Only the requested morning warning; no new promotion gate."""
+    from khipu import wiki_nightly
+    if not wiki_nightly.enabled():
+        return None
+    counts = (_wiki_last() or {}).get("counts") or {}
+    if counts.get("queue_remaining", 0) and not counts.get("pages_revised", 0) and not counts.get("pages_opened", 0):
+        return {"queue_remaining": counts["queue_remaining"], "queue_oldest_age_days": counts.get("queue_oldest_age_days")}
+    return None
 
 
 def _capture_export() -> dict[str, Any]:

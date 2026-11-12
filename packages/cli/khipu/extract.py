@@ -14,6 +14,7 @@ Synth routing (Settings → Models): Gemini, Anthropic, OpenAI, OpenRouter REST;
 from __future__ import annotations
 
 import json
+from contextvars import ContextVar
 import math
 import os
 import re
@@ -75,12 +76,15 @@ def _key() -> str:
     return key
 
 
+_CALL_SCOPE: ContextVar[str] = ContextVar("extract_call_scope", default="synth")
+
+
 def _synth_budget_take() -> None:
     """Charge one cloud synth call against today's ceiling (embed scope
     ``synth``); raises ``khipu.embed.BudgetExhausted`` when it is spent."""
     from khipu.embed import _budget_take
 
-    _budget_take(scope="synth")
+    _budget_take(scope=_CALL_SCOPE.get())
 
 
 SYNTH_USAGE_NAME = "synth-usage.jsonl"
@@ -133,6 +137,8 @@ def _record_usage(data: Any, *, model_id: str, caller: str, provider: str = "gem
         if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost):
             row["cost_usd"] = float(cost)
         path = synth_usage_path()
+        if _CALL_SCOPE.get() == "wiki":
+            path = path.with_name("wiki-usage.jsonl")
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
@@ -231,8 +237,26 @@ def synth_usage_today() -> dict[str, Any]:
     return {"day": day, **totals, "by_model": by_model, "by_provider": by_provider}
 
 
+class ProviderTruncated(RuntimeError):
+    """The provider reported an incomplete answer; never save partial pages."""
+
+
+def _truncated(data: dict, provider: str) -> None:
+    if _CALL_SCOPE.get() != "wiki":
+        return
+    if provider in {"gemini", "cloud"}:
+        reason = (data.get("candidates") or [{}])[0].get("finishReason")
+    elif provider == "anthropic":
+        reason = data.get("stop_reason")
+    else:
+        reason = (data.get("choices") or [{}])[0].get("finish_reason")
+    if reason in {"MAX_TOKENS", "max_tokens", "length"}:
+        raise ProviderTruncated("truncated")
+
+
 def _generate_gemini(prompt: str, *, model_id: str, timeout: int, retries: int,
-                    caller: str = "synth") -> str:
+                    caller: str = "synth", system_prompt: str | None = None,
+                    max_output_tokens: int | None = None) -> str:
     # Header auth, not ?key=. Same reasoning as khipu.embed: a live credential
     # in a URL is one logging or exception-formatting change away from the
     # logs. The embed module was fixed in the 2026-08-17 audit and this one was
@@ -248,9 +272,10 @@ def _generate_gemini(prompt: str, *, model_id: str, timeout: int, retries: int,
         # 2.5-flash "thinks" by default and thinking tokens count against
         # maxOutputTokens — with a small cap the JSON came back truncated
         # (first real Aegis run, 2026-08-17). Extraction needs no thinking.
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096,
-                             "responseMimeType": "application/json",
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_output_tokens or 4096,
+                             **({} if system_prompt else {"responseMimeType": "application/json"}),
                              "thinkingConfig": {"thinkingBudget": 0}},
+        **({"systemInstruction": {"parts": [{"text": system_prompt}]}} if system_prompt else {}),
     }).encode("utf-8")
     last: Exception | None = None
     for attempt in range(retries + 1):
@@ -263,8 +288,11 @@ def _generate_gemini(prompt: str, *, model_id: str, timeout: int, retries: int,
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             _record_usage(data, model_id=model_id, caller=caller)
+            _truncated(data, "gemini")
             parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
             return "".join(p.get("text", "") for p in parts)
+        except ProviderTruncated:
+            raise
         except urllib.error.HTTPError as e:
             last = RuntimeError(_http_error_text(e, key))
             if e.code < 500 and e.code != 429:
@@ -313,10 +341,11 @@ def _provider_key(provider: str) -> str:
 
 
 def _generate_api(prompt: str, *, provider: str, model_id: str, timeout: int,
-                  retries: int, caller: str) -> str:
+                  retries: int, caller: str, system_prompt: str | None = None,
+                  max_output_tokens: int | None = None) -> str:
     key = _provider_key(provider)
     headers = {"Content-Type": "application/json"}
-    payload = {"model": model_id, "max_tokens": 4096,
+    payload = {"model": model_id, "max_tokens": max_output_tokens or 4096,
                "messages": [{"role": "user", "content": prompt}]}
     if provider == "anthropic":
         # No sampling settings: Claude Haiku 5.5 (the default here) and the
@@ -335,6 +364,11 @@ def _generate_api(prompt: str, *, provider: str, model_id: str, timeout: int,
         headers["Authorization"] = f"Bearer {key}"
     if provider != "anthropic":
         payload["temperature"] = 0.2
+    if system_prompt:
+        if provider == "anthropic":
+            payload["system"] = system_prompt
+        else:
+            payload["messages"].insert(0, {"role": "system", "content": system_prompt})
     body = json.dumps(payload).encode("utf-8")
     last: Exception | None = None
     for attempt in range(retries + 1):
@@ -344,10 +378,13 @@ def _generate_api(prompt: str, *, provider: str, model_id: str, timeout: int,
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             _record_usage(data, provider=provider, model_id=model_id, caller=caller)
+            _truncated(data, provider)
             if provider == "anthropic":
                 return "".join(part.get("text", "") for part in data.get("content", [])
                                if isinstance(part.get("text"), str))
             return str(data["choices"][0]["message"].get("content") or "")
+        except ProviderTruncated:
+            raise
         except urllib.error.HTTPError as exc:
             last = RuntimeError(_http_error_text(exc, key))
             if exc.code < 500 and exc.code != 429:
@@ -360,21 +397,27 @@ def _generate_api(prompt: str, *, provider: str, model_id: str, timeout: int,
 
 
 def _generate_anthropic(prompt: str, *, model_id: str, timeout: int, retries: int,
-                        caller: str = "synth") -> str:
+                        caller: str = "synth", system_prompt: str | None = None,
+                    max_output_tokens: int | None = None) -> str:
     return _generate_api(prompt, provider="anthropic", model_id=model_id,
-                         timeout=timeout, retries=retries, caller=caller)
+                         timeout=timeout, retries=retries, caller=caller,
+                         system_prompt=system_prompt, max_output_tokens=max_output_tokens)
 
 
 def _generate_openai(prompt: str, *, model_id: str, timeout: int, retries: int,
-                     caller: str = "synth") -> str:
+                     caller: str = "synth", system_prompt: str | None = None,
+                    max_output_tokens: int | None = None) -> str:
     return _generate_api(prompt, provider="openai", model_id=model_id,
-                         timeout=timeout, retries=retries, caller=caller)
+                         timeout=timeout, retries=retries, caller=caller,
+                         system_prompt=system_prompt, max_output_tokens=max_output_tokens)
 
 
 def _generate_openrouter(prompt: str, *, model_id: str, timeout: int, retries: int,
-                         caller: str = "synth") -> str:
+                         caller: str = "synth", system_prompt: str | None = None,
+                    max_output_tokens: int | None = None) -> str:
     return _generate_api(prompt, provider="openrouter", model_id=model_id,
-                         timeout=timeout, retries=retries, caller=caller)
+                         timeout=timeout, retries=retries, caller=caller,
+                         system_prompt=system_prompt, max_output_tokens=max_output_tokens)
 
 
 # Replaces Claude Code's own agent system prompt for the summariser call. With
@@ -390,7 +433,8 @@ CLAUDE_CLI_SYSTEM_PROMPT = (
 
 
 def _generate_claude_cli(prompt: str, *, model_id: str, timeout: int = 60, retries: int = 2,
-                         caller: str = "synth") -> str:
+                         caller: str = "synth", system_prompt: str | None = None,
+                    max_output_tokens: int | None = None) -> str:
     from khipu import synth_cli
 
     env = synth_cli.environment()
@@ -412,12 +456,25 @@ def _generate_claude_cli(prompt: str, *, model_id: str, timeout: int = 60, retri
             persistence = (["--no-session-persistence"]
                            if synth_cli.supports_flag(cli, "--no-session-persistence", env) else [])
             argv = [cli, "-p", *persistence, "--setting-sources", "", "--model", model_id,
-                    "--system-prompt", CLAUDE_CLI_SYSTEM_PROMPT,
+                    "--system-prompt", system_prompt or CLAUDE_CLI_SYSTEM_PROMPT,
                     "--output-format", "json", "--max-turns", "1", "--disallowedTools",
                     "Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,Agent", "--session-id", sid]
+            if max_output_tokens is not None:
+                env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
             result = subprocess.run(argv, input=prompt, text=True, capture_output=True,
                                     cwd=cwd, env=env, timeout=timeout, check=False)
             data = json.loads(result.stdout)
+            if _CALL_SCOPE.get() == "wiki" and (data.get("stop_reason") == "max_tokens"
+                    or data.get("subtype") == "error_max_output_tokens"
+                    or ((data.get("is_error") or result.returncode or data.get("error"))
+                        and re.search(r"exceeded\b.*?\boutput token maximum\b", json.dumps(data), re.I | re.S))):
+                raise ProviderTruncated("truncated")
+            # Measured 2026-11-12: a reply that passes the output allowance is
+            # continued in a further turn and "result" holds only the last
+            # part, with exit 0 and stop_reason end_turn. A whole reply is one turn.
+            turns = data.get("num_turns")
+            if _CALL_SCOPE.get() == "wiki" and isinstance(turns, int) and turns > 1:
+                raise ProviderTruncated("truncated")
             text = data.get("result")
             if not isinstance(text, str):
                 raise ValueError("missing result")
@@ -426,6 +483,8 @@ def _generate_claude_cli(prompt: str, *, model_id: str, timeout: int = 60, retri
                 _record_usage(data, provider="claude-cli", model_id=model_id, caller=caller)
                 return text
             last = synth_cli.error_text(text, prompt, env) or f"CLI exit {result.returncode}"
+        except ProviderTruncated:
+            raise
         except Exception as exc:  # noqa: BLE001 — retry without logging argv/output/env
             last = type(exc).__name__
         time.sleep(1.5 * (attempt + 1))
@@ -454,7 +513,8 @@ def _codex_cli_effort() -> str:
 
 
 def _generate_codex_cli(prompt: str, *, model_id: str, timeout: int = 60, retries: int = 2,
-                        caller: str = "synth") -> str:
+                        caller: str = "synth", system_prompt: str | None = None,
+                    max_output_tokens: int | None = None) -> str:
     from khipu import synth_cli
 
     env = synth_cli.environment()
@@ -478,6 +538,10 @@ def _generate_codex_cli(prompt: str, *, model_id: str, timeout: int = 60, retrie
                         # 2026-10-13); the login is not part of that config.
                         "--ignore-user-config",
                         "-c", f"model_reasoning_effort={_codex_cli_effort()}", "-"]
+                if system_prompt:
+                    argv[-1:-1] = ["-c", "developer_instructions=" + json.dumps(system_prompt)]
+                if max_output_tokens is not None:
+                    prompt = prompt + f"\nOutput allowance: {max_output_tokens} tokens; return the complete page."
                 result = run_text(argv, input=prompt, cwd=cwd, env=env, timeout=timeout,
                                   check=False)
                 usage = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
@@ -499,6 +563,8 @@ def _generate_codex_cli(prompt: str, *, model_id: str, timeout: int = 60, retrie
                 return text
             last = synth_cli.error_text(error or (text if _cli_failure(text) else ""), prompt, env)
             last = last or f"CLI exit {result.returncode}: no successful last message"
+        except ProviderTruncated:
+            raise
         except Exception as exc:  # noqa: BLE001 — same retry schedule as API adapters
             last = type(exc).__name__
         time.sleep(1.5 * (attempt + 1))
@@ -520,6 +586,8 @@ def _generate_local(
     model_id: str,
     timeout: int,
     retries: int,
+    system_prompt: str | None = None,
+    max_output_tokens: int | None = None,
 ) -> str:
     from khipu.keychain import get_openai_compat_key
     from khipu.models import chat_completions_url
@@ -536,13 +604,19 @@ def _generate_local(
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
         }
-        if with_response_format:
+        if system_prompt:
+            payload["messages"].insert(0, {"role": "system", "content": system_prompt})
+        if max_output_tokens is not None:
+            payload["max_tokens"] = max_output_tokens
+        if with_response_format and not system_prompt:
             payload["response_format"] = {"type": "json_object"}
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.status, resp.read().decode("utf-8")
+        except ProviderTruncated:
+            raise
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", "replace")
 
@@ -552,6 +626,7 @@ def _generate_local(
             code, text = _post(with_response_format=True)
             if code == 200:
                 data = json.loads(text)
+                _truncated(data, "local")
                 choices = data.get("choices") or []
                 msg = (choices[0] if choices else {}).get("message") or {}
                 return str(msg.get("content") or "")
@@ -559,6 +634,7 @@ def _generate_local(
                 code2, text2 = _post(with_response_format=False)
                 if code2 == 200:
                     data = json.loads(text2)
+                    _truncated(data, "local")
                     choices = data.get("choices") or []
                     msg = (choices[0] if choices else {}).get("message") or {}
                     return str(msg.get("content") or "")
@@ -573,6 +649,8 @@ def _generate_local(
                 # for 5xx / 429 like cloud.
                 if code in (401, 403) or (code < 500 and code != 429):
                     break
+        except ProviderTruncated:
+            raise
         except Exception as e:  # noqa: BLE001 — network / timeout; retry
             last = e
         time.sleep(1.5 * (attempt + 1))
@@ -580,14 +658,21 @@ def _generate_local(
 
 
 def _generate(prompt: str, *, timeout: int | None = None, retries: int = 2,
-              caller: str = "synth") -> str:
+              caller: str = "synth", settings: dict[str, str] | None = None,
+              model_id_override: str | None = None, system_prompt: str | None = None,
+              max_output_tokens: int | None = None) -> str:
     """Route by per-call ``models.synth`` (Settings). Local never calls ``_key()``."""
     from khipu.models import cloud_model_id, synth_settings
 
-    settings = synth_settings()
+    settings = synth_settings() if settings is None else settings
     provider = (settings.get("provider") or "cloud").strip().lower()
     if timeout is None:
         timeout = 60 if provider in {"claude-cli", "codex-cli"} else 45
+    options = {}
+    if system_prompt is not None:
+        options["system_prompt"] = system_prompt
+    if max_output_tokens is not None:
+        options["max_output_tokens"] = max_output_tokens
     if provider == "local":
         endpoint = (settings.get("endpoint") or "").strip()
         model_id = (settings.get("model_id") or "").strip()
@@ -602,6 +687,7 @@ def _generate(prompt: str, *, timeout: int | None = None, retries: int = 2,
             model_id=model_id,
             timeout=timeout,
             retries=retries,
+            **options,
         )
     adapters = {"cloud": _generate_cloud, "gemini": _generate_gemini,
                 "anthropic": _generate_anthropic, "openai": _generate_openai,
@@ -611,10 +697,11 @@ def _generate(prompt: str, *, timeout: int | None = None, retries: int = 2,
         raise RuntimeError(f"unknown synth provider: {provider}")
     return adapters[provider](
         prompt,
-        model_id=cloud_model_id(settings),
+        model_id=model_id_override or cloud_model_id(settings),
         timeout=timeout,
         retries=retries,
         caller=caller,
+        **options,
     )
 
 
@@ -1084,3 +1171,27 @@ def _build_prompt(*, cwd: str, transcript: str, job: bool = False) -> str:
         idx = template.index("\nSession project (cwd):")
         template = template[:idx] + JOB_SECTION + template[idx:]
     return template.format(cwd=cwd or "(unknown)", transcript=transcript)
+
+
+def generate_wiki(prompt: str, *, model_id: str | None = None, timeout: int | None = None,
+                  system_prompt: str | None = None, max_output_tokens: int | None = None) -> str:
+    """One draft call through existing adapters, separate budget, no fallback."""
+    from khipu.models import wiki_settings
+
+    settings = wiki_settings()
+    if model_id:
+        settings["model_id"] = model_id
+    # The logins count thinking against the allowance: the largest page used
+    # 15,700 to 16,600 on a plain reply and 33,000 on one that echoed its input
+    # (measured 2026-11-12), and a reply cut at 24,000 lost its beginning.
+    floor = 48000 if settings["provider"] in {"claude-cli", "codex-cli"} else 8192
+    max_output_tokens = max(floor, max_output_tokens or 0)
+    token = _CALL_SCOPE.set("wiki")
+    try:
+        if settings["provider"] == "local":
+            _synth_budget_take()
+        return _generate(prompt, timeout=timeout, retries=0, caller="wiki-draft", settings=settings,
+                         model_id_override=settings["model_id"], system_prompt=system_prompt,
+                         max_output_tokens=max_output_tokens)
+    finally:
+        _CALL_SCOPE.reset(token)

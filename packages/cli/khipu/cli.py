@@ -4047,7 +4047,7 @@ def _promote_gate_ignore_status() -> dict:
         return {"value": [], "choices": [], "error": f"{type(e).__name__}: {e}"}
 
 
-BUDGET_LIFT_SCOPES = ("synth", "memory", "library")
+BUDGET_LIFT_SCOPES = ("synth", "memory", "library", "wiki")
 
 
 def _budget_status_all() -> dict:
@@ -4541,6 +4541,10 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
                 out["mac_status"] = dict(macs.publish(), running=running)
         except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
             out["mac_status"] = timer_error(exc)
+        try:
+            out["wiki_update"] = jobs.run_wiki(periodic=True)
+        except Exception as exc:  # noqa: BLE001 — wiki cannot change the timer's outcome
+            out["wiki_update"] = timer_error(exc)
         print(json.dumps(out, indent=2))
         return rc
     if args.snapshot_cmd == "status":
@@ -4928,6 +4932,71 @@ def cmd_monthly(args: argparse.Namespace) -> int:
     from khipu.jobs import run_monthly
 
     return run_monthly(dry_run=bool(args.dry_run))
+
+
+def cmd_wiki(args: argparse.Namespace) -> int:
+    from khipu import wiki_nightly
+    if args.wiki_cmd == "slug":
+        try:
+            result = wiki_nightly.slug_decision(args.slug, decision=args.set, target=args.target, clear=args.clear)
+        except ValueError as exc:
+            result = {"ok": False, "error": str(exc)}
+        print(json.dumps(result, indent=2) if args.json else result.get("error") or f"{args.slug}: " + json.dumps(result["decision"], sort_keys=True))
+        return 0 if result["ok"] else 2
+    if args.wiki_cmd in {"run", "undo"}:
+        from khipu import jobs
+        try:
+            result = (jobs.run_wiki(max_pages=args.max, since=args.since) if args.wiki_cmd == "run" else
+                      jobs.run_wiki(undo={"slug": args.slug, "night": args.night, "run_id": args.run}))
+        except ValueError as exc:
+            result = {"ok": False, "error": str(exc)}
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            for page in result.get("written", []):
+                print(f"{page['slug']}: {'opened' if page['opened'] else 'written'} ({len(page['episode_ids'])} episodes)")
+            for page in result.get("page_outcomes", []):
+                print(f"{page['slug']}: {page['used_count']} used, {page['skipped_count']} skipped")
+            for hold in result.get("holds", []):
+                print(f"{hold['slug']}: held until {hold['until_at']} ({hold['reason']})")
+            if args.wiki_cmd == "run":
+                print("Stored slug decisions: " + json.dumps(result.get("slug_decisions", {}), sort_keys=True))
+            skipped = result.get("skipped", [])
+            for page in result.get("failures", []) + (skipped if isinstance(skipped, list) else []):
+                print(f"{page['slug']}: refused: {page['reason']}" + (" (" + ", ".join(page["checks"]) + ")" if page.get("checks") else ""))
+            for page in result.get("pages", []):
+                print(f"{page['slug']}: {'retired' if page['retired'] else 'restored'} ({page['episodes_requeued']} episodes requeued)")
+            if args.wiki_cmd == "run":
+                print(f"Wiki: {result.get('pages_revised', 0)} revised, {result.get('pages_opened', 0)} opened; "
+                      f"{result.get('episodes_absorbed', 0)} episodes absorbed, {result.get('episodes_skipped', 0)} skipped; {result.get('queue_remaining', 0)} queued; "
+                      f"oldest {result.get('queue_oldest_age_days')} days; {result.get('rewrites_refused', 0)} refused; "
+                      f"{result.get('delegated_excluded', 0)} delegated excluded; "
+                      f"{result.get('calls_used', 0)} calls; cap {'hit' if result.get('cap_hit') else 'not hit'}; "
+                      f"run {result.get('run_id', 'unavailable')}")
+            if result.get("error") or isinstance(result.get("skipped"), str):
+                print(result.get("error") or result["skipped"])
+        return result.get("exit_code", 0 if result.get("ok") else 2)
+    if args.wiki_cmd == "plan":
+        result = wiki_nightly.plan(since=args.since)
+    else:
+        result = wiki_nightly.draft(sample=args.sample, pages=args.pages.split(",") if args.pages else None, model_id=args.model,
+                                    out=Path(args.out) if args.out else None, since=args.since)
+    if getattr(args, "json", False) or args.wiki_cmd == "draft":
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Read-only wiki plan: {result['planned_calls']} calls; {result['episode_count']} episodes; "
+              f"{result['delegated_excluded']} delegated episodes excluded")
+        for page in result["pages"]:
+            print(page["slug"] + f" ({page['episode_count']} episodes)" + (" (open)" if page["open"] else ""))
+            for row in page["episodes"]:
+                print(f"  {row['episode_id']}: {row['reason']}")
+        for hold in result.get("holds", []):
+            print(f"{hold['slug']}: held until {hold['until_at']} ({hold['reason']})")
+        print("Proposed opens: " + ", ".join(p["slug"] for p in result["opens"]))
+        print("Would ask: " + ", ".join(c["slug"] for c in result["slug_candidates"]))
+        print("Stored slug decisions: " + json.dumps(result["slug_decisions"], sort_keys=True))
+        print("Unmatched: " + ", ".join(result["unmatched"]))
+    return 0
 
 
 def cmd_models(args: argparse.Namespace) -> int:
@@ -5628,17 +5697,51 @@ def build_parser() -> argparse.ArgumentParser:
     lbj.add_argument("--limit", type=int, default=None, help="Cap chunks this run")
     lbj.set_defaults(func=cmd_library_backfill_job)
 
+    wk = sub.add_parser("wiki", help="Wiki assignments, drafts, live update and exact undo")
+    wk_sub = wk.add_subparsers(dest="wiki_cmd", required=True)
+    wk_slug = wk_sub.add_parser("slug", help="Read, replace or clear a stored slug decision")
+    wk_slug.add_argument("slug")
+    wk_slug_mode = wk_slug.add_mutually_exclusive_group()
+    wk_slug_mode.add_argument("--set", choices=("page", "tag", "alias"))
+    wk_slug_mode.add_argument("--clear", action="store_true")
+    wk_slug.add_argument("--target", metavar="SLUG")
+    wk_slug.add_argument("--json", action="store_true")
+    wk_slug.set_defaults(func=cmd_wiki)
+    wk_plan = wk_sub.add_parser("plan", help="Read-only assignments, cap and slug candidates")
+    wk_plan.add_argument("--json", action="store_true")
+    wk_plan.add_argument("--since", type=int, default=8, metavar="DAYS")
+    wk_plan.set_defaults(func=cmd_wiki)
+    wk_draft = wk_sub.add_parser("draft", help="Draft artifacts outside memory; no wiki writes")
+    wk_draft_select = wk_draft.add_mutually_exclusive_group(required=True)
+    wk_draft_select.add_argument("--sample", type=int)
+    wk_draft_select.add_argument("--pages", metavar="SLUGS", help="Comma-separated exact pages; first planned batch each")
+    wk_draft.add_argument("--since", type=int, default=8, metavar="DAYS")
+    wk_draft.add_argument("--model", default=None, metavar="ID")
+    wk_draft.add_argument("--out", default=None, metavar="DIR")
+    wk_draft.set_defaults(func=cmd_wiki)
+    wk_run = wk_sub.add_parser("run", help="Run only the wiki step, even when wiki_nightly is off")
+    wk_run.add_argument("--since", type=int, default=8, metavar="DAYS")
+    wk_run.add_argument("--max", type=int, default=60, metavar="N")
+    wk_run.add_argument("--json", action="store_true")
+    wk_run.set_defaults(func=cmd_wiki)
+    wk_undo = wk_sub.add_parser("undo", help="Restore exact source bytes and hold the page for seven days")
+    wk_undo.add_argument("slug", nargs="?")
+    wk_undo.add_argument("--night", metavar="DATE")
+    wk_undo.add_argument("--run", metavar="ID")
+    wk_undo.add_argument("--json", action="store_true")
+    wk_undo.set_defaults(func=cmd_wiki)
+
     md = sub.add_parser(
         "models",
-        help="Per-role model Settings (synth / embed / vision): show / set",
+        help="Per-role model Settings (synth / embed / vision / wiki): show / set",
     )
     md_sub = md.add_subparsers(dest="models_cmd", required=False)
-    md_sub.add_parser("show", help="JSON: three roles + models_error").set_defaults(
+    md_sub.add_parser("show", help="JSON: model roles + models_error").set_defaults(
         func=cmd_models, models_cmd="show"
     )
     md_set = md_sub.add_parser(
         "set",
-        help="Merge one role (--role …) or replace all three (JSON blob)",
+        help="Merge one role (--role …) or replace roles (legacy three-role JSON accepted)",
     )
     md_set.add_argument(
         "models_json",
@@ -5648,7 +5751,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     md_set.add_argument(
         "--role",
-        choices=("synth", "embed", "vision"),
+        choices=("synth", "embed", "vision", "wiki"),
         default=None,
         help="Merge one role (other roles unchanged)",
     )

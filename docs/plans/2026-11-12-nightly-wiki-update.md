@@ -14,23 +14,62 @@ Status: scope for Matt, 2026-11-12. Nothing here is built. Read `docs/plans/2026
 
 The nightly works off a queue: one row per (page, episode), in a new table `wiki_queue` (slug, episode_id, queued_at, done_at).
 
-- **Assign.** For each episode since the last run, attach it to at most 2 pages: first an exact match of its topic slug with a page slug, then the nearest page by vector (the episode and page vectors already exist in `memory_embeddings`, so this costs no new embedding). The threshold is set from the sample in section 6. An episode with no vector yet waits for the next night; after 2 nights it is matched by exact slug only. Pages named `note:` (mirrored Claude Code notes) and pages marked superseded or retired are skipped; an episode for a superseded page goes to the page that replaced it.
-- **Open a page** when a slug with no match turns up in at least 3 episodes from at least 2 sessions within 7 days, and no existing page sits close to it by vector. At most 10 new pages a night.
-- **Cap.** At most 60 page writes a night (the ceiling in section 4). Pages with the most waiting episodes go first, and a page that has waited 3 nights goes ahead of the rest. A page with too many episodes for one call (for example `khipu`) takes more than one write, and each write counts against the cap.
-- **Catch-up.** On the first nights the queue is filled from the last 30 days and drained under the same cap.
+- **Assign.** For each episode since the last run, attach it to at most 2 pages, by a slug the episode names: a page with that slug, the page that replaced it if it was superseded, or the page the slug was filed under by the gate below. Vectors play no part (see "What the live hub showed"). Only episodes of top-level conversations are used; rows written by delegated jobs are left out, because the conversation that started them has its own episode about the same work. Pages named `note:` (mirrored Claude Code notes) and pages marked superseded or retired are skipped.
+- **The gate for new slugs.** A slug that is not a page and turns up in at least 3 episodes from at least 2 sessions within 7 days is put to the writer model once: is it a real thing worth a page (a project, a product, a system, a person, an account or plan, a standing decision), a generic tag (reviewing, fixing, testing), or does it belong on a page that already exists? The answer is checked in code and kept in a table `wiki_slugs`, so a slug is asked about once. The 30 most-used undecided slugs are asked about per run, in one call.
+- **Open a page** for a slug the gate called a real thing. At most 10 new pages a run. Pages are opened by the nightly and by a hand run, never by the hourly run.
+- **Cap.** At most 60 page writes a night (the ceiling in section 4). Pages with the most waiting episodes go first, and a page that has waited 3 nights goes ahead of the rest. Within a page, episodes are written oldest first, so an earlier fact never overwrites a later one. A page with too many episodes for one call (for example `khipu`) takes more than one write, and each write counts against the cap.
+- **Catch-up.** The first run fills the queue from the last 8 days (which takes in the 5 Nov cancellations of section 6) and drains it under the same cap. Not 30 days: a busy page such as `khipu` would take about 36 writes of old episodes before it reached today.
+
+### What the live hub showed (2026-11-12, read-only, before anything wrote)
+
+The first version of this plan matched an episode to the nearest page by vector when no slug matched. Measured on the live hub, that does not work, and it was removed before any page was written.
+
+- For 400 recent episodes, the page an episode names by slug sits at a median rank of 127 out of 597 pages by distance. The nearest page is at 0.22 to 0.29 for almost every episode and the named page at 0.26 to 0.35, so no threshold separates right from wrong. Read by eye, about 3 in 14 nearest pages were right; an Olivewood PR episode's nearest page was `mrs-lollipop-merge-gate-mechanics`.
+- The reason is plain in the data: the wiki has no page for the projects of the last weeks (`olivewood`, `church-harness`, `healthy-you`, `recap`), so the nearest page is always a page about an older project.
+- The nearest-page query did not finish either: one day is 2,863 episodes (2,191 of them rows of delegated jobs) and it timed out at 60 s.
+- Slugs are free tags. In three days top-level conversations used 8,065 distinct slugs; 17 are pages (2% of mentions). 1,197 new slugs pass the 3-episodes, 2-sessions rule, and the most used are half generic (`pr-review`, `code-review`, `bug-fix`) and half real things with no page. Hence the gate.
+- To watch on the first runs, with no mechanism built for it: the length of busy pages (`khipu` gets about 110 episodes a day). The checks keep every dated or numbered line, so a busy page only grows until the monthly pass trims it.
 
 ## 2. What the writer does to a page
 
-Input: the current page, plus one line per waiting episode (date, episode id, summary, decisions, preferences). Output: the whole page.
+Input: the page's title and body, plus one line per waiting episode (date, episode id, summary, decisions, preferences), oldest first. Output: the body, as plain text.
 
-- **Must:** keep every fact that is still true; when a newer episode contradicts an old fact, replace it and leave a dated line ("Was X until 2026-11-12"); keep the frontmatter, set `last_updated`, and move `status: seed` to `active`; list the episode ids it used in a short Sources line. Plain short prose.
-- **Must never:** invent; drop a fact that is still true; merge, retire, rename or split pages (those stay monthly); touch a `note:` page or a protected file.
-- **Checks in code, before writing:** the slug and frontmatter are intact; the page did not shrink below 70% of its old length; every old line containing a date, number, path or link is still present or named in a "Was" line. A rewrite that fails a check is not written. The page stays queued, is retried the next night, and after that is listed in the morning report.
+- **The code owns the header.** A page is split into header and body before the call. The header is the closed `---` block at the top of the file (only blank lines or one-line comments may sit above it; a `---` rule lower in the page is never a header), or, on the 221 pages that have no closed block, the opening run of `key: value` lines and their list items. The writer never sees it. The code puts it back byte for byte with two changes of its own: `last_updated` becomes today, and an exact `status: seed` becomes `status: active`. A reply that begins with a header is refused.
+- **Must:** keep every statement on the page, copied exactly; say only what an episode says happened (work it calls in progress, proposed or waiting is written that way); when an episode plainly contradicts a line, write the new statement and below it a dated "Was <old line> until <date>"; put the episode's id in every bullet it writes from it. The code reads the used ids from the new bullets and keeps the Sources line itself.
+- **May:** skip an episode that is not about the page's subject, by writing nothing from it. Its queue row closes as skipped. A page never changes without a source: a body that changed with no used id is refused, and when every episode was skipped the file keeps its exact bytes ("unchanged" is judged after normalising whitespace).
+- **Must never:** invent; give a fact to the page's subject when the episode does not name it; write notes about the rewrite; drop a statement; merge, retire, rename or split pages (those stay monthly); touch a `note:` page, an archived page or a protected file.
+- **Checks in code, before writing:** the reply starts with the page's own first line (a page with no text yet must open with a heading) and is not empty, wrapped in a fence or more than one turn long; the page did not shrink below 70% of its old length; every old line containing a date, number, path or link is still present or named in a "Was" line (compared without surrounding whitespace; a "Was" line may leave off the list marker); every old Sources id is kept and no id appears that was not given. A line the writer only tidied (at least 90% the same, the same digits in the same order) is put back as it was before the checks decide. A rewrite that fails is not written; the page is held for 24 hours (6 hours after a failed call) and listed in the run's report, so one bad page costs one call a day and never crowds out the others.
+- **Forgotten episodes** are never loaded, a writing run closes their queue rows, and each batch is checked again just before its call.
 - **Write path:** if the file changed since the hub last saw it (an Obsidian edit), reconcile it first. Then write the file and call `_upsert_topic` with source `nightly-wiki`, so the revision is recorded at once. Before the first nightly write to any page that has no revision row matching its current text, write a baseline revision so there is always something to roll back to.
+
+### What the first drafts showed (2026-11-12, 28 pages drafted, none written)
+
+- **The checks, as first built, refused half the pages.** 14 of 28 drafts were refused, nearly all over header lines: 203 of 597 pages have no fenced header, 18 never close it, and the writer kept "fixing" them or changing `stub`, `seedling` or `archived` to `active`. Hence the code owns the header.
+- **A page inside a JSON string is fragile** (2 of 28 replies did not parse), and the largest page needs 46 to 50 seconds against a 60-second limit. Hence a plain-text reply and 180 seconds.
+- **Haiku rounds up.** A Codex Sol check of the drafts against their sources found no old fact lost, but four pages where unfinished work was written as finished ("is being installed" became "installed on both Macs"), one fact given to the wrong product, and notes about the rewrite itself. Hence the rules on saying only what the episode says.
+- **Tags are loose.** 25 of 176 episodes did not belong on the page they reached (`memory-management` is used for a Mac's RAM as well as for Khipu's memory). Hence the writer may skip an episode.
+- **The gate held.** The check would reverse none of its 30 decisions.
+
+### What the second drafts showed (2026-11-12, 11 pages re-drafted, none written)
+
+- **The rules on truth worked.** A second Codex Sol check found every fault of the first sample fixed: no unfinished work written as finished, no fact given to the wrong product, no notes about the rewrite.
+- **A reply can lose its beginning, silently.** Three drafts opened mid-sentence or with the tail of an episode dump. Measured on the Claude login: a reply that passes its output allowance is continued in a further turn, and the result holds only the last part, with exit 0 and a normal stop reason. Hence: the allowance is 24,000 for the logins; a wiki reply of more than one turn is recorded as truncated; the reply must start with the page's own first line, and a page with no text yet must open with a heading.
+- **The writer forgets the Sources line** but puts the episode id in every bullet it writes. Hence the code reads the used ids from the new bullets and keeps the Sources line itself; a body that changed with no used id is refused.
+- **"Skipped everything" was refused over a trimmed blank line.** Hence "unchanged" is judged after normalising whitespace, and an unchanged page keeps its exact bytes.
+- **A cross-family review found three ways a wrong file could be written** (a chatty or fenced reply under a header, any two `---` rules read as a header, an empty reply read as "all skipped"). All three are closed, each with the review's own input as a test.
+
+### What the third and fourth samples showed (2026-11-12, 11 pages each, none written)
+
+- **Haiku, third sample:** the cut replies were gone, but an instruction ("drop it afterward") was written as done, and on the largest page (model-routing, 10.6 KB plus 27 KB of episodes) one reply in three copied the episode records into the page and lost old text. The checks refused that reply; the page would have been held a day at a time. Hence the rule that decisions are not events, the strip of copied records, and the model below.
+- **Sonnet, fourth sample:** 10 of 11 drafts passed the checks (the eleventh added a title line above a body that has none, which the code now drops). On the largest page it took 32 seconds against Haiku's 57 to 112. A Codex Sol read against the sources: no old text lost, the instruction fault fixed, the Muse, GLM and Kimi cancellations stated correctly with their end dates on model-routing (with the aliases of section 1 in place). Two faults in about 130 new bullets: one bullet wrote "is being rebuilt" as "was rebuilt" (church-harness, episode 117836), and model-routing's three-month-old "on-subscription only" block stayed in place above newer, dated statements that replace it.
+- **What that means in use.** Every new bullet carries its episode id, so a doubtful line can be checked against its source, and `khipu wiki undo` takes back a page or a whole run. The writer adds and preserves; it does not restructure a page whose old text has gone stale. That stays with the monthly pass.
+- **Known limits, not fixed here:** a loose tag still brings off-subject episodes to a page with the same name (`memory-management` receives a Mac's RAM as well as the memory system), and the writer sometimes skips an episode that belongs.
 
 ## 3. Which model writes
 
 **Recommendation: Claude Haiku via the Claude login**, the same route and model the summaries use today, unless the sample in section 6 shows it dropping facts. Then Sonnet via the login.
+
+**As built (2026-11-12): Sonnet via the Claude login.** The samples above showed Haiku rounding up and copying its input; Sonnet did neither on the same pages and was faster on the largest one. Unset, the Wiki row follows the summaries' provider, and through the Claude login it uses Sonnet; an explicit Wiki setting wins. Sonnet draws more of the plan per call than the estimate below, which was made for Haiku: on the largest page it used about 6,300 output tokens.
 
 - Why: page writing is merge-and-preserve work over short inputs, close to what Haiku already does well for summaries. Through the login it costs no cash, and at 02:05 the accounts are idle.
 - **Cost per night** at a cap of 60 writes, each about 8,000 tokens in and 1,500 out: about 0.5 million tokens in and 0.1 million out. Through the login that is $0 cash, and about a tenth on top of what the summaries already draw from the plan each day (about 1,400 calls of up to 14,000 characters each). If billed through an Anthropic API key at the repo's own price table (`models.py`, Haiku $0.10 in and $0.50 out per million tokens, as of 2026-10-13), it is about $0.10 a night, or $3 a month. Not checked: Sonnet's current price. It is to be read from Anthropic's page before the sample run.
@@ -61,7 +100,8 @@ Input: the current page, plus one line per waiting episode (date, episode id, su
 
 ## 7. Where the code lives
 
-- In Khipu: `packages/cli/khipu/wiki_nightly.py`, run as a new nightly step `wiki_update` in `_run_nightly_locked` (`jobs.py`). It goes after `capture_export` and before `consolidate_nightly`, so the outside script's git sync carries tonight's pages offsite tonight, and the `embed_backfill` that follows re-embeds the revised pages. It runs only on the Mac that holds the hub and the memory folder (the M5). Other Macs skip it. There is no daytime run: the live step exists only inside the nightly.
+- In Khipu: `packages/cli/khipu/wiki_nightly.py`, run as a new nightly step `wiki_update` in `_run_nightly_locked` (`jobs.py`). It goes after `capture_export` and before `consolidate_nightly`, so the outside script's git sync carries tonight's pages offsite tonight, and the `embed_backfill` that follows re-embeds the revised pages. It runs only on the Mac that holds the hub and the memory folder (the M5). Other Macs skip it.
+- The same step also runs outside the nightly (Matt, 2026-11-12: "I don't want to have to wait till tonight"; "not have to wait till the night for things to be put into their pages"): by hand with `khipu wiki run`, and every hour (`wiki_every_minutes`, default 60, 0 for nightly only) for pages that have waiting episodes. All three share the day's ceiling and the nightly lock. Writing at every capture was ruled out with Matt: too many writes.
 - The outside light pass (`consolidate_nightly.py`) stays as it is for now: dedupe proposals, reflection, MEMORY.md rebuild, reconcile, git sync. Moving it into Khipu belongs to the 5 Nov line budget, not to this work. `nightly_topic_amend.py` is superseded; it is removed in the same clean-up once Matt okays deletions.
 - The monthly pass keeps merge and retire. Its "update" action overlaps the nightly and is left alone until question 4 is answered.
 
@@ -69,17 +109,19 @@ Input: the current page, plus one line per waiting episode (date, episode id, su
 
 Test command for every slice: `cd packages/cli && HOME=$(mktemp -d) KHIPU_KEYCHAIN=0 python -m pytest tests/test_wiki_nightly.py -q`, plus the named failures baseline for the full suite. Any slice that touches `apps/desktop` also runs `npx vite build` there.
 
-1. **Queue and matching, read-only.** Migration for `wiki_queue`; `assign()`; `khipu wiki plan` prints tonight's pages and why. Stop if more than 20% of a day's episodes lack vectors, and report the number: matching then needs a rethink.
+1. **Queue and matching, read-only.** Migration for `wiki_queue`; `assign()`; `khipu wiki plan` prints tonight's pages and why. (As built it also matched by vector; that was measured and removed, see section 1.)
 2. **Writer, drafts only.** The `wiki` model role, the `wiki` ceiling scope, the prompt, the checks in code and `khipu wiki draft --sample N` writing to the jobs folder. Stop if adding the role breaks the app's reading of `models`. That fix becomes its own slice.
 3. **Sample run (no code).** 30 pages, Haiku and Sonnet, the Codex Sol check and Matt's 3 diffs; report in the jobs folder. Stop after two failed rounds and hand the diffs back.
-4. **Live step behind the switch.** The `wiki_update` nightly step, file write plus `_upsert_topic`, baseline revisions, carry-over, the 30-day catch-up, and `khipu wiki undo` (page and night). Never run the real nightly to test it: tests use a temp home.
+4. **Live step behind the switch.** The `wiki_update` nightly step, file write plus `_upsert_topic`, baseline revisions, carry-over, the 8-day catch-up, and `khipu wiki undo` (page and night). Never run the real nightly to test it: tests use a temp home.
 5. **Morning report (1c).** The step counts and the search page-age figures, plus a doctor line.
 6. **Wiki row in Settings,** built with the approved regrouped Models page. Until then an agent sets it on Matt's word.
 7. **Flip on by default** after 7 clean nights.
 
-## 9. Open questions for Matt
+## 9. Questions, settled
 
-1. Writer: Haiku through your Claude login, stepping up to Sonnet only if the sample says so? (yes / Sonnet)
-2. When the login is out of room at night, should the wiki wait a night or pay about 10 cents through an API key? (wait / pay)
-3. Cap of 60 page writes a night? (yes / a number)
-4. Move the monthly pass off DeepSeek onto the same Wiki model? It sends whole pages to DeepSeek today. (yes / no)
+Matt did not answer these one by one; on 2026-11-12 he asked for the step to run the same day, so each is taken as recommended and any of them changes on his word.
+
+1. Writer: Haiku through the Claude login, stepping up to Sonnet only if the sample says so.
+2. When the login is out of room, the wiki waits. No paid key.
+3. Cap of 60 page writes a day, shared by the nightly, the hourly run and a hand run.
+4. The monthly pass is left as it is.

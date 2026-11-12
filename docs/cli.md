@@ -13,7 +13,7 @@ python3 -m khipu <command>
 
 Most commands need the Python dependencies on `PYTHONPATH` first; [packages/cli/README.md](../packages/cli/README.md) shows the one-time setup. To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
 
-There are 60 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
+There are 61 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
 
 ## Health and status
 
@@ -116,6 +116,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | `library` | Folders of `.txt` and `.md` files indexed as a search space. |
 | `embed-backfill` | Job-mode alias for `embed backfill --job`. |
 | `library-backfill NAME` | Job-mode alias for `library backfill NAME --job`. |
+| `wiki` | Read-only `plan --json --since DAYS` (default 8) and `draft (--sample N | --pages a,b,c) [--since DAYS] [--model ID] [--out DIR]`; live `run [--since DAYS] [--max N] [--json]`; decision `slug <slug> [--set page|tag|alias [--target SLUG] | --clear] [--json]`; exact undo `undo <slug>` or `undo --night YYYY-MM-DD [--run ID]` (also `undo --run ID`). |
 | `models` | Per-role model settings: `show`, `set`, `welcome`. |
 | `sources` | Memory sources: `list`, `enable`, `disable`, `remove`. |
 
@@ -284,3 +285,128 @@ These are launchers, not commands you normally run by hand. `khipu integrations 
 For the MCP tools these launchers serve, see [mcp-tools.md](mcp-tools.md). For the routing record, see [routing.md](routing.md). For jobs, backups and the gateway, see [operations.md](operations.md).
 
 Owner actions that scan or change batches return “Started; it will finish on its own.” after authorization. They run in a detached process, so closing or timing out the conversation does not stop them. Owner actions records the final outcome and counts.
+
+### wiki
+
+`wiki plan` reads recent top-level, nondeleted episodes, topics, the queue and
+stored slug decisions (if migrated). Nondeleted queued history remains loaded,
+including delegated jobs already queued. Deleted episodes never enter the writer;
+a live run marks their waiting queue rows done and reports `deleted_queue_drained`. Reports count delegated recent episodes
+excluded from the input. Planning never calls a provider, creates tables, queues
+work, reconciles files or writes decisions/pages. `--since DAYS` defaults to an
+8-day catch-up for plan, draft and run. Assignments use only named page slugs,
+supersession redirects and stored aliases, at most two pages per episode.
+
+Unknown valid slugs in at least 3 episodes from at least 2 sessions in 7 days are
+candidates, ordered by distinct sessions descending, episodes descending, then
+slug. Names of any existing page, including retired/superseded pages, stay reserved.
+The nightly and a hand run ask the Wiki writer once about the first 30 undecided
+candidates: page (a named thing or standing decision), tag (a generic activity or
+word), or alias (plainly the same thing or a small part of an eligible page).
+The call includes counts, two most recent episode summaries/decisions/preferences
+and eligible page slugs/titles. Checked decisions are kept in `wiki_slugs` and are
+never asked again. Invalid replies or provider failures leave slugs undecided.
+Only approved page slugs may open under the nomination rule; tags stay unmatched.
+`plan` shows would-ask candidates and stored decisions without asking the model.
+
+`wiki draft --sample N` uses the first planned batch for up to N distinct pages (1–60); additional batches remain undrafted.
+`wiki draft --pages a,b,c [--model ID] [--out DIR]` instead drafts exactly those named pages' first planned batches,
+in the named order; names with no planned batch appear in `unplanned_pages`. The two selection flags are mutually exclusive.
+Both forms write old.md, episodes.jsonl (summary/decisions/preferences only), draft.md, checks.json and used.json
+per page, plus summary.json and slug-decisions.json in the output folder. `used.json` lists `given_episode_ids`,
+`used_episode_ids` and `skipped_episode_ids`; usage is null when no usable response is available.
+Artifacts go below the jobs folder or an empty `--out` directory outside memory_root. Draft may call the gate
+but saves its decisions only in that output folder. These are unreviewed artifacts.
+
+Code keeps the header and sends only the title and page body to the writer. A closed `---` block includes
+its entire prefix. An unclosed or bare header is its opening delimiter, if present, followed by its initial
+key/value lines and their indented or `- ` list items, ending at the first blank, heading or prose line.
+Header bytes and newline conventions stay exact except existing `last_updated` dates become today and
+an exact `status: seed` becomes `status: active`; only a closed block gets a missing date added.
+Other statuses stay exact; archived pages are ineligible. A reply containing header lines or starting
+with a `---` block is refused as `header in reply`, never stripped.
+
+Length (at least 70%), protected-line retention, repair, Was lines and Sources checks apply to the body only.
+Sources retain every old episode ID, may omit supplied episodes the writer did not use, and may never
+invent an ID. Accepted used queue rows close as `written` and unused rows as `skipped` in the same transaction.
+When every supplied episode is skipped, an unchanged body closes the rows without a file write, revision,
+new page or seed promotion; any other body change is refused. Undo requeues only written episode IDs;
+skipped rows remain closed. Reports include `episodes_skipped` and per-page used/skipped counts.
+Mechanical checks cannot establish factual truth, completeness of other facts, or correctness of a Was claim.
+Protected lines compare after stripping whitespace; a dated Was line may omit a list marker.
+A missing protected line is restored only when the most
+similar draft body line scores at least 0.90 with `SequenceMatcher` and its digit
+runs match exactly. The original line is restored verbatim and every check runs
+again; artifacts and run reports count `repaired_protected_lines`.
+
+The rewrite response is raw Markdown; only a fence wrapping the entire reply
+is stripped. The slug gate accepts one JSON object, bare, fenced or wrapped in
+prose. Rewrite calls use a dedicated wiki system prompt, a 180-second timeout,
+and an output allowance of at least 4096 tokens or the old page plus 30 percent.
+REST providers and Claude login receive output token controls; Codex login gets
+an allowance instruction because its current CLI has no output-cap option.
+Provider-reported truncation refuses the draft with reason `truncated`; partial
+pages are never saved. New pages start with title, slug, seed status and date.
+
+The `wiki` models role inherits the configured `synth` route until explicitly
+set with `models set --role wiki`; `--model ID` overrides the draft model only.
+Login exhaustion never selects a paid fallback. `wiki_daily_pages` defaults to
+60, independently of summaries; lift with `budget lift wiki --cap N` or
+`config --set wiki_daily_pages N`. Draft calls consume this separate budget.
+`wiki run [--max N] [--json]` runs only the wiki update, even with
+`wiki_nightly` off. It uses the same lock as the complete nightly: a hand run
+refuses with exit 75 while that lock is held. A page is reconciled from its
+file before the provider sees it; a missing matching revision gets a baseline.
+The accepted file and a `nightly-wiki` revision are saved before its queue
+entries are marked done. Episodes within a page run oldest timestamp first, then
+numeric id. The prompt says older episodes cannot override newer dated page facts.
+A failed check holds that page for 24 hours; source, provider, response and save
+failures hold it for two hours, with their stage as the stored reason. A longer
+existing hold is never shortened. Queue entries remain waiting. Plan and run
+reports list each active hold with slug, expiry and reason, so other pages can
+use the available calls.
+At most 60 writes run per invocation and 10 new pages open per invocation; all invocations share
+the separate daily wiki call budget, including the single gate call, failed calls and draft calls.
+`--max N` further limits one invocation. Reports count unique episode IDs
+absorbed in that run, even when an episode updates two pages.
+
+`config --set wiki_nightly true` enables the scheduled step (default false).
+It runs after `capture_export`, before the outside consolidation, only on the
+configured nightly sync host with its memory folder mounted. Its failure does
+not stop later nightly steps. `config --set wiki_every_minutes N` sets the
+periodic interval (default 60, 0 means nightly only). The existing
+`replica_refresh` timer runs it when due; it also requires `wiki_nightly` and
+quietly skips a held nightly lock. Periodic runs write at most six pages and
+stop starting pages after 180 seconds of elapsed time; an in-flight call finishes.
+Hourly runs update existing pages only; they never call the gate or open pages, including pending openings. No extra launchd job or daytime git sync
+is installed. A wiki run failure does not change the replica timer's outcome.
+
+`wiki undo <slug>` restores the exact bytes before its latest wiki write.
+`wiki undo --night YYYY-MM-DD` restores all writes on that UTC date, and
+`--run ID` selects one recorded run. These commands use the same nightly lock.
+They record `wiki-undo`, requeue absorbed episodes for existing pages and hold each affected
+page for seven days with reason `undo`; the hold expires automatically. An opened page moves to
+`topics/_retired/` and is tombstoned, never deleted; all its waiting queue rows
+are marked done so no retired-page orphan remains. Its slug decision remains. Pages changed since their
+selected write are skipped and listed. Undo refuses when exact source bytes
+are unavailable; the older body-only revision history cannot restore them.
+
+`wiki slug <slug> [--json]` reads its stored gate decision. Use
+`wiki slug <slug> --set page|tag [--json]`, or
+`wiki slug <slug> --set alias --target <eligible-existing-slug> [--json]`
+to replace it; `wiki slug <slug> --clear [--json]` makes it undecided again.
+Aliases require an eligible existing target. A hand run lists gate decisions
+newly stored during that run; plan lists the complete stored decision catalog.
+
+The `wiki_update` entry in `nightly-last.json` and `wiki-last.json` retain the
+run ID, pages revised/opened, unique episodes absorbed, waiting queue count
+and oldest age in days, refusals, calls and cap status, plus the median and
+90th percentile age of topic pages returned by searches in the past 24 hours.
+Hand runs and periodic runs update the same step receipt, keeping other
+nightly receipts. Doctor adds one wiki line only when the switch is on and
+the latest run wrote no pages while episodes remain queued.
+
+Migrations `0053_wiki_queue` and `0054_wiki_writes` are prerequisites for live
+runs. The latter retains exact before bytes separately from redacted revision
+bodies. Neither planning nor running applies migrations automatically. The
+switch stays off until the scope's sample and owner review pass.
