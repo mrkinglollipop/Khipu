@@ -1,0 +1,231 @@
+<title>Khipu Settings Regrouped</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* Layout: the app's own two-pane Settings (list left, page right; one pane at phone width),
+   five one-word pages, every control inline on its row. Tokens are the desktop app's. */
+:root {
+  --bg: #faf9f7; --surface: #ffffff; --rail: #f3f1ed; --border: #e5e1db; --border-strong: #d5d0c8;
+  --text: #201d1a; --muted: #6e6860; --accent: #a63a1e; --accent-text: #8c2d14; --accent-soft: #f6e9e3;
+  --on-accent: #ffffff; --ok: #2e7d43; --ok-soft: #eaf5ec; --warn: #96660a; --warn-soft: #fbf3e0;
+  --ring: rgba(166, 58, 30, 0.35);
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --inset: 16px;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #16130f; --surface: #1f1b17; --rail: #1a1713; --border: #332d26; --border-strong: #453d33;
+  --text: #ede8e1; --muted: #968d81; --accent: #e0703f; --accent-text: #ed9067; --accent-soft: rgba(224,112,63,.14);
+  --on-accent: #1f0e06; --ok: #63c982; --ok-soft: rgba(99,201,130,.12); --warn: #e3b241; --warn-soft: rgba(227,178,65,.12);
+  --ring: rgba(224,112,63,.4); color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #16130f; --surface: #1f1b17; --rail: #1a1713; --border: #332d26; --border-strong: #453d33;
+  --text: #ede8e1; --muted: #968d81; --accent: #e0703f; --accent-text: #ed9067; --accent-soft: rgba(224,112,63,.14);
+  --on-accent: #1f0e06; --ok: #63c982; --ok-soft: rgba(99,201,130,.12); --warn: #e3b241; --warn-soft: rgba(227,178,65,.12);
+  --ring: rgba(224,112,63,.4); color-scheme: dark }
+
+body { background: var(--bg); color: var(--text); font: 13px/1.45 var(--sans); }
+.wrap { max-width: 980px; margin: 0 auto; padding-block: 24px 48px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 24px; }
+h1 { font-size: 22px; font-weight: 650; letter-spacing: -.01em; margin: 0; text-wrap: balance; }
+.lede { color: var(--muted); margin: 6px 0 0; max-width: 62ch; font-size: 14px; }
+h2 { font-size: 15px; font-weight: 650; margin: 0 0 8px; }
+button, select, input { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* the app window */
+.app { display: grid; grid-template-columns: 220px minmax(0, 1fr); border: 1px solid var(--border-strong);
+  border-radius: 12px; overflow: hidden; background: var(--surface); min-height: 560px; }
+.side { background: var(--rail); border-right: 1px solid var(--border); padding: 14px 8px; display: flex; flex-direction: column; gap: 14px; }
+.side h3 { font-size: 15px; font-weight: 650; margin: 0; padding: 2px 10px 0; }
+.cluster { display: flex; flex-direction: column; gap: 2px; }
+.nav { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; background: none; border: 0;
+  border-radius: 8px; padding: 7px 10px; cursor: pointer; min-height: 36px; }
+.nav svg { flex: none; width: 16px; height: 16px; stroke: var(--muted); fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.nav .nm { flex: 1; min-width: 0; }
+.nav .vl { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.nav[aria-current="true"] { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; }
+.nav[aria-current="true"] svg { stroke: var(--accent-text); }
+.nav[aria-current="true"] .vl { color: var(--accent-text); font-weight: 400; }
+@media (hover: hover) and (pointer: fine) { .nav:hover:not([aria-current="true"]) { background: var(--border); } }
+
+.page { padding: 20px 24px 28px; display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.back { display: none; align-self: flex-start; background: none; border: 0; color: var(--accent-text); padding: 4px 0; cursor: pointer; }
+.page h4 { font-size: 18px; font-weight: 650; margin: 0; }
+.grp { display: flex; flex-direction: column; gap: 6px; }
+.grp > .gt { font-size: 12px; font-weight: 600; color: var(--muted); padding-inline: var(--inset); }
+.grp > .gn { font-size: 12px; color: var(--muted); padding-inline: var(--inset); margin: 0; max-width: 64ch; }
+.card { border: 1px solid var(--border); border-radius: 10px; background: var(--bg); }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap;
+  padding: 10px var(--inset); min-height: 44px; }
+.row + .row { border-top: 1px solid var(--border); }
+.row .lb { flex: 1 1 180px; min-width: 0; }
+.row .lb small { display: block; color: var(--muted); font-size: 12px; }
+.row .ct { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; min-width: 0; max-width: 100%; }
+.row .ct select { min-width: 0; text-overflow: ellipsis; }
+.val { color: var(--muted); font-variant-numeric: tabular-nums; }
+.pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--ok-soft); color: var(--ok); white-space: nowrap; }
+.pill.off { background: var(--border); color: var(--muted); }
+.btn { border: 1px solid var(--border-strong); background: var(--surface); border-radius: 7px; padding: 5px 11px; cursor: pointer; white-space: nowrap; }
+.btn.pri { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+select, input[type="text"] { border: 1px solid var(--border-strong); background: var(--surface); border-radius: 7px; padding: 5px 8px; max-width: 100%; }
+input[type="text"] { font-family: var(--mono); font-size: 12px; width: 150px; }
+.sw { width: 38px; height: 22px; border-radius: 999px; border: 0; background: var(--border-strong); position: relative; cursor: pointer; flex: none; }
+.sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: transform .15s; }
+.sw[aria-checked="true"] { background: var(--accent); }
+.sw[aria-checked="true"]::after { transform: translateX(16px); }
+@media (prefers-reduced-motion: reduce) { .sw::after { transition: none; } }
+.seg { display: inline-flex; border: 1px solid var(--border-strong); border-radius: 7px; overflow: hidden; }
+.seg button { border: 0; background: var(--surface); padding: 5px 10px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--border-strong); }
+.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; }
+.foot { display: flex; justify-content: flex-end; }
+
+/* what moved where */
+.tw { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; min-width: 460px; font-size: 13px; }
+th, td { text-align: left; padding: 8px var(--inset); border-top: 1px solid var(--border); vertical-align: top; }
+th { border-top: 0; font-size: 12px; color: var(--muted); font-weight: 600; }
+td:first-child { color: var(--muted); }
+.note { color: var(--muted); font-size: 12px; margin: 0; }
+
+@media (max-width: 720px) {
+  .app { grid-template-columns: minmax(0, 1fr); min-height: 0; }
+  .side { border-right: 0; }
+  .app[data-open="true"] .side { display: none; }
+  .app:not([data-open="true"]) .page { display: none; }
+  .back { display: inline-block; }
+  .page { padding: 14px 14px 22px; }
+  /* the list alone is showing, so no page is current */
+  .nav[aria-current="true"] { background: none; color: inherit; font-weight: 400; }
+  .nav[aria-current="true"] svg { stroke: var(--muted); }
+  .nav[aria-current="true"] .vl { color: var(--muted); }
+}
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Khipu Settings, regrouped</h1>
+    <p class="lede">A proposal to approve before anything is built. Thirteen rows become five pages, each named in one word, and every choice sits on its own row. Tap through it. Values are examples from the M5 Max.</p>
+  </header>
+
+  <div class="app" id="app">
+    <nav class="side" aria-label="Settings">
+      <h3>Settings</h3>
+      <div id="nav"></div>
+    </nav>
+    <section class="page" id="page" aria-live="polite"></section>
+  </div>
+
+  <section>
+    <h2>Where each of today's rows goes</h2>
+    <div class="tw"><table>
+      <thead><tr><th>Today</th><th>Proposed page</th><th>What changes</th></tr></thead>
+      <tbody>
+        <tr><td>Look</td><td>General</td><td>A three-way switch on the row</td></tr>
+        <tr><td>Open Khipu when M5 Max starts</td><td>General</td><td>A switch on the row</td></tr>
+        <tr><td>Search by meaning</td><td>General</td><td>A switch on the row; its model moves to Models</td></tr>
+        <tr><td>Include your books in search</td><td>General</td><td>A switch on the row</td></tr>
+        <tr><td>Updates</td><td>General</td><td>Version and the check button on one row</td></tr>
+        <tr><td>Who writes the summaries</td><td>Models</td><td>A pick-list per job; keys in their own group</td></tr>
+        <tr><td>Where memory is kept</td><td>Storage</td><td>Named for what it is: the database</td></tr>
+        <tr><td>Backups</td><td>Storage</td><td>Next to the thing it backs up</td></tr>
+        <tr><td>Apps that use Khipu</td><td>Connections</td><td>One page for everything Khipu is connected to</td></tr>
+        <tr><td>Sign-ins</td><td>Connections</td><td>Same page</td></tr>
+        <tr><td>Your Macs</td><td>Connections</td><td>Same page</td></tr>
+        <tr><td>Help</td><td>Help</td><td>Unchanged</td></tr>
+        <tr><td>Details for an agent</td><td>Help</td><td>A Copy button on a row</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <p class="note">Not in this mock: a model for the nightly wiki update. It gets a row under Models when that work is scoped.</p>
+</div>
+
+<script>
+const I = {
+  gen: '<circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M3.6 12.4l1.1-1.1M11.3 4.7l1.1-1.1"/>',
+  mod: '<path d="M8 1.8l1.5 3.6 3.7.4-2.8 2.5.9 3.7L8 10.1 4.7 12l.9-3.7-2.8-2.5 3.7-.4z"/>',
+  sto: '<ellipse cx="8" cy="4" rx="5" ry="2"/><path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>',
+  con: '<path d="M6.5 9.5l3-3M7 4.6l1-1a2.6 2.6 0 013.7 3.7l-1 1M9 11.4l-1 1a2.6 2.6 0 01-3.7-3.7l1-1"/>',
+  hlp: '<circle cx="8" cy="8" r="6"/><path d="M6.3 6.3a1.8 1.8 0 113 1.4c-.7.5-1.3.9-1.3 1.8M8 11.6v.2"/>'
+};
+const sw = (id, on) => `<button class="sw" id="${id}" role="switch" aria-checked="${on}" aria-label="${id.replace(/-/g, ' ')}"></button>`;
+const seg = (id, opts, cur) => `<span class="seg" id="${id}">${opts.map(o => `<button type="button" aria-pressed="${o === cur}">${o}</button>`).join('')}</span>`;
+const sel = (id, opts) => `<select id="${id}" aria-label="${id.replace(/-/g, ' ')}">${opts.map(o => `<option>${o}</option>`).join('')}</select>`;
+const btn = (t, pri) => `<button type="button" class="btn${pri ? ' pri' : ''}">${t}</button>`;
+const pill = (t, off) => `<span class="pill${off ? ' off' : ''}">${t}</span>`;
+const val = t => `<span class="val">${t}</span>`;
+
+const PAGES = [
+  { id: 'general', cluster: 0, name: 'General', icon: I.gen, value: '', groups: [
+    { title: 'Appearance', rows: [['Look', 'Only on M5 Max', seg('look', ['Follows this Mac', 'Light', 'Dark'], 'Follows this Mac')]] },
+    { title: 'Starting up', rows: [['Open Khipu when M5 Max starts', 'Only on M5 Max', sw('open-at-start', true)]] },
+    { title: 'Search', rows: [
+      ['Search by meaning', 'Off: Khipu matches only the words you type.', sw('search-by-meaning', true)],
+      ['Include your books', 'Off: books are searched only when you ask.', sw('include-books', false)] ] },
+    { title: 'Updates', rows: [['Khipu 0.4.15', 'Each update is signed and checked before it replaces anything.', btn('Check for updates')]] } ] },
+  { id: 'models', cluster: 0, name: 'Models', icon: I.mod, value: 'Haiku', save: 'Save models', groups: [
+    { title: 'Summaries', note: 'Writes the short summary of each conversation.', rows: [
+      ['Model', 'Uses the login you already have; counts against that plan.', sel('summary-model', ['Claude Haiku, on my Claude login', 'Claude Haiku (API key)', 'Gemini Flash (API key)', 'OpenAI (API key)', 'OpenRouter (API key)', 'ChatGPT, on my ChatGPT login', 'A model on this Mac or my network'])],
+      ['Model id', 'Change it only to pin a specific version.', '<input type="text" id="summary-model-id" value="haiku" aria-label="Model id">'],
+      ['If that model fails', '', sel('summary-fallback', ['Use Gemini Flash', 'Wait and try again'])],
+      ['Daily limit', 'Once reached, new summaries wait until tomorrow. Nothing is lost.', val('10,000 summaries') + btn('Change')] ] },
+    { title: 'Search by meaning', note: 'Matches what you meant, not only the words you typed.', rows: [
+      ['Model', '', sel('search-model', ['Gemini Embedding 2 (API key)', 'A model on this Mac or my network'])] ] },
+    { title: 'API keys', note: 'Kept in this Mac’s keychain. Khipu never shows a key.', rows: [
+      ['Anthropic', '', pill('Not added', true) + btn('Add key')],
+      ['Gemini', '', pill('Saved') + btn('Replace')],
+      ['OpenAI', '', pill('Not added', true) + btn('Add key')],
+      ['OpenRouter', 'One key, any model.', pill('Not added', true) + btn('Add key')],
+      ['Your own model', 'Only if it asks for a key.', pill('Not added', true) + btn('Add key')] ] } ] },
+  { id: 'storage', cluster: 0, name: 'Storage', icon: I.sto, value: '', groups: [
+    { title: 'Database', note: 'Where memory is kept.', rows: [
+      ['Status', '', pill('Connected')],
+      ['Memories ready to search', '', val('48,708')],
+      ['Move this memory to another database', '', btn('Move…')],
+      ['Connect to a different database', '', btn('Connect…')],
+      ['Run setup again', '', btn('Run setup')] ] },
+    { title: 'Backups', rows: [
+      ['Last backup', 'A zip of this Mac’s Khipu files, written to Downloads.', val('10 hours ago') + btn('Back up now')],
+      ['Free space on M5 Max', '', val('461 GB')] ] } ] },
+  { id: 'connections', cluster: 0, name: 'Connections', icon: I.con, value: '', groups: [
+    { title: 'Apps', note: 'Khipu remembers conversations from these apps.', rows: [
+      ['Claude Code', '', pill('Connected')], ['Codex', '', pill('Connected')], ['Cursor', '', pill('Connected')], ['Antigravity', '', pill('Connected')],
+      ['Changes agents make for you', '', btn('See all changes')] ] },
+    { title: 'Accounts', note: 'Khipu reads each account’s usage to keep you off its limits.', rows: [
+      ['Claude', '', pill('Signed in')], ['Claude second', '', pill('Signed in')], ['Codex', '', pill('Signed in')], ['Grok', '', pill('Signed in')],
+      ['Muse', '', pill('Signed in')], ['Kimi', '', pill('Signed in')], ['GLM', '', pill('Signed in')], ['DeepSeek', '', pill('Signed in')] ] },
+    { title: 'Macs', note: 'Both Macs run the same version.', rows: [
+      ['M5 Max', 'This Mac', val('Khipu 0.4.15')],
+      ['M1 Max', 'Heard from 3 minutes ago', val('Khipu 0.4.15')],
+      ['Add another Mac', '', btn('Add…')] ] } ] },
+  { id: 'help', cluster: 1, name: 'Help', icon: I.hlp, value: '', groups: [
+    { title: 'Help', rows: [
+      ['Help on the website', '', btn('Open the website')],
+      ['Guides in this app', '', btn('Open guides')],
+      ['Send feedback', '', btn('Write feedback')] ] },
+    { title: 'When something is wrong', rows: [
+      ['Details for an agent', 'Everything an agent needs to look into a problem. Paste it into any conversation.', btn('Copy')] ] } ] }
+];
+
+const app = document.getElementById('app'), nav = document.getElementById('nav'), page = document.getElementById('page');
+let cur = 'general';
+function drawNav() {
+  nav.innerHTML = [0, 1].map(c => `<div class="cluster">${PAGES.filter(p => p.cluster === c).map(p =>
+    `<button type="button" class="nav" data-id="${p.id}" ${p.id === cur ? 'aria-current="true"' : ''}><svg viewBox="0 0 16 16" aria-hidden="true">${p.icon}</svg><span class="nm">${p.name}</span>${p.value ? `<span class="vl">${p.value}</span>` : ''}</button>`).join('')}</div>`).join('<div style="height:10px"></div>');
+}
+function drawPage() {
+  const p = PAGES.find(x => x.id === cur);
+  page.innerHTML = `<button type="button" class="back" id="back">‹ Settings</button><h4>${p.name}</h4>` + p.groups.map(g =>
+    `<div class="grp"><div class="gt">${g.title}</div>${g.note ? `<p class="gn">${g.note}</p>` : ''}<div class="card">${g.rows.map(r =>
+      `<div class="row"><div class="lb">${r[0]}${r[1] ? `<small>${r[1]}</small>` : ''}</div><div class="ct">${r[2]}</div></div>`).join('')}</div></div>`).join('') +
+    (p.save ? `<div class="foot">${btn(p.save, true)}</div>` : '');
+}
+nav.addEventListener('click', e => { const b = e.target.closest('.nav'); if (!b) return; cur = b.dataset.id; app.dataset.open = 'true'; drawNav(); drawPage(); });
+page.addEventListener('click', e => {
+  if (e.target.id === 'back') { app.dataset.open = 'false'; return; }
+  const s = e.target.closest('.sw'); if (s) { s.setAttribute('aria-checked', s.getAttribute('aria-checked') !== 'true'); return; }
+  const g = e.target.closest('.seg button'); if (g) g.parentElement.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', b === g));
+});
+drawNav(); drawPage();
+</script>
