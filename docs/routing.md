@@ -591,7 +591,18 @@ Agents do not have to ask. When the `routing_push` feature is on, Khipu puts rou
 What the agent sees:
 
 Every reader gets the same text: the routing page (`khipu route --page`), at most
-5,500 characters (`routing_page.LIMIT`), headed "ROUTING HH:MMZ".
+6,000 characters (`routing_page.LIMIT`), headed "ROUTING HH:MMZ".
+
+To fit, the page shortens roles and exception quotes before dropping whole rule
+lines from the bottom, reporting the omitted count and headings. Older exceptions
+may become counts. The newest exception written within the past 48 hours on each
+account keeps at least 110 characters of quote width, even when other exceptions
+become counts; this fresh direction outranks standing rule lines for space. Only
+the final all-zero-width last resort may remove it. A leading stamp (`Matt YYYY-MM-DD`,
+with an optional `Reaffirmed by` and time, then a comma or colon and a space) becomes `(MM-DD)` on roles and exceptions before
+cutting. Everything after the stamp is kept word for word, place label included
+(`Olivewood Bible Study:`, `Codex:`, `until the build is out:`): no pattern can tell a place
+from a scope or condition, so none is removed. The stored and full record stay unchanged.
 
 - **Session start**: the page, whole, every time. It has a time budget of 1 second by default.
 - **Each prompt**: the page again only when its signature changed (a status word, the owner's order or the owner's words; a percentage moving on its own does not count). Read from `page.txt`, never folded on the prompt.

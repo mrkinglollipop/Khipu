@@ -186,16 +186,194 @@ def _exception(n, *, ago_hours, until_days=2, text=None):
             "at": _iso(NOW - timedelta(hours=ago_hours)), "by": "owner"}
 
 
-def _with_exceptions(view, counts):
+def _with_exceptions(view, counts, *, ago_hours=10):
     for entry in view["priority"]["entries"]:
         label = entry["label"]
         for n in range(counts.get(label, 0)):
-            entry.setdefault("exceptions", []).append(_exception(n + 1, ago_hours=10 + n))
+            entry.setdefault("exceptions", []).append(_exception(n + 1, ago_hours=ago_hours + n))
     return view
 
 
 def _rules_of(view):
     return [text for _head, text in routing_page._rules(view)]
+
+
+@pytest.mark.parametrize("prefix,kept", [
+    ("Matt 2026-11-12 09:30:", ""), ("Matt 2026-11-12 ~09:30Z:", ""),
+    ("Matt 2026-11-12 09:30Z, in this conversation:", "in this conversation: "),
+    ("Matt 2026-11-12, in this conversation:", "in this conversation: "),
+    ("Reaffirmed by Matt 2026-11-12 ~09:30, on the main Mac:", "on the main Mac: "),
+    ("Reaffirmed by Matt 2026-11-12, here:", "here: "),
+])
+def test_page_attribution_keeps_the_day_before_cutting(prefix, kept):
+    words = prefix + " Keep Codex available for cross-family review."
+    view = _view()
+    item = view["priority"]["entries"][0]
+    item["role"] = words
+    item["exceptions"] = [_exception(1, ago_hours=1, text=words)]
+    before = copy.deepcopy(view)
+    text = _page(view)
+    assert _line(text, "Codex").count(f"(11-12) {kept}Keep Codex") == 2
+    assert prefix not in text
+    assert view == before
+    facts = routing_page.facts(view, NOW)["accounts"][0]
+    assert facts["role"] == words
+    assert facts["exceptions"] == [{k: item["exceptions"][0][k] for k in ("id", "text", "until")}]
+
+
+@pytest.mark.parametrize("words", [
+    "Keep Matt 2026-11-12 09:30Z: in the middle.", "Matt says: keep this.",
+    "Someone 2026-11-12 09:30Z: keep this.", "Matt 2026-11-12 tomorrow: keep this.",
+    "Matt presses resets; say when one is worth it.",
+    "Matt 2026-11-12 06:56:30Z is when Codex resets.", "Matt 2026-11-12:06:56Z resets.",
+])
+def test_text_without_a_leading_stamp_is_unchanged(words):
+    assert routing_page._page_words(words) == words
+
+
+# Only the "Matt <date> [time]" stamp goes. Everything after it stays word for
+# word, whether it is a place ("Olivewood Bible Study:") or a scope or
+# condition ("Codex:", "at the limit:", "until the build is out:"): no pattern
+# can tell those apart, so none is guessed at (review 2026-11-12).
+@pytest.mark.parametrize("words", [
+    "Matt 2026-11-12, use Claude until Codex resets at 06:56Z",
+    "Matt 2026-11-12, until the Bible Study build is out: no Xcode builds on the M5.",
+    "Matt 2026-11-12, no Grok builds this week. Reason: the xAI week is shared.",
+    "Matt 2026-11-12, no Grok builds: the xAI week is shared.",
+    "Matt 2026-11-12, Codex first: Claude only for checks",
+    "Matt 2026-11-12 ~01:00Z, never Fable on second: it bills main",
+    "Matt 2026-11-12, Codex: run it to its limit",
+    "Matt 2026-11-12, on Codex: ration nothing",
+    "Matt 2026-11-12, at the limit: tell him",
+    "Matt 2026-11-12, Grok Bot Only: pause",
+    "Matt 2026-11-12, Use Codex: keep Claude for checks.",
+    "Matt 2026-11-12, in doubt: use Opus.",
+    "Matt 2026-11-12: 06:56Z is when Codex resets.",
+    'Matt 2026-11-11 ~23:35Z, Olivewood orchestrator: "run workflows on it instead of main too."',
+    'Matt 2026-11-11, Olivewood: ~20:50Z "Reset button hit..."',
+    "Reaffirmed by Matt 2026-11-11 ~22:30Z, Olivewood Bible Study: \"dont forget\"",
+    "Matt 2026-11-12: Keep this.",
+])
+def test_only_the_stamp_is_shortened_and_every_word_after_it_is_kept(words):
+    out = routing_page._page_words(words)
+    assert out.startswith(f"({words.split('Matt ', 1)[1][5:10]}) ")
+    rest = out[len("(11-12) "):]
+    assert words.endswith(rest) and len(rest) >= len(words) - len("Reaffirmed by Matt 2026-11-12 ~22:30Z, ")
+    assert "Matt 20" not in out
+
+
+@pytest.mark.parametrize("words,expected", [
+    ('Matt 2026-11-11 ~13:30Z, Olivewood Bible Study: "Lean more"', '(11-11) Olivewood Bible Study: "Lean more"'),
+    ("Matt 2026-11-12: Keep this.", "(11-12) Keep this."),
+    ("Reaffirmed by Matt 2026-11-12: Keep this.", "(11-12) Keep this."),
+    ("Matt 2026-11-12, at the limit: tell him", "(11-12) at the limit: tell him"),
+    ("Matt 2026-11-12: 06:56Z is when Codex resets.", "(11-12) 06:56Z is when Codex resets."),
+    ("Matt 2026-11-12 06:56:30Z: Codex resets.", "(11-12) Codex resets."),
+])
+def test_page_attribution_examples(words, expected):
+    assert routing_page._page_words(words) == expected
+
+
+def _fresh_fixture():
+    now = datetime(2026, 11, 12, 20, 10, tzinfo=timezone.utc)
+    rules = [f"{head}: Rule {i}: " + "Keep the owner words intact and route by the current account record. " * 4
+             for i, head in enumerate(("WHICH MODEL", "NEVER", "CHECKS", "MACS") * 3)]
+    view = _view(rules=rules)
+    delta = now - NOW
+    for account in view["accounts"]:
+        for pace in account.get("pace", []):
+            pace["cycle_resets_at"] = _iso(routing._parse(pace["cycle_resets_at"]) + delta)
+    for hold in view["holds"]:
+        hold["until"] = _iso(routing._parse(hold["until"]) + delta)
+    for entry in view["priority"]["entries"]:
+        entry["role"] = "Matt 2026-11-12 ~19:00Z, in chat: " + (
+            "Keep this account for work it fits; use even pace and review the result. " * 8)
+    for label, ages in (("Codex", (1, 2, 72)), ("Claude second", (1, 72, 73))):
+        item = next(e for e in view["priority"]["entries"] if e["label"] == label)
+        item["exceptions"] = [dict(_exception(i, ago_hours=age), at=_iso(now - timedelta(hours=age)),
+                                   until=_iso(now + timedelta(days=2)),
+                                   text="Matt 2026-11-12 ~19:10Z, in this chat: " +
+                                   f"Newest {label} direction {i}: keep this lane open for the cross-family review "
+                                   "and use the standing rules to choose each job carefully. " * 2)
+                              for i, age in enumerate(ages, 1)]
+    return view, now
+
+
+def test_fresh_realistic_page_keeps_directions_and_measures_rules():
+    view, now = _fresh_fixture()
+    before = copy.deepcopy(view)
+    text = routing_page.page(view, now)
+    rules = _rules_of(view)
+    kept = sum(rule in text for rule in rules)
+    assert 3200 < sum(map(len, rules)) < 3500
+    assert len(text) <= routing_page.LIMIT
+    cut = routing_page.left_out(view, now)
+    assert kept + sum(count for _head, count in cut) == 12
+    if kept < 12:
+        all_at_floor = routing_page._render(view, now, {}, {}, routing_page._rules(view), 12,
+                                           routing_page._WIDTHS[-2], 0, routing)
+        assert len(all_at_floor) > routing_page.LIMIT
+        footer = next(line for line in text.splitlines() if "more rule lines" in line)
+        assert all(head in footer for head, _n in cut)
+    else:
+        assert "more rule lines" not in text
+    for label in ("Codex", "Claude second"):
+        assert f"(11-12) in this chat: Newest {label} direction 1:" in _line(text, label)
+    assert "Matt 2026-" not in text
+    assert view == before
+
+
+def test_fresh_floor_survives_each_width_and_old_exceptions_collapse_at_zero():
+    view, now = _fresh_fixture()
+    for widths in routing_page._WIDTHS[:-1]:
+        text = routing_page._render(view, now, {}, {}, [], 0, widths, 140, routing)
+        for label in ("Codex", "Claude second"):
+            line = _line(text, label)
+            quote = re.search(r'Exception until [^“]+“([^”]+)”', line)[1]
+            expected = routing_page._cut(_page_words_for_test(view, label), max(widths[1], 110))
+            assert quote == expected
+            if widths[1] == 0:
+                assert line.count("Exception until") == 1
+                assert "+2 more: khipu route --full" in line
+    old = _with_exceptions(_view(), {"Codex": 3}, ago_hours=72)
+    text = routing_page._render(old, NOW, {}, {}, [], 0, (90, 0, 60), 0, routing)
+    assert "3 exceptions: khipu route --full" in _line(text, "Codex")
+    assert "Exception until" not in _line(text, "Codex")
+    last = routing_page._render(view, now, {}, {}, [], 0, (0, 0, 0), 0, routing)
+    assert "Exception until" not in _line(last, "Codex")
+
+
+def _page_words_for_test(view, label):
+    item = next(e for e in view["priority"]["entries"] if e["label"] == label)
+    return routing_page._page_words(item["exceptions"][0]["text"])
+
+
+@pytest.mark.parametrize("at", [None, "bad time", _iso(NOW + timedelta(hours=1)), _iso(NOW - timedelta(hours=49))])
+def test_missing_invalid_future_and_old_times_have_no_fresh_floor(at):
+    assert routing_page._fresh_exception([dict(_exception(1, ago_hours=1), at=at)], NOW, routing) is None
+
+
+def test_rule_omissions_report_headings_while_fresh_direction_stays_at_floor(monkeypatch):
+    view, now = _fresh_fixture()
+    view["rules"] *= 3
+    attempts = []
+    render = routing_page._render
+
+    def tracked(*args):
+        attempts.append((args[5], args[6]))
+        return render(*args)
+
+    monkeypatch.setattr(routing_page, "_render", tracked)
+    text = routing_page.page(view, now)
+    first_drop = next(i for i, (keep, _widths) in enumerate(attempts) if keep < len(view["rules"]))
+    assert [widths for _keep, widths in attempts[:first_drop]] == list(routing_page._WIDTHS[:-1])
+    assert attempts[first_drop][1] == routing_page._WIDTHS[-2]
+    cut = routing_page.left_out(view, now)
+    assert len(text) <= routing_page.LIMIT
+    assert cut and sum(n for _head, n in cut) > 0
+    footer = next(line for line in text.splitlines() if "more rule lines" in line)
+    assert all(head in footer for head, _n in cut)
+    assert "(11-12) in this chat: Newest Codex direction 1:" in _line(text, "Codex")
 
 
 def test_twelve_standing_rules_fit_with_eight_long_account_roles():
@@ -246,11 +424,11 @@ def test_an_ended_exception_is_never_shown_or_counted():
     assert "Exception number 1:" not in codex and "Exception number 2:" in codex and "older" not in codex
 
 
-def test_exception_text_gives_way_before_any_rule_line_is_touched():
+def test_old_exception_text_gives_way_before_any_rule_line_is_touched():
     long = "an exception quote that goes on and on about one more temporary thing " * 3
     view = _view(rules=RULES_10)
     for entry in view["priority"]["entries"]:
-        entry["exceptions"] = [_exception(n, ago_hours=n, text=long) for n in range(1, 7)]
+        entry["exceptions"] = [_exception(n, ago_hours=72 + n, text=long) for n in range(1, 7)]
     text = _page(view)
     assert len(text) <= routing_page.LIMIT
     for rule in _rules_of(view):
@@ -543,3 +721,15 @@ def test_a_new_page_limit_resends_the_page_once(monkeypatch):
     monkeypatch.setattr(routing_page, "LIMIT", routing_page.LIMIT + 1000)
     assert routing_page.signature(view, NOW) != sig
     assert routing_page.signature(copy.deepcopy(view), NOW) == routing_page.signature(view, NOW)
+
+
+@pytest.mark.parametrize("label", ["Codex", "Claude second"])
+def test_an_exception_ageing_past_48_hours_changes_the_signature(label):
+    view = _with_exceptions(_view(), {label: 1}, ago_hours=47)
+    item = next(e for e in view["priority"]["entries"] if e["label"] == label)
+    sig = routing_page.signature(view, NOW)
+    # Moving the timestamp within the fresh window alone should not resend.
+    item["exceptions"][0]["at"] = _iso(NOW - timedelta(hours=46))
+    assert routing_page.signature(view, NOW) == sig
+    item["exceptions"][0]["at"] = _iso(NOW - timedelta(hours=49))
+    assert routing_page.signature(view, NOW) != sig

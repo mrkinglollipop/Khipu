@@ -487,8 +487,8 @@ def test_the_routing_imports_cover_everything_the_page_read_imports(home):
 # ---- doctor speaks of the page, not the old summary --------------------------------------------
 
 
-def _long_rules(n=12, size=450):
-    for i in range(n):
+def _long_rules(size=450):
+    for i in range(routing_page.LIMIT // size + 2):
         routing.add_rule(f"RULES: rule {i} " + "x" * size, via="app")
 
 
