@@ -60,7 +60,7 @@ export const GUIDES: GuideMeta[] = [
   { id: "caps", group: "accounts", title: "Caps, pauses and exceptions", blurb: "Keep an account from running out, or allow something for a few days.", aliases: ["cap", "pause", "hold", "limit"] },
   { id: "saving", group: "memory", title: "How saving and recall work", blurb: "When a session is saved, and what your agent is shown.", aliases: ["capture", "recall", "save"] },
   { id: "forget", group: "memory", title: "Forget something", blurb: "Hide a saved session from every agent.", aliases: ["delete", "remove", "privacy"] },
-  { id: "projects", group: "memory", title: "Projects, Owed and Work", blurb: "How sessions group into projects, and what 'owed' means.", aliases: ["owed", "work", "commitments"] },
+  { id: "projects", group: "memory", title: "Projects and Needs you", blurb: "How sessions group into projects and where your decisions wait.", aliases: ["needs you", "work", "asks"] },
   { id: "backups", group: "safe", title: "Backups and copies on this Mac", blurb: "What's copied where, and how to restore.", aliases: ["backup", "restore", "copy"] },
   { id: "another_mac", group: "safe", title: "Add another Mac", blurb: "Save a join kit here, open it on the other Mac.", aliases: ["mac", "join", "kit", "second"] },
   { id: "gateway", group: "safe", title: "Run a gateway", blurb: "The one part of Khipu that cloud agents reach over the internet.", aliases: ["server", "https", "address", "cloud"] },

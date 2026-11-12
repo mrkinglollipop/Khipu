@@ -131,11 +131,11 @@ export const OUTLINES: Partial<Record<GuideId, GuideOutline>> = {
     ],
   },
   projects: {
-    lede: "Khipu groups sessions into projects by name, and keeps a list of what you still owe.",
+    lede: "Khipu groups sessions into projects by name. Needs you holds explicit questions waiting for your answer.",
     steps: [
       { title: "Projects", text: "Merge two names that are one project, or keep a pair apart." },
-      { title: "Owed", text: "Follow-ups, blockers and promises Khipu found in your sessions. Close one when it's done." },
-      { title: "Work", text: "What is waiting on you right now." },
+      { title: "Needs you", text: "Questions a conversation deliberately asks you, and changes waiting for your approval." },
+      { title: "Project work lists", text: "The work recorded for each project." },
     ],
     opens: [{ label: "Open Projects", target: { kind: "settings", section: "projects" } }],
   },

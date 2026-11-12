@@ -17,7 +17,7 @@ Each step checks itself, so you can stop and resume later. A step ends in one of
 After setup, the left rail has six screens, one per job:
 
 - **Home**: is memory working right now.
-- **Work**: Owed, project ledger boards, Waiting on you, Running now and Accounts.
+- **Work**: project work lists, Needs you, Running now and Accounts.
 - **Recall**: ask what it remembers. It has a Search and Graph switch.
 - **Activity**: every session it recorded.
 - **Harnesses**: which agents are wired in, and whether each is recording.

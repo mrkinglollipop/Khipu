@@ -687,6 +687,12 @@ def resolve_owner(text: str, *, kind: str | None = None, declared: Any = None,
                                    future_trigger=future_trigger, origin=origin)[0]
 
 
+def owner_is_user_sql(table: str = "commitments") -> str:
+    """Stored-owner classification used by owner-only SQL reads, like row_owner."""
+    names = ", ".join("'" + name + "'" for name in sorted(ASSISTANT_OWNERS))
+    return f"lower(rtrim(btrim(coalesce({table}.owner, '')), ':')) NOT IN ({names})"
+
+
 def row_owner(row: dict[str, Any]) -> tuple[str, str | None]:
     """``(owner, owner_label)`` of a stored row: the owner it was given, read
     the same on every Mac. Capture decides an owner once (:func:`resolve_owner_and_label`)
@@ -1190,17 +1196,6 @@ def quiet_label(weeks: int | None) -> str | None:
     return f"Quiet for {weeks} weeks" if weeks else None
 
 
-# ---------------------------------------------------------------------------
-# Session-plan closure. Before the precision filter shipped, a session's own
-# plan steps and in-flight status lines were opened as commitments; they are
-# finished (or abandoned) when the session ends, and no later capture ever
-# says "done: <phrase>" about them, so archived commitment matching never fires. Retire them
-# when their OWN session ends.
-# ---------------------------------------------------------------------------
-
-SESSION_END_EVENTS = frozenset({"sessionend", "session_end", "sessionended", "session-end"})
-
-
 def list_owed(cur, *, project: str | None = None, parent_session_id: str | None = None,
               session_id: str | None = None, status: str = "open",
               limit: int | None = 50, hide_snoozed: bool = False) -> list[dict[str, Any]]:
@@ -1319,6 +1314,7 @@ def finish_owed_rows(rows: list[dict[str, Any]], limit: int | None) -> list[dict
     """Owner, trigger, priority and order for raw commitment rows, the same
     for a hub read and an offline read of the replica (``offline_reads``)."""
     resolve_owed_rows(rows)
+    rows = [row for row in rows if row["owner"] == OWNER_USER]
     # O3: age x kind — within a priority tier (kind), the LONGEST-outstanding
     # item leads (opened_at ascending), not the newest one the SQL fetched
     # first. A row with no opened_at (should not happen; NOT NULL) sorts
@@ -1326,8 +1322,7 @@ def finish_owed_rows(rows: list[dict[str, Any]], limit: int | None) -> list[dict
     from datetime import datetime, timezone
 
     _max_dt = datetime.max.replace(tzinfo=timezone.utc)
-    # The owner's quiet items follow his active ones (quiet_weeks), still
-    # ahead of everyone else's, so no limit cuts them off.
+    # The owner's quiet items follow the active ones.
     rows.sort(key=lambda r: (r["owner"] != OWNER_USER, bool(r.get("quiet_weeks")), r["priority"],
                              r.get("opened_at") or _max_dt))
     return rows[:limit]
@@ -1473,6 +1468,7 @@ def set_status(cur, commitment_id: int, status: str, *, reason: str | None = Non
 # ---- paging, filters and bulk changes (design (c), slice 3) -----------------
 
 OWNERS = (OWNER_USER, OWNER_ASSISTANT, OWNER_AGENT)
+AGENT_TODOS_REMOVED = "To-do lists for agents were removed; use ask for something the owner must decide."
 ORIGINS = (ORIGIN_CONVERSATION, ORIGIN_JOB)
 # How the owner gate passed for a bulk change to the owner's items: the app
 # or a typed yes (``bulk_owner_gate``), or the owner's direction in a
@@ -1576,6 +1572,7 @@ def page_owed(rows: list[dict[str, Any]], *, owner: str | None = None, kind: str
     from datetime import timezone
 
     resolve_owed_rows(rows)
+    rows = [row for row in rows if row["owner"] == OWNER_USER]
     as_of = cursor_as_of(cursor) or datetime.now(timezone.utc)
     for row in rows:
         set_quiet(row, as_of)
@@ -1626,20 +1623,18 @@ def owners_of(cur, ids: list[int], *, lock: bool = False) -> dict[int, dict[str,
 
 def reassign(cur, commitment_id: int, owner: str, label: str | None = None, *,
              by: str | None = None, reason: str | None = None) -> bool:
-    """Set one item's owner by hand. ``agent`` keeps ``label``; with none,
-    the owner function's own label for the item's words (the third party it
-    names as its subject), else the orchestrator. The user and the assistant
-    take no label. Once migration 0035 is in, a read keeps the owner as
-    written; with 0037 the change also keeps who made it (``by``), its
-    ``reason`` and the owner before it, so a Mac's copy shows the same."""
-    if owner not in OWNERS:
-        raise ValueError(f"owner must be one of {', '.join(OWNERS)}, got {owner!r}")
-    if owner == OWNER_AGENT and not clean_owner_label(label):
-        label = _default_agent_label(cur, commitment_id)
+    """Explicitly assign an archived item to the owner, retaining its lineage.
+    Agent and assistant assignment was removed; archive ownership is still read
+    unchanged for replication, provenance and owner-directed undo.
+    """
+    if owner in (OWNER_ASSISTANT, OWNER_AGENT):
+        raise ValueError(AGENT_TODOS_REMOVED)
+    if owner != OWNER_USER:
+        raise ValueError("owner must be user")
     sets, params = ["owner = %s"], [owner]
     if _owner_columns_ready(cur):
         sets.append("owner_label = %s")
-        params.append((clean_owner_label(label) or ORCHESTRATOR) if owner == OWNER_AGENT else None)
+        params.append(None)
     if _lineage_columns_ready(cur):
         # The right-hand sides read the row as it was before this UPDATE.
         sets[:0] = ["owner_prior = owner", "owner_prior_label = owner_label",
@@ -1650,21 +1645,6 @@ def reassign(cur, commitment_id: int, owner: str, label: str | None = None, *,
     cur.execute(f"UPDATE commitments SET {', '.join(sets)} WHERE id = %s AND {_not_forgotten_clause(cur)}",
                 (*params, commitment_id))
     return cur.rowcount > 0
-
-
-def _default_agent_label(cur, commitment_id: int) -> str:
-    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
-    """The label a reassign to ``agent`` takes when none is given: the third
-    party the item's words name as their subject, else the orchestrator."""
-    try:
-        cur.execute("SELECT text, kind FROM commitments WHERE id = %s", (commitment_id,))
-        got = cur.fetchone()
-    except Exception:  # noqa: BLE001 — a default label is never worth failing the change
-        return ORCHESTRATOR
-    if not got:
-        return ORCHESTRATOR
-    owner, label = resolve_owner_and_label(got[0] or "", kind=got[1])
-    return label if owner == OWNER_AGENT and label and label != "other" else ORCHESTRATOR
 
 
 def bulk_owner_refusal() -> str:
@@ -1715,15 +1695,3 @@ def _normalize_open_loop(item: Any) -> dict[str, Any] | None:
         # detector decides the stored value (see resolve_owner/has_future_trigger).
         "future_trigger": item.get("future_trigger"),
     }
-
-def _payload_event(payload: dict[str, Any]) -> str:
-    """Normalized capture event. Queued jobs carry it as ``event``; older
-    payloads only encoded it into ``scope`` ("claude sessionend")."""
-    ev = str(payload.get("event") or "").strip().lower()
-    if ev:
-        return ev
-    scope = str(payload.get("scope") or "").strip().lower()
-    for candidate in SESSION_END_EVENTS:
-        if scope.endswith(candidate):
-            return candidate
-    return ""

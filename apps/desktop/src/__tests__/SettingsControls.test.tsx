@@ -179,7 +179,7 @@ describe("CaptureTuningCard", () => {
     const [first, second] = Array.from(container.querySelectorAll(".section-card"));
     expect(first.querySelector("select")).not.toBeNull();
     expect(first.textContent).toContain("Merge near-duplicate saved conversations at");
-    expect(second.textContent).toContain("The work list keeps explicitly filed asks and archived commitments");
+    expect(second.textContent).toContain("Needs you keeps explicitly filed owner asks");
     expect(second.textContent).toContain("Your names");
     expect(second.textContent).not.toContain("Close a commitment when a later save matches it at");
     expect(second.textContent).toContain("Default: none.");

@@ -1,9 +1,7 @@
-"""khipu_capture never lets a tool caller declare a session end."""
+"""khipu_capture accepts only its declared metadata."""
 from __future__ import annotations
 
 from unittest import mock
-
-import pytest
 
 from khipu import mcp_server as srv
 
@@ -15,21 +13,6 @@ def _captured(args: dict) -> dict:
             mock.patch.object(srv, "_captured_episode_id", return_value=None):
         srv._tool_capture(args)
     return capture.call_args.args[0]
-
-
-@pytest.mark.parametrize("extra", [{"event": "sessionend"}, {"scope": "claude sessionend"}])
-def test_a_tool_call_cannot_close_a_named_sessions_items(extra):
-    from khipu.commitments import _payload_event, SESSION_END_EVENTS
-
-    payload = _captured({"summary": "done", "session_id": "claude:OTHER", **extra})
-    assert "event" not in payload, sorted(payload)
-    assert _payload_event(payload) not in SESSION_END_EVENTS, payload.get("scope")
-    assert payload["summary"] == "done" and payload["session_id"] == "claude:OTHER"
-
-
-def test_a_scope_naming_a_session_end_anywhere_is_not_kept():
-    payload = _captured({"summary": "done", "session_id": "claude:OTHER", "scope": "sessionend notes"})
-    assert "sessionend" not in str(payload.get("scope") or "").lower(), payload.get("scope")
 
 
 def test_only_declared_keys_pass_and_tool_callers_cannot_assign_or_close():

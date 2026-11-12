@@ -569,22 +569,10 @@ TOOLS: list[dict] = [
         "name": "khipu_owed",
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
         "description": (
-            "List open (or closed/stale) commitments: explicit asks filed with khipu_owed_update "
-            "and archived followups, blockers, questions and promises. Captures no longer add "
-            "to this list. Call this at session start for "
-            "a harness with no pushed slice (Aegis), or whenever 'what do I "
-            "still owe on this project' would change the answer. Pages "
-            "newest first: pass the reply's next_cursor as cursor for the "
-            "next page; total and counts (by owner and kind) cover every "
-            "matching item, not just this page. The user's own items never "
-            "go stale: one unmentioned for weeks lists after the active ones "
-            "with quiet_weeks and group 'Quiet for N weeks'. Nothing "
-            "automatic closes the user's own items: an archived one that was "
-            "already marked done has "
-            "group 'Looks done' and looks_done (rule, reason, evidence); "
-            "looks_done=true lists only those and counts.looks_done counts "
-            "them. When the user says to close them, close them with "
-            "khipu_owed_update."
+            "List only the owner's explicit asks and archived owner items, including routing-direction "
+            "reminders. Captures never add agent to-dos. For everything waiting on an owner decision, "
+            "use khipu_needs_you. This archive also supports project/status filters, paging with "
+            "next_cursor, and owner-directed close, reopen and snooze through khipu_owed_update."
         ),
         "inputSchema": {
             "type": "object",
@@ -594,7 +582,7 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "open (default) | closed | stale",
                 },
-                "owner": {"type": "string", "description": "user | assistant | agent | all (default)"},
+                "owner": {"type": "string", "description": "user (default); agent lists were removed"},
                 "kind": {"type": "string", "description": "followup | blocker | question | promise | routing_direction"},
                 "origin": {"type": "string", "description": "conversation | job"},
                 "query": {"type": "string", "description": "Words that must all be in the text"},
@@ -615,19 +603,10 @@ TOOLS: list[dict] = [
             "The sentence is requester asks: question Yes: yes. No: no. An omitted episode_id stays NULL. "
             "This records a question only: it cannot confirm or apply anything. An identical open ask returns "
             "its existing id and already_open=true. The conversation hearing the answer closes that id here. "
-            "Close, reopen, snooze or reassign commitments by id (ids come "
-            "from khipu_owed). A routing_direction has an rd-* string id: "
-            "close it singly to dismiss it; reopen, snooze, reassign and bulk "
-            "changes are unsupported for routing directions and return errors. Close it when the work is done or the question "
-            "is answered; snooze it with `until` (a date, or 7d / 2w / 1m) when "
-            "it is real but not now; reassign it with `owner` (and "
-            "`owner_label` for an agent) when it is someone else's. `ids` "
-            "changes several in one transaction, one result per id, and needs "
-            "a `reason`. A change to more than one of the user's own items "
-            "needs the user (the Khipu app, or their yes on a terminal) and is "
-            "refused here, nothing changed; items you or your jobs own need "
-            "nothing more. Cloud agents: this is how you close what you "
-            "opened through khipu_capture."
+            "Close, reopen or snooze owner items by id from khipu_needs_you or khipu_owed. "
+            "A routing_direction has an rd-* id and supports only single close. "
+            "Multiple ids require a reason and owner authorization. "
+            "To-do lists for agents were removed; use ask for something the owner must decide."
         ),
         "inputSchema": {
             "type": "object",
@@ -643,10 +622,7 @@ TOOLS: list[dict] = [
                 "no": {"type": "string", "description": "ask only: what no does"},
                 "episode_id": {"type": "integer", "description": "ask only: optional live source episode"},
                 "until": {"type": "string", "description": "snooze only: 2026-09-30, 7d, 2w, 1m"},
-                "owner": {"type": "string", "description": "reassign only: user | assistant | agent"},
-                "owner_label": {"type": "string",
-                                "description": "reassign to agent only: who (orchestrator, builder, reviewer); "
-                                               "default: the third party the item names, else the orchestrator"},
+                "owner": {"type": "string", "description": "reassign only: user"},
                 "reason": {"type": "string",
                            "description": "why (kept on a closed item); required with more than one id"},
             },
@@ -1027,7 +1003,7 @@ TOOLS: list[dict] = [
             "of what waits for the owner's answer: a conversation's change to the priority, a standing rule, a "
             "routing setting, the account list or the tier table; requests held from any conversation; forgets the "
             "hub lacks; same-project questions; holds to review; "
-            "and accounts to sign in. Owed items that need the owner are a separate list: khipu_owed. "
+            "and accounts to sign in. Explicit asks are included; khipu_owed also reads archived owner items. "
             "Each item has `words`, `asked_by`, `confirm_does`, `undo_does` and `settle` (the khipu_owner_act action "
             "and args for confirm and for undo; null with `do` where there is none). "
             "Show the owner the words. Reading the list is the ask and changes nothing; only what the owner types "
@@ -1782,17 +1758,11 @@ def _tool_capture(args: dict) -> dict:
             "write through MCP."
         )
     from khipu.capture import capture, load_payload
-    from khipu.commitments import _payload_event, SESSION_END_EVENTS
 
-    # Only declared keys pass. A session end is the hook's to declare
-    # (the archived writer could close the open items of a session_id the
-    # caller names), and lineage, owners, decision authors and commitment ids
-    # are the hook's and the owner's to set, never a tool caller's.
+    # Only declared keys pass. Lineage, owners, decision authors and
+    # commitment ids are the hook's and the owner's to set.
     schema = next(t["inputSchema"] for t in TOOLS if t["name"] == "khipu_capture")
     args = {k: v for k, v in args.items() if k in schema["properties"]}
-    scope = str(args.get("scope") or "").lower()
-    if _payload_event(args) in SESSION_END_EVENTS or "sessionend" in scope:
-        args["scope"] = "general"
     for key, dropped in (("open_loops", {"owner", "owner_label"}),
                          ("closed_loops", {"commitment_id"}),
                          ("decision_details", {"by"})):
@@ -1989,9 +1959,11 @@ def owed_filters(args: dict) -> dict:
     looks_done, cursor."""
     from khipu import commitments
 
-    owner = (args.get("owner") or "all").strip().lower()
-    if owner not in (*commitments.OWNERS, "all"):
-        raise ValueError("owner must be 'user', 'assistant', 'agent' or 'all'")
+    owner = (args.get("owner") or "user").strip().lower()
+    if owner in ("assistant", "agent"):
+        raise ValueError(commitments.AGENT_TODOS_REMOVED)
+    if owner not in ("user", "all"):
+        raise ValueError("owner must be user")
     kind = (args.get("kind") or "").strip().lower() or None
     if kind and kind != "routing_direction" and kind not in commitments.VALID_KINDS:
         raise ValueError(f"kind must be one of {', '.join(commitments.VALID_KINDS)} or routing_direction")
@@ -2009,7 +1981,7 @@ def owed_filters(args: dict) -> dict:
     looks_done = args.get("looks_done")
     if isinstance(looks_done, str):
         looks_done = looks_done.strip().lower() in ("1", "true", "yes")
-    return {"owner": None if owner == "all" else owner, "kind": kind, "origin": origin,
+    return {"owner": "user", "kind": kind, "origin": origin,
             "query": str(args.get("query") or "").strip() or None, "pr": pr, "cursor": cursor,
             "looks_done": bool(looks_done) or None}
 
@@ -2028,17 +2000,16 @@ def owed_page_limit(raw) -> tuple[int | None, str | None]:
 
 
 def _tool_owed_update(args: dict) -> dict:
-    """Close / reopen / snooze one commitment — the write half of khipu_owed,
-    so a cloud agent can close what it opened (audit 2026-09-04: cloud
-    clients could open commitments they could never close). With the hub away
-    a local call queues the write (``owner_writes``) and says it is waiting to
-    sync; the gateway never queues. ``ids``, or ``reassign``, go through
-    ``owed_change``: one transaction, one result per id."""
+    """File or update explicit owner asks and archived owner items.
+    Local writes can queue while the hub is away; deliberate asks do not.
+    """
     action = (args.get("action") or "").strip().lower()
     _ensure_path()
     from khipu import commitments, owner_writes
     from khipu.owed_changes import BULK_ACTIONS
 
+    if str(args.get("owner") or "").strip().lower() in ("assistant", "agent"):
+        raise ValueError(commitments.AGENT_TODOS_REMOVED)
     if action == "ask":
         from khipu import explicit_asks
         values = explicit_asks.validate(args)
@@ -2120,8 +2091,10 @@ def owed_change(ids: list[int], action: str, *, by: str, reason=None, until=None
         if _snooze_until_sql(str(until or "")) is None:
             raise ValueError("until must be a date (2026-09-30) or a window (7d, 2w, 1m)")
     owner = str(owner or "").strip().lower() or None
+    if action == "reassign" and owner in ("assistant", "agent"):
+        raise ValueError(commitments.AGENT_TODOS_REMOVED)
     if action == "reassign" and owner not in commitments.OWNERS:
-        raise ValueError("owner must be 'user', 'assistant' or 'agent' to reassign; nothing was changed")
+        raise ValueError("owner must be user to reassign; nothing was changed")
     gate = None
     directed = None
     if len(ids) > 1:

@@ -105,7 +105,7 @@ def _fake_terminal(monkeypatch, answer: str) -> list[str]:
 
 
 def test_4000_items_page_through_with_no_skip_or_repeat_while_50_more_arrive(owed):
-    first = _seed(owed, 4000)
+    first = _seed(owed, 4000, owner="user")
     seen: list[int] = []
     cursor = None
     pages = 0
@@ -114,7 +114,7 @@ def test_4000_items_page_through_with_no_skip_or_repeat_while_50_more_arrive(owe
         if pages == 0:
             assert out["total"] == 4000
             # 50 more arrive while the caller is paging.
-            _seed(owed, 50, start=10_000, at=datetime.now(timezone.utc))
+            _seed(owed, 50, start=10_000, owner="user", at=datetime.now(timezone.utc))
         seen += [r["id"] for r in out["results"]]
         pages += 1
         cursor = out["next_cursor"]
@@ -127,7 +127,7 @@ def test_4000_items_page_through_with_no_skip_or_repeat_while_50_more_arrive(owe
 
 
 def test_the_page_size_is_50_by_default_capped_by_the_setting_and_0_lifts_it(owed):
-    _seed(owed, 600)
+    _seed(owed, 600, owner="user")
     assert len(srv._tool_owed({"project": PROJECT})["results"]) == 50
     capped = srv._tool_owed({"project": PROJECT, "limit": 500})
     assert len(capped["results"]) == 200 and capped["limit"] == 200
@@ -140,26 +140,27 @@ def test_the_page_size_is_50_by_default_capped_by_the_setting_and_0_lifts_it(owe
 
 def test_filters_and_counts(owed):
     mine = _seed(owed, 3, text="should we ship widget {i}?", kind="question")
-    job = _seed(owed, 2, start=100, text="builder to rerun the suite {i}", owner="agent",
+    _seed(owed, 2, start=100, text="builder to rerun the suite {i}", owner="agent",
                 origin="job", label="builder")
-    pr = _seed(owed, 1, start=200, text="follow up once PR #412 merges {i}")
-    plain = _seed(owed, 4, start=300, text="tidy the release notes {i}")
+    pr = _seed(owed, 1, start=200, text="follow up once PR #412 merges {i}", owner="user")
+    plain = _seed(owed, 4, start=300, text="tidy the release notes {i}", owner="user")
 
     every = srv._tool_owed({"project": PROJECT})
-    assert every["total"] == 10
-    assert every["counts"]["owner"] == {"user": 3, "assistant": 5, "agent": 2}
-    assert every["counts"]["kind"] == {"question": 3, "followup": 7}
+    assert every["total"] == 8
+    assert every["counts"]["owner"] == {"user": 8}
+    assert every["counts"]["kind"] == {"question": 3, "followup": 5}
 
     user = srv._tool_owed({"project": PROJECT, "owner": "user"})
-    assert sorted(r["id"] for r in user["results"]) == mine and user["total"] == 3
-    # Counts by owner stay over every owner, so a caller sees what the other headings hold.
-    assert user["counts"]["owner"]["assistant"] == 5 and user["counts"]["kind"] == {"question": 3}
-    assert sorted(r["id"] for r in srv._tool_owed({"project": PROJECT, "owner": "agent"})["results"]) == job
-    assert sorted(r["id"] for r in srv._tool_owed({"project": PROJECT, "origin": "job"})["results"]) == job
+    assert sorted(r["id"] for r in user["results"]) == sorted(mine + pr + plain) and user["total"] == 8
+    # Agent rows contribute neither results nor counts.
+    assert user["counts"]["owner"] == {"user": 8}
+    with pytest.raises(ValueError, match="To-do lists for agents were removed"):
+        srv._tool_owed({"project": PROJECT, "owner": "agent"})
+    assert sorted(r["id"] for r in srv._tool_owed({"project": PROJECT, "origin": "job"})["results"]) == []
     assert sorted(r["id"] for r in srv._tool_owed({"project": PROJECT, "kind": "question"})["results"]) == mine
     assert [r["id"] for r in srv._tool_owed({"project": PROJECT, "pr": 412})["results"]] == pr
     assert sorted(r["id"] for r in srv._tool_owed({"project": PROJECT, "query": "Release NOTES"})["results"]) == plain
-    assert srv._tool_owed({"project": PROJECT, "owner": "all"})["total"] == 10
+    assert srv._tool_owed({"project": PROJECT, "owner": "all"})["total"] == 8
     with pytest.raises(ValueError, match="owner"):
         srv._tool_owed({"owner": "bogus"})
     with pytest.raises(ValueError, match="cursor"):
@@ -305,20 +306,6 @@ def test_a_single_close_by_id_stays_as_today(owed, monkeypatch):
     assert _status(owed, mine) == {mine[0]: "closed"}
 
 
-def test_reassign_moves_owner_and_label_and_it_sticks(owed):
-    ids = _seed(owed, 2, start=0, text="rerun the flaky suite {i}")
-    out = srv._tool_owed_update({"ids": ids, "action": "reassign", "owner": "agent",
-                                 "owner_label": "builder", "reason": "the job owns these"})
-    assert out["ok"] is True and out["changed"] == 2
-    rows = {r["id"]: r for r in srv._tool_owed({"project": PROJECT})["results"]}
-    assert {(rows[i]["owner"], rows[i]["owner_label"]) for i in ids} == {("agent", "builder")}
-    # A question moved to the assistant stays the assistant's, though its text reads as the owner's.
-    q = _seed(owed, 1, start=500, text="should we ship widget {i}?", kind="question")
-    srv._tool_owed_update({"id": q[0], "action": "reassign", "owner": "assistant"})
-    row = next(r for r in srv._tool_owed({"project": PROJECT})["results"] if r["id"] == q[0])
-    assert row["owner"] == "assistant"
-    with pytest.raises(ValueError, match="owner"):
-        srv._tool_owed_update({"id": q[0], "action": "reassign", "owner": "someone"})
 
 
 def _owners(conn, ids):
@@ -328,27 +315,6 @@ def _owners(conn, ids):
         return {int(r[0]): r[1:] for r in cur.fetchall()}
 
 
-def test_bulk_reassignment_keeps_its_reason_and_prior_owner(owed, monkeypatch):
-    """A successful owner-approved bulk move must leave a durable undo/audit record."""
-    from khipu import owed_changes
-
-    reason = "Owner-approved move after a specific review"
-    ids = _seed(owed, 1, text="ship widget {i} to staging", owner="user") + _seed(
-        owed, 1, start=10, text="reviewer to rebase widget {i}", owner="agent", origin="job", label="reviewer")
-    before = _owners(owed, ids)
-    monkeypatch.setattr(routing, "_caller", lambda: {"app": True, "chain": ["khipu"]})
-    result = srv.owed_change(ids, "reassign", by=co.BY_APP, reason=reason, owner="assistant", queue_ok=False)
-    assert result["changed"] == 2
-    assert {row[0] for row in _owners(owed, ids).values()} == {"assistant"}
-    with owed.cursor() as cur:
-        cur.execute("SELECT commitment_id, reason, prior FROM commitment_tidy_items WHERE batch_id = ANY(%s)",
-                    (result["batches"],))
-        state = {int(c): {"reason": r, "prior": p} for c, r, p in cur.fetchall()}
-    assert reason in json.dumps(state), "Successful bulk reassignment discarded its required reason and prior owners"
-    assert (state[ids[0]]["prior"]["owner"], state[ids[1]]["prior"]["owner_label"]) == ("user", "reviewer")
-    undone = owed_changes.undo(result["batches"][0], project=PROJECT)
-    assert undone["ok"] and undone["restored"] == 2
-    assert _owners(owed, ids) == before
 
 
 # ---- the CLI ----------------------------------------------------------------
@@ -370,7 +336,7 @@ def test_cli_filters_cursor_and_json_is_a_no_op(owed, capsys):
 
     page = run("--project", PROJECT, "--owner", "user", "--limit", "2")
     assert page["total"] == 3 and len(page["results"]) == 2 and page["next_cursor"]
-    assert page["counts"]["owner"]["assistant"] == 3
+    assert page["counts"]["owner"] == {"user": 3}
     rest = run("--project", PROJECT, "--owner", "user", "--kind", "question", "--limit", "2",
                "--cursor", page["next_cursor"])
     assert sorted(r["id"] for r in page["results"] + rest["results"]) == mine and rest["next_cursor"] is None
@@ -387,8 +353,6 @@ def test_cli_reassign_and_reopen_take_lists(owed, capsys):
         rc = args.func(args)
         return rc, json.loads(capsys.readouterr().out)
 
-    rc, out = run("--reassign", f"{ids[0]},{ids[1]}", "--to", "agent", "--label", "reviewer", "--reason", "review")
-    assert rc == 0 and out["changed"] == 2
     rc, out = run("--close", f"{ids[0]},{ids[1]}", "--reason", "done", "--json")
     assert rc == 0 and out["changed"] == 2
     rc, out = run("--reopen", f"{ids[0]},{ids[1]}", "--reason", "not done")
@@ -457,7 +421,7 @@ def test_every_bulk_action_keeps_the_same_audit_record_and_undoes_exactly(owed, 
                         "closed_by = 'a conversation' WHERE id = ANY(%s)", (ids,))
     before = _state(owed, ids)
     reason = f"bulk {action} for the audit test"
-    extra = {"until": "2w"} if action == "snooze" else {"owner": "agent", "owner_label": "reviewer"} \
+    extra = {"until": "2w"} if action == "snooze" else {"owner": "user"} \
         if action == "reassign" else {}
     result = srv.owed_change(ids, action, by=co.BY_CONVERSATION, reason=reason, queue_ok=False, **extra)
     assert result["ok"] and result["changed"] == 2, result
@@ -467,7 +431,10 @@ def test_every_bulk_action_keeps_the_same_audit_record_and_undoes_exactly(owed, 
         assert audit[cid]["action"] == action and audit[cid]["reason"] == reason
         assert set(audit[cid]["prior"]) == set(owed_changes.BULK_PRIOR_FIELDS)
     assert _state(owed, ids) != before
-    undone = owed_changes.undo(result["batches"][0], project=PROJECT)
+    # A reassign can now only hand items to the owner, so undoing it changes the owner's items
+    # and needs the owner, as an Undo from the owner-actions log has.
+    gate = sorted(co.OWNER_GATE_PASSES)[0] if action == "reassign" else None
+    undone = owed_changes.undo(result["batches"][0], project=PROJECT, owner_gate=gate)
     assert undone["ok"] and undone["restored"] == 2, undone
     assert _state(owed, ids) == before
 
@@ -476,7 +443,7 @@ def test_plain_cli_listing_obeys_page_cap(monkeypatch, capsys):
     """The review's probe: `khipu owed --limit 500` with owed_page_max 200
     gives one page of 200 and a cursor, through the same listing as the tool."""
     at = datetime(2026, 10, 1, tzinfo=timezone.utc)
-    rows = [dict(id=i, text=f"Rebuild deployment index {i}", owner="assistant", kind="followup", opened_at=at)
+    rows = [dict(id=i, text=f"Rebuild deployment index {i}", owner="user", kind="followup", opened_at=at)
             for i in range(1, 501)]
 
     class Cursor:
@@ -673,10 +640,10 @@ def test_four_thousand_rows_page_stably_while_fifty_arrive():
     from datetime import datetime,timezone,timedelta
     from khipu import commitments as co
     at=datetime(2026,10,1,tzinfo=timezone.utc)
-    rows=[dict(id=i,text=f'Rebuild deployment index {i}',owner='assistant',kind='followup',opened_at=at+timedelta(seconds=i//3)) for i in range(1,4001)]
+    rows=[dict(id=i,text=f'Rebuild deployment index {i}',owner='user',kind='followup',opened_at=at+timedelta(seconds=i//3)) for i in range(1,4001)]
     result=co.page_owed(rows,limit=113)
     seen=[r['id'] for r in result['results']]
-    rows.extend(dict(id=i,text=f'Rebuild deployment index {i}',owner='assistant',kind='followup',opened_at=at+timedelta(days=1)) for i in range(4001,4051))
+    rows.extend(dict(id=i,text=f'Rebuild deployment index {i}',owner='user',kind='followup',opened_at=at+timedelta(days=1)) for i in range(4001,4051))
     while result['next_cursor']:
         result=co.page_owed(rows,cursor=result['next_cursor'],limit=113)
         seen.extend(r['id'] for r in result['results'])
@@ -685,22 +652,6 @@ def test_four_thousand_rows_page_stably_while_fifty_arrive():
 
 # ---- reassignment metadata and linked items on the hub (migration 0037) -----
 
-def test_a_reassign_keeps_who_why_and_the_prior_owner(owed):
-    ids = _seed(owed, 1, start=700, text="The reviewer must rebase the release branch {i}", owner="user")
-    out = srv._tool_owed_update({"id": ids[0], "action": "reassign", "owner": "agent",
-                                 "reason": "the reviewer owns rebases"})
-    assert out["ok"] is True
-    with owed.cursor() as cur:
-        cur.execute("SELECT owner, owner_label, owner_prior, owner_prior_label, owner_reassigned_by, "
-                    "owner_reassign_reason, owner_reassigned_at IS NOT NULL FROM commitments WHERE id = %s",
-                    (ids[0],))
-        owner, label, prior, prior_label, by, reason, stamped = cur.fetchone()
-    # No label given: the owner function's own, the subject the words name.
-    assert (owner, label, prior, prior_label, reason, stamped) == (
-        "agent", "reviewer", "user", None, "the reviewer owns rebases", True)
-    assert by
-    row = next(r for r in srv._tool_owed({"project": PROJECT})["results"] if r["id"] == ids[0])
-    assert (row["owner_prior"], row["owner_reassign_reason"]) == ("user", "the reviewer owns rebases")
 
 
 # ---- "close those": a bulk change to the owner's items on his direction ---------------------
@@ -753,19 +704,6 @@ def test_close_those_is_refused_without_a_recent_owner_turn(owed, tmp_path, monk
     assert set(_status(owed, mine).values()) == {"open"}
 
 
-def test_a_direction_reassign_is_undone_back_to_the_owner(owed, tmp_path, monkeypatch):
-    from khipu import owner_act
-
-    mine = _seed(owed, 2, text="should we ship widget {i}?", kind="question")
-    before = _state(owed, mine)
-    _direction(tmp_path, monkeypatch)
-    ok_, out = finish_owner_job(owner_act.act("owed.change", {"ids": mine, "change": "reassign", "why": "the builder has these",
-                                             "to": "agent", "label": "builder"}))
-    assert ok_ and out["changed"] == 2, out
-    assert _state(owed, mine) != before
-    rc, undone = _owner_undo(out["owner_action"])
-    assert rc == 0 and undone["restored"] == 2, undone
-    assert _state(owed, mine) == before
 
 
 def test_owed_change_by_direction_takes_only_its_own_arguments():

@@ -3110,6 +3110,7 @@ def _thread_memory_hits(thread: str, *, progress: dict | None = None) -> list[di
     """
     from khipu import hub_snapshot
     from khipu.db import has_columns
+    from khipu.commitments import owner_is_user_sql
 
     def rows_to_hits(rows):
         grouped = {"decision": [], "commitment": []}
@@ -3188,7 +3189,8 @@ def _thread_memory_hits(thread: str, *, progress: dict | None = None) -> list[di
                     "c.opened_episode, c.opened_at AS ts FROM commitments c "
                     "JOIN episodes e ON e.id = c.opened_episode "
                     "WHERE e.raw->>'t3_thread_id' = %s AND e.deleted_at IS NULL "
-                    "AND c.status = 'open' AND (c.due_after IS NULL OR c.due_after <= now()) "
+                    f"AND c.status = 'open' AND {owner_is_user_sql('c')} "
+                    "AND (c.due_after IS NULL OR c.due_after <= now()) "
                     "ORDER BY c.opened_at, c.id LIMIT 3) owed", (thread, thread),
                 )
                 return rows_to_hits(cur.fetchall())

@@ -144,7 +144,7 @@ class OpenFromEpisodeStoresTriggerTextTest(unittest.TestCase):
 class ListOwedShowsUntilLineTest(unittest.TestCase):
     def test_list_owed_carries_an_until_line_for_a_deferred_row(self):
         cur = _CommitmentsCursor(migrated=True)
-        cur._seed("Run the oracle again until the ledger closes.", owner="assistant")
+        cur._seed("Review the report until the ledger closes.", owner="user")
         row = co.list_owed(cur, project="acme/widget")[0]
         self.assertIsNotNone(row["until"])
         assert row["until"] is not None
@@ -560,20 +560,20 @@ class SnoozeHidesFromTheSliceTest(unittest.TestCase):
 
     def test_hide_snoozed_excludes_a_future_due_after(self):
         cur = _CommitmentsCursor(migrated=True)
-        cur._seed("Parked until next quarter", due_after="2099-01-01T00:00:00+00:00")
-        cur._seed("Not snoozed", due_after=None)
+        cur._seed("Parked until next quarter", owner="user", due_after="2099-01-01T00:00:00+00:00")
+        cur._seed("Not snoozed", owner="user", due_after=None)
         rows = co.list_owed(cur, project="acme/widget", hide_snoozed=True)
         self.assertEqual([r["text"] for r in rows], ["Not snoozed"])
 
     def test_a_past_due_after_is_no_longer_hidden(self):
         cur = _CommitmentsCursor(migrated=True)
-        cur._seed("Snooze expired", due_after="2020-01-01T00:00:00+00:00")
+        cur._seed("Snooze expired", owner="user", due_after="2020-01-01T00:00:00+00:00")
         rows = co.list_owed(cur, project="acme/widget", hide_snoozed=True)
         self.assertEqual([r["text"] for r in rows], ["Snooze expired"])
 
     def test_hide_snoozed_defaults_to_false_so_khipu_owed_still_shows_it(self):
         cur = _CommitmentsCursor(migrated=True)
-        cur._seed("Parked until next quarter", due_after="2099-01-01T00:00:00+00:00")
+        cur._seed("Parked until next quarter", owner="user", due_after="2099-01-01T00:00:00+00:00")
         rows = co.list_owed(cur, project="acme/widget")
         self.assertEqual(len(rows), 1)
 

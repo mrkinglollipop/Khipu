@@ -79,12 +79,12 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | Command | What it does |
 | --- | --- |
 | `needs-you` | Show what waits on the owner. `--json` prints structured output; `--item KEY_OR_NUMBER` shows one whole item. `--yes KEY_OR_NUMBER` and `--no KEY_OR_NUMBER` display it and ask once for a typed yes in a real owner terminal. Conversation shells answer in the conversation or app. |
-| `owed` | List, close, reopen, snooze or reassign commitments, dismiss routing directions. |
+| `owed` | List and update owner asks and archived owner items; dismiss routing directions. |
 | `work` | Project progress, running jobs, and Waiting on you; see below for summary checks and owner answers. |
 
-`owed` listing flags: `--project`, `--status open|closed|stale`, `--limit` (default 50), `--owner user|assistant|agent|all`, `--kind followup|blocker|question|promise|routing_direction`, `--origin conversation|job`, `--query WORDS`, `--pr NUMBER`, and `--looks-done`. Follow `next_cursor` with `--cursor`; `--envelope` always includes stale, snapshot freshness, and waiting-to-sync metadata. `owed_page_max` caps pages at 200 by default; 0 removes the cap.
+`owed` listing flags: `--project`, `--status open|closed|stale`, `--limit` (default 50), `--owner user`, `--kind followup|blocker|question|promise|routing_direction`, `--origin conversation|job`, `--query WORDS`, `--pr NUMBER`, and `--looks-done`. Follow `next_cursor` with `--cursor`; `--envelope` always includes stale, snapshot freshness, and waiting-to-sync metadata. `owed_page_max` caps pages at 200 by default; 0 removes the cap.
 
-`--close ID[,ID...]`, `--reopen ID[,ID...]`, and `--reassign ID[,ID...]` accept comma-separated ids. Reassignment needs `--to user|assistant|agent` and accepts `--label` for an agent. Multiple ids require `--reason` and default to a 500-item cap (`owed_bulk_max`; 0 unlimited). A multi-item change including the owner's items requires owner authorization. `--dismiss ID[,ID...]` dismisses `rd-...` routing directions. `--snooze ID --until WINDOW` takes a date or a window like `7d` or `2w`.
+`--close ID[,ID...]`, `--reopen ID[,ID...]`, and `--reassign ID[,ID...]` accept comma-separated ids. Reassignment accepts `--to user`; agent and assistant to-do lists were removed. Multiple ids require `--reason` and default to a 500-item cap (`owed_bulk_max`; 0 unlimited). A multi-item change including the owner's items requires owner authorization. `--dismiss ID[,ID...]` dismisses `rd-...` routing directions. `--snooze ID --until WINDOW` takes a date or a window like `7d` or `2w`.
 
 `work [--json]` shows the Work view. `work check FILE` validates a runner summary; `hidden`, `hide ID`, and `unhide ID` manage hidden commitments. `same ROW COMMITMENT` and `not-same ROW COMMITMENT` answer a proposed match, with ROW written as `<project>#<row id>`. Hide/unhide and match answers support `--owner-direction`.
 

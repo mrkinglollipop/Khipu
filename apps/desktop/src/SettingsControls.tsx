@@ -186,8 +186,8 @@ const SIMILARITY_ENV = {
 
 /** Owed's limits (`khipu.config.COUNT_SETTINGS`), each liftable with 0. */
 const OWED_LIMIT_ROWS: ReadonlyArray<readonly [string, string, string]> = [
-  ["owed_page_max", "Most items on one page of the work list", "How many items one read of the work list returns. Show more reads the next page."],
-  ["owed_bulk_max", "Most items changed at once", "How many items one Close… or Move to… changes together."],
+  ["owed_page_max", "Most items on one page of the work list", "How many owner items one archive read returns. The next read can show the next page."],
+  ["owed_bulk_max", "Most items changed at once", "How many owner items one deliberate archive update changes together."],
 ];
 
 
@@ -316,7 +316,7 @@ export function CaptureTuningCard({
         <div className="section-head">Commitments</div>
         <div className="section-body">
           <p className="set-help">
-            The work list keeps explicitly filed asks and archived commitments. Only a deliberate update changes them.
+            Needs you keeps explicitly filed owner asks. Archived owner items are available from the command line; agent to-do lists were removed.
           </p>
           <SettingField
             label="Your names"

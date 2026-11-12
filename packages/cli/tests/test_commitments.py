@@ -359,7 +359,7 @@ class ScopeCoalescingTest(unittest.TestCase):
         cur = _RegistryCursor()
         self.addCleanup(cur.conn.close)
         cur.episode(1, "child-session", "claude_code:host-1")
-        cur.commitment("a", project=None)
+        cur.commitment("a", project=None, owner="user")
         rows = co.list_owed(cur, parent_session_id="claude_code:host-1")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["text"], "a")
@@ -377,8 +377,8 @@ class MarkStaleTest(unittest.TestCase):
 class ListOwedAndSetStatusTest(unittest.TestCase):
     def test_list_owed_filters_by_project_and_status(self):
         cur = _CommitmentsCursor()
-        cur._seed("a", project="acme/widget")
-        cur._seed("b", project="other/repo")
+        cur._seed("a", project="acme/widget", owner="user")
+        cur._seed("b", project="other/repo", owner="user")
         rows = co.list_owed(cur, project="acme/widget", status="open")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["text"], "a")
@@ -515,35 +515,7 @@ class SessionPlanClosureTest(unittest.TestCase):
 class OwedOutputTest(unittest.TestCase):
     """Item 6: last_seen_at / seen_count / priority on every listed row."""
 
-    def test_priority_ranks_user_owed_first_then_triggers_then_kind(self):
-        cur = _CommitmentsCursor(migrated=True)
-        cur._seed("Matt must decide whether to ship", kind="blocker")       # user
-        cur._seed("Matt must answer the licence query", kind="question")    # user
-        cur._seed("Matt must merge the stack himself", kind="followup")     # user
-        cur._seed("Send the numbers next session", kind="promise")          # trigger
-        cur._seed("Rebuild the index", kind="blocker")                      # rest
-        cur._seed("Rebuild the search index later", kind="followup")        # rest
-        rows = co.list_owed(cur, project="acme/widget")
-        by_text = {r["text"]: r["priority"] for r in rows}
-        self.assertEqual(by_text["Matt must decide whether to ship"], 0)
-        self.assertEqual(by_text["Matt must answer the licence query"], 1)
-        self.assertEqual(by_text["Matt must merge the stack himself"], 2)
-        self.assertEqual(by_text["Send the numbers next session"], 3)
-        self.assertEqual(by_text["Rebuild the index"], 4)
-        self.assertEqual(by_text["Rebuild the search index later"], 7)
-        # and the list itself comes back in that order
-        self.assertEqual([r["priority"] for r in rows], sorted(r["priority"] for r in rows))
 
-    def test_owner_and_future_trigger_are_on_every_row(self):
-        cur = _CommitmentsCursor(migrated=True)
-        cur._seed("Matt must merge the stack himself")
-        cur._seed("Run oracle.sh once Matt says the lane is re-authed")
-        rows = {r["text"]: r for r in co.list_owed(cur, project="acme/widget")}
-        self.assertEqual(rows["Matt must merge the stack himself"]["owner"], "user")
-        self.assertFalse(rows["Matt must merge the stack himself"]["future_trigger"])
-        trig = rows["Run oracle.sh once Matt says the lane is re-authed"]
-        self.assertEqual(trig["owner"], "assistant")
-        self.assertTrue(trig["future_trigger"])
 
     def test_a_legacy_model_owner_is_normalised_not_echoed(self):
         """Rows opened before this change carry whatever the model said
@@ -558,19 +530,13 @@ class OwedOutputTest(unittest.TestCase):
         cur._seed("Rebuild the search index", owner=None)
         rows = {r["text"]: r["owner"] for r in co.list_owed(cur, project="acme/widget")}
         self.assertEqual(rows["Critique the draft plan for the app"], "user")
-        self.assertEqual(rows["Matt reviews and merges the stack himself"], "assistant")
+        self.assertNotIn("Matt reviews and merges the stack himself", rows)
         self.assertEqual(rows["Rebuild the search index"], "user")
 
-    def test_a_stored_future_trigger_column_is_read_when_present(self):
-        cur = _CommitmentsCursor(migrated=True, trigger=True)
-        cur._seed("Ship the packaging change", future_trigger=True)
-        row = co.list_owed(cur, project="acme/widget")[0]
-        self.assertTrue(row["future_trigger"])
-        self.assertEqual(row["priority"], 3)
 
     def test_seen_fields_are_present_on_a_migrated_hub(self):
         cur = _CommitmentsCursor(migrated=True)
-        cid = cur._seed("send Matt the restore numbers")
+        cid = cur._seed("Matt to send the restore numbers", owner="user")
         cur.rows[cid]["seen_count"] = 4
         cur.rows[cid]["last_seen_at"] = "2026-09-04"
         row = co.list_owed(cur, project="acme/widget")[0]
@@ -579,17 +545,17 @@ class OwedOutputTest(unittest.TestCase):
 
     def test_pre_migration_hub_gets_the_same_shape_with_defaults(self):
         cur = _CommitmentsCursor(migrated=False)
-        cur._seed("send Matt the restore numbers")
+        cur._seed("Matt to send the restore numbers", owner="user")
         row = co.list_owed(cur, project="acme/widget")[0]
         self.assertIsNone(row["last_seen_at"])
         self.assertEqual(row["seen_count"], 1)
-        self.assertEqual(row["owner"], "assistant")
+        self.assertEqual(row["owner"], "user")
         self.assertFalse(row["future_trigger"])
-        self.assertEqual(row["priority"], 7)
+        self.assertEqual(row["priority"], 2)
 
     def test_existing_fields_are_unchanged(self):
         cur = _CommitmentsCursor(migrated=True)
-        cur._seed("send Matt the restore numbers")
+        cur._seed("Matt to send the restore numbers", owner="user")
         row = co.list_owed(cur, project="acme/widget")[0]
         for field in ("id", "text", "project", "owner", "kind", "opened_episode",
                       "opened_at", "due_after", "status", "closed_episode",
@@ -737,7 +703,7 @@ class OpenStoresOwnerAndTriggerTest(unittest.TestCase):
 class DroppedStatusTest(unittest.TestCase):
     def test_set_status_accepts_dropped_and_still_rejects_junk(self):
         cur = _CommitmentsCursor(migrated=True)
-        cid = cur._seed("send Matt the restore numbers")
+        cid = cur._seed("Matt to send the restore numbers", owner="user")
         self.assertTrue(co.set_status(cur, cid, "dropped"))
         self.assertEqual(cur.rows[cid]["status"], "dropped")
         self.assertTrue(co.set_status(cur, cid, "open"))

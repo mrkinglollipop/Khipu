@@ -92,7 +92,7 @@ def _counts(cur, names: list[str]) -> dict[str, dict[str, int]]:
     out = {n: {"open_commitments": 0, "standing_decisions": 0, "episodes": 0} for n in names}
     rows = _savepoint(
         cur, "project_group_commitments",
-        f"SELECT project, count(*) FROM commitments WHERE status = 'open' AND project = ANY(%s) "
+        f"SELECT project, count(*) FROM commitments WHERE status = 'open' AND {commitments.owner_is_user_sql()} AND project = ANY(%s) "
         f"AND {commitments._not_forgotten_clause(cur)} GROUP BY project", (names,))
     for project, n in rows:
         out[project]["open_commitments"] = int(n)
