@@ -869,6 +869,68 @@ def _turn_due(config_dir: str | None, *, key: str | None = None, every: float = 
         _release(fd)
 
 
+# How long ``_forget_turn`` tries for the turn lock before it gives up: it
+# runs inside a report, which must answer even while a stuck process holds it.
+FORGET_TURN_WAIT_S = 0.25
+
+
+def _forget_turn(config_dir: str | None) -> bool:
+    """Drop this login's last-turn stamp (``_turn_due``'s key for it), so its
+    next read may take the figures turn at once. True when one was dropped.
+    Best effort: never waits more than ``FORGET_TURN_WAIT_S`` for the turn
+    lock (False when it stays held) and never raises."""
+    try:
+        key = str(_home_path(config_dir) or config_dir) if config_dir else ""
+        path = cache_file().with_name(TURN_STAMP_NAME)
+        fd = _open_lock(TURN_LOCK_NAME, directory=path.parent)
+    except Exception:  # noqa: BLE001 - best effort
+        return False
+    if fd is None:
+        return False
+    try:
+        deadline = time.monotonic() + FORGET_TURN_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.02)
+        try:
+            stamps = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(stamps, dict) or key not in stamps:
+            return False
+        del stamps[key]
+        tmp = path.with_name(TURN_STAMP_NAME + ".tmp")
+        tmp.write_text(json.dumps(stamps, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+        return True
+    except Exception:  # noqa: BLE001 - best effort
+        return False
+    finally:
+        _release(fd)
+
+
+def reread_reported(key: str, *, spawn=None) -> bool:
+    """A conversation reported this account open (the owner pressed its
+    reset, say): read its plan figures again now rather than at the next
+    turn allowance. Drops the login's turn stamp and starts the detached
+    refresh at once, whatever kicked one in the last minute. Never waits,
+    never raises; True when a refresh was started."""
+    try:
+        account = next((a for a in all_accounts() if not a.get("invalid") and _key(a) == key), None)
+        if account is None:
+            return False
+        if account.get("harness") == "claude":
+            _forget_turn(account.get("home"))
+        return kick_refresh(max_age=0, spawn=spawn, force=True)
+    except Exception:  # noqa: BLE001 - a report is never failed by its re-read
+        return False
+
+
 def _claude_turn_frame(frame: dict) -> bool:
     return frame.get("type") in ("rate_limit_event", "result") or (
         frame.get("type") == "system" and frame.get("subtype") == "init")
@@ -3693,16 +3755,16 @@ def refresh_due(*, max_age: float = PERIODIC_MAX_AGE_S, timeout: float = TIMEOUT
         return {"refreshed": 0, "skipped": "error"}
 
 
-def kick_refresh(*, max_age: float = PROMPT_MAX_AGE_S, spawn=None) -> bool:
+def kick_refresh(*, max_age: float = PROMPT_MAX_AGE_S, spawn=None, force: bool = False) -> bool:
     """For a caller that must not wait (the per-prompt routing read): when
     some account's figures are older than ``max_age``, no refresh holds the
-    lock and none was started in the last ``KICK_EVERY_S``, start
-    ``khipu usage --refresh-due`` as its own detached process and return at
-    once. True when one was started. Never raises."""
+    lock and none was started in the last ``KICK_EVERY_S`` (``force``: however
+    recently), start ``khipu usage --refresh-due`` as its own detached
+    process and return at once. True when one was started. Never raises."""
     try:
         stamp = cache_file().with_name(KICK_STAMP_NAME)
         with contextlib.suppress(OSError):
-            if 0 <= time.time() - stamp.stat().st_mtime < KICK_EVERY_S:
+            if not force and 0 <= time.time() - stamp.stat().st_mtime < KICK_EVERY_S:
                 return False
         if not _due(all_accounts(), _load_cache(), _now(), max_age):
             return False

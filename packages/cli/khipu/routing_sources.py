@@ -1726,6 +1726,7 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
     newest: datetime | None = None
     by = {"kind": "probe"}
     accounts_read = 0
+    reads: dict[str, dict] = {}
     from khipu.routing_identity import STABLE
 
     for key, row in sorted(rows.items()):
@@ -1750,6 +1751,28 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
             continue
         if not (row.get("ok") or row.get("last_good_at")):
             continue
+        # Each window's own figures time, never the row's retrieval time: a
+        # newer probed_at over older window figures is not a newer reading.
+        # The oldest window counts, so every window must postdate a report.
+        own = {w["name"]: usage._figures_time(row, w) for w in row.get("windows") or []
+               if isinstance(w, dict) and isinstance(w.get("name"), str)} \
+            if isinstance(row.get("windows"), list) else {}
+        own = {name: t for name, t in own.items() if t is not None}
+        figures_at = min(own.values()) if own else usage._figures_time(row)
+        if figures_at is not None:
+            # When this Mac last read the figures, each window's own time,
+            # and whether its reads fail since (the fold weighs a reported
+            # reset against each window; the page says when kept figures are old).
+            ws = [w for w in row.get("windows") or [] if isinstance(w, dict) and isinstance(w.get("name"), str)] \
+                if isinstance(row.get("windows"), list) else []
+            used = {w["name"]: w["used_pct"] for w in ws if isinstance(w.get("used_pct"), (int, float))
+                    and not isinstance(w.get("used_pct"), bool)}
+            reads[key] = {"figures_at": _iso(figures_at), "failing": not row.get("ok"),
+                          "windows": {name: _iso(t) for name, t in sorted(own.items())},
+                          # Each window's figure, and the windows that are one
+                          # model's, not the whole account's.
+                          "used": dict(sorted(used.items())),
+                          "models": sorted({w["name"] for w in ws if w.get("model")})}
         windows = [w for w in row.get("windows") if isinstance(w, dict)] if isinstance(row.get("windows"), list) else []
         if not windows:
             continue
@@ -1807,6 +1830,8 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
                                 basis="checked", window=None, used_pct=top,
                                 evidence=f"usage probe: highest window at {top}%"))
     status = {"accounts": accounts_read, "newest": _iso(newest)}
+    if reads:
+        status["reads"] = reads
     same = usage.same_account_groups({key: row for key, row in rows.items()
                                      if configured is None or key in configured})
     if same:
