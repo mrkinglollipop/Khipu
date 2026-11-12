@@ -147,23 +147,25 @@ button { font: inherit; color: inherit; }
             <span class="top"><span class="nm">Grok</span><span class="pace ok"><i></i>On pace</span></span>
             <span class="bar"><i style="width:56%"></i></span>
             <span class="left"><b>56% left</b><span>this week · resets Mon</span></span>
+            <span class="also">Read 7 minutes ago</span>
           </button>
           <button class="tile" type="button">
             <span class="top"><span class="nm">Muse</span><span class="pace warn"><i></i>Ahead of pace</span></span>
             <span class="bar"><i class="warn" style="width:30%"></i></span>
             <span class="left"><b>30% left</b><span>this week · resets Sun</span></span>
-            <span class="also">5 hours: 72% left · read 7 min ago</span>
+            <span class="also">Plan ends tomorrow, 13 Nov</span>
           </button>
           <button class="tile" type="button">
             <span class="top"><span class="nm">GLM</span><span class="pace ok"><i></i>Under pace</span></span>
             <span class="bar"><i style="width:100%"></i></span>
             <span class="left"><b>100% left</b><span>this week · resets Tue</span></span>
+            <span class="also">Plan ends 20 Nov</span>
           </button>
           <button class="tile" type="button">
             <span class="top"><span class="nm">Kimi</span><span class="pace err"><i></i>Limit reached</span></span>
             <span class="bar"><i style="width:0%"></i></span>
             <span class="left"><b>0% left</b><span>this month · resets 28 Nov</span></span>
-            <span class="also">5 hours: 100% left</span>
+            <span class="also">Plan ends 27 Nov</span>
           </button>
           <button class="tile none" type="button">
             <span class="top"><span class="nm">DeepSeek</span><span class="pace"><i></i>No limit</span></span>
@@ -185,7 +187,8 @@ button { font: inherit; color: inherit; }
     <li><b>What each tile shows</b>The limit closest to running out, as a bar of what is left, with its reset day. A second limit sits on one small line under it.</li>
     <li><b>The word in the corner</b>On pace, Under pace, Ahead of pace or Limit reached. It is the same word the Accounts place uses, in the same colour.</li>
     <li><b>When a reading is old</b>The tile says when it was read. Khipu never shows an old number as if it were current.</li>
-    <li><b>Choosing what shows</b>Choose accounts has a switch for each account. Off takes it off Today and deletes nothing. Muse and Kimi start off here, as an example.</li>
+    <li><b>Choosing what shows</b>Choose accounts has a switch for each account. Off takes it off Today and deletes nothing.</li>
+    <li><b>A plan that is ending</b>The tile says the day it ends. Khipu keeps using the account until then, and nothing is paused or hidden early. After that day the tile leaves Today by itself and stays in Choose accounts.</li>
     <li><b>Where it sits</b>Under the status sentence and above Needs you. The tiles wrap to fit the window: three across here, one across on a narrow one.</li>
   </ul>
 </div>
@@ -196,7 +199,7 @@ button { font: inherit; color: inherit; }
   const name = t => t.querySelector('.nm').textContent;
   const list = document.getElementById('choose-list');
   const line = document.getElementById('hidden-line');
-  const off = new Set(['Muse', 'Kimi']);
+  const off = new Set();
   const draw = () => {
     tiles.forEach(t => { t.hidden = off.has(name(t)); });
     line.hidden = off.size === 0;
