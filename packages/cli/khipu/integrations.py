@@ -4375,9 +4375,11 @@ def rules_warnings() -> list[str]:
     """One advisory line at most; never changes doctor's health verdict."""
     problems = []
     for app in rules_status_all():
+        # A file that is not there is a fact `rules show` reports, not a fault:
+        # warn only for one that exists and can't be read or parsed.
         if app["channel"] == "can't read" or any(
-                r["state"] == "can't read" and (r.get("reason") != "file missing"
-                    or Path(r["path"]).parent.exists()) for r in app["files"] + app["hooks"]):
+                r["state"] == "can't read" and r.get("reason") != "file missing"
+                for r in app["files"] + app["hooks"]):
             problems.append(f"{app['harness']}: can't read")
         cap = app.get("cap", {})
         if cap.get("over"):

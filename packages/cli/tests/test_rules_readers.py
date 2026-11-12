@@ -303,10 +303,11 @@ def test_cursor_import_omits_unmapped_claude_events(home):
     assert integ.rules_status("cursor")["hooks"][1]["entries"] == []
 
 
-def test_detected_app_missing_rules_gets_one_doctor_warning(home):
+def test_missing_files_never_raise_a_doctor_warning(home):
     (home / ".codex").mkdir()
-    warnings = cli._rules_warnings()
-    assert len(warnings) == 1 and "codex: can't read" in warnings[0]
+    (home / ".claude").mkdir()
+    (home / ".config" / "khipu").mkdir(parents=True)
+    assert cli._rules_warnings() == []
 
 
 def test_malformed_large_marker_version_is_reported(home):
