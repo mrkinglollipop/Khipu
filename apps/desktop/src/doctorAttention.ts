@@ -346,8 +346,8 @@ export function buildAttention(parsed: Record<string, unknown>): {
       tone: "err",
       title: "The summariser cannot run",
       cause: login
-        ? `The ${bin} command was not found on this Mac. Install it and sign in, or pick another summariser under Settings › Who writes the summaries. Saves wait in the queue meanwhile.`
-        : `No key is stored for the ${sp?.provider ?? "chosen"} summariser. Set it under Settings › Who writes the summaries, next to the provider. Saves wait in the queue meanwhile.` });
+        ? `The ${bin} command was not found on this Mac. Install it and sign in, or pick another summariser under Settings › Models and API keys. Saves wait in the queue meanwhile.`
+        : `No key is stored for the ${sp?.provider ?? "chosen"} summariser. Set it under Settings › Models and API keys, next to the provider. Saves wait in the queue meanwhile.` });
   }
 
   if ((parsed as { synth_budget_ok?: boolean }).synth_budget_ok === false) {
@@ -359,7 +359,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       title: sb?.error ? "The summariser's call count cannot be read" : "The summariser reached today's call ceiling",
       cause: sb?.error
         ? `${sb.error}. Saves wait in the queue; nothing is lost.`
-        : `${sb?.calls ?? "?"} of ${sb?.cap ?? "?"} calls used. Saves wait in the queue until UTC midnight, nothing is lost; lift it for today under Settings › Who writes the summaries.` });
+        : `${sb?.calls ?? "?"} of ${sb?.cap ?? "?"} calls used. Saves wait in the queue until UTC midnight, nothing is lost; lift it for today under Settings › Models and API keys.` });
   }
 
   // The hub lacks a migration this version ships (0028 sat unapplied on

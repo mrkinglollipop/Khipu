@@ -8,7 +8,7 @@ import type { SettingsCtx } from "../context";
 export function SummariesPage({ ctx, active }: { ctx: SettingsCtx; active: boolean }) {
   return (
     <>
-      <p className="st-muted" id="synth-help">Which model writes the short summary of each conversation.</p>
+      <p className="st-muted" id="synth-help">Which model writes the short summary of each conversation, its model id, and the API keys Khipu uses. Keys are further down this page.</p>
       {ctx.modelsError ? (
         <Callout tone="err" title="The stored models setting could not be read">
           {ctx.modelsError}. Showing defaults; saving is blocked until it is fixed or cleared.
