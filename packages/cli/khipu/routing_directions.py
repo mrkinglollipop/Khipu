@@ -440,6 +440,11 @@ def directions() -> list[dict]:
                                                                  d.get("id") or ""))
 
 
+def _same_words(row: dict) -> tuple[str, str]:
+    """One conversation's same words, said any number of times: one reminder."""
+    return _bare_session(row.get("session")), " ".join(str(row.get("words") or "").split()).lower()
+
+
 def dismiss(direction_id: str) -> dict | None:
     """The owner dismisses a direction: it stays dismissed on later captures."""
     with _store_lock():
@@ -448,6 +453,11 @@ def dismiss(direction_id: str) -> dict | None:
         if row is None:
             return None
         row["status"] = "dismissed"
+        # The same words said again in that conversation are one reminder
+        # (``owed_items``): dismissing it dismisses its open copies too.
+        for other in data["directions"].values():
+            if other.get("status") == "open" and _same_words(other) == _same_words(row):
+                other["status"] = "dismissed"
         _save(_with_malformed(data, bad))
         return row
 
@@ -473,9 +483,18 @@ def owed_items(now: float | None = None) -> list[dict]:
     from datetime import datetime, timezone
 
     out = []
+    # The same words said again in one conversation are one reminder: the
+    # newest stands for them (every row stays stored and closes on its own).
+    newest: dict[tuple, dict] = {}
     for row in directions():
         if not listable(row, now):
             continue
+        key = _same_words(row)
+        held = newest.get(key)
+        if held is None or (row.get("at") or 0) >= (held.get("at") or 0):
+            newest[key] = row
+    for row in sorted(newest.values(), key=lambda d: (d.get("session") or "", d.get("occurrence") or 0,
+                                                       d.get("id") or "")):
         out.append({"id": row["id"], "kind": "routing_direction",
                     "text": f"Routing said here, not in Khipu: '{row['words']}'",
                     "words": row["words"], "session": row["session"], "target": row.get("target"),
@@ -688,13 +707,40 @@ def capture_scan(session: str, turns, *, now: float | None = None, actions: list
         return _capture_scan_locked(session, turns, now=now, actions=actions)
 
 
-def _his(turn: dict, conf: dict, *, t3: str | None = None) -> bool:
+def t3_owner_hashes(session: str) -> set[str] | None:
+    """The canonical hashes of every prompt the owner typed in the T3
+    threads that run ``session`` (``t3.owner_texts_result``), or None when
+    T3's record could not be read in full. T3's scheduled wake-ups, relayed
+    messages and briefs reach the hook as plain prompts; T3's own message
+    record names their sender, so this is how a T3 turn is told apart."""
+    from khipu import t3 as t3_record
+
+    threads, definitive = t3_record.session_thread_ids_result(session)
+    if not definitive or threads is None:
+        return None
+    hashes: set[str] = set()
+    for thread in threads:
+        texts, ok = t3_record.owner_texts_result(thread)
+        if not ok or texts is None:
+            return None
+        for text in texts:
+            hashes.add(owner_turns.prompt_sha256(text))
+            typed = owner_text(text)
+            if typed is not None:
+                hashes.add(owner_turns.prompt_sha256(typed))
+    return hashes
+
+
+def _his(turn: dict, conf: dict, *, t3: str | None = None, t3_owner: set[str] | None = None) -> bool:
     """Whether a recorded turn is the owner's for opening an owed item.
     ``owner_turns.eligible`` decides, except for the one refusal that is about
     authorizing a change: a T3 conversation can't be told apart from T3's
     scheduled or relayed messages, so no change asked for there is applied on
     its word. Opening a direction only creates a reminder and authorizes
-    nothing, so a typed turn in T3 opens one; a turn T3's record marks as a
+    nothing, so a typed turn in T3 opens one when T3's message record shows
+    the owner typed that prompt (``t3_owner``, from ``t3_owner_hashes``; None,
+    an unread record, opens nothing): a T3 scheduled wake-up carries the
+    conversation's own notes, never his words. A turn T3's record marks as a
     machine's, a handoff, a helper, a dispatched job's or untyped is still
     refused by the same checks. (Nothing here changes ``eligible``.)
 
@@ -706,6 +752,8 @@ def _his(turn: dict, conf: dict, *, t3: str | None = None) -> bool:
     otherwise (still unreadable, or not read)."""
     entry = turn.get("entrypoint")
     if entry == "t3" or (entry == "t3-unverified" and t3 == "t3"):
+        if t3_owner is None or turn.get("prompt_sha256") not in t3_owner:
+            return False
         harness = turn.get("harness")
         return owner_turns.eligible(dict(turn, entrypoint="cli"),
                                     dict(conf, trusted=[f"{harness}:cli"]))[0]
@@ -729,7 +777,9 @@ def _capture_scan_locked(session, turns, *, now, actions):
     his_turns = owner_turns.with_origins(owner_turns.turns(session, now))
     t3 = owner_turns._t3_membership(session) \
         if any(t.get("entrypoint") == "t3-unverified" for t in his_turns) else None
-    is_his = lambda turn: _his(turn, conf, t3=t3)  # noqa: E731
+    t3_runs = any(t.get("entrypoint") == "t3" for t in his_turns) or t3 == "t3"
+    t3_owner = t3_owner_hashes(session) if t3_runs else None
+    is_his = lambda turn: _his(turn, conf, t3=t3, t3_owner=t3_owner)  # noqa: E731
     counted: set[str] = set()
     for turn in his_turns:
         sha = turn.get("prompt_sha256")
@@ -755,6 +805,7 @@ def _capture_scan_locked(session, turns, *, now, actions):
     # transcript numbering is the placeholder and the join check below
     # marks the direction unjoined until the record agrees.
     typed_turns: list[tuple[str, float | None, str]] = []
+    refused: set[str] = set()
     for raw in turns:
         text, at = _turn_parts(raw)
         typed = owner_text(text)
@@ -766,6 +817,7 @@ def _capture_scan_locked(session, turns, *, now, actions):
                 or owner_turns.brief_for(typed) is not None:
             continue  # a dispatched job's prompt is never the owner's direction
         if seen is not None and sha not in counted:
+            refused.add(sha)
             continue  # recorded, and no recorded copy of it is the owner's turn
         typed_turns.append((typed, at, sha))
     totals: dict[str, int] = {}
@@ -810,6 +862,12 @@ def _capture_scan_locked(session, turns, *, now, actions):
                          # Only where capture saw a recorded turn of his own with these words (a
                          # transcript turn no hook recorded may be an agent's brief): listed only then.
                          "typed": sha in counted}
+    for row in rows.values():
+        # A row an earlier capture marked his, whose recorded turns no
+        # longer count as his (a T3 scheduled wake-up, before T3's message
+        # record was read): no longer listed. Its status is left as it was.
+        if row.get("session") == session and row.get("prompt_sha256") in refused and row.get("typed"):
+            row["typed"] = False
     for row in rows.values():
         if row.get("session") == session and not row.get("project"):
             row["project"] = _project_from_cwd((recorded.get(row.get("prompt_sha256")) or {}).get("cwd"))

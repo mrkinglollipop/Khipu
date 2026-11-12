@@ -452,6 +452,26 @@ def owner_reply_read(thread_id: str, seen, since) -> tuple[dict | None, bool]:
     return _read_messages(thread_id, read)
 
 
+def owner_texts_result(thread_id: str) -> tuple[list[str] | None, bool]:
+    """``(texts, definitive)``: the text of every message the owner typed in
+    ``thread_id`` (``is_owner_message``), from one read-only bounded read, for
+    hashing only. T3 writes its scheduled wake-ups, relayed messages and
+    delegated briefs into a thread under another sender, so these are the
+    prompts a person typed. A failed read is ``(None, False)``."""
+
+    def read(con):
+        texts = []
+        for (payload_json,) in con.execute(
+                "SELECT payload_json FROM orchestration_v2_projection_messages "
+                f"WHERE thread_id = :thread AND {_owner_rows_sql()}", {"thread": thread_id}):
+            payload = _owner_payload(payload_json, thread_id)
+            if payload is not None:
+                texts.append(payload["text"])
+        return texts
+
+    return _read_messages(thread_id, read)
+
+
 def delegated_thread_result(thread_id: str) -> tuple[bool, bool]:
     """``(delegated, definitive)``: whether a T3 thread is a delegated child
     (a job another thread started), never the owner's own conversation.
