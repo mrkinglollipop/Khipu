@@ -106,6 +106,166 @@ HARNESSES = ("claude_code", "cursor", "aegis", "codex", "grok_build", "grok_bot"
 HOME = Path.home()
 
 
+# Read-only rules inventory. Bodies, commands, matchers and environment values
+# stay in the source files; this view carries metadata only.
+_RULE_START = re.compile(r"<!-- khipu: rules v(?P<version>\d{1,9})(?:,[^\n]*?)? -->")
+_RULE_END = "<!-- khipu: end -->"
+_RULE_LAUNCHERS = (
+    "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
+    "khipu-delegation-hook", "khipu-aegis-capture", "khipu-grok-build-capture",
+)
+
+
+def _read_rules_file(path: Path) -> dict:
+    row = {"path": str(path), "exists": False, "state": "can't read",
+           "reason": "file missing", "characters": None, "bytes": None,
+           "khipu_block": {"present": False}}
+    try:
+        raw = path.read_bytes()
+        row.update(exists=True, bytes=len(raw))
+        text = raw.decode("utf-8")
+        row.update(state="read", reason=None, characters=len(text))
+        starts = list(_RULE_START.finditer(text))
+        ends = list(re.finditer(re.escape(_RULE_END), text))
+        row["always_on"] = bool(re.search(r"(?m)^trigger: *always_on *$", text))
+        if "<!-- khipu: rules" in text or ends:
+            if (text.count("<!-- khipu: rules") != 1 or len(starts) != 1 or len(ends) != 1
+                    or starts[0].end() > ends[0].start()):
+                row.update(state="can't read", reason="malformed Khipu rules block")
+            else:
+                row["khipu_block"] = {"present": True,
+                    "version": int(starts[0]["version"]),
+                    "characters": ends[0].start() - starts[0].end()}
+        # Existing recall markers are distinct from the future owner-rules block.
+        row["recall_marker"] = ("grok_build" if "<!-- khipu-grok-build: recall instructions -->" in text
+                                else "antigravity" if "<!-- khipu-antigravity-rule -->" in text else None)
+        if ("<!-- khipu-grok-build:" in text and not _GROK_BUILD_AGENTS_RE.search(text)):
+            row.update(state="can't read", reason="malformed Khipu recall block")
+    except FileNotFoundError:
+        pass
+    except UnicodeError:
+        row.update(exists=True, state="can't read", reason="not UTF-8")
+    except OSError as exc:
+        row.update(exists=path.exists(), state="can't read",
+                   reason="permission denied" if isinstance(exc, PermissionError) else "file unavailable")
+    return row
+
+
+def _hook_identity(command: Any) -> tuple[str, str | None, bool]:
+    """Extract a script/executable path, never return shell text or assignments.
+
+    Complex shell commands and inline programs have no safely known script path.
+    They still get an inventory row, with the path explicitly unknown.
+    """
+    if not isinstance(command, str):
+        return "non-command hook", None, False
+    # A bare launcher path is ours even when it has a space in it (a checkout on
+    # "/Volumes/Cloud Storage"): match the whole command before splitting it.
+    # Only a bare path qualifies: no assignment, quote or second word that starts
+    # an option or another path, so a foreign command that merely ends in a
+    # launcher's name is never ours and never comes back whole.
+    whole = command.strip()
+    bare = (whole.startswith(("/", "~/")) and "=" not in whole and not re.search(r"""['"`$;|&<>\n]|\s[-/~]""", whole))
+    if bare and any(_launcher_path_is_legacy(whole, launcher) for launcher in _RULE_LAUNCHERS):
+        return Path(whole).name, whole, True
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return "command hook", None, False
+    if not argv or any(c in command for c in (";", "|", "&", "`", "$", "\n", "<", ">")):
+        return "command hook", None, False
+    if Path(argv[0]).name == "env":
+        argv = argv[1:]
+        while argv and "=" in argv[0] and not argv[0].startswith("/"):
+            argv = argv[1:]
+    if not argv:
+        return "command hook", None, False
+    executable = argv[0]
+    base = Path(executable).name
+    if base.startswith(("python", "node", "ruby", "perl")) or base in ("sh", "bash", "zsh"):
+        if len(argv) < 2 or argv[1].startswith("-"):
+            return "command hook", None, False
+        executable = argv[1]
+    # Only literal file paths or simple executable names can leave this reader.
+    if not re.fullmatch(r"[\w./~ +@:-]+", executable) or "=" in executable:
+        return "command hook", None, False
+    name = Path(executable).name
+    ours = any(_launcher_path_is_legacy(executable, launcher) for launcher in _RULE_LAUNCHERS)
+    script = Path(executable.replace("~/", str(HOME) + "/", 1)) if executable.startswith("~/") else Path(executable)
+    owner_hooks = HOME / ".config" / "khipu" / "hooks"
+    ours = ours or (script.is_absolute() and script.parent == owner_hooks)
+    return name, executable, ours
+
+
+def _read_hook_inventory(path: Path, *, format: str = "json", antigravity: bool = False) -> dict:
+    row = {"path": str(path), "exists": False, "state": "can't read",
+           "reason": "file missing", "entries": []}
+    try:
+        text = path.read_text(encoding="utf-8")
+        row["exists"] = True
+        data = tomllib.loads(text) if format == "toml" else json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError
+        if antigravity:
+            # Antigravity has named packs at the root, each holding event lists.
+            packs = [v for v in data.values() if isinstance(v, dict)]
+            if len(packs) != len(data):
+                raise ValueError
+        else:
+            packs = [data.get("hooks", {})]
+        entries = []
+        for hooks in packs:
+            if not isinstance(hooks, dict):
+                raise ValueError
+            for event, groups in hooks.items():
+                if antigravity and event == "enabled":
+                    if not isinstance(groups, bool):
+                        raise ValueError
+                    continue
+                if format == "toml" and isinstance(groups, dict):
+                    groups = [groups]
+                if not isinstance(groups, list):
+                    raise ValueError
+                for group in groups:
+                    if not isinstance(group, dict):
+                        raise ValueError
+                    handlers = group.get("hooks", [group])
+                    if not isinstance(handlers, list):
+                        raise ValueError
+                    for handler in handlers:
+                        if not isinstance(handler, dict):
+                            raise ValueError
+                        command = handler.get("command")
+                        if command is not None and not isinstance(command, str):
+                            raise ValueError
+                        name, script, ours = _hook_identity(command)
+                        entries.append({"event": event, "name": name, "path": script,
+                                        "owner": "Khipu" if ours else "Not Khipu's"})
+        row.update(state="read", reason=None, entries=entries)
+    except FileNotFoundError:
+        pass
+    except (ValueError, UnicodeError):
+        row.update(state="can't read", reason="malformed hook config")
+    except OSError as exc:
+        row.update(exists=path.exists(), state="can't read",
+                   reason="permission denied" if isinstance(exc, PermissionError) else "file unavailable")
+    return row
+
+
+def _rule_paths(folder: Path, suffix: str) -> list[Path]:
+    try:
+        return sorted(p for p in folder.iterdir() if p.suffix == suffix)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return [folder]  # Keep an unreadable folder visible as a failed read.
+
+
+def _rules_inventory(channel: str, files: list[Path], hooks: list[dict], **extra) -> dict:
+    return {"channel": channel, "files": [_read_rules_file(p) for p in files],
+            "hooks": hooks, **extra}
+
+
 def _root() -> Path:
     """The repo this code lives in — derived from the module's own path so an
     install on another machine writes correct commands without an env var
@@ -992,6 +1152,12 @@ def _claude_pack_fields(scope: list[dict]) -> dict:
     }
 
 
+def _claude_rules_status(project: str | None = None) -> dict:
+    homes = _claude_homes()
+    return _rules_inventory("CLAUDE.md", [h.path / "CLAUDE.md" for h in homes],
+                            [_read_hook_inventory(h.settings_path) for h in homes])
+
+
 def _claude_status() -> dict:
     """Pack-level fields (what the Harnesses card reads) are the AND over the
     homes that exist; `homes` has every home found, one row each:
@@ -1237,6 +1403,24 @@ def _cursor_third_party_import(h: dict) -> dict:
         if own and any(c not in own for c in imported):
             double.append(event)
     return {"claude_settings": bool(events), "events": events, "double_firing": double}
+
+
+def _cursor_rules_status(project: str | None = None) -> dict:
+    files = [HOME / ".config" / "khipu" / "rules.md"]
+    if project:
+        files += _rule_paths(Path(project).expanduser() / ".cursor" / "rules", ".mdc")
+        files.append(Path(project).expanduser() / "AGENTS.md")
+    imported = _read_hook_inventory(CLAUDE_SETTINGS)
+    imported["source"] = "Claude import (enabled by default; CLI cannot opt out)"
+    imported["entries"] = [e for e in imported["entries"] if e["event"] in _CURSOR_IMPORT_EVENTS]
+    for entry in imported["entries"]:
+        entry["event"] = _CURSOR_IMPORT_EVENTS[entry["event"]]
+    out = _rules_inventory("session-start text", files, [_read_hook_inventory(CURSOR_HOOKS), imported],
+        note="Cursor keeps global User Rules in its own settings; that channel is not reached.",
+        cap={"limit": 10000, "unit": "characters", "path": str(files[0])})
+    measured = out["files"][0]["characters"]
+    out["cap"].update(measured=measured, over=measured is not None and measured > 10000)
+    return out
 
 
 def _cursor_status() -> dict:
@@ -1655,6 +1839,26 @@ def antigravity_project_state(project: str) -> dict:
     """What a project's ``.agents`` folder holds, read the way the installer
     writes it (exact commands, ``--event`` included, and the exact rule)."""
     return _ag_state(_ag_project_base(project), _AG_PROJECT_EVENTS)
+
+
+def _antigravity_rules_status(project: str | None = None) -> dict:
+    base = _ag_config_dir()
+    files = [HOME / ".gemini" / "GEMINI.md", base / "rules" / "khipu.md"]
+    files += [p for p in _rule_paths(base / "rules", ".md") if p not in files]
+    hooks = [_read_hook_inventory(base / "hooks.json", antigravity=True)]
+    if project:
+        project_base = _ag_project_base(project)
+        files += _rule_paths(project_base / "rules", ".md")
+        hooks.append(_read_hook_inventory(project_base / "hooks.json", antigravity=True))
+    out = _rules_inventory("rules/khipu.md", files, hooks,
+        note="T3 private profile not reached; runtime loading unchecked.",
+        cap={"limit": 24000, "unit": "bytes", "scope": "global rule files"})
+    # The global cap is measured across GEMINI.md and the global rules folder.
+    global_rows = [r for r in out["files"] if Path(r["path"]) == HOME / ".gemini" / "GEMINI.md"
+                   or Path(r["path"]).parent == base / "rules"]
+    measured = sum(r["bytes"] or 0 for r in global_rows)
+    out["cap"].update(measured=measured, over=measured > 24000)
+    return out
 
 
 def _antigravity_status(project: str | None = None) -> dict:
@@ -2171,6 +2375,11 @@ def _aegis_capture_command(text: str) -> str | None:
     return None
 
 
+def _aegis_rules_status(project: str | None = None) -> dict:
+    return _rules_inventory("not reached", [], [_read_hook_inventory(AEGIS_TOML, format="toml")],
+                            note="Aegis has no known rule-file channel.")
+
+
 def _aegis_status() -> dict:
     text = AEGIS_TOML.read_text(encoding="utf-8") if AEGIS_TOML.is_file() else ""
     m = _toml_table_block(text, "mcp_servers.khipu")
@@ -2569,6 +2778,13 @@ def _grok_build_uninstall(dry: bool, project: str | None = None) -> dict:
     return out
 
 
+def _grok_build_rules_status(project: str | None = None) -> dict:
+    agents = _grok_build_agents_path(project)
+    return _rules_inventory("not reached", [agents] if agents is not None else [],
+        [_read_hook_inventory(_grok_build_toml(), format="toml")],
+        note="No known global rule file; project AGENTS.md is recall-only.")
+
+
 def _grok_build_status(project: str | None = None) -> dict:
     config = _grok_build_toml()
     text = config.read_text(encoding="utf-8") if config.is_file() else ""
@@ -2743,6 +2959,11 @@ def _codex_uninstall(dry: bool) -> dict:
     return out
 
 
+def _codex_rules_status(project: str | None = None) -> dict:
+    return _rules_inventory("AGENTS.md", [CODEX_HOOKS.parent / "AGENTS.md"],
+                            [_read_hook_inventory(CODEX_HOOKS)])
+
+
 def _codex_status() -> dict:
     text = CODEX_TOML.read_text(encoding="utf-8") if CODEX_TOML.is_file() else ""
     m = _toml_table_block(text, "mcp_servers.khipu")
@@ -2906,6 +3127,12 @@ def _grok_bot_liveness(url: str) -> dict:
         return {"installed": False, "last_beat_at": last_ok,
                 "reason": "no successful gateway call in the last 7 days"}
     return {"installed": True, "last_beat_at": last_ok}
+
+
+def _grok_bot_rules_status(project: str | None = None) -> dict:
+    files = _rule_paths(Path(project).expanduser() / ".cursor" / "rules", ".mdc") if project else []
+    return _rules_inventory("not reached", files, [],
+        note="Cloud account rules and hooks are not readable locally; MCP recall instructions are separate.")
 
 
 def _grok_bot_status(project: str | None = None) -> dict:
@@ -4093,7 +4320,7 @@ def _last_beat_at(harness: str) -> str | None:
     return at if isinstance(at, str) else None
 
 
-def status(harness: str, *, project: str | None = None) -> dict:
+def _status_with_probes(harness: str, *, project: str | None = None) -> dict:
     if harness == "grok_bot":
         out = _guarded(harness, _grok_bot_status, project)
     elif harness == "grok_build":
@@ -4118,6 +4345,50 @@ def status(harness: str, *, project: str | None = None) -> dict:
     if isinstance(out, dict) and out.get("launcher_ok") is False:
         out["installed"] = False
     return out
+
+
+def status(harness: str, *, project: str | None = None) -> dict:
+    try:
+        out = _status_with_probes(harness, project=project)
+    except (OSError, ValueError, TypeError, AttributeError):
+        # Malformed native hook shapes must not prevent the other app rows.
+        out = {"harness": harness, "detected": True, "installed": False,
+               "ok": False, "error": "can't read native integration config", "aborted": True}
+    out["rules"] = rules_status(harness, project=project)
+    return out
+
+
+def rules_status(harness: str, *, project: str | None = None) -> dict:
+    """Local metadata only: no gateway, hub, installer, or config writes."""
+    readers = {"claude_code": _claude_rules_status, "cursor": _cursor_rules_status,
+               "aegis": _aegis_rules_status, "codex": _codex_rules_status,
+               "grok_build": _grok_build_rules_status, "grok_bot": _grok_bot_rules_status,
+               "antigravity": _antigravity_rules_status}
+    try:
+        return {"harness": harness, **readers[harness](project)}
+    except OSError:
+        return {"harness": harness, "channel": "can't read", "files": [], "hooks": [],
+                "reason": "rules folder unavailable"}
+
+
+def rules_status_all() -> list[dict]:
+    return [rules_status(h) for h in HARNESSES]
+
+
+def rules_warnings() -> list[str]:
+    """One advisory line at most; never changes doctor's health verdict."""
+    problems = []
+    for app in rules_status_all():
+        # A file that is not there is a fact `rules show` reports, not a fault:
+        # warn only for one that exists and can't be read or parsed.
+        if app["channel"] == "can't read" or any(
+                r["state"] == "can't read" and r.get("reason") != "file missing"
+                for r in app["files"] + app["hooks"]):
+            problems.append(f"{app['harness']}: can't read")
+        cap = app.get("cap", {})
+        if cap.get("over"):
+            problems.append(f"{app['harness']}: {cap['measured']} {cap['unit']} exceeds {cap['limit']}")
+    return ["Rules and hooks: " + "; ".join(problems)] if problems else []
 
 
 def status_all() -> list[dict]:

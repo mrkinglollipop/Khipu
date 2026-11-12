@@ -695,11 +695,52 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
     out["warnings"] = (list(schema.get("warnings") or []) + _disk_space_warnings(local)
                        + _replica_schema_warnings(local) + _recall_outcomes_warnings(local)
                        + _storage_warnings(local) + _owner_writes_warnings()
-                       + list(hook_wiring.get("warnings") or []))
+                       + list(hook_wiring.get("warnings") or []) + _rules_warnings())
     out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
                  and all(bool(local[k]) for k in LOCAL_GATES) and out["schema_migrations_ok"])
     print(_strict_json(out, indent=2, default=str))
     return 0 if out["ok"] else 2
+
+
+def _rules_warnings() -> list[str]:
+    from khipu.integrations import rules_warnings
+
+    return rules_warnings()
+
+
+def cmd_rules_show(args: argparse.Namespace) -> int:
+    from khipu.integrations import rules_status_all
+
+    apps = rules_status_all()
+    if getattr(args, "json", False):
+        print(_strict_json(apps, indent=2))
+        return 0
+    labels = {"claude_code": "Claude Code", "cursor": "Cursor", "aegis": "Aegis",
+              "codex": "Codex", "grok_build": "Grok Build", "grok_bot": "Grok Bot",
+              "antigravity": "Antigravity"}
+    for app in apps:
+        print(f"{labels[app['harness']]}: {app['channel']}")
+        for row in app["files"]:
+            detail = (f"{row['characters']} characters, {row['bytes']} bytes"
+                      if row["state"] == "read" else f"can't read ({row['reason']})")
+            marker = row["khipu_block"]
+            if marker["present"]:
+                detail += f"; Khipu rules v{marker['version']}"
+            print(f"  {row['path']}: {detail}")
+        for config in app["hooks"]:
+            if config["state"] == "can't read":
+                print(f"  Hooks {config['path']}: can't read ({config['reason']})")
+            elif not config["entries"]:
+                print(f"  Hooks {config['path']}: none" + (" (file missing)" if not config["exists"] else ""))
+            for hook in config["entries"]:
+                print(f"  {hook['owner']}: {hook['event']} / {hook['name']} / {hook['path'] or 'path unknown'}")
+        cap = app.get("cap")
+        if cap:
+            print(f"  Cap: {cap['measured'] if cap['measured'] is not None else 'unknown'}/{cap['limit']} "
+                  f"{cap['unit']}" + (" (over cap)" if cap["over"] else ""))
+        if app.get("note") or app.get("reason"):
+            print(f"  {app.get('note') or app['reason']}")
+    return 0
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -1151,7 +1192,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
                      + list(fact_provenance.get("warnings") or []) + _disk_space_warnings(local)
                      + _replica_schema_warnings(local) + _recall_outcomes_warnings(local)
                      + _storage_warnings(local) + _owner_writes_warnings()
-                     + list(hook_wiring_block.get("warnings") or [])),
+                     + list(hook_wiring_block.get("warnings") or []) + _rules_warnings()),
         "not_configured": not_configured,
         "drift_ok": drift_ok,
         "outbox_ok": outbox_ok,
@@ -5173,6 +5214,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include sample_drift (slower; doctor already covers this)",
     )
     s.set_defaults(func=cmd_status)
+
+    rules = sub.add_parser("rules", help="Read local rules and hook metadata (read-only)")
+    rules_sub = rules.add_subparsers(dest="rules_command", required=True)
+    rules_show = rules_sub.add_parser("show", help="Show each app's rule files and wired hooks")
+    rules_show.add_argument("--json", action="store_true", help="Print metadata as JSON")
+    rules_show.set_defaults(func=cmd_rules_show)
 
     d = sub.add_parser("doctor", help="Drift samples + health JSON")
     d.add_argument("--memory-root", default=_memory_root_default())
