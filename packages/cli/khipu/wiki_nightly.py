@@ -1022,7 +1022,7 @@ The page is about one thing: what its title and its existing text describe. For 
 
 Episodes
 1. Use an episode only if it tells something about this page's subject. If it only mentions the subject in passing, or is about another project, skip it: take nothing from it and leave its id out of your reply.
-2. Say exactly what the episode says happened and no more. Work the episode calls in progress, proposed, planned, drafted, queued, blocked, held or waiting is written that way, with the episode's date. Never write that something was merged, shipped, installed, chosen, decided or finished unless the episode says so itself.
+2. Say exactly what the episode says happened and no more. Work the episode calls in progress, proposed, planned, drafted, queued, blocked, held or waiting is written that way, with the episode's date. Never write that something was merged, shipped, installed, chosen, decided or finished unless the episode says so itself. An episode's decisions and preferences are rules and intentions, not events: write them as what was decided or asked for, never as something that was done.
 3. Never join what the episode keeps apart. If the episode does not say which project, product or person a fact belongs to, do not give it to this page's subject: leave that fact out.
 4. Episodes come oldest first. Where two disagree, the later one is current. Where the page already says something dated later than an episode, the page stands.
 5. Add nothing that is in neither the page nor an episode. No notes about this rewrite, about the page's condition, or about missing text. Nothing before or after the page text. Never copy an episode record into your reply.

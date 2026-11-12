@@ -17,6 +17,7 @@ from khipu.config import load_config, mutate_config
 ROLES = ("synth", "embed", "vision", "wiki")
 LEGACY_ROLES = ("synth", "embed", "vision")
 CLI_PROVIDERS = frozenset({"claude-cli", "codex-cli"})
+WIKI_CLAUDE_CLI_MODEL = "sonnet"
 PROVIDERS = frozenset({"gemini", "anthropic", "openai", "openrouter", "local"}) | CLI_PROVIDERS
 DEFAULT_SYNTH_MODELS = {"gemini": "gemini-2.5-flash", "anthropic": "claude-haiku-5-5",
                         "claude-cli": "haiku"}
@@ -144,7 +145,12 @@ def validate_models_object(raw: Any, *, for_set: bool) -> dict[str, dict[str, st
     for role in ROLES:
         if role not in raw:
             if role == "wiki":
+                # Unset, the wiki follows the summaries' provider. Through the
+                # Claude login it writes with Sonnet: the 2026-11-12 samples
+                # showed Haiku rounding up and copying its input on large pages.
                 out[role] = dict(out["synth"])
+                if out[role].get("provider") == "claude-cli":
+                    out[role]["model_id"] = WIKI_CLAUDE_CLI_MODEL
                 continue
             if for_set:
                 raise ValueError(f"models payload missing role: {role}")

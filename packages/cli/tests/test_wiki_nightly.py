@@ -138,7 +138,8 @@ def test_fact_truth_limitation_explicit():
 
 def test_wiki_role_inherits_and_legacy_desktop_round_trip_preserves_explicit():
     models.set_models_merge_role("synth", provider="claude-cli",model_id="haiku")
-    assert models.wiki_settings()["model_id"] == "haiku"
+    # Unset, the wiki follows the summaries' provider but writes with Sonnet on the Claude login.
+    assert models.wiki_settings()["provider"] == "claude-cli" and models.wiki_settings()["model_id"] == "sonnet"
     legacy = {r:models.show_models()[r] for r in models.LEGACY_ROLES}
     models.set_models_replace(legacy)
     assert "wiki" not in config.load_config()["models"]
