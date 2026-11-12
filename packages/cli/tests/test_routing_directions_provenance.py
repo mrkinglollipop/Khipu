@@ -46,6 +46,9 @@ def test_a_direction_typed_in_a_t3_conversation_still_opens_the_item(world, monk
     monkeypatch.setattr(owner_turns, "dispatched_job", lambda *a, **k: None)  # T3's record is readable: no job
     say(GLM)
     assert owner_turns.turns(SESSION)[-1]["eligible"] is False
+    sha = owner_turns.turns(SESSION)[-1]["prompt_sha256"]
+    monkeypatch.setattr(routing_directions, "t3_owner_messages",
+                        lambda session: [(time.time(), {sha})])  # T3: he typed it
     (row,) = scan()
     assert row["status"] == "open"
 
@@ -101,8 +104,12 @@ def test_his_judges_an_unverified_turn_by_its_native_front_end_once_t3_settles_n
 
 def test_his_keeps_the_t3_rule_for_an_unverified_turn_t3_runs(world):
     conf = owner_turns.settings()
-    assert routing_directions._his(_UNVERIFIED, conf, t3="t3")
-    assert not routing_directions._his(dict(_UNVERIFIED, machine=True), conf, t3="t3")
+    turn = dict(_UNVERIFIED, prompt_sha256="h1")
+    yes = lambda turn: True  # noqa: E731 - T3's record holds his message
+    assert routing_directions._his(turn, conf, t3="t3", t3_owner=yes)
+    assert not routing_directions._his(dict(turn, machine=True), conf, t3="t3", t3_owner=yes)
+    assert not routing_directions._his(turn, conf, t3="t3", t3_owner=lambda turn: False)  # not his message
+    assert not routing_directions._his(turn, conf, t3="t3")  # T3's record unread
 
 
 def test_his_refuses_an_unverified_turn_while_t3_stays_unreadable(world):

@@ -440,6 +440,11 @@ def directions() -> list[dict]:
                                                                  d.get("id") or ""))
 
 
+def _same_words(row: dict) -> tuple[str, str]:
+    """One conversation's same words, said any number of times: one reminder."""
+    return _bare_session(row.get("session")), " ".join(str(row.get("words") or "").split()).lower()
+
+
 def dismiss(direction_id: str) -> dict | None:
     """The owner dismisses a direction: it stays dismissed on later captures."""
     with _store_lock():
@@ -448,6 +453,11 @@ def dismiss(direction_id: str) -> dict | None:
         if row is None:
             return None
         row["status"] = "dismissed"
+        # The same words said again in that conversation are one reminder
+        # (``owed_items``): dismissing it dismisses its open copies too.
+        for other in data["directions"].values():
+            if other.get("status") == "open" and _same_words(other) == _same_words(row):
+                other["status"] = "dismissed"
         _save(_with_malformed(data, bad))
         return row
 
@@ -473,9 +483,18 @@ def owed_items(now: float | None = None) -> list[dict]:
     from datetime import datetime, timezone
 
     out = []
+    # The same words said again in one conversation are one reminder: the
+    # newest stands for them (every row stays stored and closes on its own).
+    newest: dict[tuple, dict] = {}
     for row in directions():
         if not listable(row, now):
             continue
+        key = _same_words(row)
+        held = newest.get(key)
+        if held is None or (row.get("at") or 0) >= (held.get("at") or 0):
+            newest[key] = row
+    for row in sorted(newest.values(), key=lambda d: (d.get("session") or "", d.get("occurrence") or 0,
+                                                       d.get("id") or "")):
         out.append({"id": row["id"], "kind": "routing_direction",
                     "text": f"Routing said here, not in Khipu: '{row['words']}'",
                     "words": row["words"], "session": row["session"], "target": row.get("target"),
@@ -688,13 +707,81 @@ def capture_scan(session: str, turns, *, now: float | None = None, actions: list
         return _capture_scan_locked(session, turns, now=now, actions=actions)
 
 
-def _his(turn: dict, conf: dict, *, t3: str | None = None) -> bool:
+# T3 puts this before a prompt sent at its "ultrathink" effort; its own
+# record keeps the message as typed.
+_ULTRATHINK = re.compile(r"^Ultrathink:\s*", re.I)
+# How long before the hook saw a prompt T3 may have recorded the owner's
+# message (a message queued behind a busy turn waits), and how far after.
+T3_MESSAGE_BEFORE_S = 86400.0
+T3_MESSAGE_AFTER_S = 5.0
+
+
+def _prompt_hashes(text: str) -> set[str]:
+    """The hashes a prompt typed as ``text`` may reach the hook with."""
+    bare = _ULTRATHINK.sub("", text, count=1)
+    out = set()
+    for form in (text, bare, f"Ultrathink:\n{bare}"):
+        out.add(owner_turns.prompt_sha256(form))
+        typed = owner_text(form)
+        if typed is not None:
+            out.add(owner_turns.prompt_sha256(typed))
+    return out
+
+
+def t3_owner_messages(session: str) -> list[tuple[float, set[str]]] | None:
+    """Every message the owner typed in the T3 threads that run ``session``
+    (``t3.owner_messages_result``), oldest first, as ``(ts, hashes)``; None
+    when T3's record could not be read in full. T3's scheduled wake-ups,
+    relayed messages and briefs reach the hook as plain prompts; T3's own
+    message record names their sender, so this is how a T3 turn is told
+    apart."""
+    from khipu import t3 as t3_record
+
+    threads, definitive = t3_record.session_thread_ids_result(session)
+    if not definitive or threads is None:
+        return None
+    out = []
+    for thread in threads:
+        messages, ok = t3_record.owner_messages_result(thread)
+        if not ok or messages is None:
+            return None
+        out.extend((float(m["ts"]), _prompt_hashes(m["text"])) for m in messages)
+    return sorted(out, key=lambda m: m[0])
+
+
+def _t3_claimer(messages):
+    """A claim on ``messages`` for one scan: a recorded T3 turn is the
+    owner's when an unclaimed message he typed carries its hash and was
+    recorded from a day before to a few seconds after the turn. Each message
+    vouches for one turn, so a later wake-up repeating his words is not his.
+    None (T3's record unread) claims nothing."""
+    if messages is None:
+        return None
+    used: set[int] = set()
+
+    def claim(turn) -> bool:
+        sha, ts = turn.get("prompt_sha256"), turn.get("ts")
+        if not isinstance(sha, str) or type(ts) not in (int, float):
+            return False
+        for i, (at, hashes) in enumerate(messages):
+            if i not in used and sha in hashes and ts - T3_MESSAGE_BEFORE_S <= at <= ts + T3_MESSAGE_AFTER_S:
+                used.add(i)
+                return True
+        return False
+
+    return claim
+
+
+def _his(turn: dict, conf: dict, *, t3: str | None = None, t3_owner=None) -> bool:
     """Whether a recorded turn is the owner's for opening an owed item.
     ``owner_turns.eligible`` decides, except for the one refusal that is about
     authorizing a change: a T3 conversation can't be told apart from T3's
     scheduled or relayed messages, so no change asked for there is applied on
     its word. Opening a direction only creates a reminder and authorizes
-    nothing, so a typed turn in T3 opens one; a turn T3's record marks as a
+    nothing, so a typed turn in T3 opens one when T3's message record shows
+    the owner typed that prompt (``t3_owner``, a ``_t3_claimer`` claim; None,
+    an unread record, opens nothing): a T3 scheduled wake-up carries the
+    conversation's own notes, never his words. A turn T3's record marks as a
     machine's, a handoff, a helper, a dispatched job's or untyped is still
     refused by the same checks. (Nothing here changes ``eligible``.)
 
@@ -708,7 +795,8 @@ def _his(turn: dict, conf: dict, *, t3: str | None = None) -> bool:
     if entry == "t3" or (entry == "t3-unverified" and t3 == "t3"):
         harness = turn.get("harness")
         return owner_turns.eligible(dict(turn, entrypoint="cli"),
-                                    dict(conf, trusted=[f"{harness}:cli"]))[0]
+                                    dict(conf, trusted=[f"{harness}:cli"]))[0] \
+            and t3_owner is not None and t3_owner(turn)
     return owner_turns.eligible(turn, conf, t3_settled_none=entry == "t3-unverified" and t3 == "none")[0]
 
 
@@ -718,6 +806,7 @@ def _capture_scan_locked(session, turns, *, now, actions):
     rows = data["directions"]
     recorded: dict[str, dict] = {}
     recorded_occs: dict[str, list[int]] = {}
+    every_occs: dict[str, set[int]] = {}  # his or not: what the recorder numbered
     # A recorded turn counts as the owner's only where owner provenance says
     # so (``owner_turns.eligible``, the check every owner change goes
     # through): a machine entrypoint, a T3 conversation, a helper or a
@@ -729,7 +818,9 @@ def _capture_scan_locked(session, turns, *, now, actions):
     his_turns = owner_turns.with_origins(owner_turns.turns(session, now))
     t3 = owner_turns._t3_membership(session) \
         if any(t.get("entrypoint") == "t3-unverified" for t in his_turns) else None
-    is_his = lambda turn: _his(turn, conf, t3=t3)  # noqa: E731
+    t3_runs = any(t.get("entrypoint") == "t3" for t in his_turns) or t3 == "t3"
+    t3_owner = _t3_claimer(t3_owner_messages(session)) if t3_runs else None
+    is_his = lambda turn: _his(turn, conf, t3=t3, t3_owner=t3_owner)  # noqa: E731
     counted: set[str] = set()
     for turn in his_turns:
         sha = turn.get("prompt_sha256")
@@ -741,8 +832,10 @@ def _capture_scan_locked(session, turns, *, now, actions):
             counted.add(sha)
         else:
             recorded.setdefault(sha, turn)
-        if ok and isinstance(turn.get("occurrence"), int):
-            recorded_occs.setdefault(sha, []).append(turn["occurrence"])
+        if isinstance(turn.get("occurrence"), int):
+            every_occs.setdefault(sha, set()).add(turn["occurrence"])
+            if ok:
+                recorded_occs.setdefault(sha, []).append(turn["occurrence"])
     known = known_entities()
     # First pass: the eligible typed turns in this scanned window, in
     # order. Occurrences come from the owner turn record (the durable
@@ -755,6 +848,7 @@ def _capture_scan_locked(session, turns, *, now, actions):
     # transcript numbering is the placeholder and the join check below
     # marks the direction unjoined until the record agrees.
     typed_turns: list[tuple[str, float | None, str]] = []
+    refused: set[str] = set()
     for raw in turns:
         text, at = _turn_parts(raw)
         typed = owner_text(text)
@@ -766,20 +860,32 @@ def _capture_scan_locked(session, turns, *, now, actions):
                 or owner_turns.brief_for(typed) is not None:
             continue  # a dispatched job's prompt is never the owner's direction
         if seen is not None and sha not in counted:
+            refused.add(sha)
             continue  # recorded, and no recorded copy of it is the owner's turn
         typed_turns.append((typed, at, sha))
     totals: dict[str, int] = {}
     for _typed, _at, sha in typed_turns:
         totals[sha] = totals.get(sha, 0) + 1
-    assigned: dict[str, list[int]] = {}
+    assigned: dict[str, list[int | None]] = {}
     for sha, total in totals.items():
         # A late copy of one Antigravity typing shares its occurrence: one typing.
         occs = sorted(set(recorded_occs.get(sha) or []))
-        assigned[sha] = occs[-total:] if len(occs) >= total else list(range(1, total + 1))
+        every = sorted(every_occs.get(sha) or ())
+        if len(occs) < total <= len(every):
+            # More copies here than his recorded typings, and the record
+            # numbers them all: some are not his (a T3 wake-up repeating his
+            # words). Copies line up with the record in order, and only his
+            # open anything. (A transcript that already dropped a machine's
+            # copy has no more copies than his typings: the branch below.)
+            assigned[sha] = [o if o in occs else None for o in every[-total:]]
+        else:
+            assigned[sha] = occs[-total:] if len(occs) >= total else list(range(1, total + 1))
     counts: dict[str, int] = {}
     for typed, at, sha in typed_turns:
         counts[sha] = counts.get(sha, 0) + 1
         occurrence = assigned[sha][counts[sha] - 1]
+        if occurrence is None:
+            continue
         for found in extract(typed, known):
             key = _direction_id(session, sha, occurrence, found["words"])
             if key in rows:
@@ -810,6 +916,15 @@ def _capture_scan_locked(session, turns, *, now, actions):
                          # Only where capture saw a recorded turn of his own with these words (a
                          # transcript turn no hook recorded may be an agent's brief): listed only then.
                          "typed": sha in counted}
+    # Judged on every recorded turn, not only this window's: a text recorded
+    # and never his.
+    refused |= {sha for sha in recorded if sha not in counted}
+    for row in rows.values():
+        # A row an earlier capture marked his, whose recorded turns no
+        # longer count as his (a T3 scheduled wake-up, before T3's message
+        # record was read): no longer listed. Its status is left as it was.
+        if row.get("session") == session and row.get("prompt_sha256") in refused and row.get("typed"):
+            row["typed"] = False
     for row in rows.values():
         if row.get("session") == session and not row.get("project"):
             row["project"] = _project_from_cwd((recorded.get(row.get("prompt_sha256")) or {}).get("cwd"))
