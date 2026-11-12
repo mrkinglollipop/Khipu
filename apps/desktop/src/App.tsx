@@ -464,6 +464,7 @@ export default function App() {
   // Accounts and routing is its own rail destination; Work shows the accounts too.
   const routing = useRouting(tab === "home" || tab === "routing");
   // Accounts view: Room right now or Running now (Order and rules is still its older screen).
+  const [todayAccountKey, setTodayAccountKey] = useState<string | null>(null);
   const [acctView, setAcctView] = useState<"room" | "running" | "rules">("room");
   const runningNow = useRunning(tab === "routing");
   // "Connect to a server you run or another Mac…" reopens the first-run flow
@@ -472,6 +473,7 @@ export default function App() {
   // `welcomeInitialStep` itself does not change value.
   const [welcomeInitialStep, setWelcomeInitialStep] = useState<string | undefined>(undefined);
   const [welcomeInitialStepKey, setWelcomeInitialStepKey] = useState(0);
+  useEffect(() => { if (tab !== "routing") setTodayAccountKey(null); }, [tab]);
   const needsRoutingSetup = routingNeedsSetup(routing.data);
   const openNoticeTarget = useCallback((target: NoticeTarget) => {
     if (target.kind === "home") setTab("home");
@@ -1125,6 +1127,8 @@ export default function App() {
             <Today
               active={tab === "home"}
               needs={needs}
+              view={routing.data} plans={plans.data} routingError={routing.error}
+              onOpenAccount={(key) => { setTodayAccountKey(key); setAcctView("room"); setTab("routing"); }}
               onOpen={(link) => {
                 if (link === "running-now") { setAcctView("running"); setTab("routing"); }
                 else if (link === "accounts") setTab("routing");
@@ -1175,6 +1179,8 @@ export default function App() {
             {tab === "routing" && acctView === "rules" ? <OrderAndRules active /> : null}
             {tab === "routing" && acctView === "room" ? (
               <Accounts
+                initialAccountKey={todayAccountKey}
+                onInitialAccountUsed={() => setTodayAccountKey(null)}
                 routing={routing}
                 plans={plans.data}
                 thisMac={thisMac}
