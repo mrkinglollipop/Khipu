@@ -121,8 +121,10 @@ This replaces item 8's reminders and is how item 4 stays true over time.
 - Remove routing-direction reminders (item 8): yes, "if we don't need them". They are not needed: the rules already require his routing words to go into Khipu in the same turn.
 - Scope the nightly wiki update (item 1a): go ("we definitely need it").
 - A "Proportion" rule was added to `~/.claude/CLAUDE.md` at his ask and synced to both Macs.
+- The regrouped Settings mock (item 6) is approved: "Approve mock", after two rounds of changes (one-word page names; Model and Source as two separate choices instead of "on my Claude login"). It is being built from `docs/plans/mocks/2026-11-12-settings-regrouped.html`.
+- Khipu should carry the rules and his own hooks to every app (item 3a): "Yes, scope it." It must work for a user with no Claude, across Macs, at setup, change and move, and it must read the rules and hooks other apps already have. Scope: `docs/plans/2026-11-12-rules-and-hooks-in-khipu.md` (being written).
+- The nightly wiki update is scoped in `docs/plans/2026-11-12-nightly-wiki-update.md`.
 
 ## Questions for Matt
 
-1. Approve the regrouped Settings mock (item 6), or say what to change?
-2. Should Khipu carry the rules file and his own hooks to every app (item 3a), replacing the shell script?
+None open in this plan. The two scope docs carry their own.

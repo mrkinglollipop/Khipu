@@ -127,7 +127,7 @@ td:first-child { color: var(--muted); }
         <tr><td>Search by meaning</td><td>General</td><td>A switch on the row; its model moves to Models</td></tr>
         <tr><td>Include your books in search</td><td>General</td><td>A switch on the row</td></tr>
         <tr><td>Updates</td><td>General</td><td>Version and the check button on one row</td></tr>
-        <tr><td>Who writes the summaries</td><td>Models</td><td>A pick-list per job; keys in their own group</td></tr>
+        <tr><td>Who writes the summaries</td><td>Models</td><td>Two choices per job, Model and Source; keys in their own group</td></tr>
         <tr><td>Where memory is kept</td><td>Storage</td><td>Named for what it is: the database</td></tr>
         <tr><td>Backups</td><td>Storage</td><td>Next to the thing it backs up</td></tr>
         <tr><td>Apps that use Khipu</td><td>Connections</td><td>One page for everything Khipu is connected to</td></tr>
@@ -166,12 +166,14 @@ const PAGES = [
     { title: 'Updates', rows: [['Khipu 0.4.15', 'Each update is signed and checked before it replaces anything.', btn('Check for updates')]] } ] },
   { id: 'models', cluster: 0, name: 'Models', icon: I.mod, value: 'Haiku', save: 'Save models', groups: [
     { title: 'Summaries', note: 'Writes the short summary of each conversation.', rows: [
-      ['Model', 'Uses the login you already have; counts against that plan.', sel('summary-model', ['Claude Haiku, on my Claude login', 'Claude Haiku (API key)', 'Gemini Flash (API key)', 'OpenAI (API key)', 'OpenRouter (API key)', 'ChatGPT, on my ChatGPT login', 'A model on this Mac or my network'])],
-      ['Model id', 'Change it only to pin a specific version.', '<input type="text" id="summary-model-id" value="haiku" aria-label="Model id">'],
-      ['If that model fails', '', sel('summary-fallback', ['Use Gemini Flash', 'Wait and try again'])],
+      ['Model', '', sel('summary-model', ['Claude Haiku', 'Gemini Flash', 'GPT', 'Other model…'])],
+      ['Source', 'A subscription counts against that plan. An API key is billed by use.', sel('summary-source', ['Claude subscription', 'Anthropic API key', 'OpenRouter'])],
+      ['Model name', 'As the source lists it.', '<input type="text" id="summary-model-name" placeholder="model name" aria-label="Model name">', 'summary-name-row'],
+      ['Fallback', 'Used when the model above fails.', sel('summary-fallback', ['Gemini Flash', 'None'])],
       ['Daily limit', 'Once reached, new summaries wait until tomorrow. Nothing is lost.', val('10,000 summaries') + btn('Change')] ] },
     { title: 'Search by meaning', note: 'Matches what you meant, not only the words you typed.', rows: [
-      ['Model', '', sel('search-model', ['Gemini Embedding 2 (API key)', 'A model on this Mac or my network'])] ] },
+      ['Model', '', sel('search-model', ['Gemini Embedding 2', 'Other model…'])],
+      ['Source', '', sel('search-source', ['Google API key', 'This Mac or my network'])] ] },
     { title: 'API keys', note: 'Kept in this Mac’s keychain. Khipu never shows a key.', rows: [
       ['Anthropic', '', pill('Not added', true) + btn('Add key')],
       ['Gemini', '', pill('Saved') + btn('Replace')],
@@ -218,7 +220,7 @@ function drawPage() {
   const p = PAGES.find(x => x.id === cur);
   page.innerHTML = `<button type="button" class="back" id="back">‹ Settings</button><h4>${p.name}</h4>` + p.groups.map(g =>
     `<div class="grp"><div class="gt">${g.title}</div>${g.note ? `<p class="gn">${g.note}</p>` : ''}<div class="card">${g.rows.map(r =>
-      `<div class="row"><div class="lb">${r[0]}${r[1] ? `<small>${r[1]}</small>` : ''}</div><div class="ct">${r[2]}</div></div>`).join('')}</div></div>`).join('') +
+      `<div class="row"${r[3] ? ` id="${r[3]}" hidden` : ''}><div class="lb">${r[0]}${r[1] ? `<small>${r[1]}</small>` : ''}</div><div class="ct">${r[2]}</div></div>`).join('')}</div></div>`).join('') +
     (p.save ? `<div class="foot">${btn(p.save, true)}</div>` : '');
 }
 nav.addEventListener('click', e => { const b = e.target.closest('.nav'); if (!b) return; cur = b.dataset.id; app.dataset.open = 'true'; drawNav(); drawPage(); });
@@ -226,6 +228,19 @@ page.addEventListener('click', e => {
   if (e.target.id === 'back') { app.dataset.open = 'false'; return; }
   const s = e.target.closest('.sw'); if (s) { s.setAttribute('aria-checked', s.getAttribute('aria-checked') !== 'true'); return; }
   const g = e.target.closest('.seg button'); if (g) g.parentElement.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', b === g));
+});
+// The sources on offer follow the model picked.
+const SOURCES = {
+  'Claude Haiku': ['Claude subscription', 'Anthropic API key', 'OpenRouter'],
+  'Gemini Flash': ['Google API key', 'OpenRouter'],
+  'GPT': ['ChatGPT subscription', 'OpenAI API key', 'OpenRouter'],
+  'Other model…': ['OpenRouter', 'This Mac or my network']
+};
+page.addEventListener('change', e => {
+  if (e.target.id !== 'summary-model') return;
+  const m = e.target.value;
+  document.getElementById('summary-source').innerHTML = SOURCES[m].map(o => `<option>${o}</option>`).join('');
+  document.getElementById('summary-name-row').hidden = m !== 'Other model…';
 });
 drawNav(); drawPage();
 </script>
