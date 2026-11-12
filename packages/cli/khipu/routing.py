@@ -3898,11 +3898,17 @@ def _fold_account(account: dict, items: list[dict], owner: dict, now: datetime, 
         any_open = max((_k(e) for e in pool if e["state"] == OPEN and e["scope"] in scopes), default=None)
         own_open = max((_k(e) for e in pool if e["state"] == OPEN and e["scope"] in scopes
                         and e["source"] in ("probe", "check")), default=None)
+        # A conversation's report that the whole quota is open again (the
+        # owner pressed a reset, 2026-11-12) ends a limit Khipu read from
+        # figures older than it; a limit read after the report still holds.
+        reset_open = max((_k(e) for e in pool if _reset_report(e, now) and e["scope"] in scopes), default=None)
 
         def holds(limit: dict) -> bool:
             if limit["state"] != LIMITED or limit["until"] is None or limit["until"] <= now:
                 return False
             newest = own_open if limit["basis"] in STRONG_BASES else any_open
+            if limit["source"] == "probe" and reset_open is not None and (newest is None or reset_open > newest):
+                newest = reset_open
             return newest is None or not newest > _k(limit)
 
         return holds
@@ -4357,6 +4363,91 @@ def _failed_reader(entry: dict, samples: list[dict], mac: str | None, now: datet
            and 0 <= (now - s["t"]).total_seconds() <= routing_pace.QUIET_READING_S for s in samples):
         return None
     return entry["reason"]
+
+
+def _reset_report(e: dict, now: datetime) -> bool:
+    """An open report from a conversation on the account's whole quota, in
+    force at ``now`` (what ``khipu_route_report`` writes when a reset is
+    pressed)."""
+    return (e.get("source") == "report" and e.get("state") == OPEN and (e.get("scope") or "all") == "all"
+            and (e.get("observation_scope") or {}).get("kind", "account_quota") == "account_quota"
+            and isinstance(e.get("at"), datetime) and e["at"] <= now
+            and (_parse(e.get("expires_at")) is None or _parse(e.get("expires_at")) > now))
+
+
+def _newest_reset_report(entry: dict, items: list[dict], owner: dict, samples: dict[str, list[dict]],
+                         read: dict, now: datetime) -> datetime | None:
+    """When the newest open report on the account's whole quota (not
+    dismissed, not before an owner clear) that says a reset was pressed was
+    made, or None. An open report says that only when it contradicts the
+    figures before it: some window's last reading before it was nearly out
+    or at the limit (the owner presses a reset only at 100%, 2026-11-12).
+    An open report that agrees with the figures ("Codex is open" at 40%)
+    leaves them as they are. ``samples`` are the whole account's windows
+    only (one model's limit is no account reset); ``read`` adds this Mac's
+    cached figures, each at its own time, for a window not yet sampled."""
+    from khipu import routing_pace
+
+    clear = owner["clears"].get(entry["key"])
+    reports = sorted((e["at"] for e in items
+                      if _reset_report(e, now) and e.get("id") not in owner["dismissed"]
+                      and (clear is None or _k(e) > _k(clear))), reverse=True)
+    models = set(read.get("models") or ())
+    cached = {w: (_parse(t), (read.get("used") or {}).get(w))
+              for w, t in (read.get("windows") or {}).items() if w not in models}
+    for at in reports:
+        for w in set(samples) | set(cached):
+            seen = [(s["t"], s.get("used")) for s in samples.get(w, []) if s["t"] <= at]
+            t, used = cached.get(w, (None, None))
+            if t is not None and t <= at:
+                seen.append((t, used))
+            used = max(seen, key=lambda pair: pair[0])[1] if seen else None
+            if isinstance(used, (int, float)) and not isinstance(used, bool) and (
+                    used >= 100 or routing_pace.nearly_out(used)):
+                return at
+    return None
+
+
+def _reset_pending(entry: dict, items: list[dict], owner: dict, samples: dict[str, list[dict]],
+                   read: dict, now: datetime) -> dict | None:
+    """The account's newest open report on its whole quota (a conversation's
+    "the reset was pressed") while some window's own figures are older than
+    it: ``{"at", "figures_at", "used_pct", "windows"}``, ``windows`` naming
+    those windows. Each window is judged on its own newest reading, any Mac's
+    pace sample or this Mac's last good read of that window: a five-hour
+    figure read after the report says nothing of the week (2026-11-12: a 99%
+    from before the reset said NEARLY OUT for minutes). A window read after
+    the report is used as normal; when every window is, pending ends."""
+    if entry.get("state") not in (OPEN, PROBABLY_OPEN):
+        return None
+    reported = _newest_reset_report(entry, items, owner, samples, read, now)
+    if reported is None:
+        return None
+    newest = {w: max((s for s in group if s["t"] <= now), key=lambda s: s["t"], default=None)
+              for w, group in samples.items()}
+    models = set(read.get("models") or ())
+    read_windows = {w: t for w, t in (read.get("windows") or {}).items() if w not in models} \
+        if isinstance(read.get("windows"), dict) else {}
+    times: dict[str, datetime] = {}
+    for w in set(newest) | set(read_windows):
+        seen = [t for t in ((newest.get(w) or {}).get("t"), _parse(read_windows.get(w))) if t is not None]
+        if seen:
+            times[w] = max(seen)
+    read_at = _parse(read.get("figures_at"))
+    if not times:
+        # No window to judge: this Mac's last read of the figures as a whole.
+        if read_at is None or read_at >= reported:
+            return None
+        stale, figures_at = set(samples), read_at
+    else:
+        stale = {w for w, t in times.items() if t < reported}
+        if not stale:
+            return None
+        figures_at = max(times[w] for w in stale)
+    used = [s["used"] for w, s in newest.items() if w in stale and s is not None
+            and isinstance(s.get("used"), (int, float)) and not isinstance(s.get("used"), bool)]
+    return {"at": _iso(reported), "figures_at": _iso(figures_at), "used_pct": max(used) if used else None,
+            "windows": sorted(stale)}
 
 
 def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
@@ -5005,14 +5096,41 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             if live[2] is not None:
                 pace_cap_at[slot_key] = live[2]
     pace_samples = {slot: _pace.shared_readings(group, mac, now, slot[1]) for slot, group in pace_samples.items()}
+    reads = ((sources or {}).get("usage") or {}).get("reads") or {}
     for entry in entries:
         windows = sorted({w for (a, w) in pace_samples if a == entry["key"]}
                          | {w for (a, w, _k2, _purpose) in pace_caps if a == entry["key"] and w})
+        read = reads.get(entry["key"]) if isinstance(reads.get(entry["key"]), dict) else {}
+        if read.get("failing") and _parse(read.get("figures_at")) is not None:
+            entry["figures_failing_since"] = read["figures_at"]
+        # One model's windows are no part of a whole-account reset.
+        model_windows = set(read.get("models") or ())
+        account_samples = {w: pace_samples.get((entry["key"], w), []) for w in windows if w not in model_windows}
+        pending = _reset_pending(entry, per_account.get(entry["key"]) or [], owner, account_samples, read, now)
+        if pending is not None:
+            entry["reset_reported"] = pending
+        reported_at = _newest_reset_report(entry, per_account.get(entry["key"]) or [], owner,
+                                           account_samples, read, now)
+        stale = set((pending or {}).get("windows") or ())
+
+        def paced(w: str) -> list[dict]:
+            # Figures from before a reported reset say nothing of now: no
+            # pace, verdict or run-out comes of them. A window still pending
+            # has none left; one sampled since keeps only those samples (a
+            # 100% from 14:01 must not share a bucket with the 99% read at
+            # 14:03 after a 14:02 reset). A window read since but not yet
+            # sampled keeps what it has, its read being newer than the report.
+            group = pace_samples.get((entry["key"], w), [])
+            if reported_at is None or w in model_windows:
+                return group
+            after = [s for s in group if s["t"] >= reported_at]
+            return after if after or w in stale else group
+
         if windows:
             # ``priority`` is the held record; share_pct is read from live
             # exceptions here because the folded priority is built later.
             entry["pace"] = [_pace.compute_pace(
-                pace_samples.get((entry["key"], w), []),
+                paced(w),
                 _caps_with_exception_share(
                     [c for (a, ww, _k2, _purpose), c in pace_caps.items()
                      if a == entry["key"] and ww == w],
@@ -7153,6 +7271,16 @@ def report(*, state: str, account: str | None = None, runner: str | None = None,
     elif state == DOWN:
         event["reason"] = "not_signed_in" if message and _SIGNIN.search(message) else "out_of_service"
     written, view = _write(event)
+    if state == OPEN and written.get("account") and not scope \
+            and (written.get("observation_scope") or {}).get("kind", "account_quota") == "account_quota":
+        # Reported open (a reset pressed, 2026-11-12): read its figures now,
+        # not at the next turn allowance. Best effort; the report stands.
+        try:
+            from khipu import usage
+
+            usage.reread_reported(written["account"])
+        except Exception:  # noqa: BLE001 - the re-read never fails the report
+            pass
     return _done(written, view, account=key, state=state, until=written.get("until"), basis=written.get("basis"))
 
 
@@ -9490,6 +9618,19 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
     return fact
 
 
+def reset_pending_words(pending: dict, now: datetime) -> str:
+    """"Reset reported 02:22Z; figures pending (last read 02:18Z: 99% used)"."""
+    words = "Reset reported" + (f" {_clock(at, now)}" if (at := _parse(pending.get("at"))) else "")
+    read = _parse(pending.get("figures_at"))
+    used = pending.get("used_pct")
+    last = ""
+    if read is not None:
+        last = f"last read {_clock(read, now)}"
+        if isinstance(used, (int, float)) and not isinstance(used, bool):
+            last += f": {used:g}% used"
+    return words + "; figures pending" + (f" ({last})" if last else "")
+
+
 def plan_facts(view: dict, now: datetime) -> dict[str, dict]:
     """``plan_fact`` for each account the view holds, from the usage cache
     (read once; nothing is probed)."""
@@ -9502,6 +9643,12 @@ def plan_facts(view: dict, now: datetime) -> dict[str, dict]:
     out = {}
     for entry in view.get("accounts") or []:
         try:
+            pending = entry.get("reset_reported") if isinstance(entry.get("reset_reported"), dict) else None
+            if pending is not None:
+                # Figures from before a reported reset are not the plan's now.
+                out[entry["key"]] = {"readable": False, "reset_reported": True,
+                                     "why": reset_pending_words(pending, now)}
+                continue
             fact = plan_fact(rows.get(entry["key"]), now)
             # Even allowance arithmetic cannot promise time when observed
             # consumption predicts exhaustion before a reset.
@@ -10254,7 +10401,9 @@ def _sources_brief(sources: dict) -> dict:
                                                  "unreadable", "unreadable_since", "lanes", "unmatched_lanes", "lane_matches")}
                         for r in sources.get("runners") or []],
             "refused": sources.get("refused") or [], "invalid": sources.get("invalid") or 0,
-            "usage": sources.get("usage"), "table": sources.get("table")}
+            "usage": ({k: v for k, v in sources["usage"].items() if k != "reads"}
+                      if isinstance(sources.get("usage"), dict) else sources.get("usage")),
+            "table": sources.get("table")}
 
 
 def _launch_warnings(view: dict, launched: list[dict], cfg: dict, now: datetime) -> list[str]:

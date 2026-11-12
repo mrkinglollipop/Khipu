@@ -24,6 +24,8 @@ NEARLY_OUT_PCT = 10.0
 # their width until that step too.
 _WIDTHS = ((220, 140, 140), (140, 100, 100), (90, 60, 60), (90, 30, 60), (90, 0, 60), (0, 0, 0))
 FRESH_HOURS = 48
+# Kept figures older than this, while this Mac's reads of them fail, say so.
+FAILING_FIGURES_S = 10 * 60
 FRESH_FLOOR = 110
 # Newest exceptions shown on an account's line; older ones collapse to a count.
 EXCEPTIONS_SHOWN = 2
@@ -244,6 +246,15 @@ def _fresh_exception(live: list[dict], now: datetime, r) -> dict | None:
                  and now - timedelta(hours=FRESH_HOURS) <= at <= now), None)
 
 
+def _failing_words(entry: dict, now: datetime, r) -> str:
+    """"figures from 02:18Z; reads failing" when this Mac's reads of the
+    account fail and the figures it keeps are over ``FAILING_FIGURES_S`` old."""
+    since = r._parse(entry.get("figures_failing_since"))
+    if since is None or (now - since).total_seconds() <= FAILING_FIGURES_S:
+        return ""
+    return f"figures from {r._clock(since, now)}; reads failing"
+
+
 def _account_text(label: str, entry: dict, item: dict | None, *, number, holds: list[dict], last: bool,
                   providers: dict, override: dict | None, readings: dict, widths, now: datetime, r) -> str:
     windows = _windows(entry, now, r)
@@ -267,18 +278,31 @@ def _account_text(label: str, entry: dict, item: dict | None, *, number, holds: 
         target = _job_target(window)
         if target is not None:
             text += f"; used {_pct(window['used'])}%, even pace {_pct(target['allowance_pct'])}%"
+        failing = _failing_words(entry, now, r)
+        if failing:
+            text += f" ({failing})"
         parts.append(text)
         for other in windows[1:]:
             if other["left"] < NEARLY_OUT_PCT:
                 parts.append(f"{_WINDOW_NAMES.get(other['name'], other['name'])} {_pct(other['left'])}% left, "
                              f"resets {r._clock(other['resets'], now)}")
+    elif isinstance(entry.get("reset_reported"), dict):
+        text = r.reset_pending_words(entry["reset_reported"], now)
+        failing = _failing_words(entry, now, r)
+        if failing:
+            text += f" ({failing})"
+        parts.append(text)
     elif entry.get("state") in (r.OPEN, r.PROBABLY_OPEN, r.UNKNOWN):
         parts.append("No reading of its limit yet")
-    if (entry.get("state") == r.LIMITED):
-        for m in entry.get("models") or []:
-            m_until = r._parse(m.get("until"))
-            if m_until is not None:
-                parts.append(f"{r.model_words(m, push=True)} limit reached, back {r._clock(m_until, now)}")
+    if window is not None and isinstance(entry.get("reset_reported"), dict):
+        # Some windows were read after a reported reset, others not yet.
+        parts.append(r.reset_pending_words(entry["reset_reported"], now))
+    # A model's own limit stands whatever the whole account's state: a reset
+    # reported for the account leaves an Opus limit read at 100% in force.
+    for m in entry.get("models") or []:
+        m_until = r._parse(m.get("until"))
+        if m_until is not None and m_until > now:
+            parts.append(f"{r.model_words(m, push=True)} limit reached, back {r._clock(m_until, now)}")
     caps = [_cap_words(c, now, r, (readings.get(entry["key"]) or {}).get(c.get("kind")))
             for c in entry.get("caps") or []]
     if caps:

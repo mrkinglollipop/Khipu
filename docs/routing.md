@@ -430,6 +430,20 @@ Muse's every 30. The queue-drain job reads every account each minute, and an
 active conversation's prompt starts a read when the figures are over a minute
 old, so a reset the owner presses shows within about 2 minutes. `khipu_usage`
 replies from cache immediately; its background refresh can use these fallbacks.
+
+A conversation that reports an account open (`khipu_route_report` with state
+open, for example after the owner presses a reset) makes Khipu read that
+account's figures again at once: the login's 2-minute turn allowance is reset
+and the background read starts without waiting. When the figures before the
+report say the account was nearly out or at its limit, the report means the
+reset was pressed (an open report that agrees with the figures changes
+nothing). Until figures newer than such a report arrive, the routing page and
+advice treat the older figures as out of date, and no pace is worked out from
+readings older than it: the account shows as "OK. Reset reported 02:22Z; figures pending (last
+read 02:18Z: 99% used)", with no NEARLY OUT, hold-back or run-out time
+worked out from them. When reads keep failing and the figures Khipu kept are
+over 10 minutes old, the page says so on that account's line ("figures from
+02:18Z; reads failing").
 From Muse 1.4.13, `muse usage --json` gives the figures with no turn; older Muse
 keeps the turn.
 

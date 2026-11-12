@@ -128,6 +128,16 @@ def _isolate_routing_inventory(monkeypatch):
     monkeypatch.setattr(agent_view, "_TABLE", {"sig": None, "at": 0.0, "table": None})
 
 
+@pytest.fixture(autouse=True)
+def _no_reread_after_open_report(monkeypatch):
+    """An open report starts a detached usage refresh (``usage.reread_reported``),
+    which would run the real CLIs; tests that mean it call the real function
+    with a fake ``spawn`` (``test_routing_reset_report``)."""
+    from khipu import usage
+
+    monkeypatch.setattr(usage, "reread_reported", lambda key, **kw: False, raising=False)
+
+
 RULE_SIZE_SETTINGS = ("routing_rule_chars", "routing_rules_max", "routing_note_chars")
 
 
