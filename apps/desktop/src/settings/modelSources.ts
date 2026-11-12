@@ -33,8 +33,12 @@ export function selectionPatch(row: SynthRow, model: ModelName, source: string):
   // A source-only change preserves a custom model id. Defaults follow the new source.
   const generatedDefaults = ["haiku", "claude-haiku-5-5", "gemini-2.5-flash", "anthropic/claude-haiku-5-5", "google/gemini-2.5-flash", "openai/gpt-6-luna"];
   const custom = row.model_id.trim() && row.model_id !== defaultSynthModel(row.provider) && !generatedDefaults.includes(row.model_id);
-  let model_id = before.model === model && custom ? row.model_id : defaultSynthModel(provider);
-  if (provider === "openrouter" && !(before.model === model && custom)) {
+  // OpenRouter ids carry a vendor prefix the direct sources reject, and the reverse, so a custom id
+  // never crosses that line: the new source's default (or an empty, required field) takes its place.
+  const crossesOpenRouter = (canonicalSynthProvider(row.provider) === "openrouter") !== (provider === "openrouter");
+  const keep = before.model === model && custom && !crossesOpenRouter;
+  let model_id = keep ? row.model_id : defaultSynthModel(provider);
+  if (provider === "openrouter" && !keep) {
     model_id = model === "Claude Haiku" ? "anthropic/claude-haiku-5-5" : model === "Gemini Flash" ? "google/gemini-2.5-flash" : model === "GPT" ? "openai/gpt-6-luna" : "";
   }
   return { provider, model_id };

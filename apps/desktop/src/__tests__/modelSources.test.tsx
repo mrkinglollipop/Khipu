@@ -53,6 +53,14 @@ describe("Models and sources retain the seven stored providers", () => {
   ] as const)("moves generated %s names from OpenRouter to %s using destination defaults", (model, model_id, source, provider, expected) => {
     expect(selectionPatch({ provider: "openrouter", model_id, endpoint: "" }, model, source)).toEqual({ provider, model_id: expected });
   });
+  it.each([
+    ["openai", "gpt-6-luna", "GPT", "OpenRouter", "openrouter", "openai/gpt-6-luna"],
+    ["anthropic", "claude-custom-2026", "Claude Haiku", "OpenRouter", "openrouter", "anthropic/claude-haiku-5-5"],
+    ["openrouter", "anthropic/claude-haiku-4", "Claude Haiku", "Anthropic API key", "anthropic", "claude-haiku-5-5"],
+    ["openrouter", "openai/gpt-custom", "GPT", "OpenAI API key", "openai", ""],
+  ] as const)("never carries a custom %s id (%s) across the OpenRouter line", (from, model_id, model, source, provider, expected) => {
+    expect(selectionPatch({ provider: from, model_id, endpoint: "" }, model, source)).toEqual({ provider, model_id: expected });
+  });
   it("keeps custom model ids and endpoints when only their source changes", () => {
     render(<Host provider="anthropic" model_id="claude-custom-2026" />);
     fireEvent.change(screen.getByLabelText("Source"), { target: { value: "Claude subscription" } });

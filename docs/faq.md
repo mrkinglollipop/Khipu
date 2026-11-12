@@ -87,7 +87,7 @@ No. It reports each account's state and plan headroom, and the choice stays with
 ## Desktop app and platforms
 
 **Does the app update itself?**
-It checks GitHub Releases at launch and flags a new version in the menu-bar tooltip. It never downloads or installs on its own. To install, go to Settings > Updates > Check for updates. See [desktop-app.md](desktop-app.md).
+It checks GitHub Releases at launch and flags a new version in the menu-bar tooltip. It never downloads or installs on its own. To install, go to Settings > General > Updates > Check for updates. See [desktop-app.md](desktop-app.md).
 
 **Can I run this on Linux or Windows?**
 The desktop app is macOS only (macOS 12 or later, Apple silicon), and so is the Keychain integration. The CLI is plain Python, but it has not been tested on Linux or Windows. If you try, set `KHIPU_KEYCHAIN=0` and pass settings through the environment, for example `KHIPU_DATABASE_URL`, instead of the Keychain. Scheduled jobs use macOS LaunchAgents.

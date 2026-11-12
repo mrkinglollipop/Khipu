@@ -28,7 +28,7 @@ The app bundle carries the CLI and Python under `Contents/Resources/khipu`. You 
 The updater uses `tauri-plugin-updater`. It reads `https://github.com/mrkinglollipop/Khipu/releases/latest/download/latest.json` and downloads a signed `Khipu.app.tar.gz` plus a minisign signature. It does not use the DMG. The public key is in `src-tauri/tauri.conf.json` (`plugins.updater.pubkey`). The private signing key is kept outside the repo.
 
 - On launch the app only checks. If a newer version exists, the tray tooltip reads "Khipu · update vX available". Nothing is downloaded or installed.
-- To install, go to Settings > Updates > Check for updates. The app downloads, installs and relaunches.
+- To install, go to Settings > General > Updates > Check for updates. The app downloads, installs and relaunches.
 - After an upgrade, the app can show a one-time notice for that version.
 - `latest.json` lists `darwin-aarch64` only.
 

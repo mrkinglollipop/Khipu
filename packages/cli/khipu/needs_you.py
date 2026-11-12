@@ -302,9 +302,9 @@ def _settings() -> list[dict]:
         if differences:
             out.append(_item("setting", "settings-sync", f"On {len(differences)} setting difference"
                              f"{'s' if len(differences) != 1 else ''} between your Macs to choose.",
-                             confirm_does="Open Your Macs and choose which value to use.",
+                             confirm_does="Open Settings, then Connections, then Macs, and choose which value to use.",
                              undo_does="Nothing is changed until you choose.",
-                             do="Open Accounts and routing, then Your Macs."))
+                             do="Open Settings, then Connections, then Macs."))
     except Exception:  # noqa: BLE001 - a read failure never hides real requests
         pass
     return out

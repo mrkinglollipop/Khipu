@@ -27,7 +27,7 @@ You can reopen Welcome later from Settings, Advanced, **Run setup again**.
 
 ### Updates
 
-The app checks GitHub Releases when it launches. If a newer version exists, the menu-bar tooltip says so. Nothing downloads or installs on its own. To install, go to Settings, Updates, **Check for updates**.
+The app checks GitHub Releases when it launches. If a newer version exists, the menu-bar tooltip says so. Nothing downloads or installs on its own. To install, go to Settings, General, **Check for updates**.
 
 If macOS blocks a release that is not notarized, right-click **Khipu.app**, choose **Open**, and confirm once.
 
