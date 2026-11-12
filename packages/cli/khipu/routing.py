@@ -4375,6 +4375,18 @@ def _reset_report(e: dict, now: datetime) -> bool:
             and (_parse(e.get("expires_at")) is None or _parse(e.get("expires_at")) > now))
 
 
+def _window_live(w: str, group: list[dict], t: datetime, at: datetime) -> bool:
+    """Whether a window read at ``t`` was still in use at ``at``: read within
+    one of its own lengths before. A window the account no longer reports
+    (Claude's five-hour figures stopped on Oct 31) is no figure of now, so
+    it neither marks nor holds open a reported reset."""
+    from khipu import routing_pace
+
+    params = routing_pace._sample_params(w, group)
+    length = (params or {}).get("window_s")
+    return not length or (at - t).total_seconds() <= length
+
+
 def _newest_reset_report(entry: dict, items: list[dict], owner: dict, samples: dict[str, list[dict]],
                          read: dict, now: datetime) -> datetime | None:
     """When the newest open report on the account's whole quota (not
@@ -4401,7 +4413,8 @@ def _newest_reset_report(entry: dict, items: list[dict], owner: dict, samples: d
             t, used = cached.get(w, (None, None))
             if t is not None and t <= at:
                 seen.append((t, used))
-            used = max(seen, key=lambda pair: pair[0])[1] if seen else None
+            last = max(seen, key=lambda pair: pair[0]) if seen else None
+            used = last[1] if last and _window_live(w, samples.get(w, []), last[0], at) else None
             if isinstance(used, (int, float)) and not isinstance(used, bool) and (
                     used >= 100 or routing_pace.nearly_out(used)):
                 return at
@@ -4431,7 +4444,7 @@ def _reset_pending(entry: dict, items: list[dict], owner: dict, samples: dict[st
     times: dict[str, datetime] = {}
     for w in set(newest) | set(read_windows):
         seen = [t for t in ((newest.get(w) or {}).get("t"), _parse(read_windows.get(w))) if t is not None]
-        if seen:
+        if seen and _window_live(w, samples.get(w, []), max(seen), reported):
             times[w] = max(seen)
     read_at = _parse(read.get("figures_at"))
     if not times:

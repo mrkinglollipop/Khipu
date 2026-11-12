@@ -460,3 +460,28 @@ def test_a_model_limit_alone_does_not_make_an_open_report_a_reset(home):
     assert pace["weekly"].get("used_pct") == 40
     assert [m["model"].casefold() for m in entry.get("models") or []] == ["opus"]
     assert "Reset reported" not in _line(routing_page.page(view, now))
+
+
+# ---- live 2026-11-12: a window the account stopped reporting -------------------------------------
+
+
+def test_a_window_no_longer_reported_does_not_hold_the_reset_pending(home):
+    # A five-hour sample from two days before (the window has not been
+    # reported since); weekly 99% at 13:56, reset reported 14:00, weekly
+    # read again at 14:02: nothing is pending.
+    clock = home["clock"]
+    old = T0 - timedelta(days=2)
+    five = {"name": "five_hour", "used_pct": 16, "resets_at": routing._iso(old + timedelta(hours=3)),
+            "window_mins": 300}
+    row = _row("Claude second", "claude", "/logins/claude-second", _week(50, RESETS), five)
+    row.update(probed_at=routing._iso(old), last_attempt_at=routing._iso(old), last_good_at=routing._iso(old))
+    _cache(home, dict(FIGURES, **{SECOND: row}))
+    routing.record_pace_samples(old)
+    _read(home, 99, T0 - timedelta(minutes=4))
+    _report_open(home)
+    now = clock.advance(minutes=2)
+    _read(home, 3, now)
+    view = routing.read_view(now)
+    entry = _entry(view)
+    assert "reset_reported" not in entry, entry.get("reset_reported")
+    assert "Reset reported" not in _line(routing_page.page(view, now))
