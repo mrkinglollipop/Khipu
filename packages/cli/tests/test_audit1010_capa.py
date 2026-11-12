@@ -426,7 +426,9 @@ class CaptureCapaTest(unittest.TestCase):
                                    text=True, env=env, capture_output=True, timeout=5, cwd=td)
             self.assertEqual(fixed.returncode, 0)
             jobs = list((Path(env["KHIPU_CAPTURE_HOME"]) / "queue").glob("*.json"))
-            self.assertEqual(len(jobs), 1, "the production enqueue path must durably queue")
+            hook_log = Path(td) / "Library" / "Logs" / "khipu" / "stop-hook.log"
+            self.assertEqual(len(jobs), 1, "the production enqueue path must durably queue: " +
+                             (hook_log.read_text() if hook_log.exists() else fixed.stderr))
 
             root = Path(td) / "fake-root"
             package = root / "packages" / "cli" / "khipu"

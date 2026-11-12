@@ -152,6 +152,12 @@ def test_a_hub_that_is_down_never_fails_health_or_macs(monkeypatch, capsys, tmp_
     monkeypatch.setattr(db, "connect", down)
     monkeypatch.setattr("khipu.hub_reach.known_unreachable", lambda: None)
     monkeypatch.setattr(health_five, "run_doctor", lambda: (report(), ""))
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW
+
+    monkeypatch.setattr(health_five, "datetime", Clock)
     assert macs.publish(macs.local_row()) == {"ok": False, "why": "OperationalError"}
     assert cli.main(["health", "--json"]) == 0
     doc = json.loads(capsys.readouterr().out)

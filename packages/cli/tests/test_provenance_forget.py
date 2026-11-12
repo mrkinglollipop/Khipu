@@ -82,7 +82,7 @@ def pg(env):
     return env
 
 
-def _payload(*, loop=CANON, kind="followup", owner="assistant", decision=None, title=None,
+def _payload(*, loop=CANON, kind="followup", owner="user", decision=None, title=None,
              path="docs/checklist.md", **extra) -> dict:
     n = next(_N)
     payload = {
@@ -311,8 +311,8 @@ def _owner_fields(hub, cid) -> dict:  # noqa: F811
 
 def test_r6_owner_separated_twins_forget_without_a_key_conflict(pg):
     a = _capture(owner="user", kind="promise")
-    b = _capture()
-    c = _capture()
+    b = _capture(owner="assistant")
+    c = _capture(owner="assistant")
     rows = _rows(pg, "SELECT id, opened_episode, content_hash FROM commitments ORDER BY id")
     assert [r[1] for r in rows] == [a, b]
     _forget(pg, b)
@@ -542,11 +542,11 @@ def test_t2_a_legacy_restater_is_proven_whatever_its_kind_or_the_current_owner(e
         _capture(kind="promise", owner="user", loop="I will review the deployment checklist before release")
         b = _capture(kind="followup", owner="user", loop="I will review the deployment checklist before the release")
     else:
-        _capture(kind="promise", owner="user", loop="I will review the deployment checklist before release")
-        b = _capture(kind="promise", owner="user", loop="I will review the deployment checklist before the release")
+        _capture(kind="promise", owner="assistant", loop="I will review the deployment checklist before release")
+        b = _capture(kind="promise", owner="assistant", loop="I will review the deployment checklist before the release")
         with env.connect() as conn, conn.cursor() as cur:
             cid = cur.execute("SELECT id FROM commitments").fetchone()[0]
-            assert co.reassign(cur, cid, "assistant", by=co.BY_APP, reason="schedule")
+            assert co.reassign(cur, cid, "user", by=co.BY_APP, reason="schedule")
             conn.commit()
     assert _rows(env, "SELECT count(*) FROM commitments") == [(1,)]
     words = "I will review the deployment checklist before the release"
@@ -559,7 +559,7 @@ def test_t2_a_legacy_restater_is_proven_whatever_its_kind_or_the_current_owner(e
         provenance.backfill(conn)  # the nightly again: nothing to re-add
     assert words not in _readers(env)
     if schedule == "reassigned":
-        assert _rows(env, "SELECT owner FROM commitments") == [("assistant",)]
+        assert _rows(env, "SELECT owner FROM commitments") == [("user",)]
 
 
 def test_t2_live_mixed_kind_witness_keeps_its_wording(pg):
@@ -755,11 +755,11 @@ def _assert_forgotten_unreadable(hub, held: dict[int, set[str]] | None = None): 
 
 
 SCHEDULE_CAPTURES = {
-    "A": dict(loop=CANON, decision="Keep the release train weekly", title="the checklist"),
-    "B": dict(loop=ALT + " in PR #41", kind="question", decision="Keep the release train weekly",
+    "A": dict(loop=CANON, owner="assistant", decision="Keep the release train weekly", title="the checklist"),
+    "B": dict(loop=ALT + " in PR #41", owner="assistant", kind="question", decision="Keep the release train weekly",
               title="The checklist (final)"),
     "C": dict(loop=CANON, kind="promise", owner="user", decision="Ship on Thursdays", title=None),
-    "D": dict(loop=CANON + " and the rollback plan", decision="Keep the release train weekly",
+    "D": dict(loop=CANON + " and the rollback plan", owner="assistant", decision="Keep the release train weekly",
               title="the checklist"),
 }
 
@@ -795,7 +795,12 @@ def test_forget_schedules_hold_i1_i2_i3(env, order, legacy):
         if name == "B":
             with env.connect() as conn, conn.cursor() as cur:
                 cid = cur.execute("SELECT min(id) FROM commitments").fetchone()[0]
-                co.reassign(cur, cid, "agent", "reviewer", by=co.BY_CONVERSATION, reason="schedule")
+                # Seed the historical assignment directly: new agent assignments
+                # were removed, but forget must still preserve archived metadata.
+                cur.execute("UPDATE commitments SET owner_prior = owner, owner_prior_label = owner_label, "
+                            "owner_reassigned_at = now(), owner_reassigned_by = %s, owner_reassign_reason = %s, "
+                            "owner = 'agent', owner_label = 'reviewer' WHERE id = %s",
+                            (co.BY_CONVERSATION, "schedule", cid))
                 conn.commit()
     if legacy:
         env.to_0047()
