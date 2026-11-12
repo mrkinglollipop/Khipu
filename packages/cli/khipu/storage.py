@@ -416,6 +416,53 @@ def _disk_write_targets() -> list[tuple[str, Path]]:
     return targets
 
 
+def _purgeable_free(path: Path) -> int | None:
+    """macOS's own "available" figure for ``path``'s volume: free space plus
+    what the system purges for a user's write (Finder's number,
+    ``NSURLVolumeAvailableCapacityForImportantUsageKey``). APFS keeps local
+    snapshots and caches as purgeable, so the plain free figure can read 40 GB
+    on a disk with 460 GB a write can use (seen 2026-11-12). None off macOS
+    or when it can't be read: the plain figure stands."""
+    import sys
+
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+
+        cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation") or "CoreFoundation")
+        cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+        cf.CFURLCreateFromFileSystemRepresentation.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                                               ctypes.c_long, ctypes.c_bool]
+        cf.CFURLCopyResourcePropertyForKey.restype = ctypes.c_bool
+        cf.CFURLCopyResourcePropertyForKey.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                                       ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+        cf.CFNumberGetValue.restype = ctypes.c_bool
+        cf.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        raw = os.fsencode(str(path))
+        url = cf.CFURLCreateFromFileSystemRepresentation(None, raw, len(raw), True)
+        if not url:
+            return None
+        try:
+            key = ctypes.c_void_p.in_dll(cf, "kCFURLVolumeAvailableCapacityForImportantUsageKey")
+            value = ctypes.c_void_p()
+            if not cf.CFURLCopyResourcePropertyForKey(url, key, ctypes.byref(value), None) or not value.value:
+                return None
+            try:
+                number = ctypes.c_int64()
+                if not cf.CFNumberGetValue(value, 4, ctypes.byref(number)):  # kCFNumberSInt64Type
+                    return None
+                return number.value if number.value > 0 else None
+            finally:
+                cf.CFRelease(value)
+        finally:
+            cf.CFRelease(url)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def disk_space(limits: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Free space on every distinct device Khipu writes (data dir, temp,
     the inactive live slot, and a configured worktree
@@ -437,15 +484,17 @@ def disk_space(limits: Mapping[str, Any] | None = None) -> dict[str, Any]:
         except OSError as exc:
             errors.append(f"{label}: {describe_os_error(exc)}")
             continue
-        percent = round(usage.free * 100 / usage.total, 1) if usage.total else 0.0
-        free_gb = usage.free / GB
+        # Purgeable space counts: macOS frees it for a write (``_purgeable_free``).
+        free = max(usage.free, min(_purgeable_free(probe) or 0, usage.total))
+        percent = round(free * 100 / usage.total, 1) if usage.total else 0.0
+        free_gb = free / GB
         if free_gb < limits["disk_fail_free_gb"] or percent < limits["disk_fail_free_percent"]:
             level = "red"
         elif free_gb < limits["disk_warn_free_gb"] or percent < limits["disk_warn_free_percent"]:
             level = "amber"
         else:
             level = "ok"
-        volumes.append({"label": label, "path": str(path), "free_bytes": usage.free,
+        volumes.append({"label": label, "path": str(path), "free_bytes": free,
                         "total_bytes": usage.total, "free_percent": percent, "level": level})
     worst = max(volumes, key=lambda v: (_WORSE[v["level"]], -v["free_bytes"]), default=None)
     level = "red" if errors else (worst["level"] if worst else "red")

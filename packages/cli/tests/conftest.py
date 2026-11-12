@@ -47,6 +47,7 @@ from __future__ import annotations
 import atexit
 import os
 import shutil
+import signal
 import tempfile
 from pathlib import Path
 
@@ -58,8 +59,44 @@ import pytest
 # (about 112,000 were found). The root sits directly in the system temp folder
 # and its name is short: macOS caps a unix socket path at 104 bytes and
 # several tests bind sockets under temporary folders.
+# A run killed outright (a timeout's SIGTERM skips atexit, a SIGKILL or a
+# crash skips everything) left its root behind: about 29 of them, 6 GB, by
+# 2026-11-12. SIGTERM now removes the root before the run dies, and each run
+# removes roots another run left more than a day ago (no run lasts that long).
+_STALE_ROOT_S = 86400
+
+
+def _sweep_stale_roots() -> None:
+    import time
+
+    base = Path(tempfile.gettempdir())
+    try:
+        entries = list(base.glob("kt-*"))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_dir() and not entry.is_symlink() and time.time() - entry.stat().st_mtime > _STALE_ROOT_S:
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            continue
+
+
+_sweep_stale_roots()
 TEMP_ROOT = tempfile.mkdtemp(prefix="kt-")
 atexit.register(shutil.rmtree, TEMP_ROOT, ignore_errors=True)
+
+
+def _remove_on_term(signum, _frame):
+    shutil.rmtree(TEMP_ROOT, ignore_errors=True)
+    home = globals().get("_HERMETIC_HOME")
+    if home:
+        shutil.rmtree(home, ignore_errors=True)
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+signal.signal(signal.SIGTERM, _remove_on_term)
 os.environ["TMPDIR"] = TEMP_ROOT
 tempfile.tempdir = TEMP_ROOT
 
@@ -119,6 +156,15 @@ if os.environ.get("KHIPU_LIVE_TESTS") != "1":
     # where this Mac's real one may be.
     os.environ["KHIPU_GH_CLI"] = _gh
     os.environ["PATH"] = _SHIM_DIR + os.pathsep + os.environ.get("PATH", "")
+
+@pytest.fixture(autouse=True)
+def _plain_disk_free(monkeypatch):
+    """The disk check reads macOS's purgeable-inclusive figure for the real
+    disk; tests that fake ``shutil.disk_usage`` judge their own numbers."""
+    from khipu import storage
+
+    monkeypatch.setattr(storage, "_purgeable_free", lambda path: None)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_routing_inventory(monkeypatch):
