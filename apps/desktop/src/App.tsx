@@ -442,7 +442,7 @@ export default function App() {
   // while it shows and at its earliest reset, so it never outlives a reset
   // or freezes its countdown while Home stays open.
   const plans = usePlanUsage(
-    tab === "guides" ? "guides" : tab === "home" ? "home" : tab === "routing" ? "settings" : null,
+    tab === "guides" ? "guides" : tab === "routing" ? "settings" : null,
   );
   // Guides: the guide on screen (Grok Bot also takes the step to open at), and
   // the live evidence the page, the rail badge and Home's hint all read. It
@@ -1180,6 +1180,7 @@ export default function App() {
             {tab === "routing" && acctView === "room" ? (
               <Accounts
                 initialAccountKey={todayAccountKey}
+                onInitialAccountUsed={() => setTodayAccountKey(null)}
                 routing={routing}
                 plans={plans.data}
                 thisMac={thisMac}

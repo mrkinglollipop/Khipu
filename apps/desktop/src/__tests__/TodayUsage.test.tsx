@@ -34,13 +34,20 @@ describe("Today usage words", () => {
     expect(tile(account({ state: "unknown" }))).toMatchObject({ left: null, word: "Not known" });
     expect(tile(account({ pace: [] }))).toMatchObject({ left: null, word: "No reading yet" });
   });
-  it("says no limit only for an explicit successful unlimited read in an otherwise open account", () => {
+  it("never claims an account has no limit: an account with no reading says so", () => {
     const a = account({ pace: [] });
     const plans = { accounts: [{ key: a.key, ok: true, credits: { unlimited: true } }] };
-    expect(tile(a, view([a]), plans)).toMatchObject({ left: null, word: "No limit", line: "Pay as you go" });
-    expect(tile({ ...a, state: "unknown" }, view([a]), plans).word).toBe("Not known");
-    expect(tile(a, view([a]), { accounts: [{ key: a.key, ok: false, error: "no_plan_limits" }] }).word).not.toBe("No limit");
-    expect(tile(a, view([a]), { accounts: [{ key: a.key, ok: true, windows: [] }] }).word).not.toBe("No limit");
+    expect(tile(a, view([a]), plans)).toMatchObject({ left: null, word: "No reading yet" });
+  });
+  it("shows no percent beside a limit that is reached, even when an older reading has room", () => {
+    const t = tile(account({ state: "limited", pace: [win("weekly", 80, "ahead")] }));
+    expect(t).toMatchObject({ left: 0, word: "Out of room", tone: "err", window: "" });
+    expect(t.line).not.toMatch(/% left/);
+  });
+  it("keeps a paused account's figures", () => {
+    const t = tile(account({ state: "paused", pace: [win("weekly", 38, "on_pace")] }));
+    expect(t.left).toBe(62);
+    expect(t.line).toBe("62% left");
   });
   it("prioritizes plan end over old reading over the second window", () => {
     const a = account({ pace: [win(), win("daily", 10)], terms: { ends: "2026-11-13" } });

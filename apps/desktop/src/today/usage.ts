@@ -43,11 +43,13 @@ export function planEnd(a: RouteAccount, now: Date): { ended: boolean; line: str
 export function usageTiles(view: RouteView | null | undefined, plans: UsageReport | null | undefined, choices: UsageChoices, now: Date): UsageTile[] {
   return orderedAccounts(view).map((a) => {
     const row = rowModel(a, view, plans, 0, now);
-    const windows = ["room", "paused", "limited"].includes(row.kind) ? accountWindows(a, view, now) : [];
+    // A paused account keeps its figures (the owner paused it; the room is real).
+    // One at its limit says so in Khipu's words with an empty bar: an older
+    // reading's percent must never sit beside "Out of room".
+    const windows = row.kind === "room" || row.kind === "paused" ? accountWindows(a, view, now) : [];
     const w = tightest(windows);
+    const limited = row.kind === "limited";
     const usage = plans?.accounts?.find((r) => r.key === a.key);
-    // Missing windows and no_plan_limits are unreadable, never evidence of no limit.
-    const noLimit = row.kind === "noreading" && usage?.ok === true && usage.credits?.unlimited === true;
     const end = planEnd(a, now);
     const at = view?.plan_facts?.[a.key]?.figures_at ?? a.advice?.newest_reading_at ?? usage?.observed_at ?? usage?.probed_at ?? view?.checked_at;
     const age = at ? now.getTime() - new Date(at).getTime() : 0;
@@ -55,9 +57,9 @@ export function usageTiles(view: RouteView | null | undefined, plans: UsageRepor
       ? readLine({ checked_at: at }, now)?.replace(/\.$/, "") ?? null : null;
     const second = windows.find((x) => x !== w);
     return {
-      key: a.key, label: a.label, word: noLimit ? "No limit" : row.word, tone: row.tone,
-      left: w?.left ?? null,
-      line: w ? `${w.left}% left` : noLimit ? "Pay as you go" : row.line,
+      key: a.key, label: a.label, word: row.word, tone: row.tone,
+      left: w?.left ?? (limited ? 0 : null),
+      line: w ? `${w.left}% left` : row.line,
       window: w ? `${w.name.toLowerCase()}${w.resets ? ` · resets ${w.resets}` : ""}` : "",
       detail: end?.line ?? reading ?? (second ? `${second.name}: ${second.left}% left` : null),
       ended: end?.ended ?? false, planEnd: end?.line ?? null,
