@@ -503,6 +503,11 @@ def _prepare_body(slug: str, old: str, body: str, ids: list[str], today: str, *,
     header, old_body, closed = split_header(old)
     used = _used_ids(old_body, body, ids)
     skipped = [str(i) for i in ids if str(i) not in used]
+    if not used and not old_body.strip() and all(line.lstrip().startswith("#") for line in body.splitlines() if line.strip()):
+        # A page with no text yet whose writer skipped every episode replies
+        # with its heading alone: nothing to write, the rows close as skipped.
+        return old, {"passed": True, "errors": [], "checks": {}, "repaired_protected_lines": 0,
+                     "used_episode_ids": [], "skipped_episode_ids": skipped}
     # Check before repair/join: header text is refused, never silently stripped.
     if _header_in_reply(header, body):
         return body, {"passed": False, "errors": ["header in reply"],

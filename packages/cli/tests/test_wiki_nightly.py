@@ -847,3 +847,13 @@ def test_new_page_reply_must_open_with_a_heading():
 
 def test_writer_prompt_tells_a_new_page_to_open_with_a_heading():
     assert 'A page with no text yet starts with a "# " heading line' in wiki._rewrite_prompt('x','','','2026-11-12')
+
+
+def test_heading_only_reply_on_a_page_with_no_text_is_all_skipped():
+    old='---\ntitle: Memory Management\nslug: memory-management\nstatus: seed\nlast_updated: 2026-11-01\n---\n'
+    joined,checks=wiki._prepare_body('memory-management',old,'# Memory Management\n',['19','20'],TODAY)
+    assert checks['passed'] and joined==old
+    assert checks['used_episode_ids']==[] and checks['skipped_episode_ids']==['19','20']
+    # Prose with no episode id is not a skip: it stays refused, so the rows are retried.
+    _,checks=wiki._prepare_body('memory-management',old,'# Memory Management\n\nSome fact with no source.\n',['19'],TODAY)
+    assert not checks['passed'] and 'changed without a source' in checks['errors']
