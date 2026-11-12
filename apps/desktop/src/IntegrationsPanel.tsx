@@ -1264,7 +1264,7 @@ export function IntegrationsPanel({
         >
           {unreadableStatus
             ? "Khipu returned an unreadable app status. The last known state is still shown."
-            : "The CLI didn't answer, so this is the last known state. Check that Python 3.11 and the Khipu folder are set under Settings → Advanced."}
+            : "The CLI didn't answer, so this is the last known state. Check Python 3.11 and the Khipu folder, then use Settings → Storage → Run setup again."}
         </Callout>
       ) : null}
 

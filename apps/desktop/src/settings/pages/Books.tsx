@@ -42,7 +42,7 @@ export function BooksPage({ active }: { active: boolean }) {
           disabled={busy}
           onChange={(e) => void set(e.target.checked)}
         />
-        <label htmlFor="st-books">Include your books in search</label>
+        <label htmlFor="st-books">Include your books</label>
       </div>
       <p className="st-muted">
         {all ? "On: searches look through your books too." : some ? "Some books are on and some are off. Turning this on includes all of them." : "Off: books are searched only when you ask."}

@@ -58,7 +58,7 @@ afterEach(cleanup);
 describe("Settings › Sign-ins after a login", () => {
   it("reads the Macs again, so the page stops saying Needs signing in and drops the button", async () => {
     render(<Settings ctx={ctx} active />);
-    fireEvent.click(await screen.findByRole("button", { name: /Sign-ins/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Connections/ }));
     expect(await screen.findByText("Needs signing in")).toBeTruthy();
     const macsReads = () => calls.filter((c) => c === "khipu_macs").length;
     const before = macsReads();

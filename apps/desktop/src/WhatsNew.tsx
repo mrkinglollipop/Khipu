@@ -81,7 +81,7 @@ export function WhatsNewCard({
           </span>
           <span className="spacer" />
           <button type="button" className="link sm" onClick={onSeeAll}>
-            See all in Settings → Updates
+            See all in Settings → General → Updates
           </button>
         </div>
       ) : null}

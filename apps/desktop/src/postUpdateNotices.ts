@@ -171,9 +171,9 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
     version: "0.4.8",
     items: [
       {
-        title: "Embeddings has its own screen in Settings",
-        text: "Add a model, switch to one, or redo some of it, with an estimate first.",
-        short: "Add a model, switch to one, or redo some of it.",
+        title: "Search models are in Settings › Models",
+        text: "See the active search model, its source and how much memory it covers.",
+        short: "See the active search model and its coverage.",
         target: { kind: "settings", section: "index" },
       },
     ],
@@ -182,9 +182,9 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
     version: "0.4.9",
     items: [
       {
-        title: "Faster Embeddings screen and library search",
-        text: "Settings › Embeddings opens in about two seconds instead of twelve with a large library, and adding a library no longer slows everyday search.",
-        short: "Embeddings opens fast; a new library no longer slows search.",
+        title: "Faster search model status and library search",
+        text: "Search model status is in Settings › Models. Adding a library no longer slows everyday search.",
+        short: "Search models open fast; a new library no longer slows search.",
         target: { kind: "settings", section: "index" },
       },
     ],
@@ -293,7 +293,7 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
       },
       {
         title: "Updates",
-        text: "Settings → Updates lists everything new, by version.",
+        text: "Settings → General → Updates lists everything new, by version.",
         short: "This list.",
         target: { kind: "settings", section: "updates" },
       },

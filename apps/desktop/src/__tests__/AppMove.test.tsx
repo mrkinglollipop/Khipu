@@ -34,7 +34,7 @@ describe("App — Move", () => {
       return JSON.stringify({ ok: true });
     });
     render(<App />);
-    await openSettingsRow("Where memory is kept");
+    await openSettingsRow("Storage");
     fireEvent.click(screen.getByRole("button", { name: /Move this memory to another database/ }));
     fireEvent.change(screen.getByLabelText("Target connection string"), { target: { value: "postgresql://target" } });
     fireEvent.click(screen.getByRole("button", { name: "Check the target" }));
@@ -49,7 +49,7 @@ describe("App — Move", () => {
   it("UI-20 does not offer an unsupported certificate picker for moves", async () => {
     invokeMock.mockResolvedValue(JSON.stringify({ ok: true, host_kind: "remote" }));
     render(<App />);
-    await openSettingsRow("Where memory is kept");
+    await openSettingsRow("Storage");
     fireEvent.click(screen.getByRole("button", { name: /Move this memory to another database/ }));
     expect(screen.getByText(/Custom certificate files are not supported for moves yet/)).toBeInTheDocument();
     expect(screen.queryByText(/destination already trusts/)).not.toBeInTheDocument();

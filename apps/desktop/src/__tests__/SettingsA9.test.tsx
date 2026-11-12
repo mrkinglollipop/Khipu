@@ -7,6 +7,7 @@ let libsOn = false;
 let healthMode: "ok" | "slow" | "fail" = "ok";
 let healthResolve: ((v: string) => void) | null = null;
 let healthNote = "NOTE-TEXT";
+let searchProfiles: unknown[] | null = [];
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string, args?: unknown) => {
@@ -21,7 +22,7 @@ vi.mock("@tauri-apps/api/core", () => ({
         return JSON.stringify({ libraries: [{ name: "Bible", enabled: libsOn }, { name: "Notes", enabled: libsOn }] });
       case "khipu_library_enable": libsOn = true; return JSON.stringify({ ok: true });
       case "khipu_library_disable": libsOn = false; return JSON.stringify({ ok: true });
-      case "khipu_embed_profiles_list": return JSON.stringify({ profiles: [] });
+      case "khipu_embed_profiles_list": return JSON.stringify(searchProfiles === null ? {} : { profiles: searchProfiles });
       default: return JSON.stringify({});
     }
   }),
@@ -31,7 +32,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(async () => {}) }))
 vi.mock("@tauri-apps/plugin-updater", () => ({ check: async () => null }));
 vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: async () => {} }));
 
-import { Settings, ROW_IDS } from "../settings/Settings";
+import { Settings, ROW_IDS, settingsPage } from "../settings/Settings";
 import { clearHealthCache, saveHealth } from "../shared/healthCache";
 import type { SettingsCtx } from "../settings/context";
 
@@ -56,21 +57,41 @@ beforeEach(() => {
   healthMode = "ok";
   healthResolve = null;
   healthNote = "NOTE-TEXT";
+  searchProfiles = [];
   clearHealthCache();
   macsDoc = { macs: [row("M5", true, 0), row("M1", false, 2400)], shared: true };
 });
 afterEach(cleanup);
 
 describe("Settings (A9)", () => {
-  it("lists the 13 rows", () => {
+  it("lists only the five approved pages", () => {
     render(<Settings ctx={ctx} active />);
-    expect(ROW_IDS).toHaveLength(13);
+    expect(ROW_IDS).toHaveLength(5);
     const list = screen.getByRole("region", { name: "Settings" });
-    expect(list.querySelectorAll("button.st-row")).toHaveLength(13);
+    expect(list.querySelectorAll("button.st-row")).toHaveLength(5);
+  });
+
+  it("keeps all thirteen legacy links and groups their controls on the new pages", async () => {
+    const destinations = { macs: "connections", updates: "general", signins: "connections", apps: "connections", summaries: "models", meaning: "general", books: "general", backups: "storage", where: "storage", look: "general", login: "general", help: "help", agent: "help" };
+    for (const [old, page] of Object.entries(destinations)) expect(settingsPage(old)).toBe(page);
+    render(<Settings ctx={ctx} active />);
+    const nav = screen.getByRole("region", { name: "Settings" });
+    expect(Array.from(nav.querySelectorAll("button.st-row")).map((b) => b.querySelector(".st-rk")?.textContent)).toEqual(["General", "Models", "Storage", "Connections", "Help"]);
+    for (const old of ["Your Macs", "Sign-ins", "Apps that use Khipu", "Models and API keys", "Where memory is kept", "Details for an agent"]) expect(nav.textContent).not.toContain(old);
+    for (const group of ["Appearance", "Starting up", "Search", "Updates"]) expect(screen.getByRole("region", { name: group })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /^Models/ }));
+    for (const group of ["Summaries", "Search by meaning", "API keys"]) expect(screen.getByRole("region", { name: group })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /^Storage/ }));
+    for (const group of ["Database", "Backups"]) expect(screen.getByRole("region", { name: group })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /^Connections/ }));
+    for (const group of ["Apps", "Accounts", "Macs"]) expect(screen.getByRole("region", { name: group })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /^Help/ }));
+    expect(screen.getByRole("region", { name: "When something is wrong" })).toBeTruthy();
   });
 
   it("shows a quiet other Mac as quiet, in words", async () => {
     render(<Settings ctx={ctx} active />);
+    fireEvent.click(screen.getByRole("button", { name: /^Connections/ }));
     expect(await screen.findByText(/last heard from 40 min ago, so this may be out of date/)).toBeTruthy();
     expect(screen.getAllByText("Not heard from lately").length).toBeGreaterThan(0);
   });
@@ -78,18 +99,19 @@ describe("Settings (A9)", () => {
   it("says the other Mac is absent when only this Mac reported", async () => {
     macsDoc = { macs: [row("M5", true, 0)], shared: true, note: "No other Mac has reported yet, so only this Mac is shown." };
     render(<Settings ctx={ctx} active />);
-    expect(await screen.findByText(/No other Mac has reported yet/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /^Connections/ }));
+    expect((await screen.findAllByText(/No other Mac has reported yet/)).length).toBeGreaterThan(0);
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("the books switch enables then disables each library with the old commands", async () => {
     render(<Settings ctx={ctx} active />);
-    fireEvent.click(screen.getByRole("button", { name: /Include your books in search/ }));
-    const sw = await screen.findByRole("switch", { name: "Include your books in search" });
+    fireEvent.click(screen.getByRole("button", { name: /^General/ }));
+    const sw = await screen.findByRole("switch", { name: "Include your books" });
     fireEvent.click(sw);
     await waitFor(() => expect(calls.filter((c) => c.cmd === "khipu_library_enable").map((c) => c.args)).toEqual([{ name: "Bible" }, { name: "Notes" }]));
-    await waitFor(() => expect((screen.getByRole("switch", { name: "Include your books in search" }) as HTMLInputElement).checked).toBe(true));
-    fireEvent.click(screen.getByRole("switch", { name: "Include your books in search" }));
+    await waitFor(() => expect((screen.getByRole("switch", { name: "Include your books" }) as HTMLInputElement).checked).toBe(true));
+    fireEvent.click(screen.getByRole("switch", { name: "Include your books" }));
     await waitFor(() => expect(calls.filter((c) => c.cmd === "khipu_library_disable")).toHaveLength(2));
   });
 
@@ -97,7 +119,7 @@ describe("Settings (A9)", () => {
     const writeText = vi.fn(async () => {});
     Object.assign(navigator, { clipboard: { writeText } });
     render(<Settings ctx={ctx} active />);
-    fireEvent.click(screen.getByRole("button", { name: /Details for an agent/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Help/ }));
     await screen.findByText("NOTE-TEXT");
     fireEvent.click(screen.getByRole("button", { name: "Copy" }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("NOTE-TEXT"));
@@ -117,13 +139,13 @@ describe("Settings (A9)", () => {
 
   it("the move button calls the old move flow", () => {
     render(<Settings ctx={ctx} active />);
-    fireEvent.click(screen.getByRole("button", { name: /Where memory is kept/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Storage/ }));
     fireEvent.click(screen.getByRole("button", { name: /Move this memory to another database/ }));
     expect(ctx.onMoveMemory).toHaveBeenCalled();
   });
 
   describe("the health answer", () => {
-    const openAgent = () => fireEvent.click(screen.getByRole("button", { name: /Details for an agent/ }));
+    const openAgent = () => fireEvent.click(screen.getByRole("button", { name: /^Help/ }));
 
     it("shows the last answer at once with its time, then swaps the new one in", async () => {
       saveHealth({ areas: [], agent_note: "OLD-NOTE" }, Date.now() - 4 * 60000);
@@ -169,16 +191,31 @@ describe("Settings (A9)", () => {
       saveHealth({ areas: [], last_backup_at: null }, Date.now() - 4 * 60000);
       healthMode = "slow";
       render(<Settings ctx={ctx} active />);
-      fireEvent.click(screen.getByRole("button", { name: /^Backups/ }));
-      expect(screen.getByText(/Checked 4 min ago/)).toBeTruthy();
-      fireEvent.click(screen.getByRole("button", { name: /Where memory is kept/ }));
-      expect(screen.getByText(/Checked 4 min ago/)).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: /^Storage/ }));
+      expect(screen.getAllByText(/Checked 4 min ago/)).toHaveLength(2);
     });
+  });
+
+  it("keeps an unreadable search status from crashing General", async () => {
+    searchProfiles = null;
+    render(<Settings ctx={ctx} active />);
+    expect(await screen.findByText("Khipu could not read the search model just now.")).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Appearance" })).toBeTruthy();
+  });
+
+  it.each([["cloud", "Google API key"], ["local", "This Mac or my network"], ["custom-provider", "custom-provider"]])("shows active embedding model and %s source without rewriting it", async (provider, source) => {
+    searchProfiles = [{ id: "custom@768", provider, model: "custom-search-model", is_active: true, dim: 768,
+      coverage: { memory: { total: 10, embedded: 8, missing: 2, stale: 0, pct: 80 } } }];
+    render(<Settings ctx={ctx} active />);
+    fireEvent.click(screen.getByRole("button", { name: /^Models/ }));
+    expect(await screen.findByText("custom-search-model")).toBeTruthy();
+    expect(screen.getByText(source)).toBeTruthy();
+    expect(screen.getByText("80% of your memory (2 still to do)")).toBeTruthy();
   });
 
   it("Search by meaning says in one sentence what is true", async () => {
     render(<Settings ctx={ctx} active />);
-    fireEvent.click(screen.getByRole("button", { name: /^Search by meaning/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^General/ }));
     expect(await screen.findByText(/Search by meaning is off because no search model is set up/)).toBeTruthy();
   });
 });

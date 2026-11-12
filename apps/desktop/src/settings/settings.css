@@ -31,3 +31,64 @@
 .st-name { display: flex; flex-direction: column; gap: 6px; padding: 12px 0; border-bottom: 1px solid var(--border); }
 .st-input { min-width: 0; flex: 1 1 200px; max-width: 320px; height: 32px; padding: 0 10px; border: 1px solid var(--border); border-radius: var(--r-sm, 6px); background: var(--surface); color: var(--text); font: inherit; }
 .st-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Regrouped Settings keeps the app's split view, tokens and existing controls. */
+.st-list .st-cap { color: var(--text); font-size: 15px; font-weight: 650; }
+.st-row { align-items: center; justify-content: flex-start; gap: 10px; }
+.st-row svg { flex: none; color: var(--muted); }
+.st-rk { flex: 1; font-weight: 400; }
+.st-rv { max-width: 110px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.st-row[aria-current="true"] .st-rk { font-weight: 600; }
+.st-list .st-row:last-child { margin-top: 16px; }
+.st-page { gap: 20px; min-width: 0; }
+.st-regroup { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.st-regroup > h2 { margin: 0; padding-inline: 16px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.st-regroup > p { padding-inline: 16px; }
+.st-card { border: 1px solid var(--border); border-radius: var(--r-md); padding: 12px 16px; display: flex; flex-direction: column; gap: 12px; min-width: 0; background: var(--surface-2); }
+.st-choice-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; min-width: 0; }
+.st-choice-row + .st-choice-row { border-top: 1px solid var(--border); padding-top: 10px; }
+.st-choice-row select { max-width: 100%; min-width: 0; padding: 5px 8px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface); color: var(--text); font: inherit; }
+.st-choice-row > div { flex: 1 1 180px; }
+.st-choice-row .st-muted { font-size: 12px; max-width: 38ch; }
+.st-model-address { overflow-wrap: anywhere; min-width: 0; }
+.st-save-models { justify-content: flex-end; }
+.st-inline-title { margin: 0; font-size: 13px; font-weight: 600; }
+.st-card .section-card { border: 0; margin: 0; background: transparent; box-shadow: none; }
+.st-card .section-body { padding: 0; }
+.st-card .section-head { border: 0; padding: 0; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
+.st-card .section-head small { font-weight: 400; color: var(--muted); }
+.st-card .look-page .section-body { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.st-card .look-page .section-body > .muted { font-size: 12px; }
+.st-card .opt-row { display: flex; flex-direction: row-reverse; justify-content: space-between; width: 100%; }
+.st-card .opt-text { flex: 1; }
+.st-card .st-switch { flex-direction: row-reverse; justify-content: space-between; }
+.st-card .st-switch label { flex: 1; font-weight: 400; }
+.st-card .choice-body { padding: 0; border: 0; }
+.st-card .choice-body .toolbar input { min-width: 0; max-width: 100%; }
+.st-regroup > .section-card { margin: 0; }
+@media (max-width: 639px) {
+  .st-card { padding: 10px 12px; }
+  .st-card .toolbar { flex-wrap: wrap; }
+  .st-card .toolbar input { width: 100%; }
+  .st-regroup .section-body { min-width: 0; }
+}
+.st-card .look-page > .section-card:has(.section-head) { display: grid; grid-template-columns: minmax(100px, 1fr) auto; gap: 8px 16px; align-items: start; }
+.st-card .look-page > .section-card:has(.section-head) .section-head { flex-direction: column; align-items: flex-start; font-size: 13px; }
+.st-card .look-page > .section-card:has(.section-head) .section-body { justify-content: flex-end; flex-direction: column; align-items: flex-end; }
+@media (max-width: 420px) { .st-card .look-page > .section-card:has(.section-head) { grid-template-columns: minmax(0, 1fr); } }
+/* Approved Settings proportions, scoped so other split views retain their layout. */
+.st-fill .sh-listpane { width: 220px; padding: 14px 8px; }
+.st-fill .sh-detail-in { max-width: none; padding: 0 24px; }
+.st-fill .st-page { padding: 20px 0 28px; }
+.st-fill .st-back { display: none; }
+@media (min-width: 721px) and (max-width: 899px) {
+  .st-fill .sh-split { display: flex; overflow: hidden; }
+  .st-fill .sh-split[data-detail] .sh-listpane { display: block; width: 220px; overflow: auto; border-right: 1px solid var(--border); }
+  .st-fill .sh-split[data-detail] .sh-detail { display: block; overflow: auto; }
+}
+@media (max-width: 720px) {
+  .st-fill .sh-listpane { width: auto; }
+  .st-fill .sh-detail-in { padding: 0 14px; }
+  .st-fill .st-page { padding: 14px 0 22px; }
+  .st-fill .st-back { display: inline-flex; }
+}

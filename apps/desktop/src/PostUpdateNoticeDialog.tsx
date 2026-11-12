@@ -80,7 +80,7 @@ export function PostUpdateNoticeDialog({ plan, needsRoutingSetup, caps = BUILD_C
             );
           })}
         </ul>
-        {more > 0 ? <p className="set-help wn-more">And {more} more in Settings → Updates.</p> : null}
+        {more > 0 ? <p className="set-help wn-more">And {more} more in Settings → General → Updates.</p> : null}
         <div className="post-update-actions">
           <button type="button" className="primary" ref={primaryRef} onClick={close}>
             Got it
