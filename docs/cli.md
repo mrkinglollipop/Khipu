@@ -116,7 +116,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | `library` | Folders of `.txt` and `.md` files indexed as a search space. |
 | `embed-backfill` | Job-mode alias for `embed backfill --job`. |
 | `library-backfill NAME` | Job-mode alias for `library backfill NAME --job`. |
-| `wiki` | Read-only `plan --json --since DAYS` (default 8) and `draft --sample N [--since DAYS] [--model ID] [--out DIR]`; live `run [--since DAYS] [--max N] [--json]`; decision `slug <slug> [--set page|tag|alias [--target SLUG] | --clear] [--json]`; exact undo `undo <slug>` or `undo --night YYYY-MM-DD [--run ID]` (also `undo --run ID`). |
+| `wiki` | Read-only `plan --json --since DAYS` (default 8) and `draft (--sample N | --pages a,b,c) [--since DAYS] [--model ID] [--out DIR]`; live `run [--since DAYS] [--max N] [--json]`; decision `slug <slug> [--set page|tag|alias [--target SLUG] | --clear] [--json]`; exact undo `undo <slug>` or `undo --night YYYY-MM-DD [--run ID]` (also `undo --run ID`). |
 | `models` | Per-role model settings: `show`, `set`, `welcome`. |
 | `sources` | Memory sources: `list`, `enable`, `disable`, `remove`. |
 
@@ -309,23 +309,32 @@ never asked again. Invalid replies or provider failures leave slugs undecided.
 Only approved page slugs may open under the nomination rule; tags stay unmatched.
 `plan` shows would-ask candidates and stored decisions without asking the model.
 
-`wiki draft --sample N` uses the first planned batch for up to N distinct pages (1–60); additional batches remain undrafted. It writes
-old.md, episodes.jsonl (summary/decisions/preferences only), draft.md,
-checks.json and summary.json, plus slug-decisions.json with the sample gate reply, below the jobs folder or an empty `--out` directory
-outside memory_root. Draft may call the gate but saves its decisions only in that output folder. These are unreviewed artifacts. Mechanical checks preserve
-frontmatter (except today's last_updated and seed → active), at least 70% of old
-length, old lines carrying numbers/dates/paths/links verbatim or named verbatim
-in a dated Was line, and the supplied Sources ids. They cannot establish factual
-truth, completeness of other facts, or correctness of a Was claim.
-Closed frontmatter keeps its prefix and every line except one quoted or unquoted
-`last_updated` set to today (added if missing), and the exact raw `status: seed`
-line becoming `status: active`. Other statuses stay exact; archived pages are
-ineligible. Absent or unclosed frontmatter stays body-only: no new block or bare
-metadata. Existing bare metadata before the first heading stays exact, except
-one existing `last_updated` may stay or become today's date. Protected lines
-compare after stripping whitespace; a dated Was line may omit a list marker.
-Sources lines may be extended or combined, retaining every old and new episode
-ID on Sources lines. A missing protected line is restored only when the most
+`wiki draft --sample N` uses the first planned batch for up to N distinct pages (1–60); additional batches remain undrafted.
+`wiki draft --pages a,b,c [--model ID] [--out DIR]` instead drafts exactly those named pages' first planned batches,
+in the named order; names with no planned batch appear in `unplanned_pages`. The two selection flags are mutually exclusive.
+Both forms write old.md, episodes.jsonl (summary/decisions/preferences only), draft.md, checks.json and used.json
+per page, plus summary.json and slug-decisions.json in the output folder. `used.json` lists `given_episode_ids`,
+`used_episode_ids` and `skipped_episode_ids`; usage is null when no usable response is available.
+Artifacts go below the jobs folder or an empty `--out` directory outside memory_root. Draft may call the gate
+but saves its decisions only in that output folder. These are unreviewed artifacts.
+
+Code keeps the header and sends only the title and page body to the writer. A closed `---` block includes
+its entire prefix. An unclosed or bare header is its opening delimiter, if present, followed by its initial
+key/value lines and their indented or `- ` list items, ending at the first blank, heading or prose line.
+Header bytes and newline conventions stay exact except existing `last_updated` dates become today and
+an exact `status: seed` becomes `status: active`; only a closed block gets a missing date added.
+Other statuses stay exact; archived pages are ineligible. A reply containing header lines or starting
+with a `---` block is refused as `header in reply`, never stripped.
+
+Length (at least 70%), protected-line retention, repair, Was lines and Sources checks apply to the body only.
+Sources retain every old episode ID, may omit supplied episodes the writer did not use, and may never
+invent an ID. Accepted used queue rows close as `written` and unused rows as `skipped` in the same transaction.
+When every supplied episode is skipped, an unchanged body closes the rows without a file write, revision,
+new page or seed promotion; any other body change is refused. Undo requeues only written episode IDs;
+skipped rows remain closed. Reports include `episodes_skipped` and per-page used/skipped counts.
+Mechanical checks cannot establish factual truth, completeness of other facts, or correctness of a Was claim.
+Protected lines compare after stripping whitespace; a dated Was line may omit a list marker.
+A missing protected line is restored only when the most
 similar draft body line scores at least 0.90 with `SequenceMatcher` and its digit
 runs match exactly. The original line is restored verbatim and every check runs
 again; artifacts and run reports count `repaired_protected_lines`.

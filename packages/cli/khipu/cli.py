@@ -4955,6 +4955,8 @@ def cmd_wiki(args: argparse.Namespace) -> int:
         else:
             for page in result.get("written", []):
                 print(f"{page['slug']}: {'opened' if page['opened'] else 'written'} ({len(page['episode_ids'])} episodes)")
+            for page in result.get("page_outcomes", []):
+                print(f"{page['slug']}: {page['used_count']} used, {page['skipped_count']} skipped")
             for hold in result.get("holds", []):
                 print(f"{hold['slug']}: held until {hold['until_at']} ({hold['reason']})")
             if args.wiki_cmd == "run":
@@ -4966,7 +4968,7 @@ def cmd_wiki(args: argparse.Namespace) -> int:
                 print(f"{page['slug']}: {'retired' if page['retired'] else 'restored'} ({page['episodes_requeued']} episodes requeued)")
             if args.wiki_cmd == "run":
                 print(f"Wiki: {result.get('pages_revised', 0)} revised, {result.get('pages_opened', 0)} opened; "
-                      f"{result.get('episodes_absorbed', 0)} episodes absorbed; {result.get('queue_remaining', 0)} queued; "
+                      f"{result.get('episodes_absorbed', 0)} episodes absorbed, {result.get('episodes_skipped', 0)} skipped; {result.get('queue_remaining', 0)} queued; "
                       f"oldest {result.get('queue_oldest_age_days')} days; {result.get('rewrites_refused', 0)} refused; "
                       f"{result.get('delegated_excluded', 0)} delegated excluded; "
                       f"{result.get('calls_used', 0)} calls; cap {'hit' if result.get('cap_hit') else 'not hit'}; "
@@ -4977,7 +4979,7 @@ def cmd_wiki(args: argparse.Namespace) -> int:
     if args.wiki_cmd == "plan":
         result = wiki_nightly.plan(since=args.since)
     else:
-        result = wiki_nightly.draft(sample=args.sample, model_id=args.model,
+        result = wiki_nightly.draft(sample=args.sample, pages=args.pages.split(",") if args.pages else None, model_id=args.model,
                                     out=Path(args.out) if args.out else None, since=args.since)
     if getattr(args, "json", False) or args.wiki_cmd == "draft":
         print(json.dumps(result, indent=2))
@@ -5710,7 +5712,9 @@ def build_parser() -> argparse.ArgumentParser:
     wk_plan.add_argument("--since", type=int, default=8, metavar="DAYS")
     wk_plan.set_defaults(func=cmd_wiki)
     wk_draft = wk_sub.add_parser("draft", help="Draft artifacts outside memory; no wiki writes")
-    wk_draft.add_argument("--sample", type=int, required=True)
+    wk_draft_select = wk_draft.add_mutually_exclusive_group(required=True)
+    wk_draft_select.add_argument("--sample", type=int)
+    wk_draft_select.add_argument("--pages", metavar="SLUGS", help="Comma-separated exact pages; first planned batch each")
     wk_draft.add_argument("--since", type=int, default=8, metavar="DAYS")
     wk_draft.add_argument("--model", default=None, metavar="ID")
     wk_draft.add_argument("--out", default=None, metavar="DIR")

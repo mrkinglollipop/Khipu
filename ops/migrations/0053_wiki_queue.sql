@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS wiki_queue (
     episode_id BIGINT NOT NULL REFERENCES episodes(id),
     queued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     done_at TIMESTAMPTZ,
+    outcome TEXT CHECK (outcome IN ('written', 'skipped', 'forgotten')),
+    CHECK ((done_at IS NULL AND outcome IS NULL) OR (done_at IS NOT NULL AND outcome IS NOT NULL)),
     PRIMARY KEY (slug, episode_id)
 );
 -- No topics FK: a proposed new slug may enter the queue before its page exists.

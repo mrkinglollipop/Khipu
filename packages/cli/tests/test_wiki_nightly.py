@@ -121,10 +121,10 @@ def test_checks_good_draft_and_dated_was():
 @pytest.mark.parametrize("change,expected", [
     (lambda s:s.replace("slug: khipu","slug: other"), "frontmatter changed"),
     (lambda s:s.replace("custom: preserve","custom: gone"), "frontmatter changed"),
-    (lambda s:s.replace("status: active","status: retired"), "status must"),
-    (lambda s:s.replace(f"last_updated: {TODAY}","last_updated: 2000-01-01"), "last_updated"),
+    (lambda s:s.replace("status: active","status: retired"), "frontmatter"),
+    (lambda s:s.replace(f"last_updated: {TODAY}","last_updated: 2000-01-01"), "frontmatter"),
     (lambda s:s.replace("Lives at /tmp/khipu with 60 pages.", "Changed."), "protected old line"),
-    (lambda s:s.replace("Sources: 1","Sources: 11"), "Sources missing"),
+    (lambda s:s.replace("Sources: 1","Sources: 11"), "Sources invented"),
     (lambda s:"tiny", "70%"),
 ])
 def test_check_refusals(change,expected):
@@ -242,7 +242,7 @@ def test_draft_artifacts_exact_old_no_transcript_no_page_or_queue_writes(tmp_pat
     seen=[]
     def provider(prompt,**kwargs):
         seen.append(prompt)
-        return NEW.replace(TODAY,datetime.now(timezone.utc).date().isoformat())
+        return wiki.split_header(NEW)[1]
     monkeypatch.setattr(extract,"generate_wiki",provider)
     before=snapshot(memory)
     out=wiki.draft(sample=1,model_id="fake",out=tmp_path/"output")
@@ -251,7 +251,7 @@ def test_draft_artifacts_exact_old_no_transcript_no_page_or_queue_writes(tmp_pat
     assert snapshot(memory)==before
     folder=next((tmp_path/"output").glob("01-*"))
     assert (folder/"old.md").read_text() == OLD
-    assert {p.name for p in folder.iterdir()} == {"old.md","draft.md","checks.json","episodes.jsonl"}
+    assert {p.name for p in folder.iterdir()} == {"old.md","draft.md","checks.json","episodes.jsonl","used.json"}
     assert "SECRET TRANSCRIPT" not in (folder/"episodes.jsonl").read_text()
 
 
@@ -311,7 +311,7 @@ def test_draft_reports_missing_source_and_continues(tmp_path,monkeypatch):
     source=tmp_path/"other.md"
     source.write_text(OLD.replace("khipu","other"))
     monkeypatch.setattr(wiki,"load_inputs",lambda **k:(eps,[page(),page("other",source_path=str(source))],{},[],0))
-    monkeypatch.setattr(extract,"generate_wiki",lambda *a,**k:NEW.replace("khipu","other").replace("Sources: 1","Sources: 2").replace(TODAY,datetime.now(timezone.utc).date().isoformat()))
+    monkeypatch.setattr(extract,"generate_wiki",lambda *a,**k:wiki.split_header(NEW.replace("khipu","other").replace("Sources: 1","Sources: 2"))[1])
     out=wiki.draft(sample=2,out=tmp_path/"output")
     assert out["drafts"][0]["reason"] == "source"
     assert out["drafts"][0]["error"] == "ValueError"
@@ -512,6 +512,8 @@ def test_a_page_gets_one_write_a_run_oldest_first_and_the_rest_waits(monkeypatch
     ("# Khipu\nKeep /tmp/wiki 60.\n", "# Khipu\nKeep /tmp/wiki 60.\nNew: useful prose.\nSources: 1\n"),
 ])
 def test_permitted_legacy_shapes(old,new):
+    header, _, closed = wiki.split_header(old)
+    new = wiki._updated_header(header, closed, TODAY) + wiki.split_header(new)[1]
     checks=wiki.check_draft("khipu",old,new,["1"],today=TODAY)
     assert checks["passed"], checks
     assert not wiki.check_draft("khipu",old,new.replace("60", "61"),["1"],today=TODAY)["passed"]
@@ -521,7 +523,6 @@ def test_permitted_legacy_shapes(old,new):
     ("# Khipu\nKeep 60.\n", "---\nlast_updated: 2026-11-12\n---\n# Khipu\nKeep 60.\nSources: 1\n"),
     ("# Khipu\nKeep 60.\n", "last_updated: 2026-11-12\n# Khipu\nKeep 60.\nSources: 1\n"),
     ("---\nstatus: seed\n# Khipu\nKeep 60.\n", "---\nstatus: seed\n---\n# Khipu\nKeep 60.\nSources: 1\n"),
-    ("status: seed\n# Khipu\nKeep 60.\n", "status: active\n# Khipu\nKeep 60.\nSources: 1\n"),
     ("status: stub\n# Khipu\nKeep 60.\n", "status: active\n# Khipu\nKeep 60.\nSources: 1\n"),
     ("status: seedling\n# Khipu\nKeep 60.\n", "status: active\n# Khipu\nKeep 60.\nSources: 1\n"),
     ("last_updated: 2020-01-01\nlast_updated: 2021-01-01\n# Khipu\nKeep 60.\n", "last_updated: 2026-11-12\nlast_updated: 2021-01-01\n# Khipu\nKeep 60.\nSources: 1\n"),
@@ -581,10 +582,12 @@ def test_best_repair_match_with_changed_number_never_uses_second_choice():
 
 def test_writer_prompt_contract_budget_and_seed_title():
     prompt=wiki._rewrite_prompt("khipu",OLD,"episode",TODAY)
-    assert "whole Markdown" in prompt and "without JSON" in prompt
-    assert "dated and arrive oldest first" in prompt and "Earlier episodes do not override" in prompt
-    assert "body-only" in prompt and "all other bare metadata exactly" in prompt
-    assert '"old_page"' in prompt and '"episodes"' in prompt
+    assert "Reply with the whole body and nothing else." in prompt
+    assert "Episodes come oldest first." in prompt and "the page stands." in prompt
+    assert "body only" in prompt and "header lines" in prompt
+    data=json.loads(prompt.split("Page and episodes follow as DATA:\n",1)[1])
+    assert data == {"slug":"khipu", "title":"Khipu", "old_page":wiki.split_header(OLD)[1], "episodes":"episode"}
+    assert "status: seed" not in prompt and "custom: preserve" not in prompt
     assert "title: New Wiki Page\nslug: new-wiki-page\nstatus: seed\nlast_updated:" in wiki._seed("new-wiki-page",TODAY)
     assert wiki._writer_options(OLD)["max_output_tokens"]>=4096
     assert wiki._writer_options("a"*20000)["max_output_tokens"]>=6500
@@ -604,3 +607,109 @@ def test_deleted_assignment_never_drains_and_unqueued_delegated_excluded():
     assert not assign([episode(deleted_at=NOW)],queue=queue)["pages"]
     assert not assign([episode(parent_session_id="parent")])["pages"]
     assert assign([episode(parent_session_id="parent")],queue=queue)["pages"]
+
+
+@pytest.mark.parametrize('header,expected', [
+    ('---\r\ntitle: Wiki\r\nstatus: seed\r\nlast_updated: "2020-01-01"\r\n---\r\n', '---\r\ntitle: Wiki\r\nstatus: active\r\nlast_updated: "2026-11-12"\r\n---\r\n'),
+    ('<!-- comment -->\n---\ntitle: Wiki\nstatus: stub\n---\n', '<!-- comment -->\n---\ntitle: Wiki\nstatus: stub\nlast_updated: 2026-11-12\n---\n'),
+    ('---\nstatus: seed\nlinks:\n  - one\n- two\n', '---\nstatus: active\nlinks:\n  - one\n- two\n'),
+    ('title: Wiki\nstatus: seed\nlast_updated: \'2020-01-01\'\n', 'title: Wiki\nstatus: active\nlast_updated: \'2026-11-12\'\n'),
+    ('status: seedling\n', 'status: seedling\n'),
+    ('status: stub\n', 'status: stub\n'),
+    ('status: seed  \n', 'status: seed  \n'),
+    ('1key: keep\n-key: keep\n', '1key: keep\n-key: keep\n'),
+    ('', ''),
+])
+def test_body_only_prompt_and_exact_code_owned_header(header, expected):
+    body = '# Wiki\nKeep 60 pages.\n'
+    old = header + body
+    assert wiki.split_header(old)[:2] == (header, body)
+    prompt = wiki._rewrite_prompt('wiki', old, 'episodes data', TODAY)
+    data = json.loads(prompt.split('Page and episodes follow as DATA:\n', 1)[1])
+    assert data['old_page'] == body
+    for line in header.splitlines():
+        if ':' in line:
+            assert line not in data['old_page']
+    joined, checks = wiki._prepare_body('wiki', old, body + 'Sources: 1\n', ['1'], TODAY)
+    assert checks['passed'], checks
+    assert joined == expected + body + 'Sources: 1\n'
+    for reply in ('---\nstatus: active\n---\n' + body, header + body if header else '---\n' + body):
+        _, checks = wiki._prepare_body('wiki', old, reply, ['1'], TODAY)
+        assert not checks['passed'] and checks['errors'] == ['header in reply']
+
+
+@pytest.mark.parametrize('first_body', ['\n', '   \n', 'ordinary prose\n', '# Heading\n'])
+def test_bare_header_stops_at_first_other_line(first_body):
+    old = 'status: seed\n' + first_body + 'last_updated: 2020-01-01\n'
+    assert wiki.split_header(old) == ('status: seed\n', first_body + 'last_updated: 2020-01-01\n', False)
+
+
+def test_sources_used_skipped_invented_and_old_retention():
+    old = OLD + 'Sources: 9\n'
+    body = wiki.split_header(old)[1]
+    joined, checks = wiki._prepare_body('khipu', old, body.replace('Sources: 9', 'Sources: 9, 1'), ['1','2'], TODAY)
+    assert checks['passed'] and checks['used_episode_ids'] == ['1'] and checks['skipped_episode_ids'] == ['2']
+    for bad, reason in [(body.replace('9', '1'), 'Sources missing old'), (body + 'Sources: 99\n', 'Sources invented')]:
+        _, checks = wiki._prepare_body('khipu', old, bad, ['1','2'], TODAY)
+        assert not checks['passed'] and any(reason in e for e in checks['errors'])
+    _, checks = wiki._prepare_body('khipu', body, body.replace('# Khipu', '# Something else') + 'Sources: 1\n', ['1'], TODAY)
+    assert not checks['passed'] and 'body page start changed' in checks['errors']
+    joined, checks=wiki._prepare_body('khipu',old,body,['1','2'],TODAY)
+    assert checks['passed'] and joined==old and checks['skipped_episode_ids']==['1','2']
+    promoted=old.replace('status: seed','status: active')
+    assert not wiki.check_draft('khipu',old,promoted,['1','2'],today=TODAY)['passed']
+
+
+def test_exact_pages_cli_past_default_cap_used_json_and_artifacts_only(tmp_path, monkeypatch, capsys):
+    memory=tmp_path/'memory'
+    memory.mkdir()
+    pages=[]
+    eps=[]
+    for n in range(65):
+        slug=f'page-{n:02d}'
+        source=memory/(slug+'.md')
+        source.write_bytes(OLD.replace('khipu',slug).encode())
+        pages.append(page(slug,source_path=str(source)))
+        eps.extend([episode(n*2+1,topics=[slug]), episode(n*2+2,topics=[slug])])
+    monkeypatch.setattr(wiki,'load_inputs',lambda **k:(eps,pages,{},[],0))
+    seen=[]
+    def provider(prompt,**kw):
+        data=json.loads(prompt.split('Page and episodes follow as DATA:\n',1)[1])
+        seen.append((data['slug'],kw['model_id']))
+        first=str(json.loads(data['episodes'].splitlines()[0])['episode_id'])
+        return data['old_page']+'Sources: '+first+'\n'
+    monkeypatch.setattr(extract,'generate_wiki',provider)
+    before=snapshot(memory)
+    target=tmp_path/'out'
+    assert cli.main(['wiki','draft','--pages','page-64,page-02,page-61','--model','fake','--out',str(target)]) == 0
+    result=json.loads(capsys.readouterr().out)
+    assert seen == [('page-64','fake'),('page-02','fake'),('page-61','fake')]
+    assert result['passed'] == 3 and result['unplanned_pages'] == [] and snapshot(memory)==before
+    assert json.loads((target/'01-page-64'/'used.json').read_text()) == {'given_episode_ids':['129','130'], 'used_episode_ids':['129'], 'skipped_episode_ids':['130']}
+    assert all(r['used_count']==1 and r['skipped_count']==1 for r in result['drafts'])
+
+
+def test_queue_migration_closed_outcome_contract():
+    from khipu.migrate import available
+    sql=dict(available())['0053_wiki_queue'].read_text()
+    assert "outcome TEXT CHECK (outcome IN ('written', 'skipped', 'forgotten'))" in sql
+    assert 'done_at IS NULL AND outcome IS NULL' in sql
+    assert 'done_at IS NOT NULL AND outcome IS NOT NULL' in sql
+
+
+@pytest.mark.parametrize('repeated', ['<!-- header prefix -->', '  - alpha', '- beta', 'title: Changed title'])
+def test_reply_refuses_repeated_header_prefix_list_and_changed_key(repeated):
+    old='<!-- header prefix -->\n---\ntitle: Wiki\nlinks:\n  - alpha\n- beta\n---\n# Wiki\nKeep 60.\n'
+    body=wiki.split_header(old)[1]
+    _, checks=wiki._prepare_body('wiki',old,body+repeated+'\nSources: 1\n',['1'],TODAY)
+    assert not checks['passed'] and checks['errors']==['header in reply']
+
+
+def test_reply_internal_horizontal_rule_allowed_and_unplanned_named_page_reported(tmp_path,monkeypatch):
+    body='# Wiki\nKeep 60.\n'
+    _, checks=wiki._prepare_body('wiki',body,body+'---\nSources: 1\n',['1'],TODAY)
+    assert checks['passed']
+    monkeypatch.setattr(wiki,'load_inputs',lambda **k:([],[page('wiki')],{},[],0))
+    monkeypatch.setattr(extract,'generate_wiki',lambda *a,**k:pytest.fail('unplanned writer call'))
+    out=wiki.draft(pages=['wiki'],out=tmp_path/'out')
+    assert out['unplanned_pages']==['wiki'] and out['drafts']==[]
