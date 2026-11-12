@@ -4047,7 +4047,7 @@ def _promote_gate_ignore_status() -> dict:
         return {"value": [], "choices": [], "error": f"{type(e).__name__}: {e}"}
 
 
-BUDGET_LIFT_SCOPES = ("synth", "memory", "library")
+BUDGET_LIFT_SCOPES = ("synth", "memory", "library", "wiki")
 
 
 def _budget_status_all() -> dict:
@@ -4930,6 +4930,30 @@ def cmd_monthly(args: argparse.Namespace) -> int:
     return run_monthly(dry_run=bool(args.dry_run))
 
 
+def cmd_wiki(args: argparse.Namespace) -> int:
+    from khipu import wiki_nightly
+    if args.wiki_cmd == "plan":
+        result = wiki_nightly.plan(since=args.since)
+    else:
+        result = wiki_nightly.draft(sample=args.sample, model_id=args.model,
+                                    out=Path(args.out) if args.out else None)
+    if getattr(args, "json", False) or args.wiki_cmd == "draft":
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Read-only wiki plan: {result['planned_calls']} calls; "
+              f"{result['no_vector_count']}/{result['episode_count']} episodes lack vectors")
+        print("Provisional cosine distance <= 0.15; sample calibration required")
+        if result["blocked"]:
+            print("BLOCKED: " + result["block_reason"])
+        for page in result["pages"]:
+            print(page["slug"] + f" ({page['episode_count']} episodes)" + (" (open)" if page["open"] else ""))
+            for row in page["episodes"]:
+                print(f"  {row['episode_id']}: {row['reason']}; distance={row['distance']}")
+        print("Proposed opens: " + ", ".join(p["slug"] for p in result["opens"]))
+        print("Unmatched: " + ", ".join(result["unmatched"]))
+    return 2 if result.get("blocked", result.get("plan", {}).get("blocked", False)) else 0
+
+
 def cmd_models(args: argparse.Namespace) -> int:
     from khipu import models as models_mod
 
@@ -5628,17 +5652,29 @@ def build_parser() -> argparse.ArgumentParser:
     lbj.add_argument("--limit", type=int, default=None, help="Cap chunks this run")
     lbj.set_defaults(func=cmd_library_backfill_job)
 
+    wk = sub.add_parser("wiki", help="Read-only nightly wiki plan and draft artifacts")
+    wk_sub = wk.add_subparsers(dest="wiki_cmd", required=True)
+    wk_plan = wk_sub.add_parser("plan", help="Read-only assignments, cap and vector coverage")
+    wk_plan.add_argument("--json", action="store_true")
+    wk_plan.add_argument("--since", type=int, default=30, metavar="DAYS")
+    wk_plan.set_defaults(func=cmd_wiki)
+    wk_draft = wk_sub.add_parser("draft", help="Draft artifacts outside memory; no wiki writes")
+    wk_draft.add_argument("--sample", type=int, required=True)
+    wk_draft.add_argument("--model", default=None, metavar="ID")
+    wk_draft.add_argument("--out", default=None, metavar="DIR")
+    wk_draft.set_defaults(func=cmd_wiki)
+
     md = sub.add_parser(
         "models",
-        help="Per-role model Settings (synth / embed / vision): show / set",
+        help="Per-role model Settings (synth / embed / vision / wiki): show / set",
     )
     md_sub = md.add_subparsers(dest="models_cmd", required=False)
-    md_sub.add_parser("show", help="JSON: three roles + models_error").set_defaults(
+    md_sub.add_parser("show", help="JSON: model roles + models_error").set_defaults(
         func=cmd_models, models_cmd="show"
     )
     md_set = md_sub.add_parser(
         "set",
-        help="Merge one role (--role …) or replace all three (JSON blob)",
+        help="Merge one role (--role …) or replace roles (legacy three-role JSON accepted)",
     )
     md_set.add_argument(
         "models_json",
@@ -5648,7 +5684,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     md_set.add_argument(
         "--role",
-        choices=("synth", "embed", "vision"),
+        choices=("synth", "embed", "vision", "wiki"),
         default=None,
         help="Merge one role (other roles unchanged)",
     )

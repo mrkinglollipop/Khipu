@@ -403,6 +403,7 @@ def set_list_setting(key: str, values: "str | list[str] | tuple[str, ...]") -> P
 
 INT_SETTINGS: dict[str, str] = {
     "synth_daily_calls": "synth",
+    "wiki_daily_pages": "wiki",
     "embed_daily_calls": "memory",
     "library_embed_daily_calls": "library",
 }

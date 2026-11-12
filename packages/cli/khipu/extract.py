@@ -14,6 +14,7 @@ Synth routing (Settings → Models): Gemini, Anthropic, OpenAI, OpenRouter REST;
 from __future__ import annotations
 
 import json
+from contextvars import ContextVar
 import math
 import os
 import re
@@ -75,12 +76,15 @@ def _key() -> str:
     return key
 
 
+_CALL_SCOPE: ContextVar[str] = ContextVar("extract_call_scope", default="synth")
+
+
 def _synth_budget_take() -> None:
     """Charge one cloud synth call against today's ceiling (embed scope
     ``synth``); raises ``khipu.embed.BudgetExhausted`` when it is spent."""
     from khipu.embed import _budget_take
 
-    _budget_take(scope="synth")
+    _budget_take(scope=_CALL_SCOPE.get())
 
 
 SYNTH_USAGE_NAME = "synth-usage.jsonl"
@@ -133,6 +137,8 @@ def _record_usage(data: Any, *, model_id: str, caller: str, provider: str = "gem
         if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost):
             row["cost_usd"] = float(cost)
         path = synth_usage_path()
+        if _CALL_SCOPE.get() == "wiki":
+            path = path.with_name("wiki-usage.jsonl")
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
@@ -580,11 +586,12 @@ def _generate_local(
 
 
 def _generate(prompt: str, *, timeout: int | None = None, retries: int = 2,
-              caller: str = "synth") -> str:
+              caller: str = "synth", settings: dict[str, str] | None = None,
+              model_id_override: str | None = None) -> str:
     """Route by per-call ``models.synth`` (Settings). Local never calls ``_key()``."""
     from khipu.models import cloud_model_id, synth_settings
 
-    settings = synth_settings()
+    settings = synth_settings() if settings is None else settings
     provider = (settings.get("provider") or "cloud").strip().lower()
     if timeout is None:
         timeout = 60 if provider in {"claude-cli", "codex-cli"} else 45
@@ -611,7 +618,7 @@ def _generate(prompt: str, *, timeout: int | None = None, retries: int = 2,
         raise RuntimeError(f"unknown synth provider: {provider}")
     return adapters[provider](
         prompt,
-        model_id=cloud_model_id(settings),
+        model_id=model_id_override or cloud_model_id(settings),
         timeout=timeout,
         retries=retries,
         caller=caller,
@@ -1084,3 +1091,20 @@ def _build_prompt(*, cwd: str, transcript: str, job: bool = False) -> str:
         idx = template.index("\nSession project (cwd):")
         template = template[:idx] + JOB_SECTION + template[idx:]
     return template.format(cwd=cwd or "(unknown)", transcript=transcript)
+
+
+def generate_wiki(prompt: str, *, model_id: str | None = None) -> str:
+    """One draft call through existing adapters, separate budget, no fallback."""
+    from khipu.models import wiki_settings
+
+    settings = wiki_settings()
+    if model_id:
+        settings["model_id"] = model_id
+    token = _CALL_SCOPE.set("wiki")
+    try:
+        if settings["provider"] == "local":
+            _synth_budget_take()
+        return _generate(prompt, retries=0, caller="wiki-draft", settings=settings,
+                         model_id_override=settings["model_id"])
+    finally:
+        _CALL_SCOPE.reset(token)

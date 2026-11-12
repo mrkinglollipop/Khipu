@@ -13,7 +13,7 @@ python3 -m khipu <command>
 
 Most commands need the Python dependencies on `PYTHONPATH` first; [packages/cli/README.md](../packages/cli/README.md) shows the one-time setup. To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
 
-There are 60 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
+There are 61 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
 
 ## Health and status
 
@@ -116,6 +116,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | `library` | Folders of `.txt` and `.md` files indexed as a search space. |
 | `embed-backfill` | Job-mode alias for `embed backfill --job`. |
 | `library-backfill NAME` | Job-mode alias for `library backfill NAME --job`. |
+| `wiki` | Read-only nightly assignments: `plan --json --since DAYS` (default 30); draft artifacts: `draft --sample N [--model ID] [--out DIR]` (last 30 days). |
 | `models` | Per-role model settings: `show`, `set`, `welcome`. |
 | `sources` | Memory sources: `list`, `enable`, `disable`, `remove`. |
 
@@ -284,3 +285,30 @@ These are launchers, not commands you normally run by hand. `khipu integrations 
 For the MCP tools these launchers serve, see [mcp-tools.md](mcp-tools.md). For the routing record, see [routing.md](routing.md). For jobs, backups and the gateway, see [operations.md](operations.md).
 
 Owner actions that scan or change batches return “Started; it will finish on its own.” after authorization. They run in a detached process, so closing or timing out the conversation does not stop them. Owner actions records the final outcome and counts.
+
+### wiki
+
+`wiki plan` reads episodes, existing active-profile vectors, topics and the queue
+(if migrated). It never creates tables, embeds, queues work, reconciles files or
+writes wiki pages. `--since DAYS` defaults to a 30-day catch-up proposal. Exact
+slug and supersession redirects precede nearest vector matching (at most two
+pages per episode). The provisional maximum cosine distance is 0.15; sample
+calibration is required before live use. More than 20% missing episode vectors on any day
+blocks drafting and returns a blocked plan with the count. Episodes without a
+vector wait two UTC nights, then use exact matches only.
+
+`wiki draft --sample N` uses the first planned batch for up to N distinct pages (1–60); additional batches remain undrafted. It it writes
+old.md, episodes.jsonl (summary/decisions/preferences only), draft.md,
+checks.json and summary.json below the jobs folder or an empty `--out` directory
+outside memory_root. These are unreviewed artifacts. Mechanical checks preserve
+frontmatter (except today's last_updated and seed → active), at least 70% of old
+length, old lines carrying numbers/dates/paths/links verbatim or named verbatim
+in a dated Was line, and the supplied Sources ids. They cannot establish factual
+truth, completeness of other facts, or correctness of a Was claim.
+
+The `wiki` models role inherits the configured `synth` route until explicitly
+set with `models set --role wiki`; `--model ID` overrides the draft model only.
+Login exhaustion never selects a paid fallback. `wiki_daily_pages` defaults to
+60, independently of summaries; lift with `budget lift wiki --cap N` or
+`config --set wiki_daily_pages N`. Draft calls consume this separate budget.
+There is no live nightly step or undo command in this draft-only slice.

@@ -1,6 +1,6 @@
-"""Per-role model Settings (synth / embed / vision) in Hub ``config.json``.
+"""Per-role model Settings (synth / embed / vision / wiki) in Hub ``config.json``.
 
-Stored under the ``models`` key. Only synth routes this cut (see ``extract.py``);
+Stored under the ``models`` key. Synth and wiki route via ``extract.py``;
 embed is persist-only display/storage; vision defaults to ``off`` with no ingest.
 OpenRouter model IDs are explicit vendor/model values, for example
 openai/gpt-6-luna, anthropic/claude-haiku-5-5, or google/gemini-2.5-flash.
@@ -14,7 +14,8 @@ from urllib.parse import urlparse
 
 from khipu.config import load_config, mutate_config
 
-ROLES = ("synth", "embed", "vision")
+ROLES = ("synth", "embed", "vision", "wiki")
+LEGACY_ROLES = ("synth", "embed", "vision")
 CLI_PROVIDERS = frozenset({"claude-cli", "codex-cli"})
 PROVIDERS = frozenset({"gemini", "anthropic", "openai", "openrouter", "local"}) | CLI_PROVIDERS
 DEFAULT_SYNTH_MODELS = {"gemini": "gemini-2.5-flash", "anthropic": "claude-haiku-5-5",
@@ -44,7 +45,7 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 def default_role(role: str) -> dict[str, str]:
-    if role == "synth":
+    if role in {"synth", "wiki"}:
         return {
             "provider": "gemini",
             "endpoint": "",
@@ -62,6 +63,7 @@ def default_document() -> dict[str, Any]:
         "synth": default_role("synth"),
         "embed": default_role("embed"),
         "vision": default_role("vision"),
+        "wiki": default_role("synth"),
         "models_error": None,
     }
 
@@ -102,9 +104,9 @@ def _normalize_role(role: str, raw: Any, *, for_set: bool) -> dict[str, str]:
     if not isinstance(raw, dict):
         raise ValueError(f"{role}: expected an object")
     provider = str(raw.get("provider", "") or "").strip().lower()
-    if role == "synth" and provider == "cloud":
+    if role in {"synth", "wiki"} and provider == "cloud":
         provider = "gemini"
-    allowed = PROVIDERS if role == "synth" else (VISION_PROVIDERS if role == "vision" else frozenset({"cloud", "local"}))
+    allowed = PROVIDERS if role in {"synth", "wiki"} else (VISION_PROVIDERS if role == "vision" else frozenset({"cloud", "local"}))
     if provider not in allowed:
         raise ValueError(
             f"{role}: unknown provider {provider!r}; expected one of {sorted(allowed)}"
@@ -125,10 +127,10 @@ def _normalize_role(role: str, raw: Any, *, for_set: bool) -> dict[str, str]:
         return {"provider": "local", "endpoint": endpoint, "model_id": model_id}
 
     # API provider
-    if role == "synth" and not model_id:
+    if role in {"synth", "wiki"} and not model_id:
         model_id = DEFAULT_SYNTH_MODELS.get(provider, "")
         if not model_id:
-            raise ValueError(f"synth: {provider} provider requires --model (model_id)")
+            raise ValueError(f"{role}: {provider} provider requires --model (model_id)")
     if endpoint:
         # Persist a cleaned endpoint even on cloud (user may flip to local later).
         endpoint = validate_endpoint(endpoint) if endpoint else ""
@@ -141,13 +143,16 @@ def validate_models_object(raw: Any, *, for_set: bool) -> dict[str, dict[str, st
     out: dict[str, dict[str, str]] = {}
     for role in ROLES:
         if role not in raw:
+            if role == "wiki":
+                out[role] = dict(out["synth"])
+                continue
             if for_set:
                 raise ValueError(f"models payload missing role: {role}")
             out[role] = default_role(role)
             continue
         out[role] = _normalize_role(role, raw[role], for_set=for_set)
     if for_set:
-        # Replace requires exactly the three roles (extras refused).
+        # Legacy three-role callers remain valid; wiki is optional.
         extra = set(raw) - set(ROLES)
         if extra:
             raise ValueError(f"models payload has unknown keys: {sorted(extra)}")
@@ -170,6 +175,7 @@ def show_models() -> dict[str, Any]:
         "synth": roles["synth"],
         "embed": roles["embed"],
         "vision": roles["vision"],
+        "wiki": roles["wiki"],
         "models_error": None,
     }
 
@@ -182,7 +188,7 @@ def _store_roles(roles: dict[str, dict[str, str]]) -> dict[str, Any]:
                 "endpoint": roles[role]["endpoint"],
                 "model_id": roles[role]["model_id"],
             }
-            for role in ROLES
+            for role in roles
         }
     return show_models()
 
@@ -219,6 +225,12 @@ def set_models_replace(payload: dict[str, Any]) -> dict[str, Any]:
     with mutate_config():
         _require_stored_models_writable()
         roles = validate_models_object(payload, for_set=True)
+        if "wiki" not in payload:
+            stored = load_config().get("models", {})
+            if isinstance(stored, dict) and "wiki" in stored:
+                roles["wiki"] = _normalize_role("wiki", stored["wiki"], for_set=True)
+            else:
+                roles.pop("wiki", None)
         return _store_roles(roles)
 
 
@@ -239,9 +251,9 @@ def set_models_merge_role(
     """
     if role not in ROLES:
         raise ValueError(f"unknown role: {role}")
-    if (role == "synth" and provider.strip().lower() in {"openai", "openrouter", "codex-cli"}
+    if (role in {"synth", "wiki"} and provider.strip().lower() in {"openai", "openrouter", "codex-cli"}
             and not (model_id or "").strip()):
-        raise ValueError(f"synth: {provider.strip().lower()} provider requires --model (model_id)")
+        raise ValueError(f"{role}: {provider.strip().lower()} provider requires --model (model_id)")
     # Read and write under one lock: the other roles are the ones stored now.
     with mutate_config():
         _require_stored_models_writable()
@@ -256,9 +268,11 @@ def set_models_merge_role(
             patch["model_id"] = model_id
         else:
             canonical = "gemini" if provider.strip().lower() == "cloud" else provider.strip().lower()
-            patch["model_id"] = ("" if role == "synth" and canonical != base[role]["provider"]
+            patch["model_id"] = ("" if role in {"synth", "wiki"} and canonical != base[role]["provider"]
                                  else base[role].get("model_id", ""))
         base[role] = _normalize_role(role, patch, for_set=True)
+        if role != "wiki" and "wiki" not in load_config().get("models", {}):
+            base.pop("wiki", None)
         return _store_roles(base)
 
 
@@ -357,6 +371,8 @@ def apply_welcome_models(
         "embed": _normalize_role("embed", embed, for_set=True),
         "vision": dict(current["vision"]),
     }
+    if "wiki" in load_config().get("models", {}):
+        roles["wiki"] = dict(current["wiki"])
     stored = _store_roles(roles)
     embed_result: dict[str, Any] = {"skipped": True}
     if embed_choice == "cloud":
@@ -364,3 +380,11 @@ def apply_welcome_models(
 
         embed_result = activate_welcome_embed(provider="cloud")
     return {"ok": True, "models": stored, "embed": embed_result}
+
+
+def wiki_settings() -> dict[str, str]:
+    """Wiki inherits synth until explicitly configured; no fallback routing."""
+    shown = show_models()
+    if shown["models_error"]:
+        raise ValueError(shown["models_error"])
+    return dict(shown["wiki"])

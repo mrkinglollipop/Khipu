@@ -375,6 +375,7 @@ SYNTH_DAILY_CALL_BUDGET = int(os.environ.get("KHIPU_SYNTH_DAILY_CALLS", "5000"))
 BUDGET_SCOPES: dict[str, tuple[str, str]] = {
     # scope: (config.json key, env variable)
     "synth": ("synth_daily_calls", "KHIPU_SYNTH_DAILY_CALLS"),
+    "wiki": ("wiki_daily_pages", "KHIPU_WIKI_DAILY_PAGES"),
     "memory": ("embed_daily_calls", "KHIPU_EMBED_DAILY_CALLS"),
     "library": ("library_embed_daily_calls", "KHIPU_LIBRARY_EMBED_DAILY_CALLS"),
 }
@@ -395,6 +396,7 @@ def _budget_path(scope: str = "memory") -> Path:
     d = ensure_data_dir() / "state"
     d.mkdir(parents=True, exist_ok=True)
     return d / {"library": "embed-budget-library.json",
+                "wiki": "wiki-budget.json",
                 "synth": "embed-budget-synth.json"}.get(scope, "embed-budget.json")
 
 
@@ -414,7 +416,7 @@ def _budget_cap(scope: str) -> tuple[int, str]:
             return int(env), "env"
         except ValueError:
             pass
-    default = {"synth": SYNTH_DAILY_CALL_BUDGET,
+    default = {"wiki": 60, "synth": SYNTH_DAILY_CALL_BUDGET,
                "library": LIBRARY_DAILY_CALL_BUDGET}.get(scope, EMBED_DAILY_CALL_BUDGET)
     return default, "default"
 
@@ -536,7 +538,7 @@ def _budget_take(*, deadline: float | None = None, scope: str = "memory") -> Non
     day = _budget_today()
     cap, source = _budget_cap(scope)
     variable = BUDGET_SCOPES.get(scope, BUDGET_SCOPES["memory"])[1]
-    label = "synth call budget" if scope == "synth" else "embed budget"
+    label = f"{scope} call budget" if scope in {"synth", "wiki"} else "embed budget"
     try:
         path = _budget_path(scope)
         lock_path = path.with_suffix(path.suffix + ".lock")
