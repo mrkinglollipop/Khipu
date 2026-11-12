@@ -365,36 +365,6 @@ class RecallQualityMetricHelpersTest(unittest.TestCase):
         self.assertEqual(row["value"], 1.0)
         self.assertFalse(row["ok"])
 
-    def test_commitments_counts_missing_table(self):
-        from khipu.drift import _commitments_counts
-
-        cur = _FakeCur([("SELECT to_regclass", {"row": (False,)})])
-        open_m, stale_m = _commitments_counts(cur)
-        self.assertIsNone(open_m["value"])
-        self.assertIsNone(stale_m["value"])
-
-    def test_commitments_counts_present(self):
-        from khipu.drift import _commitments_counts
-
-        cur = _FakeCur([
-            ("SELECT to_regclass", {"row": (True,)}),
-            ("SELECT status, COUNT(*) FROM commitments", {"rows": [("open", 5), ("stale", 2)]}),
-        ])
-        open_m, stale_m = _commitments_counts(cur)
-        self.assertEqual(open_m["value"], 5)
-        self.assertEqual(stale_m["value"], 2)
-        self.assertTrue(stale_m["ok"])  # 2 <= max(5,1)
-
-    def test_commitments_counts_more_stale_than_open_warns(self):
-        from khipu.drift import _commitments_counts
-
-        cur = _FakeCur([
-            ("SELECT to_regclass", {"row": (True,)}),
-            ("SELECT status, COUNT(*) FROM commitments", {"rows": [("open", 1), ("stale", 9)]}),
-        ])
-        _open_m, stale_m = _commitments_counts(cur)
-        self.assertFalse(stale_m["ok"])
-
 
 class QueryLogMetricsTest(unittest.TestCase):
     """`_query_log_window`/`_query_log_metrics` are a read-only pass over the
@@ -475,12 +445,14 @@ class RecallQualityIntegrationTest(unittest.TestCase):
                 block = drift.recall_quality(hub_snapshot={"ok": True, "behind_ingest_seconds": 5})
         for key in (
             "one_episode_session_ratio", "cross_session_pairs_5min",
-            "dangling_topic_ratio", "junk_path_ratio", "commitments_open",
-            "commitments_stale", "query_zero_result_rate", "slice_error_count",
+            "dangling_topic_ratio", "junk_path_ratio",
+            "query_zero_result_rate", "slice_error_count",
             "snapshot_behind_ingest_seconds",
         ):
             self.assertIn(key, block)
         self.assertTrue(block["snapshot_behind_ingest_seconds"]["ok"])
+        self.assertNotIn("commitments_open", block)
+        self.assertNotIn("commitments_stale", block)
 
     def test_a_db_failure_reports_error_not_a_crash(self):
         from khipu import drift

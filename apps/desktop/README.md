@@ -8,7 +8,7 @@ The left rail has six destinations:
 
 - **Home**: is memory working right now. Health callouts, tiles for Database, Recording, Search index and Backups, a Right now card, plan usage and routing cards, and recent captures.
 - **Recall**: a Search | Graph switch. Search modes are Best match (hybrid, the default), By meaning and Exact words. Graph walks what a topic or node connects to.
-- **Owed**: commitments by project, filtered Open, Closed or Stale, with snooze.
+- **Needs you**: explicit owner questions and decisions waiting for your answer.
 - **Activity**: every capture, newest first. Open one to read, correct or forget it.
 - **Harnesses**: which agents are wired in and whether each is recording. Install, verify and remove per harness (Claude Code, Cursor, Aegis, Codex). Grok Bot runs in the cloud, so it has nothing local to install; its button is Probe gateway.
 - **Settings**: ten sections, in this order: Database, Capture & models, Routing, Optional features, Embeddings, Data & backups, Another Mac, Components, Updates, Advanced.

@@ -374,7 +374,7 @@ export function GrokBotGuide({
             <ul>
               <li><Check size={14} aria-hidden /><span>Search what all your agents remember, and open any result</span></li>
               <li><Check size={14} aria-hidden /><span>Save a summary of its work when it calls <code>khipu_capture</code></span></li>
-              <li><Check size={14} aria-hidden /><span>Read and close open to-dos and decisions</span></li>
+              <li><Check size={14} aria-hidden /><span>File explicit questions for your decision</span></li>
               <li><Check size={14} aria-hidden /><span>See which accounts are open, once the cloud copy of routing is available (not available yet)</span></li>
             </ul>
           </div>

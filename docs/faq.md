@@ -45,7 +45,7 @@ The daily synth call ceiling covers API and subscription-CLI summarizers. Local-
 ## Recall
 
 **Does an agent have to ask for memory?**
-Not always. Claude Code and Codex get memory pushed in two ways. At session start they receive a recall rule and a slice for the current project. On each prompt they receive up to three prior-work hits, capped at 600 characters. That uses no summariser, but an uncached prompt costs one call to your embedding provider. Cursor gets only the session-start push and a project rule. Aegis gets no push, so it uses the `khipu_status` and `khipu_owed` tools. Agents can always search on their own. See [integrations.md](integrations.md).
+Not always. Claude Code and Codex get memory pushed in two ways. At session start they receive a recall rule and a slice for the current project. On each prompt they receive up to three prior-work hits, capped at 600 characters. That uses no summariser, but an uncached prompt costs one call to your embedding provider. Cursor gets only the session-start push and a project rule. Aegis gets no push, so it uses the `khipu_status` and search tools. Explicit owner asks appear in `khipu_needs_you`. Agents can always search on their own. See [integrations.md](integrations.md).
 
 **How do I search?**
 `khipu search "why did we pick pgvector"` runs a hybrid search by default. It fuses meaning, token overlap and exact text. Use `--mode literal` for exact strings, ids and error messages. Use `--mode semantic` for meaning only. `--semantic` still works but is deprecated. You can filter with `--kind`, `--project`, `--since`, `--until` and `--source`. In the app, use Recall, which has a Search and Graph switch. See [cli.md](cli.md).

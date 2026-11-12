@@ -3478,11 +3478,13 @@ def coverage(
             has_commitments = bool(cur.fetchone()[0])
             commitments_total = commitments_refs = commitments_chunks = 0
             if has_commitments:
-                cur.execute("SELECT COUNT(*) FROM commitments WHERE status = 'open'")
+                from khipu.commitments import owner_is_user_sql
+                cur.execute("SELECT COUNT(*) FROM commitments WHERE status = 'open' AND " + owner_is_user_sql())
                 commitments_total = int(cur.fetchone()[0])
                 cur.execute(
                     "SELECT COUNT(DISTINCT m.ref), COUNT(*) FROM memory_embeddings m"
                     " JOIN commitments c ON c.id::text = m.ref AND c.status = 'open'"
+                    f" AND {owner_is_user_sql('c')}"
                     " WHERE m.profile = %s AND m.kind = 'commitment'",
                     (profile,),
                 )

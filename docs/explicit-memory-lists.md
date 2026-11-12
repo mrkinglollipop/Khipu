@@ -6,8 +6,10 @@ commitments, create decision registry rows, or detect decision reversals.
 
 `khipu_owed_update(action="ask", requester=..., question=..., yes=..., no=...)`
 files an ask deliberately. `khipu_needs_you` includes those questions.
-`khipu_owed` and explicit updates remain available, including manual changes
-to archived rows. The ledger remains the work record.
+Agent and assistant to-do lists were removed. `khipu_owed` reads owner items
+only: explicit asks, archived owner items and routing-direction reminders.
+Explicit owner updates remain available; reassignment to an assistant or agent
+is refused. The ledger remains the work record.
 
 Session start includes recent episodes and linked topics. Search uses the
 owner's original words and summaries, including episode decision strings.

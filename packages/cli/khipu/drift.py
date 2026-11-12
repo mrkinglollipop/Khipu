@@ -633,26 +633,6 @@ def _junk_path_ratio(cur) -> dict:
     return _metric(ratio, threshold, ok=ok, note=f"failing={failing} total={total}")
 
 
-def _commitments_counts(cur) -> tuple[dict, dict]:
-    # forget-fence: doctor counts
-    if not _table_exists(cur, "commitments"):
-        na = _metric(None, None, ok=True, note="commitments table not present yet (pre-0009)")
-        return na, na
-    cur.execute("SELECT status, COUNT(*) FROM commitments GROUP BY status")
-    counts = {status: int(n) for status, n in cur.fetchall()}
-    open_n = counts.get("open", 0)
-    stale_n = counts.get("stale", 0)
-    # Recommended posture (scope §7 item 4): err toward leaving commitments
-    # open rather than auto-closing wrong — so a nonzero stale count is
-    # expected background noise, not itself unhealthy. It only warns once
-    # stale rows outnumber open ones, which would suggest auto-close (or
-    # someone reviewing `khipu owed --status stale`) has stopped happening.
-    open_metric = _metric(open_n, None, ok=True)
-    stale_ok = stale_n <= max(open_n, 1)
-    stale_metric = _metric(stale_n, "stale <= open (heuristic)", ok=stale_ok)
-    return open_metric, stale_metric
-
-
 def _query_log_window(days: int) -> list[dict]:
     """Read-only pass over query_log.jsonl (khipu.query_log owns the writer;
     this only consumes the public log_path()/format it already documents)."""
@@ -717,7 +697,6 @@ def recall_quality(*, hub_snapshot: dict | None = None) -> dict:
                 cross_session = _cross_session_pairs_5min(cur)
                 dangling_topics = _dangling_topic_ratio(cur)
                 junk_paths = _junk_path_ratio(cur)
-                commitments_open, commitments_stale = _commitments_counts(cur)
     except Exception as exc:  # noqa: BLE001 — a failed check must not look like a pass
         err = f"{type(exc).__name__}: {exc}"
         na = _metric(None, None, ok=False, note=err)
@@ -727,8 +706,6 @@ def recall_quality(*, hub_snapshot: dict | None = None) -> dict:
             "cross_session_pairs_5min": na,
             "dangling_topic_ratio": na,
             "junk_path_ratio": na,
-            "commitments_open": na,
-            "commitments_stale": na,
             "query_zero_result_rate": na,
             "slice_error_count": na,
             "snapshot_behind_ingest_seconds": na,
@@ -750,8 +727,6 @@ def recall_quality(*, hub_snapshot: dict | None = None) -> dict:
         "cross_session_pairs_5min": cross_session,
         "dangling_topic_ratio": dangling_topics,
         "junk_path_ratio": junk_paths,
-        "commitments_open": commitments_open,
-        "commitments_stale": commitments_stale,
         "query_zero_result_rate": zero_result,
         "slice_error_count": slice_errors,
         "snapshot_behind_ingest_seconds": behind,

@@ -137,7 +137,7 @@ class CommitmentAgingTest(RegistryTest):
     def test_rsn14_oldest_user_blocker_precedes_limit(self):
         urgent = self.cur.commitment("User must approve the release", owner="user", kind="blocker", age=60)
         for i in range(51):
-            self.cur.commitment(f"review change {i}", age=i / 100)
+            self.cur.commitment(f"review change {i}", owner="user", age=60 + i / 100)
         rows = co.list_owed(self.cur, project="p", limit=50)
         self.assertEqual(len(rows), 50)
         self.assertEqual(rows[0]["id"], urgent)

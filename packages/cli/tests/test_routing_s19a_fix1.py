@@ -139,7 +139,8 @@ def test_khipu_owed_rows_carry_the_routing_direction(world):
     assert len(rows) == 1
     assert rows[0]["kind"] == "routing_direction" and rows[0]["owner"] == "user"
     assert rows[0]["text"] == f"Routing said here, not in Khipu: '{GLM}'"
-    assert mcp_server._routing_direction_rows("open", mcp_server.owed_filters({"owner": "assistant"})) == []
+    with pytest.raises(ValueError, match="To-do lists for agents were removed"):
+        mcp_server.owed_filters({"owner": "assistant"})
     assert mcp_server._routing_direction_rows("closed", filters) == []
 
 

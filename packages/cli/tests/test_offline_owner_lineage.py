@@ -45,7 +45,8 @@ def test_replica_keeps_an_explicit_owner_assignment(monkeypatch):
     offline = offline_reads.owed_rows("acme/widget", "open")
     assert len(offline) == 1
     page = co.page_owed(offline, owner="assistant")
-    assert len(page["results"]) == 1, "The real hub assignment became user-owned again in the replica"
+    assert page["results"] == []
+    assert offline[0]["owner"] == "assistant", "The archive owner must remain unchanged"
 
 
 _HUB_ROWS = [

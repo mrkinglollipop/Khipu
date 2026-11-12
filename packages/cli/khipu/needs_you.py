@@ -102,7 +102,7 @@ HOW_TO_SETTLE = (
     "the account list, but has no place for a request held from a conversation. A settle of null means no such "
     "action exists; do says what to do instead. An item with cut: true is shortened: read read_full and show it "
     "whole before asking; until then it asks again before it applies.")
-ALSO = "Explicit asks are included here and in khipu_owed; older Owed items remain in khipu_owed until the owner resets them."
+ALSO = "Explicit asks are included here; khipu_owed also reads archived owner items and routing-direction reminders. Agent to-do lists were removed."
 
 
 # Whether the words stay whole (a ``key`` read, an ask), and whether a quote

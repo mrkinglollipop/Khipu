@@ -118,20 +118,7 @@ Tombstone one episode. Parameter: `id` (required). The row is not erased: its su
 
 ### khipu_owed
 
-List deliberately filed asks and archived commitments. Read-only.
-
-| Parameter | Meaning |
-| --- | --- |
-| `project` | Filter to one project. |
-| `status` | `open` (default), `closed` or `stale`. |
-| `owner` | `user`, `assistant`, `agent` or `all` (default). |
-| `kind` | A commitment kind, or `routing_direction`. |
-| `origin` | `conversation` or `job`. |
-| `query`, `pr`, `looks_done` | Filter by words, pull request or a Looks done suggestion. |
-| `cursor` | The `next_cursor` from an earlier page. |
-| `limit` | Default 50, capped by `owed_page_max` (200 by default, 0 for no cap). |
-
-Follow `next_cursor` for subsequent pages; `total` and `counts` cover all matching items. Call it at session start in a harness that gets no pushed project slice.
+Reads only explicit owner asks and archived owner items, plus routing-direction reminders. Agent and assistant lists were removed. Use `khipu_needs_you` for current owner decisions; this archive additionally supports closed/stale owner items, project/kind filters and keyset paging with `next_cursor`. Counts cover owner items only.
 
 ### khipu_owed_update
 
@@ -141,10 +128,10 @@ To file an ask, use `action="ask"` with `requester`, `question`, `yes` and `no`.
 
 | Parameter | Meaning |
 | --- | --- |
-| `id`, `ids` | For an existing item, supply a commitment id or a list of ids from `khipu_owed`. |
+| `id`, `ids` | For an existing item, supply a commitment id or a list of ids from `khipu_needs_you` or the owner-only `khipu_owed` archive. |
 | `action` | Required. `ask`, `close`, `reopen`, `snooze` or `reassign`. |
 | `until` | For snooze: a date, or `7d`, `2w`, `1m`. |
-| `owner`, `owner_label` | Reassignment requires `owner` (`user`, `assistant` or `agent`), with an optional label. |
+| `owner` | Reassignment accepts `user` only. Agent and assistant to-do lists were removed; use `ask` for something the owner must decide. |
 | `reason` | Required when changing multiple ids. |
 
 Multiple ids are changed in one transaction with a result per id, bounded by `owed_bulk_max` (500 by default, 0 for no cap). The answer's `ok` is false, with `changed: 0`, `failed` and an `error`, when no id changed (every id missing, or a reopen of items already open); the per-id `results` still say why, and the tool call is an error. When some ids changed and others did not, `ok` stays true so the ids that landed are kept, with `partial: true` and `failed` listing the ids that did not; check `results` per id. `khipu owed --close/--reopen/--reassign ID,ID` prints the same answer and exits 1 unless `ok`. Bulk changes including user-owned items require owner confirmation or owner-directed `owed.change`.
@@ -244,7 +231,7 @@ It lists a conversation's waiting change to the priority, a standing rule, a rou
 
 Each item has `kind`, `words` (one or two plain sentences, no ids), `asked_by` (`who`, `at`, `when`), `confirm_does`, `undo_does` and `settle` (`confirm` and `undo`, each the exact `khipu_owner_act` `action` and `args`, with its `expect` pin; `null` where no such action exists, and `do` says what to do). An item carries `cut: true` when its words are shortened, and `read_full` is the `key` read that gives them whole; `permanent: true` when its confirm can't be undone. The answer has `line`, `total`, `counts`, `more` and `more_line` (at most 20 items an answer), `how_to_settle`, `here` (what a yes in this conversation does now) and `unread` (anything it could not read: it says nothing is waiting only when all of it was read).
 
-Reading it confirms nothing and records no rule or priority as shown, but it is the ask: Khipu records where the conversation stood and which answers the read showed whole, and only what the owner types after that can answer. Nothing typed before it counts, the question included. In T3, one typed message newer than the read settles an item shown in it, routing kinds at once and held kinds by the same call; a turn Khipu can't prove stays held, with nothing changed. Outside T3 an answer is refused in the same turn as the read, but an agent that never read the list still passes on a recent typed turn. Khipu proves a new typed message and doesn't read it, so it can't tell a yes from "thanks". `direction.decline` drops a held request on the owner's no, on the same proof as `direction.confirm`, and is logged. `key` reads one item with its words whole. Owed items that need the owner are a separate list: `khipu_owed`.
+Reading it confirms nothing and records no rule or priority as shown, but it is the ask: Khipu records where the conversation stood and which answers the read showed whole, and only what the owner types after that can answer. Nothing typed before it counts, the question included. In T3, one typed message newer than the read settles an item shown in it, routing kinds at once and held kinds by the same call; a turn Khipu can't prove stays held, with nothing changed. Outside T3 an answer is refused in the same turn as the read, but an agent that never read the list still passes on a recent typed turn. Khipu proves a new typed message and doesn't read it, so it can't tell a yes from "thanks". `direction.decline` drops a held request on the owner's no, on the same proof as `direction.confirm`, and is logged. `key` reads one item with its words whole. Explicit owner asks are included here; `khipu_owed` also reads archived owner items and routing-direction reminders.
 
 ## Work
 

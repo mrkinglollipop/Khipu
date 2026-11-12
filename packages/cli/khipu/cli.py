@@ -889,7 +889,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         except Exception as e:  # noqa: BLE001
             recall_probe = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
     # W6.2: recall-quality ratios (fragmentation, dangling topics, junk paths,
-    # commitments, query zero-result rate). Surfaced for visibility; per the
+    # query zero-result rate). Surfaced for visibility; per the
     # scope these only warn and never gate doctor's overall ok below.
     try:
         from khipu.drift import recall_quality
@@ -5650,12 +5650,12 @@ def build_parser() -> argparse.ArgumentParser:
     rc.add_argument("--memory-root", default=_memory_root_default())
     rc.set_defaults(func=cmd_reconcile)
 
-    owed = sub.add_parser("owed", help="List / close / reopen commitments (memory reliability W3)")
+    owed = sub.add_parser("owed", help="List / close / reopen owner asks and archived owner items")
     owed.add_argument("--project", default=None)
     owed.add_argument("--status", default="open", choices=("open", "closed", "stale"))
     owed.add_argument("--limit", type=int, default=50)
-    owed.add_argument("--owner", default=None, choices=("user", "assistant", "agent", "all"),
-                      help="Only items this owner owes (pages the list, like khipu_owed)")
+    owed.add_argument("--owner", default=None, choices=("user", "all"),
+                      help="Owner items only (agent to-do lists were removed)")
     owed.add_argument("--kind", default=None, choices=("followup", "blocker", "question", "promise", "routing_direction"))
     owed.add_argument("--origin", default=None, choices=("conversation", "job"))
     owed.add_argument("--query", default=None, help="Only items whose text holds all these words")
@@ -5669,9 +5669,8 @@ def build_parser() -> argparse.ArgumentParser:
     owed.add_argument("--reopen", metavar="ID[,ID...]", default=None, help="Reopen commitment ID, or several")
     owed.add_argument("--reassign", metavar="ID[,ID...]", default=None,
                       help="Give commitment ID, or several, to another owner (needs --to)")
-    owed.add_argument("--to", default=None, choices=("user", "assistant", "agent"),
-                      help="With --reassign: the new owner")
-    owed.add_argument("--label", default=None, help="With --reassign --to agent: who (orchestrator, builder, reviewer)")
+    owed.add_argument("--to", default=None,
+                      help="With --reassign: user (agent to-do lists were removed)")
     owed.add_argument("--reason", default=None,
                       help="Why (kept on a closed item); required with more than one id")
     owed.add_argument("--json", action="store_true", help="Accepted and ignored: the output is always JSON")

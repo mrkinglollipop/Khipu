@@ -110,12 +110,23 @@ def test_forgotten_episodes_and_archived_superseded_or_retracted_strings_stay_ou
 def test_open_commitments_of_the_thread_still_come_back(pg):
     episode = land(1, decisions=["Keep the recall budget"])
     with pg.connect() as conn:
-        for text, key, status, due in (("Verify thread continuity", "a", "open", None),
+        for text, key, status, due in (("Owner to decide the next scope", "a", "open", None),
                                        ("Already closed", "b", "closed", None),
                                        ("Snoozed", "c", "open", "2999-01-01")):
             seed(conn, "commitment",
-                 "INSERT INTO commitments (text, opened_episode, content_hash, status, due_after) "
-                 f"VALUES (%s, %s, '{key}', %s, %s)", (text, episode, status, due))
+                 "INSERT INTO commitments (text, opened_episode, content_hash, status, due_after, owner) "
+                 f"VALUES (%s, %s, '{key}', %s, %s, 'user')", (text, episode, status, due))
         conn.commit()
     assert [(h["kind"], h["snippet"]) for h in rp._thread_memory_hits(THREAD)] == [
-        ("decision", "Keep the recall budget"), ("commitment", "Verify thread continuity")]
+        ("decision", "Keep the recall budget"), ("commitment", "Owner to decide the next scope")]
+
+
+@pytest.mark.parametrize("owner,visible", [(None, True), ("Peer 1", True), ("ASSISTANT:", False), ("agent", False)])
+def test_thread_commitments_preserve_legacy_owner_classification(pg, owner, visible):
+    episode = land(1)
+    with pg.connect() as conn:
+        seed(conn, "commitment", "INSERT INTO commitments (text, owner, opened_episode, content_hash) "
+             "VALUES ('Decide the scope', %s, %s, 'legacy-owner')", (owner, episode))
+        conn.commit()
+    texts = [h["snippet"] for h in rp._thread_memory_hits(THREAD) if h["kind"] == "commitment"]
+    assert texts == (["Decide the scope"] if visible else [])

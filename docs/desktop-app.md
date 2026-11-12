@@ -61,19 +61,9 @@ How search works is in [how-it-works.md](how-it-works.md).
 
 ## Work
 
-Work brings together Owed, project ledger boards, Waiting on you, Running now and Accounts. Open a project board to read or change its ledger. Settings > Work manages the summary files your runners report.
+Project work lists show the work recorded for each project. Open a project to read or change its list. Settings > Work manages the summary files your runners report.
 
-### Owed
-
-Question it answers: "What do I still owe on each project?"
-
-Khipu keeps the follow-ups, blockers, questions and promises it finds in your sessions. Within Work, Owed groups open items by owner, with project and kind filters alongside **Open**, **Closed** and **Stale**. Select items for bulk close or reassignment, or use **Tidy this list…** to review a cleanup before applying it. For each item you can:
-
-- mark it done,
-- reopen it,
-- snooze it (a Snooze until dialog offers a week, two weeks or a month).
-
-A snoozed item does not go stale while the snooze lasts. Your own items remain open until you resolve them; **Looks done** suggests items to review, and quiet items stay visible under **Quiet for N weeks**.
+Needs you shows explicit questions from conversations and changes waiting for your approval. Answer a question in the conversation that asked it; that conversation closes the ask. Agent and assistant to-do lists and their page were removed.
 
 ## Activity
 
